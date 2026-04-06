@@ -168,16 +168,16 @@ def execute_sql(
     try:
         passed, errors = validator.validate(sql)
         real_errors = [e for e in errors if not e.startswith("WARNING:")]
-        if real_errors:
-            return {
-                "success": False,
-                "result": None,
-                "error": "SQL failed validation: " + "; ".join(real_errors),
-            }
+        warnings = [e for e in errors if e.startswith("WARNING:")]
+        # Validator warnings are returned as observations, not execution gates.
+        # Only a database-level exception stops execution.
 
         with db_engine.connect() as conn:
             result = conn.execute(sql_text(sql))
-            rows = result.fetchmany(50)
+            rows = result.fetchmany(51)
+            truncated = len(rows) > 50
+            if truncated:
+                rows = rows[:50]
             columns = list(result.keys())
 
         data = [dict(zip(columns, row)) for row in rows]
@@ -187,10 +187,36 @@ def execute_sql(
                 "rows": data,
                 "row_count": len(data),
                 "columns": columns,
+                "truncated": truncated,
+                "validator_warnings": real_errors + warnings,
             },
             "error": None,
         }
 
+    except Exception as exc:
+        return {"success": False, "result": None, "error": str(exc)}
+
+
+def validate_sql(validator: SQLValidator, sql: str) -> dict[str, Any]:
+    """
+    Run the SQL validator on a query without executing it.
+    Returns the full validation result including all errors and warnings.
+    The model uses this to decide whether to execute or regenerate.
+    """
+    try:
+        passed, errors = validator.validate(sql)
+        real_errors = [e for e in errors if not e.startswith("WARNING:")]
+        warnings = [e for e in errors if e.startswith("WARNING:")]
+        return {
+            "success": True,
+            "result": {
+                "passed": passed,
+                "real_errors": real_errors,
+                "warnings": warnings,
+                "sql_reviewed": sql,
+            },
+            "error": None,
+        }
     except Exception as exc:
         return {"success": False, "result": None, "error": str(exc)}
 
@@ -236,6 +262,7 @@ class ToolRegistry:
         "lookup_form",
         "semantic_search",
         "generate_sql",
+        "validate_sql",
         "execute_sql",
         "get_schema",
     }
@@ -287,6 +314,12 @@ class ToolRegistry:
                     self._validator,
                     question=str(args["question"]),
                     schema_hint=str(args.get("schema_hint", "")),
+                )
+
+            if name == "validate_sql":
+                return validate_sql(
+                    self._validator,
+                    sql=str(args["sql"]),
                 )
 
             if name == "execute_sql":

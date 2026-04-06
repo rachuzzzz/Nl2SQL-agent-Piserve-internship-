@@ -50,9 +50,7 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from config.custom_prompts import TEXT_TO_SQL_PROMPT, RESPONSE_SYNTHESIS_PROMPT
 from core.validator import SQLValidator
-from core.templates import SQLTemplateBypass
 from core.semantic import SemanticQuestionIndex
-from core.router import IntentRouter
 
 
 @dataclass
@@ -70,7 +68,7 @@ class QueryResult:
 class NL2SQLEngine:
     """
     The main engine. Connects LlamaIndex to your PostgreSQL via Ollama.
-    
+
     Usage:
         engine = NL2SQLEngine.from_env()     # reads .env file
         result = engine.query("How many forms are there?")
@@ -126,12 +124,8 @@ class NL2SQLEngine:
             db_engine=self.db_engine,
             embed_model=embed_model,
         )
-        self.templates = SQLTemplateBypass(semantic_index=self.semantic_index)
 
-        # --- Step 5: Build intent router ---
-        self.router = IntentRouter(embed_model=embed_model)
-
-        # --- Step 6: Set up Ollama LLM for SQL generation ---
+        # --- Step 5: Set up Ollama LLM for SQL generation ---
         print(f"  Configuring LLM: {sql_model} via Ollama...")
         self.sql_llm = Ollama(
             model=sql_model,
@@ -234,108 +228,29 @@ class NL2SQLEngine:
 
     def query(self, question: str) -> QueryResult:
         """
-        Two-path query engine:
-          Path 1 (SEMANTIC): content searches → embedding similarity → direct results
-          Path 2 (STRUCTURAL): counts, listings, config → templates/LLM → SQL → execute
+        Always routes to structural handling via SQL generation.
         """
-        # --- Step 1: Route the question ---
-        decision = self.router.route(question)
-
-        # --- Path 1: SEMANTIC — no SQL needed ---
-        if decision.path == "semantic" and self.semantic_index:
-            return self._handle_semantic(question, decision)
-
-        # --- Path 2: STRUCTURAL — needs SQL ---
         return self._handle_structural(question)
-
-    def _handle_semantic(self, question: str, decision) -> QueryResult:
-        """
-        Content search: embed the question, find similar labels, return directly.
-        No SQL, no database query, no LLM for generation. Instant.
-        """
-        matches = self.semantic_index.search(
-            query=decision.search_term or question,
-            entity_type=decision.entity_type if decision.entity_type != "QUESTION" else None,
-            form_name=decision.form_name,
-            top_k=10,
-        )
-
-        # Filter by a reasonable threshold
-        good_matches = [m for m in matches if m.score >= 0.4]
-
-        if not good_matches:
-            return QueryResult(
-                question=question,
-                sql="[semantic] No SQL — direct embedding search",
-                raw_result="No matching questions found.",
-                answer=f"No questions found matching '{decision.search_term}'" + 
-                       (f" in form '{decision.form_name}'" if decision.form_name else "") + ".",
-                tables_used=[],
-                validation_passed=True,
-                validation_errors=[],
-            )
-
-        # Format results
-        raw_lines = []
-        for m in good_matches:
-            raw_lines.append(f"Form: {m.form_name} | Type: {m.entity_type} | "
-                           f"Label: {m.text} | Score: {m.score:.2f} | ID: {m.element_id}")
-        raw_result = "\n".join(raw_lines)
-
-        # Synthesize a natural answer
-        try:
-            answer = self._synthesize_answer(question, "[semantic search]", raw_result)
-        except Exception:
-            # Fallback: format manually
-            answer_parts = []
-            forms_seen = set()
-            for m in good_matches:
-                if m.score >= 0.5:  # Only include strong matches in the answer
-                    answer_parts.append(f"- \"{m.text}\" (in form: {m.form_name}, score: {m.score:.0%})")
-                    forms_seen.add(m.form_name)
-            if answer_parts:
-                answer = f"Found {len(answer_parts)} matching questions:\n" + "\n".join(answer_parts)
-            else:
-                answer = "No strong matches found."
-
-        return QueryResult(
-            question=question,
-            sql=f"[semantic] search_term='{decision.search_term}' | form='{decision.form_name or 'all'}' | "
-                f"confidence={decision.confidence:.2f} | matches={len(good_matches)}",
-            raw_result=raw_result,
-            answer=answer,
-            tables_used=[],
-            validation_passed=True,
-            validation_errors=[],
-        )
 
     def _handle_structural(self, question: str) -> QueryResult:
         """
-        Structural query: try templates first, fall through to LLM.
-        Generates SQL, executes, synthesizes answer.
+        Structural query: LLM generates SQL, executes, synthesizes answer.
         """
-        # --- Try template bypass (instant, deterministic) ---
-        template_sql = self.templates.try_match(question)
-        if template_sql:
-            sql = template_sql
-            source = "template"
-        else:
-            # --- Fall through to LLM ---
-            source = "llm"
-            try:
-                response = self.query_engine.query(question)
-                raw_sql = str(response.metadata.get("sql_query", str(response)))
-                sql = self.validator.clean_sql(raw_sql)
-            except Exception as e:
-                return QueryResult(
-                    question=question,
-                    sql=f"-- ERROR generating SQL: {e}",
-                    raw_result="",
-                    answer=f"Error generating SQL: {e}",
-                    tables_used=[],
-                    validation_passed=False,
-                    validation_errors=[str(e)],
-                )
+        source = "llm"
+        try:
+            response = self.query_engine.query(question)
+            raw_sql = str(response.metadata.get("sql_query", str(response)))
+            sql = self.validator.clean_sql(raw_sql)
+        except Exception as e:
+            return QueryResult(
+                question=question,
+                sql=f"-- ERROR generating SQL: {e}",
+                raw_result="",
+                answer=f"Error generating SQL: {e}",
+                tables_used=[],
+                validation_passed=False,
+                validation_errors=[str(e)],
+            )
 
         # Validate
         is_valid, errors = self.validator.validate(sql)
@@ -376,120 +291,6 @@ class NL2SQLEngine:
             validation_passed=is_valid,
             validation_errors=errors,
         )
-
-    def query_sql_only(self, question: str) -> QueryResult:
-        """Generate SQL or semantic results without executing. Safe mode."""
-
-        # --- Route the question ---
-        decision = self.router.route(question)
-
-        if decision.path == "semantic" and self.semantic_index:
-            # Show what semantic search would find
-            matches = self.semantic_index.search(
-                query=decision.search_term or question,
-                form_name=decision.form_name,
-                top_k=10,
-            )
-            good = [m for m in matches if m.score >= 0.4]
-            result_lines = [f"  {m.score:.0%} | {m.form_name} | {m.text}" for m in good]
-            return QueryResult(
-                question=question,
-                sql=f"[semantic] search='{decision.search_term}' form='{decision.form_name or 'all'}'",
-                raw_result="\n".join(result_lines) if result_lines else "No matches",
-                answer="",
-                tables_used=[],
-                validation_passed=True,
-                validation_errors=[],
-            )
-
-        # --- Structural: try template ---
-        template_sql = self.templates.try_match(question)
-        if template_sql:
-            is_valid, errors = self.validator.validate(template_sql)
-            return QueryResult(
-                question=question,
-                sql=f"[template] {template_sql}",
-                raw_result="(not executed — sql_only mode)",
-                answer="",
-                tables_used=[],
-                validation_passed=is_valid,
-                validation_errors=errors,
-            )
-
-        # --- Fall through to LLM ---
-        try:
-            response = self.query_engine.query(question)
-            raw_sql = str(response.metadata.get("sql_query", str(response)))
-        except Exception as e:
-            return QueryResult(
-                question=question,
-                sql=f"-- ERROR: {e}",
-                raw_result="",
-                answer="",
-                tables_used=[],
-                validation_passed=False,
-                validation_errors=[str(e)],
-            )
-
-        sql = self.validator.clean_sql(raw_sql)
-        is_valid, errors = self.validator.validate(sql)
-
-        return QueryResult(
-            question=question,
-            sql=f"[llm] {sql}",
-            raw_result="(not executed — sql_only mode)",
-            answer="",
-            tables_used=[],
-            validation_passed=is_valid,
-            validation_errors=errors,
-        )
-
-    def _retry_with_feedback(self, question: str, bad_sql: str, errors: list[str]) -> Optional[str]:
-        """
-        When the first attempt fails validation, call the LLM directly
-        with the error feedback and a very explicit correct pattern.
-        """
-        error_text = "\n".join(f"- {e}" for e in errors)
-
-        retry_prompt = f"""### Task
-Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
-
-### Your previous SQL was WRONG:
-{bad_sql}
-
-### Errors found:
-{error_text}
-
-### MANDATORY FIX — use this exact pattern for any query needing labels/titles/names:
-SELECT elem->>'translatedText' AS label
-FROM fb_forms f
-JOIN fb_translation_json tj ON f.translations_id = tj.id,
-     jsonb_array_elements(tj.translations) AS elem
-WHERE f.name ILIKE '%TEST%'
-  AND elem->>'language' = 'eng'
-  AND elem->>'attribute' = 'NAME'
-  AND elem->>'entityType' = 'QUESTION'
-LIMIT 100;
-
-Replace '%TEST%' with the actual form name from the user's question.
-
-RULES:
-- NEVER use fb_question.label — it does not exist
-- NEVER use fb_section.title or fb_page.title — they do not exist
-- NEVER use translations->>'key' — must use jsonb_array_elements() first
-- Always use ->> not ->
-- "show all forms" → SELECT f.name, f.status, f.active FROM fb_forms f LIMIT 100;
-- For simple counts (no labels needed): SELECT COUNT(*) FROM fb_forms;
-
-### Answer
-Given the errors above, here is the corrected SQL query that [QUESTION]{question}[/QUESTION]
-[SQL]
-"""
-        try:
-            response = self.sql_llm.complete(retry_prompt)
-            return str(response).strip()
-        except Exception:
-            return None
 
     def _synthesize_answer(self, question: str, sql: str, raw_result: str) -> str:
         """Use mistral to convert raw SQL results to natural language."""

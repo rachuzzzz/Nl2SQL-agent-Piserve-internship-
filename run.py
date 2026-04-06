@@ -209,6 +209,10 @@ def main() -> None:
             break
         if not question:
             continue
+        if question.lower() == "clear":
+            orch.clear_session()
+            print("Session cleared.", flush=True)
+            continue
 
         try:
             if sql_only:

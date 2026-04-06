@@ -136,6 +136,9 @@ class AgentOrchestrator:
             sql_llm=self.sql_llm,
         )
 
+        # --- Session memory ---
+        self.session_history: list[ChatMessage] = []
+
         print()
         print("=" * 50)
         print("  AgentOrchestrator ready")
@@ -154,6 +157,7 @@ class AgentOrchestrator:
         question: str,
         max_iterations: int = 8,
         on_step=None,
+        use_session: bool = True,
     ) -> AgentResult:
         """
         Run the agent loop for the given user question.
@@ -166,7 +170,7 @@ class AgentOrchestrator:
           - Call reasoning_llm.chat(messages)
           - Parse tool call JSON
           - If final_answer → return
-          - Dispatch tool → append result as next user turn
+          - Dispatch tool → format observation → append as next user turn
           - Repeat
 
         If max_iterations is exhausted, force a summary response.
@@ -175,10 +179,17 @@ class AgentOrchestrator:
             if on_step is not None:
                 on_step(event)
 
-        messages: list[ChatMessage] = [
-            ChatMessage(role=MessageRole.SYSTEM, content=SYSTEM_PROMPT),
-            ChatMessage(role=MessageRole.USER, content=question),
-        ]
+        if use_session and self.session_history:
+            messages: list[ChatMessage] = (
+                [ChatMessage(role=MessageRole.SYSTEM, content=SYSTEM_PROMPT)]
+                + self.session_history
+                + [ChatMessage(role=MessageRole.USER, content=question)]
+            )
+        else:
+            messages: list[ChatMessage] = [
+                ChatMessage(role=MessageRole.SYSTEM, content=SYSTEM_PROMPT),
+                ChatMessage(role=MessageRole.USER, content=question),
+            ]
 
         steps: list[AgentStep] = []
 
@@ -235,6 +246,13 @@ class AgentOrchestrator:
                 )
                 steps.append(_step)
                 _emit(_step)
+
+                if use_session:
+                    new_turns = messages[1 + len(self.session_history):]
+                    self.session_history.extend(new_turns)
+                    while len(self.session_history) > 20:
+                        self.session_history = self.session_history[2:]
+
                 return AgentResult(
                     question=question,
                     answer=answer,
@@ -258,65 +276,11 @@ class AgentOrchestrator:
             steps.append(_step)
             _emit(_step)
 
-            # 5. Handle result — three paths:
-            #
-            # A) generate_sql with valid SQL → auto-execute, auto-synthesize, return.
-            # B) terminal tools (list_forms, semantic_search, execute_sql) → auto-synthesize, return.
-            # C) non-terminal tools (lookup_form, get_schema) or failures → append context, loop.
-            #
-            # Paths A and B never loop back; the answer is produced by a single
-            # focused synthesis call instead of asking the model to call final_answer.
-
-            # --- Path A: generate_sql ---
-            if tool_name == "generate_sql" and tool_result.get("success"):
-                sql_data = tool_result.get("result", {})
-                if sql_data.get("validation", {}).get("passed"):
-                    sql = sql_data.get("sql", "")
-
-                    exec_start = time.time()
-                    exec_result = self.registry.call("execute_sql", {"sql": sql})
-                    exec_ms = int((time.time() - exec_start) * 1000)
-                    _auto_step = AgentStep(
-                        iteration=iteration,
-                        thought="[auto] generate_sql validated → executing immediately",
-                        tool="execute_sql",
-                        args={"sql": sql},
-                        result=exec_result,
-                        duration_ms=exec_ms,
-                    )
-                    steps.append(_auto_step)
-                    _emit(_auto_step)
-
-                    answer = self._auto_synthesize(question, "execute_sql", exec_result)
-                    return self._make_result(question, answer, steps, iteration, _emit)
-
-                else:
-                    # Validation failed — loop back so model can retry
-                    errors = (tool_result.get("result", {})
-                              .get("validation", {})
-                              .get("errors", [str(tool_result.get("error", "unknown"))]))
-                    messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw_output))
-                    messages.append(ChatMessage(
-                        role=MessageRole.USER,
-                        content=(
-                            f"generate_sql failed validation.\n"
-                            f"Errors: {'; '.join(errors)}\n"
-                            f"Try again with a corrected question or schema_hint."
-                        ),
-                    ))
-                    continue
-
-            # --- Path B: terminal tools with data → synthesize and return ---
-            if tool_name in self._TERMINAL_TOOLS and tool_result.get("success"):
-                answer = self._auto_synthesize(question, tool_name, tool_result)
-                return self._make_result(question, answer, steps, iteration, _emit)
-
-            # --- Path C: non-terminal tools or failures → continue loop ---
+            # 5. Format observation and return to qwen — always, no branching
+            observation = self._format_observation(tool_name, tool_result, args)
             messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw_output))
-            messages.append(ChatMessage(
-                role=MessageRole.USER,
-                content=self._build_context_message(tool_name, tool_result),
-            ))
+            messages.append(ChatMessage(role=MessageRole.USER, content=observation))
+            # loop continues — qwen decides what to do next
 
         # --- max_iterations reached — force a summary ---
         force_start = time.time()
@@ -345,6 +309,12 @@ class AgentOrchestrator:
         steps.append(_summary_step)
         _emit(_summary_step)
 
+        if use_session:
+            new_turns = messages[1 + len(self.session_history):]
+            self.session_history.extend(new_turns)
+            while len(self.session_history) > 20:
+                self.session_history = self.session_history[2:]
+
         return AgentResult(
             question=question,
             answer=answer,
@@ -352,6 +322,11 @@ class AgentOrchestrator:
             total_iterations=max_iterations,
             success=False,  # didn't reach final_answer naturally
         )
+
+    def clear_session(self) -> None:
+        """Reset session memory. Call between unrelated conversations."""
+        self.session_history = []
+        print("  [session] History cleared.")
 
     def test_connection(self) -> bool:
         """Quick connection check (mirrors NL2SQLEngine.test_connection)."""
@@ -399,95 +374,238 @@ class AgentOrchestrator:
     # Private helpers                                                      #
     # ------------------------------------------------------------------ #
 
-    # Tools whose result is always sufficient to answer — no further agent
-    # loop iteration needed; the orchestrator synthesizes the answer directly.
-    _TERMINAL_TOOLS = {"list_forms", "semantic_search", "execute_sql"}
+    def _format_observation(self, tool_name: str, tool_result: dict, args: dict = None) -> str:
+        args = args or {}
+        success = tool_result.get("success", False)
+        data = tool_result.get("result")
+        error = tool_result.get("error", "unknown error")
 
-    def _make_result(
-        self,
-        question: str,
-        answer: str,
-        steps: list,
-        iteration: int,
-        emit_fn=None,
-    ) -> AgentResult:
-        """Wrap a completed answer in AgentResult and emit the final step."""
-        final_step = AgentStep(
-            iteration=iteration,
-            thought="[auto] synthesized from tool result",
-            tool="final_answer",
-            args={"answer": answer},
-            result={"answer": answer},
-            duration_ms=0,
-        )
-        steps.append(final_step)
-        if emit_fn is not None:
-            emit_fn(final_step)
-        return AgentResult(
-            question=question,
-            answer=answer,
-            steps=steps,
-            total_iterations=iteration,
-            success=True,
-        )
-
-    def _auto_synthesize(
-        self, question: str, tool_name: str, tool_result: dict
-    ) -> str:
-        """
-        Produce a natural-language answer from a terminal tool result without
-        running another agent loop iteration.
-
-        Uses a single focused completion call (no JSON format required) so the
-        model just writes a plain answer.
-        """
-        data = tool_result.get("result", {})
-        prompt = (
-            f"Answer the following question based on the data provided.\n\n"
-            f"Question: {question}\n\n"
-            f"Data ({tool_name}):\n"
-            f"{json.dumps(data, default=str, indent=2)}\n\n"
-            f"Give a concise, direct answer. Do not mention JSON, tool names, "
-            f"or data formats — just answer the question naturally."
-        )
-        try:
-            response = self.reasoning_llm.complete(prompt)
-            return str(response).strip()
-        except Exception:
-            return json.dumps(data, default=str)
-
-    def _build_context_message(self, tool_name: str, tool_result: dict) -> str:
-        """
-        Build the user-turn message for Path C tools (lookup_form, get_schema)
-        and tool failures.  Terminal tools and generate_sql are handled in query().
-        """
-        if not tool_result.get("success"):
-            return (
-                f"Tool '{tool_name}' failed: {tool_result.get('error', 'unknown error')}\n"
-                f"Consider a different approach."
-            )
+        if tool_name == "list_forms":
+            if not success:
+                return f"list_forms failed: {error}"
+            if data:
+                lines = [f"list_forms returned {len(data)} form(s):\n"]
+                for form in data:
+                    lines.append(f"  \u2022 {form['name']}  |  status: {form['status']}  |  active: {form['active']}\n")
+                lines.append("\n")
+                return "".join(lines)
+            else:
+                return (
+                    "list_forms returned 0 forms. There may be no forms with that status, "
+                    "or the status value may be incorrect. Valid values are DRAFT, PUBLISHED, DELETED."
+                )
 
         if tool_name == "lookup_form":
-            names = tool_result.get("result", [])
+            if not success:
+                return f"lookup_form failed: {error}"
+            names = data if data else []
             if names:
-                names_fmt = ", ".join(f"'{n}'" for n in names)
+                lines = [f"lookup_form found {len(names)} matching form name(s) in the database:\n"]
+                for name in names:
+                    lines.append(f"  \u2022 {name}\n")
+                lines.append("\n")
+                lines.append("These are the exact names stored in the database. Use one of them verbatim in your next generate_sql or semantic_search call.")
+                return "".join(lines)
+            else:
                 return (
-                    f"lookup_form found these exact names in the database: {names_fmt}\n\n"
-                    f"Now call generate_sql using one of these exact names in schema_hint.\n"
-                    f"Example: schema_hint='The exact name is: {names[0]}'"
+                    "lookup_form found no forms matching that name. The form may not exist, "
+                    "or the name may be spelled differently. Call list_forms() with no filter to see all available form names."
                 )
-            return (
-                f"lookup_form found no matches.\n"
-                f"Call generate_sql directly, or call list_forms() to see all names."
-            )
 
-        # get_schema and anything else — plain JSON
-        return json.dumps(tool_result, default=str)
+        if tool_name == "semantic_search":
+            if not success:
+                return f"semantic_search failed: {error}"
+            matches = data if data else []
+            query_str = args.get("query", "")
+            if matches:
+                scores = [m["score"] for m in matches]
+                max_score = max(scores)
+                lines = [f"semantic_search found {len(matches)} match(es) for '{query_str}':\n"]
+                for m in matches:
+                    lines.append(f"  \u2022 [{m['score']:.0%}] {m['entity_type']} \u2014 \"{m['text']}\" (form: {m['form_name']})\n")
+                lines.append("\n")
+                if max_score >= 0.75:
+                    lines.append("Scores are strong. These results likely answer the question.")
+                elif max_score >= 0.55:
+                    lines.append(
+                        "Scores are moderate. Results are probably relevant but consider "
+                        "whether a SQL keyword search might be more precise."
+                    )
+                else:
+                    lines.append(
+                        "Scores are weak (all below 55%). These may not be reliable matches. "
+                        "Consider using generate_sql with an ILIKE keyword search as an alternative approach."
+                    )
+                return "".join(lines)
+            else:
+                return (
+                    "semantic_search found no matches above the 0.4 threshold. The concept may not appear "
+                    "in any form labels. Consider using generate_sql with an ILIKE keyword search instead."
+                )
 
-    def _call_reasoning_llm(self, messages: list[ChatMessage]) -> str:
-        """
-        Call mistral:latest with the current message list.
-        Returns the raw string content of the response.
-        """
-        response = self.reasoning_llm.chat(messages)
-        return response.message.content.strip()
+        if tool_name == "generate_sql":
+            if not success:
+                return f"generate_sql failed entirely: {error}"
+            sql_data = data or {}
+            sql = sql_data.get("sql", "")
+            validation = sql_data.get("validation", {})
+            passed = validation.get("passed", False)
+            errors = validation.get("errors", [])
+            real_errors = [e for e in errors if not e.startswith("WARNING:")]
+            warnings = [e for e in errors if e.startswith("WARNING:")]
+            if passed:
+                lines = [f"sqlcoder generated the following SQL:\n\n{sql}\n\nValidation passed with no blocking errors."]
+                if warnings:
+                    lines.append("\nValidator warnings (non-blocking):\n")
+                    for w in warnings:
+                        lines.append(f"  \u26a0 {w}\n")
+                lines.append(
+                    "\nReview this SQL carefully. If it looks correct for the question, "
+                    "call execute_sql with it. If something looks wrong \u2014 incorrect table, "
+                    "missing filter, wrong entityType \u2014 call generate_sql again with a corrected "
+                    "schema_hint describing the exact pattern needed."
+                )
+                return "".join(lines)
+            else:
+                lines = [f"sqlcoder generated the following SQL:\n\n{sql}\n\nValidation found blocking errors:\n"]
+                for e in real_errors:
+                    lines.append(f"  \u2717 {e}\n")
+                lines.append(
+                    "\nDo not call execute_sql with this SQL. Reason about the errors above. Common fixes:\n"
+                    "  \u2014 If the error mentions a hallucinated column (e.g. fb_question.label),\n"
+                    "    the SQL must use jsonb_array_elements() instead.\n"
+                    "  \u2014 If the error mentions a wrong entityType, valid values are:\n"
+                    "    QUESTION, PAGE, FORM only.\n"
+                    "  \u2014 Provide a corrected schema_hint to generate_sql describing\n"
+                    "    exactly which SQL pattern to use."
+                )
+                return "".join(lines)
+
+        if tool_name == "execute_sql":
+            if not success:
+                return (
+                    f"execute_sql failed: {error}\n"
+                    "This is a database-level error, not a validator warning. The SQL\n"
+                    "may have a syntax error or reference a table/column that does not\n"
+                    "exist. Review the SQL and either correct it or call generate_sql\n"
+                    "again with a more explicit schema_hint."
+                )
+            row_count = data.get("row_count", 0) if data else 0
+            columns = data.get("columns", []) if data else []
+            rows = data.get("rows", []) if data else []
+            truncated = data.get("truncated", False) if data else False
+            validator_warnings = data.get("validator_warnings", []) if data else []
+            if row_count > 0:
+                lines = [f"execute_sql returned {row_count} row(s)."]
+                if truncated:
+                    lines.append(" Results were truncated at 50 rows \u2014 there may be more data.\n"
+                                 "Consider adding a more specific WHERE clause if you need all rows.\n")
+                else:
+                    lines.append("\n")
+                lines.append(f"Columns: {columns}\n\n")
+                # Format rows as readable table
+                col_widths = {col: len(str(col)) for col in columns}
+                for row in rows:
+                    for col in columns:
+                        col_widths[col] = max(col_widths[col], len(str(row.get(col, ""))))
+                header = "  ".join(str(col).ljust(col_widths[col]) for col in columns)
+                separator = "  ".join("-" * col_widths[col] for col in columns)
+                lines.append(header + "\n")
+                lines.append(separator + "\n")
+                for row in rows:
+                    lines.append("  ".join(str(row.get(col, "")).ljust(col_widths[col]) for col in columns) + "\n")
+                if validator_warnings:
+                    lines.append("\nValidator noted (informational):\n")
+                    for w in validator_warnings:
+                        lines.append(f"  \u26a0 {w}\n")
+                return "".join(lines)
+            else:
+                lines = [
+                    "execute_sql ran successfully but returned 0 rows.\n"
+                    "Possible reasons:\n"
+                    "  \u2014 The form name filter did not match any records (ILIKE is\n"
+                    "    case-insensitive but the pattern must appear in the name).\n"
+                    "  \u2014 The entityType filter excluded all records.\n"
+                    "  \u2014 There genuinely is no data matching this query.\n"
+                    "Consider calling lookup_form to verify the exact form name, or\n"
+                    "broadening the WHERE clause."
+                ]
+                if validator_warnings:
+                    lines.append("\nValidator also noted:\n")
+                    for w in validator_warnings:
+                        lines.append(f"  \u26a0 {w}\n")
+                return "".join(lines)
+
+        if tool_name == "validate_sql":
+            if not success:
+                return f"validate_sql raised an exception: {error}"
+            passed = data.get("passed", False) if data else False
+            real_errors = data.get("real_errors", []) if data else []
+            warnings = data.get("warnings", []) if data else []
+            if passed:
+                lines = ["Validation passed. No blocking errors found.\n"]
+                if warnings:
+                    lines.append("\nNon-blocking warnings:\n")
+                    for w in warnings:
+                        lines.append(f"  \u26a0 {w}\n")
+                lines.append("This SQL is safe to execute with execute_sql.")
+                return "".join(lines)
+            else:
+                lines = [f"Validation found {len(real_errors)} blocking error(s):\n"]
+                for e in real_errors:
+                    lines.append(f"  \u2717 {e}\n")
+                if warnings:
+                    lines.append("\nAdditional warnings:\n")
+                    for w in warnings:
+                        lines.append(f"  \u26a0 {w}\n")
+                lines.append("Do not execute this SQL. Review the errors and regenerate.")
+                return "".join(lines)
+
+        if tool_name == "get_schema":
+            if not success:
+                return f"get_schema failed: {error}"
+            if "tables" in data:
+                lines = [f"Database contains {len(data['tables'])} table(s):\n"]
+                for t in data["tables"]:
+                    lines.append(f"  \u2022 {t}\n")
+                return "".join(lines)
+            elif "columns" in data:
+                table_name = args.get("table_name", "unknown")
+                lines = [f"Table '{table_name}' has {len(data['columns'])} column(s):\n"]
+                for col in data["columns"]:
+                    lines.append(f"  \u2022 {col['name']}  ({col['type']})\n")
+                return "".join(lines)
+            return str(data)
+
+        # Unknown tool
+        from agent.tools import ToolRegistry
+        return (
+            f"Unknown tool '{tool_name}' was called. Available tools are: "
+            f"{sorted(ToolRegistry.KNOWN_TOOLS)}. Correct your tool name."
+        )
+
+    def _call_reasoning_llm(
+        self,
+        messages: list[ChatMessage],
+        retries: int = 3,
+        backoff: float = 2.0,
+    ) -> str:
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                response = self.reasoning_llm.chat(messages)
+                return response.message.content.strip()
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries - 1:
+                    wait = backoff * (attempt + 1)
+                    print(
+                        f"  [llm] Attempt {attempt + 1} failed: {exc}. "
+                        f"Retrying in {wait:.0f}s...",
+                        flush=True,
+                    )
+                    time.sleep(wait)
+        raise RuntimeError(
+            f"Reasoning LLM failed after {retries} attempts. "
+            f"Last error: {last_exc}"
+        )
