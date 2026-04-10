@@ -13,14 +13,25 @@ class SQLValidator:
     """
 
     # Columns that DO NOT EXIST but LLMs constantly hallucinate
+    # NOTE: the validator checks table_short ("question") in sql_lower, which
+    # matches entityType='QUESTION' in JSONB queries. Only include columns
+    # whose names are unique enough to not cause false positives.
     HALLUCINATED_COLUMNS = {
         "fb_question.label", "fb_question.title",
         "fb_question.text", "fb_question.description",
+        "fb_question.question_json",
         "fb_section.title", "fb_section.label", "fb_section.description",
         "fb_sub_form.title", "fb_sub_form.label", "fb_sub_form.description",
         "fb_page.title", "fb_page.label",
         "fb_question_group.title",
         "fb_multifield.label",
+    }
+
+    # Tables that DO NOT EXIST but LLMs constantly hallucinate
+    HALLUCINATED_TABLES = {
+        "fb_users", "fb_user", "users", "fb_creators",
+        "fb_sections", "fb_section",
+        "fb_questions",
     }
 
     # Regex patterns that indicate known mistakes
@@ -60,9 +71,20 @@ class SQLValidator:
         sql_lower = sql.lower()
         for col in self.HALLUCINATED_COLUMNS:
             table, column = col.split(".")
-            table_short = table.replace("fb_", "")
-            if re.search(rf"\b\w*\.{column}\b", sql_lower) and table_short in sql_lower:
+            # Check that the full table name appears as a table reference (not inside a string)
+            # and the column name appears with a dot prefix
+            if re.search(rf"\b{re.escape(table)}\b", sql_lower) and \
+               re.search(rf"\b\w*\.{column}\b", sql_lower):
                 errors.append(f"HALLUCINATION: '{col}' doesn't exist. Use JSONB translations.")
+
+        # Check hallucinated tables
+        for table in self.HALLUCINATED_TABLES:
+            if re.search(rf"\b{re.escape(table)}\b", sql_lower):
+                errors.append(
+                    f"HALLUCINATION: table '{table}' does not exist. "
+                    f"Use get_schema() to find the correct table. "
+                    f"For creator info, check fb_forms.created_by column."
+                )
 
         # Check wrong patterns
         for pattern, msg in self.WRONG_PATTERNS:
@@ -90,6 +112,8 @@ class SQLValidator:
         q_lower = question.lower()
 
         has_jsonb = "JSONB_ARRAY_ELEMENTS" in sql_upper
+        # Also check for subqueries that might contain jsonb_array_elements
+        has_subquery = sql_upper.count("SELECT") > 1
         # Only QUESTION and PAGE exist as entityTypes in this database
         asks_about_questions = bool(re.search(r'\bquestion', q_lower))
         asks_about_pages     = bool(re.search(r'\bpage', q_lower))
@@ -142,8 +166,8 @@ class SQLValidator:
         # Remove markdown fences
         sql = re.sub(r"```sql\s*", "", sql)
         sql = re.sub(r"```\s*$", "", sql)
-        # Remove [SQL] tags (case-insensitive — sqlcoder sometimes emits [/sql])
-        sql = re.sub(r"\[/?SQL\]", "", sql, flags=re.IGNORECASE)
+        # Remove bracket tags sqlcoder emits ([SQL], [/SQL], [QUESTION], [/ANSWER], etc.)
+        sql = re.sub(r"\[/?[A-Z_]+\]", "", sql, flags=re.IGNORECASE)
         # Remove ### headers
         sql = re.sub(r"^###.*$", "", sql, flags=re.MULTILINE)
         sql = sql.strip()
@@ -159,12 +183,8 @@ class SQLValidator:
         # Fix JSONB key casing (translatedtext → translatedText, etc.)
         sql = self.fix_jsonb_key_case(sql)
 
-        # AUTO-FIX: If query has jsonb_array_elements but SELECT doesn't use elem->>,
-        # the model copied the wrong SELECT clause. Fix it.
-        sql = self._fix_jsonb_select(sql)
-
-        # Strip any trailing [/SQL] that survived (case-insensitive, after semicolon)
-        sql = re.sub(r"\s*\[/?SQL\]\s*$", "", sql, flags=re.IGNORECASE).rstrip()
+        # Strip any trailing bracket tags that survived
+        sql = re.sub(r"\s*\[/?[A-Z_]+\]\s*$", "", sql, flags=re.IGNORECASE).rstrip()
 
         # Ensure semicolon
         if sql and not sql.rstrip().endswith(";"):
@@ -174,12 +194,14 @@ class SQLValidator:
 
     def _fix_jsonb_select(self, sql: str) -> str:
         """
-        Detects: query uses jsonb_array_elements (JSONB unpacking) but the SELECT
-        clause doesn't include elem->>'translatedText'. This means the model used
-        the wrong SELECT columns. Fix by replacing the SELECT clause.
+        Catches ONE specific sqlcoder mistake: the model copies a form-listing
+        SELECT clause (f.name, f.status, f.active) but then adds a
+        jsonb_array_elements JOIN, producing nonsensical output.
 
-        Example bad:  SELECT f.name, f.status, f.active FROM fb_forms f JOIN ... jsonb_array_elements(...) ...
-        Example good: SELECT elem->>'translatedText' AS label, elem->>'elementId' AS element_id FROM fb_forms f JOIN ...
+        Only rewrites when the SELECT clause contains exclusively simple
+        fb_forms columns (name, status, active) with no other content.
+        Leaves all other queries untouched — timestamps, DISTINCT, functions,
+        aggregates, etc. are never rewritten.
         """
         sql_upper = sql.upper()
 
@@ -187,7 +209,7 @@ class SQLValidator:
         if "JSONB_ARRAY_ELEMENTS" not in sql_upper:
             return sql
 
-        # Only fix if elem->>'translatedText' is NOT already in the SELECT
+        # Already has elem->>'translatedText' — nothing to fix
         if "TRANSLATEDTEXT" in sql_upper and "ELEM" in sql_upper:
             return sql
 
@@ -196,12 +218,28 @@ class SQLValidator:
         if not select_match:
             return sql
 
-        # Check if it's a COUNT query — leave those alone
-        select_clause = select_match.group(2)
-        if re.search(r"\bCOUNT\s*\(", select_clause, re.IGNORECASE):
+        select_clause = select_match.group(2).strip()
+
+        # Only rewrite if the SELECT clause looks like the known bad pattern:
+        # just simple column references (f.name, f.status, etc.) with no
+        # functions, timestamps, DISTINCT, *, subqueries, or JSONB operators
+        skip_indicators = [
+            r"\b(COUNT|AVG|SUM|MIN|MAX|DISTINCT)\b",  # aggregates
+            r"\b(created_on|modified_on|created_at|updated_at|creation_date|date|timestamp)\b",  # dates
+            r"\*",                                       # SELECT *
+            r"->>?",                                     # JSONB operators
+            r"\(",                                       # any function call
+        ]
+        for pattern in skip_indicators:
+            if re.search(pattern, select_clause, re.IGNORECASE):
+                return sql
+
+        # Also skip subqueries and GROUP BY
+        if sql_upper.count("SELECT") > 1 or "GROUP BY" in sql_upper:
             return sql
 
-        # Replace the SELECT clause with the correct JSONB columns
+        # At this point the SELECT clause has only simple column refs and the
+        # query unpacks JSONB — this is the known bad pattern. Fix it.
         new_select = "elem->>'translatedText' AS label, elem->>'elementId' AS element_id"
         sql = select_match.group(1) + new_select + select_match.group(3) + sql[select_match.end():]
 

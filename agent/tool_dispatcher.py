@@ -64,6 +64,15 @@ def parse_tool_call(raw_output: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
+    # 2b. Fix literal newlines inside JSON string values — LLMs often output
+    #     real newlines instead of \n escape sequences, which breaks json.loads
+    try:
+        fixed = text.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+        parsed = json.loads(fixed)
+        return _validate_tool_call(parsed, raw_output)
+    except json.JSONDecodeError:
+        pass
+
     # 3. Extract the outermost {...} block and retry
     block_match = _JSON_BLOCK_RE.search(text)
     if block_match:

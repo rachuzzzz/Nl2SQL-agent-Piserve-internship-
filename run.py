@@ -48,12 +48,16 @@ def _on_event(event) -> None:
         return
 
     if step.thought.startswith("[auto]") and step.tool == "execute_sql":
-        # Auto-chained execute_sql — print inline under the parent step
-        sql_preview = step.args.get("sql", "")[:80]
-        if len(step.args.get("sql", "")) > 80:
-            sql_preview += "…"
+        # Auto-chained execute_sql — print full SQL for debugging
+        sql_full = step.args.get("sql", "")
         result_summary = _format_result_summary("execute_sql", step.result)
-        print(f"      auto:   execute_sql(sql={sql_preview!r})", flush=True)
+        label = "auto"
+        if "[review]" in step.thought:
+            label = "auto(reviewed)"
+        print(f"      {label}:  execute_sql", flush=True)
+        # Print full SQL, indented
+        for line in sql_full.strip().split("\n"):
+            print(f"              {line}", flush=True)
         print(f"              → {result_summary}  [{step.duration_ms} ms]", flush=True)
         return
 
@@ -208,10 +212,6 @@ def main() -> None:
         if question.lower() in ("quit", "exit", "q"):
             break
         if not question:
-            continue
-        if question.lower() == "clear":
-            orch.clear_session()
-            print("Session cleared.", flush=True)
             continue
 
         try:

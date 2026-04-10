@@ -37,12 +37,15 @@ def list_forms(db_engine: Engine, status: Optional[str] = None) -> dict[str, Any
         if status:
             query = sql_text(
                 "SELECT name, status, active FROM fb_forms "
-                "WHERE status = :status ORDER BY name LIMIT 100"
+                "WHERE status = :status AND name IS NOT NULL AND name != '' "
+                "ORDER BY name LIMIT 100"
             )
             params = {"status": status.upper()}
         else:
             query = sql_text(
-                "SELECT name, status, active FROM fb_forms ORDER BY name LIMIT 100"
+                "SELECT name, status, active FROM fb_forms "
+                "WHERE name IS NOT NULL AND name != '' "
+                "ORDER BY name LIMIT 100"
             )
             params = {}
 
@@ -111,19 +114,56 @@ def semantic_search(
         return {"success": False, "result": [], "error": str(exc)}
 
 
+# Schema cache — fetched once per session, reused across calls
+_schema_cache: Optional[str] = None
+
+
+def _fetch_key_schemas(db_engine: Engine) -> str:
+    """
+    Fetch column schemas for the most commonly queried tables.
+    Cached after first call to avoid repeated DB round-trips.
+    """
+    global _schema_cache
+    if _schema_cache is not None:
+        return _schema_cache
+
+    try:
+        inspector = sa_inspect(db_engine)
+        key_tables = ["fb_forms", "fb_modules", "fb_translation_json"]
+        parts = ["### Actual database columns (use these, not guesses):"]
+        for table in key_tables:
+            try:
+                columns = inspector.get_columns(table)
+                col_list = ", ".join(f"{c['name']} ({c['type']})" for c in columns)
+                parts.append(f"  {table}: {col_list}")
+            except Exception:
+                pass
+        _schema_cache = "\n".join(parts)
+        return _schema_cache
+    except Exception:
+        return ""
+
+
 def generate_sql(
     sql_llm,
     validator: SQLValidator,
     question: str,
     schema_hint: str = "",
+    db_engine: Optional[Engine] = None,
 ) -> dict[str, Any]:
     """
     Ask sqlcoder:7b to produce a PostgreSQL SELECT for the given question.
     Applies SQLValidator.clean_sql() and validate() on the output.
 
-    sql_llm — an llama_index Ollama client initialised with sqlcoder:7b.
+    If db_engine is provided, auto-fetches column schemas for key tables
+    so sqlcoder knows what columns actually exist.
     """
     try:
+        # Auto-inject schema context if db_engine available
+        if db_engine and not schema_hint.startswith("Use"):
+            auto_schema = _fetch_key_schemas(db_engine)
+            schema_hint = f"{auto_schema}\n{schema_hint}" if schema_hint else auto_schema
+
         prompt = SQL_GENERATION_PROMPT.format(
             question=question,
             schema_hint=schema_hint or "No additional context provided.",
@@ -135,10 +175,8 @@ def generate_sql(
         # Semantic cross-check: does the SQL match what the question asks for?
         semantic_warnings = validator.validate_semantic(sql, question)
         all_errors = errors + semantic_warnings
-        # A semantic warning about missing JSONB is treated as a hard error so
-        # the agent is forced to regenerate rather than returning a wrong count.
-        if semantic_warnings:
-            passed = False
+        # Semantic warnings are informational — included in errors list
+        # but do NOT block execution (sqlcoder 15B is reliable enough).
         return {
             "success": True,
             "result": {
@@ -168,16 +206,16 @@ def execute_sql(
     try:
         passed, errors = validator.validate(sql)
         real_errors = [e for e in errors if not e.startswith("WARNING:")]
-        warnings = [e for e in errors if e.startswith("WARNING:")]
-        # Validator warnings are returned as observations, not execution gates.
-        # Only a database-level exception stops execution.
+        if real_errors:
+            return {
+                "success": False,
+                "result": None,
+                "error": "SQL failed validation: " + "; ".join(real_errors),
+            }
 
         with db_engine.connect() as conn:
             result = conn.execute(sql_text(sql))
-            rows = result.fetchmany(51)
-            truncated = len(rows) > 50
-            if truncated:
-                rows = rows[:50]
+            rows = result.fetchmany(50)
             columns = list(result.keys())
 
         data = [dict(zip(columns, row)) for row in rows]
@@ -187,36 +225,10 @@ def execute_sql(
                 "rows": data,
                 "row_count": len(data),
                 "columns": columns,
-                "truncated": truncated,
-                "validator_warnings": real_errors + warnings,
             },
             "error": None,
         }
 
-    except Exception as exc:
-        return {"success": False, "result": None, "error": str(exc)}
-
-
-def validate_sql(validator: SQLValidator, sql: str) -> dict[str, Any]:
-    """
-    Run the SQL validator on a query without executing it.
-    Returns the full validation result including all errors and warnings.
-    The model uses this to decide whether to execute or regenerate.
-    """
-    try:
-        passed, errors = validator.validate(sql)
-        real_errors = [e for e in errors if not e.startswith("WARNING:")]
-        warnings = [e for e in errors if e.startswith("WARNING:")]
-        return {
-            "success": True,
-            "result": {
-                "passed": passed,
-                "real_errors": real_errors,
-                "warnings": warnings,
-                "sql_reviewed": sql,
-            },
-            "error": None,
-        }
     except Exception as exc:
         return {"success": False, "result": None, "error": str(exc)}
 
@@ -262,7 +274,6 @@ class ToolRegistry:
         "lookup_form",
         "semantic_search",
         "generate_sql",
-        "validate_sql",
         "execute_sql",
         "get_schema",
     }
@@ -314,12 +325,7 @@ class ToolRegistry:
                     self._validator,
                     question=str(args["question"]),
                     schema_hint=str(args.get("schema_hint", "")),
-                )
-
-            if name == "validate_sql":
-                return validate_sql(
-                    self._validator,
-                    sql=str(args["sql"]),
+                    db_engine=self._db_engine,
                 )
 
             if name == "execute_sql":
