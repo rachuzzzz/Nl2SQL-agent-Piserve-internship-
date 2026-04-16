@@ -3,6 +3,7 @@ Agent Orchestrator — the main reasoning loop.
 
 Clean version: no review agent, no hardcoded SQL builders.
 Trusts sqlcoder (15B) + auto-schema injection + validator guardrails.
+Supports dynamic answer tables (fb_{module_uuid}) for submission data.
 """
 
 import json
@@ -158,6 +159,26 @@ class AgentOrchestrator:
                             f"Fix the query. Use get_schema if unsure about columns."))
                         continue
 
+                    # Check if this is a preparatory query or a final one.
+                    # If the result likely answers the full question → synthesize.
+                    # If it looks like a partial/preparatory step → feed back to agent.
+                    if self._is_preparatory_result(question, er):
+                        # Feed results back — let agent decide next step
+                        exec_data = er.get("result", {})
+                        rows_preview = json.dumps(exec_data.get("rows", [])[:10], default=str)
+                        messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
+                        messages.append(ChatMessage(role=MessageRole.USER, content=
+                            f"Tool results:\nSQL: {sql}\n"
+                            f"Result: {exec_data.get('row_count', 0)} rows, "
+                            f"columns={exec_data.get('columns', [])}\n"
+                            f"Data (first 10): {rows_preview}\n\n"
+                            f"This looks like a preparatory step — the user's original "
+                            f"question was: \"{question}\"\n"
+                            f"If you have enough data to answer, call final_answer.\n"
+                            f"If you need more data (e.g. questions/labels for a specific "
+                            f"form), call generate_sql or another tool."))
+                        continue
+
                     ans = self._synthesize(question, "execute_sql", er)
                     return self._finish(question, ans, steps, iteration, _emit)
                 else:
@@ -230,7 +251,8 @@ class AgentOrchestrator:
     # Private
     # ------------------------------------------------------------------ #
 
-    _TERMINAL_TOOLS = {"list_forms", "execute_sql"}
+    # Tools that produce final data — synthesize and return immediately
+    _TERMINAL_TOOLS = {"list_forms", "execute_sql", "query_answers", "get_answer_summary"}
 
     def _finish(self, question, answer, steps, iteration, emit_fn=None):
         s = AgentStep(iteration, "[auto] synthesized", "final_answer",
@@ -278,6 +300,40 @@ class AgentOrchestrator:
                 return f"lookup_form found: {', '.join(repr(n) for n in names)}\nNow use generate_sql with one of these exact names."
             return "lookup_form found no matches. Try list_forms()."
 
+        # --- NEW: answer tool context messages ---
+        if tool_name == "resolve_answer_table":
+            info = tool_result.get("result", {})
+            if info and info.get("table_exists"):
+                return (
+                    f"resolve_answer_table found:\n"
+                    f"  Form: '{info['form_name']}'\n"
+                    f"  Module: '{info['module_name']}'\n"
+                    f"  Answer table: {info['answer_table']}\n"
+                    f"  Table exists: {info['table_exists']}\n\n"
+                    f"Now use query_answers or get_answer_summary with "
+                    f"answer_table=\"{info['answer_table']}\".\n"
+                    f"If user wants scores, set include_scores=true.\n"
+                    f"If user wants a specific question's answers, set question_id."
+                )
+            elif info:
+                return (
+                    f"resolve_answer_table found form '{info.get('form_name')}' "
+                    f"but the answer table {info.get('answer_table')} does NOT exist.\n"
+                    f"This form may not have any submissions yet."
+                )
+            return "resolve_answer_table found no matching form. Try lookup_form first."
+
+        if tool_name == "get_answer_summary":
+            data = tool_result.get("result", {})
+            return (
+                f"Answer table summary:\n"
+                f"  Total rows: {data.get('total_rows', 0)}\n"
+                f"  Distinct forms: {data.get('distinct_forms', 0)}\n"
+                f"  Date range: {data.get('earliest', '?')} → {data.get('latest', '?')}\n"
+                f"  Status breakdown: {data.get('status_breakdown', {})}\n\n"
+                f"Call final_answer with this information, or query_answers for details."
+            )
+
         return json.dumps(tool_result, default=str)
 
     def _schema_hint_for_error(self, error_msg):
@@ -304,3 +360,41 @@ class AgentOrchestrator:
 
     def _call_llm(self, messages):
         return self.reasoning_llm.chat(messages).message.content.strip()
+
+    def _is_preparatory_result(self, question: str, exec_result: dict) -> bool:
+        """
+        Detect if an execute_sql result is a preparatory step rather than
+        a final answer. Returns True if the agent should continue.
+
+        Heuristic: if the user asked about questions/labels/content but the
+        result only contains IDs, dates, or counts — it's probably step 1
+        of a multi-step query.
+        """
+        q_lower = question.lower()
+        data = exec_result.get("result", {})
+        columns = [c.lower() for c in data.get("columns", [])]
+        row_count = data.get("row_count", 0)
+
+        # User wants content (questions, labels, names) but result has none
+        wants_content = bool(re.search(
+            r'\b(question|label|title|page|element|content|what.*in)\b', q_lower))
+        # These are the columns that indicate actual content/labels were fetched.
+        # form_name is NOT content — it's metadata about which form, not its questions.
+        has_content = any(c in columns for c in [
+            "label", "title", "translatedtext", "text",
+            "question_label", "question_text", "answer",
+        ])
+
+        if wants_content and not has_content and row_count > 0:
+            return True
+
+        # "most recent/recently" / "latest" + asking about something IN that form
+        is_superlative = bool(re.search(
+            r'\b(most\s+recent|recently|latest|newest|oldest|first|last)\b', q_lower))
+        wants_details = bool(re.search(
+            r'\b(question|page|element|what|show|list)\b', q_lower))
+
+        if is_superlative and wants_details and not has_content:
+            return True
+
+        return False

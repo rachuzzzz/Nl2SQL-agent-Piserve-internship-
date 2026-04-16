@@ -17,25 +17,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 # ---------------------------------------------------------------------------
-# Live event handler — called by the orchestrator immediately on each event
+# Live event handler
 # ---------------------------------------------------------------------------
 
 def _on_event(event) -> None:
-    """
-    Called by AgentOrchestrator immediately on every event.
-    Prints to stdout with flush=True so output appears in real time.
-
-    event is either:
-      {"_event": "thinking", "iteration": N}  — LLM call starting
-      AgentStep                                — step completed
-    """
     if isinstance(event, dict) and event.get("_event") == "thinking":
         forced = event.get("forced", False)
         label = "forced summary" if forced else "thinking..."
         print(f"\n[{event['iteration']}] ⟳ {label}", flush=True)
         return
 
-    step = event  # it's an AgentStep
+    step = event
 
     if step.tool == "[parse_error]":
         print(f"      ⚠  Parse error — model returned non-JSON", flush=True)
@@ -44,26 +36,20 @@ def _on_event(event) -> None:
         return
 
     if step.tool == "final_answer":
-        # Answer is printed after query() returns — skip here
         return
 
     if step.thought.startswith("[auto]") and step.tool == "execute_sql":
-        # Auto-chained execute_sql — print full SQL for debugging
         sql_full = step.args.get("sql", "")
         result_summary = _format_result_summary("execute_sql", step.result)
         label = "auto"
         if "[review]" in step.thought:
             label = "auto(reviewed)"
         print(f"      {label}:  execute_sql", flush=True)
-        # Print full SQL, indented
         for line in sql_full.strip().split("\n"):
             print(f"              {line}", flush=True)
         print(f"              → {result_summary}  [{step.duration_ms} ms]", flush=True)
         return
 
-    # --- Normal step: thought + tool + result ---
-
-    # Full thought, word-wrapped at 100 chars
     if step.thought:
         wrapped = _wrap(step.thought, width=100, indent="         ")
         print(f"      thought: {wrapped}", flush=True)
@@ -80,10 +66,6 @@ def _on_event(event) -> None:
 # ---------------------------------------------------------------------------
 
 def _wrap(text: str, width: int = 100, indent: str = "") -> str:
-    """
-    Wrap text at word boundaries.  First line has no indent (caller provides
-    the label prefix); subsequent lines get `indent`.
-    """
     words = text.split()
     lines = []
     current = ""
@@ -99,7 +81,6 @@ def _wrap(text: str, width: int = 100, indent: str = "") -> str:
 
 
 def _format_args(args: dict) -> str:
-    """Compact one-line representation of tool args."""
     parts = []
     for k, v in args.items():
         if isinstance(v, str) and len(v) > 72:
@@ -109,7 +90,6 @@ def _format_args(args: dict) -> str:
 
 
 def _format_result_summary(tool: str, result: dict) -> str:
-    """Human-readable one-line summary of a tool result."""
     if not result.get("success"):
         err = result.get("error", "unknown")
         return f"ERROR: {err[:100]}"
@@ -147,6 +127,31 @@ def _format_result_summary(tool: str, result: dict) -> str:
         if "tables" in data:
             return f"{len(data['tables'])} tables"
         return f"{len(data.get('columns', []))} columns"
+
+    # --- NEW: answer tool summaries ---
+
+    if tool == "resolve_answer_table":
+        if data:
+            exists = "✓" if data.get("table_exists") else "✗"
+            return (
+                f"{exists} table={data.get('answer_table', '?')[:40]}  "
+                f"module='{data.get('module_name', '?')[:30]}'"
+            )
+        return "no match"
+
+    if tool == "query_answers":
+        if data:
+            return f"{data.get('row_count', 0)} answer rows  cols={data.get('columns', [])}"
+        return "no data"
+
+    if tool == "get_answer_summary":
+        if data:
+            return (
+                f"{data.get('total_rows', 0)} rows, "
+                f"{data.get('distinct_forms', 0)} forms, "
+                f"statuses={data.get('status_breakdown', {})}"
+            )
+        return "empty"
 
     return str(data)[:100] if data else "ok"
 
@@ -230,13 +235,11 @@ def main() -> None:
 
                 orch.registry.call = _no_execute
 
-            # Steps are printed live via _on_event as they happen
             result = orch.query(question, on_step=_on_event)
 
             if sql_only:
                 orch.registry.call = original_call
 
-            # Final answer — printed once after query() returns
             print(f"\n--- Answer ---", flush=True)
             print(result.answer, flush=True)
 
