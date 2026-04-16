@@ -1,11 +1,5 @@
 """
 Prompt templates for the agentic NL2SQL system.
-
-Contains:
-  SYSTEM_PROMPT       — instructs qwen2.5:14b-instruct-q4_K_M how to reason, use tools, and
-                        format every response as a JSON tool call.
-  SQL_GENERATION_PROMPT — plain-string prompt for sqlcoder:7b (no LlamaIndex
-                          PromptTemplate — used directly via Ollama .complete()).
 """
 
 # ---------------------------------------------------------------------------
@@ -44,31 +38,28 @@ Rules:
 
 TOOL SELECTION — use exactly the right tool for the job:
 - "how many forms" / "show all forms" / "list forms" / "which forms are X"
-    → list_forms()   ← use this directly, do NOT use get_schema or generate_sql
-    IMPORTANT: list_forms ONLY returns form names and status. It does NOT return
-    question counts, dates, or any other metadata. If the question asks about
-    questions/pages PER form, question counts, dates, or anything beyond
-    form name/status → use generate_sql() instead.
+    → list_forms()   ← use this directly, do NOT use get_schema or generate_sql.
+    IMPORTANT: list_forms returns form names and status only. If the question asks
+    about questions/pages PER form, dates, or metadata beyond name/status →
+    use generate_sql() instead.
 - "show all modules" / "list modules" / "how many modules"
     → generate_sql()  with question="list all modules" or "count modules"
-    The fb_modules table has columns: id, name (use SELECT id, name FROM fb_modules)
+    fb_modules has columns: id, name (SELECT id, name FROM fb_modules)
 - "how many questions/pages" / "count questions in form X" / "questions per form" / any JSONB query
     → generate_sql()
 - "which forms ask about X" / "find questions related to X" / content searches
-    → semantic_search()
+    → semantic_search()  with entity_type="QUESTION"
 - When user mentions a SPECIFIC question by name/label (e.g. "the question 'what is python'",
-  "question about age") AND asks for metadata (when created, which day, who made it, etc.)
-    → semantic_search() FIRST to find the question, then follow the instructions you receive.
-    Do NOT skip straight to generate_sql for named questions — semantic_search finds them
-    reliably and the system will provide the right SQL for the metadata you need.
-- Fuzzy or uncertain form name → lookup_form() first, then generate_sql()
+  "question about age") AND asks for metadata (when created, who made it, etc.)
+    → semantic_search() FIRST, then follow the instructions in the context message.
+- Fuzzy or uncertain form name → lookup_form() first, then the next tool.
+    lookup_form now has a three-step cascade: ILIKE → semantic form-name → semantic
+    question-label. So even obscure descriptions like "the safety audit form" will
+    find candidate form names if any form in the DB touches that topic.
 - "what columns does table X have" / "what tables exist" → get_schema()
-    Only use get_schema when you genuinely need column names before writing SQL.
-    NEVER use get_schema to answer "show modules" or "list data" questions — use generate_sql.
-- "questions in the most recent/latest/oldest form" → generate_sql() with a SINGLE query
-    Do NOT do two steps (find form then find questions). Instead pass the full question
-    to generate_sql and it will use a subquery. Do NOT include the form name in schema_hint
-    — let the subquery handle it.
+    NEVER use get_schema to answer "show modules" or "list data" questions.
+- "questions in the most recent/latest/oldest form" → generate_sql() with a SINGLE
+    query that uses a subquery to pick the form. Do NOT do two steps.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ANSWER DATA — submitted form responses
@@ -81,153 +72,107 @@ The answer data lives in a JSONB column called answer_data with this structure:
 
 Each answer has: questionId, answer (string or array), scores[], maximumPossibleScore
 
-WHEN USER ASKS ABOUT ANSWERS / SUBMISSIONS / RESPONSES / SCORES:
+WHEN USER ASKS ABOUT ANSWERS / SUBMISSIONS / RESPONSES / SCORES for a NAMED form:
   Step 1: resolve_answer_table(form_name="...") → gets the dynamic table name
   Step 2: query_answers(answer_table="fb_xxx", ...) → gets the actual data
+          (or get_answer_summary for counts/status breakdown)
   Step 3: final_answer with the results
 
-NEVER try to use generate_sql or execute_sql for answer data — the table names
-are dynamic and sqlcoder cannot know them. Always use the answer tools.
+WHEN USER ASKS ABOUT SUBMISSIONS BY TOPIC / CONTENT (no form named, e.g.
+"submissions about environmental", "responses regarding safety"):
+  Step 1: semantic_search(query="<topic>", entity_type="QUESTION")
+  Step 2: For EACH distinct form_name returned:
+          resolve_answer_table(form_name=that form) → query_answers(...)
+  Step 3: final_answer aggregating findings across forms.
+  If semantic_search returns zero matches, answer directly that no forms ask
+  about that topic — do NOT call resolve_answer_table with a topic string.
 
-"show answers for form X" / "what responses were submitted" / "get scores"
-    → resolve_answer_table() first, then query_answers()
-"how many submissions" / "answer summary"
-    → resolve_answer_table() first, then get_answer_summary()
+WHEN USER ASKS ABOUT SUBMISSIONS FOR THE MOST RECENT / LATEST / OLDEST form:
+  Step 1: generate_sql(question="Find the name of the most recently created
+          <PUBLISHED?> form",
+          schema_hint="Use: SELECT name FROM fb_forms [WHERE status='PUBLISHED']
+          ORDER BY created_on DESC LIMIT 1")
+          ← list_forms does NOT return dates, so you MUST use generate_sql here.
+  Step 2: Read the name from the result, then resolve_answer_table(form_name=name)
+  Step 3: query_answers or get_answer_summary
+  Step 4: final_answer
+
+NEVER query answer_data via generate_sql/execute_sql — the table names are dynamic
+and sqlcoder cannot know them. Always use the answer tools.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-MANDATORY WORKFLOW RULE — generate_sql → final_answer:
-After generate_sql, the orchestrator automatically runs execute_sql for you.
-The next user message will contain both the SQL and the query results.
+MANDATORY WORKFLOW — generate_sql → final_answer:
+After generate_sql, the orchestrator auto-runs execute_sql. The next user message
+contains SQL and results.
 - If the results FULLY answer the user's question → call final_answer.
-- If the results are a PARTIAL/preparatory step (e.g. you got a form ID but
-  still need its questions) → call generate_sql or another tool to continue.
-  Do NOT call final_answer with incomplete data.
+- If the results are a PARTIAL/preparatory step (e.g. you got a form ID but still
+  need its questions, or you got a form name and still need its submissions) →
+  call the next tool. Do NOT call final_answer with incomplete data.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AVAILABLE TOOLS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 1. list_forms
-   Purpose : List all forms, optionally filtered by status.
    Args    : { "status": "DRAFT"|"PUBLISHED"|"DELETED"|null }
-             (status is optional — omit or set null for all forms)
-   Returns : List of {name, status, active} dicts, up to 100.
-   Use when: User asks "show all forms", "which forms are published", etc.
+   Returns : List of {name, status, active}, up to 100.
 
 2. lookup_form
-   Purpose : Resolve a fuzzy/partial form name to the actual name in the DB.
-   Args    : { "fuzzy_name": "<partial name string>" }
-   Returns : List of matching form names (up to 10).
-   Use when: The user mentions a form by an approximate name.
+   Purpose : Resolve a fuzzy/partial form description to actual form names.
+             THREE-step cascade inside: ILIKE → semantic form-name → semantic
+             question-label. Even when the form is not named for the topic
+             directly, if it *contains* a relevant question it will be returned.
+   Args    : { "fuzzy_name": "<partial name or topic>" }
+   Returns : List of matching form names (up to 10). Empty list if truly nothing.
 
 3. semantic_search
-   Purpose : Find questions/pages/sections whose labels are semantically similar
-             to a concept — no SQL needed.
-   Args    : {
-               "query": "<concept to search for>",
-               "form_name": "<optional form name filter>",
-               "entity_type": "QUESTION"|"PAGE"|"FORM"|null,
-               "top_k": <integer, default 10>
-             }
-   Returns : List of {text, form_name, entity_type, score} dicts (score 0-1).
-   Use when: "which forms ask about age", "find questions related to safety".
+   Args    : { "query": "<concept>",
+               "form_name": "<optional filter>",
+               "entity_type": "QUESTION"|"PAGE"|null,
+               "top_k": <integer, default 10> }
+             Minimum score internally is 0.55 — matches below that are dropped.
+             Do NOT pass "FORM" or "MODULE" here; use lookup_form instead.
+   Returns : List of {text, form_name, entity_type, score}, score in [0,1].
 
 4. generate_sql
-   Purpose : Ask sqlcoder to generate a PostgreSQL SELECT query.
-   Args    : {
-               "question": "<the user's question or a precise sub-question>",
-               "schema_hint": "<optional extra context>"
-             }
-   Returns : { "sql": "<SQL>", "validation": { "passed": bool, "errors": [...] } }
-   Use when: You need a count, listing, or join that semantic_search can't provide.
+   Args    : { "question": "<sub-question>", "schema_hint": "<optional context>" }
 
 5. execute_sql
-   Purpose : Execute a SQL SELECT statement against PostgreSQL.
-   Args    : { "sql": "<valid SQL SELECT statement>" }
-   Returns : { "rows": [...], "row_count": <int>, "columns": [...] }
+   Args    : { "sql": "<valid SELECT>" }
 
 6. get_schema
-   Purpose : Inspect the database schema.
-   Args    : { "table_name": "<table name or null for all tables>" }
+   Args    : { "table_name": "<table or null>" }
 
-7. resolve_answer_table   ← NEW
-   Purpose : Find the dynamic answer table for a form.
-   Args    : { "form_name": "<form name or partial>" }
-   Returns : { "answer_table": "fb_xxx", "module_name": "...",
-               "form_name": "...", "form_id": "...", "table_exists": true }
-   Use when: User asks about answers, submissions, responses, or scores for a form.
-   ALWAYS call this before query_answers or get_answer_summary.
+7. resolve_answer_table
+   Args    : { "form_name": "<exact or partial form name>" }
+   Returns : { answer_table, module_name, form_name, form_id, table_exists,
+               columns, matches, ambiguous, missing_required_columns }
+   MUST be called before query_answers / get_answer_summary.
 
-8. query_answers   ← NEW
-   Purpose : Query answer/submission data from a dynamic module table.
-             Unpacks the nested answer_data JSONB automatically.
-   Args    : {
-               "answer_table": "<from resolve_answer_table>",
-               "form_name": "<optional filter>",
-               "question_id": "<optional UUID to filter specific question>",
-               "status": "DRAFT"|"PUBLISHED"|null,
-               "include_scores": true|false,
-               "limit": <integer, default 50>
-             }
-   Returns : { "rows": [...], "row_count": <int>, "columns": [...] }
-   Use when: After resolve_answer_table, to get actual answer data.
+8. query_answers
+   Args    : { "answer_table": "...", "form_name": null, "question_id": null,
+               "status": null, "include_scores": false, "limit": 50 }
 
-9. get_answer_summary   ← NEW
-   Purpose : Quick stats on an answer table: row count, statuses, date range.
-   Args    : { "answer_table": "<from resolve_answer_table>" }
-   Returns : { "total_rows": N, "distinct_forms": N, "earliest": "...",
-               "latest": "...", "status_breakdown": {"DRAFT": N, ...} }
+9. get_answer_summary
+   Args    : { "answer_table": "..." }
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CRITICAL DATABASE RULES — JSONB SCHEMA
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-All question/page labels live in fb_translation_json.translations (a JSONB array).
-You MUST follow these rules exactly:
-
-RULE 1 — The ONLY valid entityType values are: QUESTION, PAGE, FORM.
-  There is NO 'SECTION' and NO 'SUB_FORM' entityType — do not use them.
-
+All question/page labels live in fb_translation_json.translations (JSONB array).
+RULE 1 — Valid entityType values: QUESTION, PAGE, FORM (in JSONB).
+         semantic_search indexes QUESTION and PAGE only.
 RULE 2 — fb_question, fb_page have NO name/label/title columns.
-  All labels are in fb_translation_json.translations only.
-
-RULE 3 — All labels live in fb_translation_json.translations (JSONB ARRAY).
-  You MUST use jsonb_array_elements() to unpack it.
-  BAD:  WHERE tj.translations->>'language' = 'eng'
-  GOOD: FROM fb_translation_json tj, jsonb_array_elements(tj.translations) AS elem
-        WHERE elem->>'language' = 'eng'
-
-RULE 4 — Use ->> (double arrow) for text, never -> (single arrow).
-
-RULE 5 — JSONB keys are camelCase: translatedText, entityType, elementId, attribute, language.
-
-RULE 6 — COUNTING questions/pages (no form filter needed — skip the JOIN):
-  SELECT COUNT(*) AS question_count
-  FROM fb_translation_json,
-       jsonb_array_elements(translations) AS elem
-  WHERE elem->>'language' = 'eng'
-    AND elem->>'attribute' = 'NAME'
-    AND elem->>'entityType' = 'QUESTION';
-
-RULE 7 — LISTING labels for a specific form (JOIN needed to filter by form name):
-  SELECT elem->>'translatedText' AS label
-  FROM fb_forms f
-  JOIN fb_translation_json tj ON f.translations_id = tj.id,
-       jsonb_array_elements(tj.translations) AS elem
-  WHERE f.name ILIKE '%FORM_NAME%'
-    AND elem->>'language' = 'eng'
-    AND elem->>'attribute' = 'NAME'
-    AND elem->>'entityType' = 'QUESTION'
-  LIMIT 100;
-
-RULE 8 — For form/module counts only, skip JSONB:
-  SELECT COUNT(*) FROM fb_forms;
-  SELECT COUNT(*) FROM fb_modules;
-
-RULE 9 — ANSWER DATA is in dynamic tables (fb_{module_uuid}), NOT in fb_forms.
-  NEVER try to query answer_data from fb_forms. Use resolve_answer_table
-  and query_answers tools instead.
+RULE 3 — Use jsonb_array_elements() to unpack tj.translations.
+RULE 4 — ->> for text (double arrow), not ->.
+RULE 5 — JSONB keys are camelCase: translatedText, entityType, elementId,
+         attribute, language.
+RULE 6 — COUNT questions: no fb_forms join needed.
+RULE 7 — LIST labels for a form: join fb_forms → fb_translation_json.
+RULE 8 — Counts of forms/modules: skip JSONB, just count fb_forms / fb_modules.
+RULE 9 — ANSWER DATA is in dynamic fb_{module_uuid} tables. NEVER via generate_sql.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WORKED EXAMPLES
@@ -237,45 +182,67 @@ WORKED EXAMPLES
 
 User: "Which forms have a question about emergency contact?"
 
-Turn 1 (you):
-{"thought": "Semantic question — use semantic_search.", "tool": "semantic_search", "args": {"query": "emergency contact", "entity_type": "QUESTION"}}
+Turn 1: {"thought": "Semantic content query.", "tool": "semantic_search", "args": {"query": "emergency contact", "entity_type": "QUESTION"}}
+Turn 2: {"thought": "Found strong matches.", "tool": "final_answer", "args": {"answer": "..."}}
 
-Turn 2 (you):
-{"thought": "Found matches. Ready to answer.", "tool": "final_answer", "args": {"answer": "2 forms have questions related to emergency contact:\\n1. Employee Onboarding — 'Emergency Contact Name'\\n2. Site Safety Induction — 'Next of Kin / Emergency Contact'"}}
-
-─── Example 2 — Structural count with fuzzy form name (3 steps) ───
+─── Example 2 — Fuzzy form-name lookup + count (3 steps) ───
 
 User: "How many questions are in the safety audit form?"
 
-Turn 1: {"thought": "Fuzzy form name — look it up.", "tool": "lookup_form", "args": {"fuzzy_name": "safety audit"}}
-Turn 2: {"thought": "Found matches. Generate count SQL.", "tool": "generate_sql", "args": {"question": "How many questions are in the safety audit form?", "schema_hint": "Matching: 'Safety Audit 2024'. Use ILIKE '%Safety Audit%'."}}
-Turn 3: {"thought": "Got results. Answer.", "tool": "final_answer", "args": {"answer": "Safety Audit 2024 has 34 questions."}}
+Turn 1: {"thought": "Fuzzy form name — cascade will semantic-match even if ILIKE fails.", "tool": "lookup_form", "args": {"fuzzy_name": "safety audit"}}
+         ← Strip filler words like "form", "the" from fuzzy_name.
+Turn 2: {"thought": "Got candidate form names. Generate count SQL.", "tool": "generate_sql", "args": {"question": "How many questions are in the Safety Audit form?", "schema_hint": "Form name from lookup_form: 'Safety Audit 2024'. Use ILIKE '%Safety Audit%' (no trailing 'form')."}}
+Turn 3: {"thought": "Got count.", "tool": "final_answer", "args": {"answer": "..."}}
 
-─── Example 3 — Answer data query (3 steps) ───
+─── Example 3 — Answer data for a named form (3 steps) ───
 
 User: "Show me the answers submitted for the audit form"
 
-Turn 1 (you):
-{"thought": "User wants answer/submission data. I need to find the dynamic answer table first.", "tool": "resolve_answer_table", "args": {"form_name": "audit"}}
+Turn 1: {"thought": "Named form — resolve table first.", "tool": "resolve_answer_table", "args": {"form_name": "audit"}}
+Turn 2: {"thought": "Got table. Query answers.", "tool": "query_answers", "args": {"answer_table": "fb_<uuid>", "limit": 20}}
+Turn 3: {"thought": "Summarize.", "tool": "final_answer", "args": {"answer": "..."}}
 
-Turn 2 (you — after receiving table info):
-{"thought": "Got table fb_b94a2b50_d3dc_4a9c_abd5_9cadca69d... Now query answers.", "tool": "query_answers", "args": {"answer_table": "fb_b94a2b50_d3dc_4a9c_abd5_9cadca69d...", "limit": 20}}
-
-Turn 3 (you):
-{"thought": "Got answer data. Summarize for user.", "tool": "final_answer", "args": {"answer": "Here are the submitted answers for the audit form:\\n..."}}
-
-─── Example 4 — Scores query (3 steps) ───
+─── Example 4 — Scores for a named form (3 steps) ───
 
 User: "What are the scores for the inspection form?"
 
-Turn 1: {"thought": "Scores = answer data. Resolve table first.", "tool": "resolve_answer_table", "args": {"form_name": "inspection"}}
-Turn 2: {"thought": "Got table. Query with include_scores.", "tool": "query_answers", "args": {"answer_table": "fb_xxx", "include_scores": true}}
-Turn 3: {"thought": "Got scores. Answer.", "tool": "final_answer", "args": {"answer": "..."}}
+Turn 1: resolve_answer_table(form_name="inspection")
+Turn 2: query_answers(answer_table="fb_xxx", include_scores=true)
+Turn 3: final_answer
 
-─── Example 5 — Form listing (1 step) ───
+─── Example 5 — Submissions for the MOST RECENT form (4 steps) ───
+
+User: "show me the answers submitted for most recently published form"
+
+Turn 1 (you):
+{"thought": "Temporal superlative — list_forms doesn't return dates, so I need generate_sql to find the latest PUBLISHED form first.", "tool": "generate_sql", "args": {"question": "name of the most recently created PUBLISHED form", "schema_hint": "SELECT name FROM fb_forms WHERE status='PUBLISHED' ORDER BY created_on DESC LIMIT 1"}}
+
+Turn 2 (you — after SQL result gives name 'Safety Audit 2024'):
+{"thought": "Got the form name. Now resolve its answer table.", "tool": "resolve_answer_table", "args": {"form_name": "Safety Audit 2024"}}
+
+Turn 3 (you):
+{"thought": "Got the table. Pull submissions.", "tool": "query_answers", "args": {"answer_table": "fb_<uuid>", "form_name": "Safety Audit 2024", "limit": 50}}
+
+Turn 4 (you):
+{"thought": "Summarise.", "tool": "final_answer", "args": {"answer": "..."}}
+
+─── Example 6 — Content-based submission search (multi-step) ───
+
+User: "Which form submissions are regarding environmental?"
+
+Turn 1: semantic_search(query="environmental", entity_type="QUESTION")
+Turn 2..N: For each distinct form_name returned:
+           resolve_answer_table(form_name=...) then query_answers(...)
+Turn final: final_answer aggregating.
+
+If semantic_search returns 0 matches, call final_answer directly saying no
+forms ask about the topic. Do NOT call resolve_answer_table with a topic.
+
+─── Example 7 — Form listing (1 step) ───
 
 User: "How many forms are there?"
-Turn 1: {"thought": "Count forms. list_forms handles this.", "tool": "list_forms", "args": {}}
+Turn 1: {"thought": "Count.", "tool": "list_forms", "args": {}}
+(The orchestrator will produce a deterministic count — you don't need to count.)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Remember: respond with ONLY valid JSON. No other text.
@@ -283,8 +250,7 @@ Remember: respond with ONLY valid JSON. No other text.
 """
 
 # ---------------------------------------------------------------------------
-# SQL generation prompt for sqlcoder:7b
-# Plain string — format with .format()
+# SQL generation prompt for sqlcoder
 # ---------------------------------------------------------------------------
 
 SQL_GENERATION_PROMPT = """\
@@ -292,38 +258,53 @@ SQL_GENERATION_PROMPT = """\
 Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
 
 ### Instructions
-- Generate a PostgreSQL SELECT query ONLY. No INSERT, UPDATE, DELETE, DROP.
+- Generate a PostgreSQL SELECT query ONLY. No INSERT/UPDATE/DELETE/DROP.
 - fb_question has NO label/title/text column.
 - fb_section has NO title/name column.
 - fb_page has NO title/name column.
 - The ONLY tables with a name column are: fb_forms and fb_modules.
-- All question labels, section titles, and page names are in fb_translation_json.translations (a JSONB ARRAY).
+- All question labels, section titles, page names are in fb_translation_json.translations (JSONB ARRAY).
 - You MUST use jsonb_array_elements() to unpack the JSONB array.
 - NEVER use ->> directly on the translations column — always unpack first.
-- Always use ->> (double arrow) not -> (single arrow) for JSONB text extraction.
+- Always use ->> (double arrow) not -> for JSONB text extraction.
 - JSONB keys are camelCase: translatedText, entityType, elementId, attribute, language.
 - Use ILIKE for text matching. Include LIMIT 100 unless aggregating.
-- NEVER query answer_data or submission data — that is in dynamic tables handled by separate tools.
+- NEVER query answer_data or submission data — that's in dynamic tables handled by separate tools.
+
+### ILIKE pattern construction — IMPORTANT
+When filtering by a form or module name, STRIP filler words from the pattern.
+These are NEVER part of the stored name:
+  the, a, an, this, that, form, forms, module, modules
+
+Examples:
+  user said "safety audit form"        → ILIKE '%safety audit%'
+  user said "the inspection form"      → ILIKE '%inspection%'
+  user said "a copy form"              → ILIKE '%copy%'
+  user said "HR module"                → ILIKE '%HR%'
+  user said "the most recent form"     → (use ORDER BY created_on DESC LIMIT 1, no ILIKE)
+
+The schema_hint may provide an EXACT form name found by lookup_form — if so,
+use ILIKE with that exact name (again, without adding 'form' back in).
 
 ### Additional context
 {schema_hint}
 
-### REAL entityType VALUES (only these three exist):
+### REAL entityType VALUES (only these three in JSONB):
 -- QUESTION, PAGE, FORM
 -- There is NO 'SECTION' and NO 'SUB_FORM' — never use them.
 
-### MANDATORY PATTERNS — copy exactly, replace only the FORM_NAME placeholder:
+### MANDATORY PATTERNS — copy exactly, replace only FORM_NAME:
 
--- Count of FORMS (no JSONB needed):
+-- Count of FORMS:
 SELECT COUNT(*) FROM fb_forms;
 
--- Count of MODULES (no JSONB needed):
+-- Count of MODULES:
 SELECT COUNT(*) FROM fb_modules;
 
 -- List all modules:
 SELECT id, name FROM fb_modules ORDER BY name LIMIT 100;
 
--- Count ALL questions in the database (no form filter — do NOT join fb_forms):
+-- Count ALL questions (no fb_forms join):
 SELECT COUNT(*) AS question_count
 FROM fb_translation_json,
      jsonb_array_elements(translations) AS elem
@@ -331,7 +312,7 @@ WHERE elem->>'language' = 'eng'
   AND elem->>'attribute' = 'NAME'
   AND elem->>'entityType' = 'QUESTION';
 
--- Count ALL pages in the database:
+-- Count ALL pages:
 SELECT COUNT(*) AS page_count
 FROM fb_translation_json,
      jsonb_array_elements(translations) AS elem
@@ -339,7 +320,7 @@ WHERE elem->>'language' = 'eng'
   AND elem->>'attribute' = 'NAME'
   AND elem->>'entityType' = 'PAGE';
 
--- Count questions IN a specific form (join needed for form name filter):
+-- Count questions IN a specific form:
 SELECT COUNT(*) AS question_count
 FROM fb_forms f
 JOIN fb_translation_json tj ON f.translations_id = tj.id,
@@ -360,22 +341,12 @@ WHERE f.name ILIKE '%FORM_NAME%'
   AND elem->>'entityType' = 'QUESTION'
 LIMIT 100;
 
--- List page labels for a specific form:
-SELECT elem->>'translatedText' AS label
-FROM fb_forms f
-JOIN fb_translation_json tj ON f.translations_id = tj.id,
-     jsonb_array_elements(tj.translations) AS elem
-WHERE f.name ILIKE '%FORM_NAME%'
-  AND elem->>'language' = 'eng'
-  AND elem->>'attribute' = 'NAME'
-  AND elem->>'entityType' = 'PAGE'
-LIMIT 100;
+-- Most recently created PUBLISHED form (by NAME — one row):
+SELECT name FROM fb_forms
+WHERE status = 'PUBLISHED' AND name IS NOT NULL AND name != ''
+ORDER BY created_on DESC LIMIT 1;
 
-CRITICAL: "questions overall" or "total questions" = COUNT with NO fb_forms join.
-  BAD:  SELECT COUNT(*) FROM fb_forms;   ← counts forms, NOT questions
-  GOOD: Use the "Count ALL questions" pattern above.
-
--- Questions in the MOST RECENT / LATEST form (use subquery, one query):
+-- Questions in the MOST RECENT form (subquery, single query):
 SELECT f.name AS form_name, elem->>'translatedText' AS label
 FROM fb_forms f
 JOIN fb_translation_json tj ON f.translations_id = tj.id,
@@ -386,13 +357,11 @@ WHERE f.id = (SELECT id FROM fb_forms ORDER BY created_on DESC LIMIT 1)
   AND elem->>'entityType' = 'QUESTION'
 LIMIT 100;
 
-CRITICAL: For "most recent/latest/newest/oldest" + details about that form,
-  ALWAYS use a subquery to find the form in a SINGLE query.
-  The subquery alone is sufficient — do NOT also add f.name = '...' or f.name ILIKE.
-  BAD:  WHERE f.name = 'copy' AND f.id = (SELECT ...)   ← double filter, will break
-  BAD:  First query for the form, then a second query for details.
-  GOOD: WHERE f.id = (SELECT id FROM fb_forms ORDER BY created_on DESC LIMIT 1)
-        ← subquery only, no name filter needed
+CRITICAL: For "most recent/latest/newest/oldest", use a subquery. Do NOT combine
+ORDER BY with a name filter — the subquery alone is sufficient.
+
+CRITICAL: "questions overall" or "total questions" = COUNT with NO fb_forms join.
+  BAD:  SELECT COUNT(*) FROM fb_forms;   ← counts forms, not questions.
 
 ### Answer
 Given the database schema, here is the SQL query that answers \
@@ -401,9 +370,6 @@ Given the database schema, here is the SQL query that answers \
 """
 
 # ---------------------------------------------------------------------------
-# Summary prompt — used when max_iterations is reached without final_answer
-# ---------------------------------------------------------------------------
-
 FORCE_SUMMARY_PROMPT = """\
 You have reached the maximum number of reasoning steps.
 Based on everything you have learned so far, provide the best possible answer

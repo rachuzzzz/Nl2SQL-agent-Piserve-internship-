@@ -24,12 +24,16 @@ class SQLValidator:
         "fb_multifield.label",
     }
 
-    # Tables that DO NOT EXIST but LLMs constantly hallucinate
+    # Tables that DO NOT EXIST but LLMs constantly hallucinate.
+    # NOTE: fb_section IS a real table (it has insertion_order) — the problem
+    # is its columns, which the HALLUCINATED_COLUMNS check handles. Do NOT
+    # include fb_section here or legitimate section queries will be rejected.
+    # Only plural/nonexistent names belong here.
     HALLUCINATED_TABLES = {
         "fb_users", "fb_user", "users", "fb_creators",
-        "fb_sections", "fb_section",
-        "fb_questions",
-        # NEW: prevent LLMs from guessing a single answer table
+        "fb_sections",          # plural — doesn't exist (singular fb_section does)
+        "fb_questions",         # plural — doesn't exist (singular fb_question does)
+        # Prevent LLMs from guessing a single global answer table
         "fb_answers", "fb_answer", "fb_form_answer",
         "fb_form_answers", "fb_submissions", "fb_submission",
         "fb_responses", "fb_response",
@@ -82,11 +86,9 @@ class SQLValidator:
                re.search(rf"\b\w*\.{column}\b", sql_lower):
                 errors.append(f"HALLUCINATION: '{col}' doesn't exist. Use JSONB translations.")
 
-        # Check hallucinated tables — but SKIP dynamic table names (fb_<uuid>)
+        # Check hallucinated tables
         for table in self.HALLUCINATED_TABLES:
             if re.search(rf"\b{re.escape(table)}\b", sql_lower):
-                # Don't flag dynamic answer tables that happen to contain "answer"
-                # Check if it's an exact match to a known-bad name
                 errors.append(
                     f"HALLUCINATION: table '{table}' does not exist. "
                     f"Use get_schema() to find the correct table. "

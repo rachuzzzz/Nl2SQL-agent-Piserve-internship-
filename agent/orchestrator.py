@@ -278,9 +278,17 @@ class AgentOrchestrator:
             data = tool_result.get("result", [])
             if data:
                 fmt = "\n".join(f"  - \"{m['text']}\" (form: {m['form_name']}, score: {m['score']})" for m in data[:5])
+                # Collect distinct form names — useful for submission-by-topic
+                # workflows where the next step is resolve_answer_table per form.
+                distinct_forms = sorted({m["form_name"] for m in data if m.get("form_name")})
+
                 needs_meta = bool(re.search(
                     r'\b(when|which day|what date|created|modified|timestamp|who created|who made)\b',
                     question.lower()))
+                asks_submissions = bool(re.search(
+                    r'\b(submission|submitted|response|responded|answer|answered|filled|scored?)\b',
+                    question.lower()))
+
                 if needs_meta:
                     top = data[0]
                     return (f"semantic_search found {len(data)} match(es):\n{fmt}\n\n"
@@ -289,10 +297,19 @@ class AgentOrchestrator:
                         f"Call generate_sql with schema_hint mentioning form name "
                         f"'{top['form_name']}' and the metadata needed.\n"
                         f"Do NOT call final_answer until you have the metadata.")
+
+                if asks_submissions:
+                    return (f"semantic_search found {len(data)} match(es) in "
+                        f"{len(distinct_forms)} distinct form(s): {distinct_forms}\n{fmt}\n\n"
+                        f"The user asked about submissions/responses on this topic.\n"
+                        f"For EACH form above, call resolve_answer_table(form_name=...)"
+                        f" then query_answers(...) to pull its submissions, then "
+                        f"aggregate in final_answer.")
+
                 return (f"semantic_search found {len(data)} match(es):\n{fmt}\n\n"
                     f"If this answers the question, call final_answer.\n"
                     f"If user needs dates/counts/metadata, use generate_sql.")
-            return "semantic_search found no matches. Try generate_sql."
+            return "semantic_search found no matches. If the user asked about a topic, answer that no forms in the system ask about it."
 
         if tool_name == "lookup_form":
             names = tool_result.get("result", [])
@@ -300,28 +317,75 @@ class AgentOrchestrator:
                 return f"lookup_form found: {', '.join(repr(n) for n in names)}\nNow use generate_sql with one of these exact names."
             return "lookup_form found no matches. Try list_forms()."
 
-        # --- NEW: answer tool context messages ---
+        # --- Answer tool context messages ---
         if tool_name == "resolve_answer_table":
             info = tool_result.get("result", {})
-            if info and info.get("table_exists"):
-                return (
-                    f"resolve_answer_table found:\n"
-                    f"  Form: '{info['form_name']}'\n"
+            if not info:
+                return "resolve_answer_table found no matching form. Try lookup_form first."
+
+            ambiguous = info.get("ambiguous", False)
+            all_matches = info.get("matches", [])
+            missing_cols = info.get("missing_required_columns", [])
+
+            # Build a concise view of all candidates when ambiguous.
+            candidates_block = ""
+            if ambiguous and all_matches:
+                lines = []
+                for m in all_matches:
+                    exists = "✓" if m.get("table_exists") else "✗"
+                    mrc = m.get("missing_required_columns") or []
+                    shape = "standard" if not mrc else f"missing: {mrc}"
+                    lines.append(
+                        f"  - form='{m['form_name']}'  module='{m['module_name']}'  "
+                        f"table={m['answer_table']}  exists={exists}  shape={shape}"
+                    )
+                candidates_block = "\nAll candidates:\n" + "\n".join(lines)
+
+            if info.get("table_exists") and not missing_cols:
+                base = (
+                    f"resolve_answer_table resolved:\n"
+                    f"  Best match form: '{info['form_name']}'\n"
                     f"  Module: '{info['module_name']}'\n"
-                    f"  Answer table: {info['answer_table']}\n"
-                    f"  Table exists: {info['table_exists']}\n\n"
-                    f"Now use query_answers or get_answer_summary with "
-                    f"answer_table=\"{info['answer_table']}\".\n"
+                    f"  Answer table: {info['answer_table']}  (exists, standard shape)\n"
+                    f"  Columns available: {info.get('columns', [])}"
+                    f"{candidates_block}\n\n"
+                )
+                if ambiguous:
+                    base += (
+                        "Multiple forms matched. If the user's intent is a specific "
+                        "form, pick one from the list above. Otherwise continue with "
+                        "the best match.\n"
+                    )
+                base += (
+                    f"Now call query_answers with answer_table=\"{info['answer_table']}\" "
+                    f"(add form_name=\"{info['form_name']}\" to scope to this form "
+                    f"if the module hosts multiple forms).\n"
                     f"If user wants scores, set include_scores=true.\n"
                     f"If user wants a specific question's answers, set question_id."
                 )
-            elif info:
+                return base
+
+            if info.get("table_exists") and missing_cols:
                 return (
-                    f"resolve_answer_table found form '{info.get('form_name')}' "
-                    f"but the answer table {info.get('answer_table')} does NOT exist.\n"
-                    f"This form may not have any submissions yet."
+                    f"resolve_answer_table found '{info['form_name']}' (module "
+                    f"'{info['module_name']}'). Answer table {info['answer_table']} "
+                    f"exists but is missing expected columns: {missing_cols}.\n"
+                    f"Available columns: {info.get('columns', [])}\n"
+                    f"{candidates_block}\n"
+                    f"query_answers/get_answer_summary may fail against this table. "
+                    f"Consider using get_schema to inspect the exact shape, or pick a "
+                    f"different candidate if ambiguous."
                 )
-            return "resolve_answer_table found no matching form. Try lookup_form first."
+
+            # Table doesn't exist at all
+            return (
+                f"resolve_answer_table found form '{info.get('form_name')}' "
+                f"(module '{info.get('module_name')}') but the answer table "
+                f"{info.get('answer_table')} does NOT exist.\n"
+                f"{candidates_block}\n"
+                f"This module may not have received any submissions yet. "
+                f"If ambiguous, try a more specific form_name."
+            )
 
         if tool_name == "get_answer_summary":
             data = tool_result.get("result", {})

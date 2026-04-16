@@ -25,6 +25,19 @@ from core.validator import SQLValidator
 from agent.prompts import SQL_GENERATION_PROMPT
 
 
+# Minimum similarity score to accept a semantic match. Raised from the
+# original 0.4 because bge-small tends to produce noisy matches for short
+# queries — "Responsible" at 0.74 for "safety" is a false positive, but
+# "Emergency Contact Name" at 0.91 for "emergency contact" is solid.
+# 0.55 is a compromise between recall and precision.
+_SEMANTIC_MIN_SCORE = 0.55
+
+# Slightly lower threshold when falling back from form-name search to
+# question-label search inside lookup_form. The match is indirect (we're
+# finding a form via one of its questions) so we accept weaker signals.
+_SEMANTIC_FALLBACK_MIN_SCORE = 0.50
+
+
 # ---------------------------------------------------------------------------
 # Individual tool functions (pure, dependency-injected)
 # ---------------------------------------------------------------------------
@@ -57,15 +70,92 @@ def list_forms(db_engine: Engine, status: Optional[str] = None) -> dict[str, Any
         return {"success": False, "result": [], "error": str(exc)}
 
 
-def lookup_form(db_engine: Engine, fuzzy_name: str) -> dict[str, Any]:
+def lookup_form(
+    db_engine: Engine,
+    semantic_index: SemanticQuestionIndex,
+    fuzzy_name: str,
+) -> dict[str, Any]:
+    """
+    Resolve a fuzzy/partial form name to actual form names in the DB.
+
+    Three-step cascade — stops at the first step that yields matches:
+
+      1. ILIKE '%fuzzy_name%' against fb_forms.name  (fast, exact substring)
+      2. Semantic search over indexed FORM names     (handles paraphrases)
+      3. Semantic search over QUESTION labels →      (indirect: the form that
+         collect distinct form_name values            *contains* a question
+                                                      about this topic)
+
+    Returns a list of form-name strings (up to 10). `_source` in the payload
+    indicates which cascade step matched, useful for logging.
+    """
     try:
+        # --- Step 1: ILIKE ---
         query = sql_text(
-            "SELECT name FROM fb_forms WHERE name ILIKE :pattern ORDER BY name LIMIT 10"
+            "SELECT name FROM fb_forms WHERE name ILIKE :pattern "
+            "AND name IS NOT NULL AND name != '' "
+            "ORDER BY name LIMIT 10"
         )
         with db_engine.connect() as conn:
             result = conn.execute(query, {"pattern": f"%{fuzzy_name}%"})
             names = [row[0] for row in result.fetchall()]
-        return {"success": True, "result": names, "error": None}
+
+        if names:
+            return {
+                "success": True,
+                "result": names,
+                "error": None,
+                "_source": "ilike",
+            }
+
+        # --- Step 2: semantic over FORM entries ---
+        form_matches = semantic_index.search(
+            fuzzy_name, entity_type="FORM", top_k=10
+        )
+        good_forms = [m for m in form_matches if m.score >= _SEMANTIC_MIN_SCORE]
+        if good_forms:
+            seen, names = set(), []
+            for m in good_forms:
+                if m.text and m.text not in seen:
+                    seen.add(m.text)
+                    names.append(m.text)
+            return {
+                "success": True,
+                "result": names,
+                "error": None,
+                "_source": "semantic_form",
+            }
+
+        # --- Step 3: semantic over QUESTION labels → collect form_names ---
+        q_matches = semantic_index.search(
+            fuzzy_name, entity_type="QUESTION", top_k=20
+        )
+        good_q = [m for m in q_matches if m.score >= _SEMANTIC_FALLBACK_MIN_SCORE]
+        if good_q:
+            seen, names = set(), []
+            for m in good_q:
+                fn = (m.form_name or "").strip()
+                if fn and fn not in seen:
+                    seen.add(fn)
+                    names.append(fn)
+                    if len(names) >= 10:
+                        break
+            if names:
+                return {
+                    "success": True,
+                    "result": names,
+                    "error": None,
+                    "_source": "semantic_question",
+                }
+
+        # --- No matches from any step ---
+        return {
+            "success": True,
+            "result": [],
+            "error": None,
+            "_source": "none",
+        }
+
     except Exception as exc:
         return {"success": False, "result": [], "error": str(exc)}
 
@@ -78,13 +168,26 @@ def semantic_search(
     top_k: int = 10,
 ) -> dict[str, Any]:
     try:
+        # Defensive: the tool-facing API advertises QUESTION|PAGE|null only.
+        # If the LLM passes FORM or MODULE, normalise to None rather than
+        # silently returning 0 matches (those entity types are reserved for
+        # internal lookup_form use).
+        if entity_type and entity_type.upper() in ("FORM", "MODULE"):
+            entity_type = None
+
         matches = semantic_index.search(
             query=query,
             entity_type=entity_type if entity_type else None,
             form_name=form_name,
             top_k=top_k,
         )
-        good = [m for m in matches if m.score >= 0.4]
+        # Filter to QUESTION/PAGE only even when caller passed entity_type=None,
+        # so the LLM-facing tool surface never leaks FORM/MODULE entries.
+        good = [
+            m for m in matches
+            if m.score >= _SEMANTIC_MIN_SCORE
+            and m.entity_type in ("QUESTION", "PAGE")
+        ]
         data = [
             {
                 "text": m.text,
@@ -196,38 +299,37 @@ def get_schema(db_engine: Engine, table_name: Optional[str] = None) -> dict[str,
 
 
 # ---------------------------------------------------------------------------
-# NEW: Answer data tools — dynamic module tables
+# Answer data tools — dynamic module tables
 # ---------------------------------------------------------------------------
 
-# Regex for validating dynamic answer table names: fb_ + UUID with underscores
 _ANSWER_TABLE_RE = re.compile(
     r'^fb_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}$'
 )
 
-# Regex for validating UUID strings (question_id, form_id, etc.)
 _UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
     re.IGNORECASE,
 )
 
+_REQUIRED_ANSWER_COLUMNS = {"form_name", "status", "answer_data", "created_on", "modified_on"}
+
 
 def _validate_answer_table_name(table_name: str) -> Optional[str]:
-    """Return error message if table name is invalid, else None."""
     if not _ANSWER_TABLE_RE.match(table_name):
         return f"Invalid answer table name: '{table_name}'. Expected fb_<uuid> pattern."
     return None
 
 
+def _safe_array(expr: str) -> str:
+    """NULL-safe jsonb_array_elements fragment — see query_answers docstring."""
+    return (
+        f"jsonb_array_elements("
+        f"CASE WHEN jsonb_typeof({expr}) = 'array' "
+        f"THEN {expr} ELSE NULL END)"
+    )
+
+
 def resolve_answer_table(db_engine: Engine, form_name: str) -> dict[str, Any]:
-    """
-    Given a form name (or partial), find its module and derive the dynamic
-    answer table name.
-
-    Chain: form_name → fb_forms.module_id → table fb_{module_id_underscored}
-
-    Returns: { answer_table, attachment_table, module_id, module_name,
-               form_name, form_id, table_exists }
-    """
     try:
         query = sql_text("""
             SELECT f.id AS form_id, f.name AS form_name,
@@ -250,23 +352,34 @@ def resolve_answer_table(db_engine: Engine, form_name: str) -> dict[str, Any]:
                 "error": f"No form found matching '{form_name}'. Use lookup_form first.",
             }
 
+        inspector = sa_inspect(db_engine)
         matches = []
         for row in rows:
             row_dict = dict(zip(columns, row))
             module_id = str(row_dict["module_id"])
             table_name = "fb_" + module_id.replace("-", "_")
 
-            # Defense-in-depth: validate derived table name too
             if not _ANSWER_TABLE_RE.match(table_name):
                 continue
 
-            # Verify table exists
             try:
                 with db_engine.connect() as conn:
                     conn.execute(sql_text(f"SELECT 1 FROM {table_name} LIMIT 1"))
                 table_exists = True
             except Exception:
                 table_exists = False
+
+            table_columns: list[str] = []
+            missing_required: list[str] = []
+            if table_exists:
+                try:
+                    cols = inspector.get_columns(table_name)
+                    table_columns = [c["name"] for c in cols]
+                    missing_required = sorted(
+                        _REQUIRED_ANSWER_COLUMNS - set(table_columns)
+                    )
+                except Exception:
+                    pass
 
             matches.append({
                 "answer_table": table_name,
@@ -276,11 +389,29 @@ def resolve_answer_table(db_engine: Engine, form_name: str) -> dict[str, Any]:
                 "module_name": row_dict["module_name"],
                 "form_name": row_dict["form_name"],
                 "form_id": str(row_dict["form_id"]),
+                "columns": table_columns,
+                "missing_required_columns": missing_required,
             })
 
-        valid = [m for m in matches if m["table_exists"]]
-        best = valid[0] if valid else matches[0]
-        return {"success": True, "result": best, "error": None}
+        fully_usable = [
+            m for m in matches
+            if m["table_exists"] and not m["missing_required_columns"]
+        ]
+        merely_existing = [m for m in matches if m["table_exists"]]
+
+        if fully_usable:
+            best = fully_usable[0]
+        elif merely_existing:
+            best = merely_existing[0]
+        else:
+            best = matches[0]
+
+        result = {
+            **best,
+            "matches": matches,
+            "ambiguous": len(matches) > 1,
+        }
+        return {"success": True, "result": result, "error": None}
 
     except Exception as exc:
         return {"success": False, "result": None, "error": str(exc)}
@@ -295,30 +426,20 @@ def query_answers(
     include_scores: bool = False,
     limit: int = 50,
 ) -> dict[str, Any]:
-    """
-    Query answer data from a dynamic module answer table.
-    Unpacks the deeply nested answer_data JSONB:
-      answer_data -> forms[] -> submissions[] -> answers[]
-
-    SECURITY: table name validated by UUID regex; all user values are
-    parameterized via SQLAlchemy :bind params — no string interpolation.
-    """
     try:
         err = _validate_answer_table_name(answer_table)
         if err:
             return {"success": False, "result": None, "error": err}
 
-        # Sanitize inputs
         if status and status.upper() not in ("DRAFT", "PUBLISHED", "DELETED"):
             return {"success": False, "result": None,
                     "error": f"Invalid status: '{status}'. Use DRAFT, PUBLISHED, or DELETED."}
         if question_id and not _UUID_RE.match(question_id):
             return {"success": False, "result": None,
                     "error": f"Invalid question_id: '{question_id}'. Must be a UUID."}
-        limit = min(max(int(limit), 1), 200)  # clamp 1-200
+        limit = min(max(int(limit), 1), 200)
 
-        # Build WHERE with bind params (not string interpolation)
-        where_parts = []
+        where_parts = ["fa.answer_data IS NOT NULL"]
         params = {}
 
         if form_name:
@@ -328,8 +449,12 @@ def query_answers(
             where_parts.append("fa.status = :status")
             params["status"] = status.upper()
 
-        where_clause = "WHERE " + " AND ".join(where_parts) if where_parts else ""
-        extra_and = "AND" if where_clause else "WHERE"
+        where_clause = "WHERE " + " AND ".join(where_parts)
+
+        forms_elem = _safe_array("fa.answer_data->'forms'")
+        subs_elem  = _safe_array("form_elem->'submissions'")
+        answers_elem = _safe_array("sub_elem->'answers'")
+        scores_elem  = _safe_array("sub_elem->'scores'")
 
         if question_id:
             params["question_id"] = question_id
@@ -342,11 +467,11 @@ def query_answers(
                        ans_elem->>'maximumPossibleScore' AS max_score,
                        fa.created_on, fa.modified_on
                 FROM {answer_table} fa,
-                     jsonb_array_elements(fa.answer_data->'forms') AS form_elem,
-                     jsonb_array_elements(form_elem->'submissions') AS sub_elem,
-                     jsonb_array_elements(sub_elem->'answers') AS ans_elem
+                     {forms_elem} AS form_elem,
+                     {subs_elem}  AS sub_elem,
+                     {answers_elem} AS ans_elem
                 {where_clause}
-                {extra_and} ans_elem->>'questionId' = :question_id
+                  AND ans_elem->>'questionId' = :question_id
                 LIMIT :limit_val
             """
         elif include_scores:
@@ -358,9 +483,9 @@ def query_answers(
                        score_elem->>'scoreType'  AS score_type,
                        fa.created_on
                 FROM {answer_table} fa,
-                     jsonb_array_elements(fa.answer_data->'forms') AS form_elem,
-                     jsonb_array_elements(form_elem->'submissions') AS sub_elem,
-                     jsonb_array_elements(sub_elem->'scores') AS score_elem
+                     {forms_elem} AS form_elem,
+                     {subs_elem}  AS sub_elem,
+                     {scores_elem} AS score_elem
                 {where_clause}
                 LIMIT :limit_val
             """
@@ -373,9 +498,9 @@ def query_answers(
                        ans_elem->>'answer'        AS answer,
                        fa.created_on, fa.modified_on
                 FROM {answer_table} fa,
-                     jsonb_array_elements(fa.answer_data->'forms') AS form_elem,
-                     jsonb_array_elements(form_elem->'submissions') AS sub_elem,
-                     jsonb_array_elements(sub_elem->'answers') AS ans_elem
+                     {forms_elem} AS form_elem,
+                     {subs_elem}  AS sub_elem,
+                     {answers_elem} AS ans_elem
                 {where_clause}
                 LIMIT :limit_val
             """
@@ -399,9 +524,6 @@ def query_answers(
 
 
 def get_answer_summary(db_engine: Engine, answer_table: str) -> dict[str, Any]:
-    """
-    Quick summary of an answer table: row count, statuses, date range.
-    """
     try:
         err = _validate_answer_table_name(answer_table)
         if err:
@@ -443,7 +565,6 @@ class ToolRegistry:
     KNOWN_TOOLS = {
         "list_forms", "lookup_form", "semantic_search",
         "generate_sql", "execute_sql", "get_schema",
-        # NEW
         "resolve_answer_table", "query_answers", "get_answer_summary",
     }
 
@@ -464,7 +585,10 @@ class ToolRegistry:
             if name == "list_forms":
                 return list_forms(self._db_engine, status=args.get("status"))
             if name == "lookup_form":
-                return lookup_form(self._db_engine, fuzzy_name=str(args["fuzzy_name"]))
+                return lookup_form(
+                    self._db_engine, self._semantic_index,
+                    fuzzy_name=str(args["fuzzy_name"]),
+                )
             if name == "semantic_search":
                 return semantic_search(
                     self._semantic_index, query=str(args["query"]),
@@ -484,7 +608,6 @@ class ToolRegistry:
             if name == "get_schema":
                 return get_schema(self._db_engine, table_name=args.get("table_name"))
 
-            # --- NEW: Answer data tools ---
             if name == "resolve_answer_table":
                 return resolve_answer_table(self._db_engine, form_name=str(args["form_name"]))
             if name == "query_answers":
