@@ -30,13 +30,15 @@ class SQLValidator:
     # include fb_section here or legitimate section queries will be rejected.
     # Only plural/nonexistent names belong here.
     HALLUCINATED_TABLES = {
-        "fb_users", "fb_user", "users", "fb_creators",
+        "fb_users", "fb_user", "fb_creators",
         "fb_sections",          # plural — doesn't exist (singular fb_section does)
         "fb_questions",         # plural — doesn't exist (singular fb_question does)
         # Prevent LLMs from guessing a single global answer table
         "fb_answers", "fb_answer", "fb_form_answer",
         "fb_form_answers", "fb_submissions", "fb_submission",
         "fb_responses", "fb_response",
+        # NOTE: "users" is a REAL table (has first_name, last_name, email).
+        # Do NOT add it here. fb_users and fb_user are fake — those stay.
     }
 
     # Regex patterns that indicate known mistakes
@@ -133,10 +135,15 @@ class SQLValidator:
             )
 
         # Warn if question asks about answers/submissions but SQL doesn't
-        # use dynamic tables (agent should use answer tools instead)
+        # use dynamic tables (agent should use answer tools instead).
+        # EXCEPTION: if the SQL references inspection_report or
+        # inspection_corrective_action, those are proper relational tables
+        # where scores/submissions live — no warning needed.
         asks_about_answers = bool(re.search(
             r'\b(answer|submission|response|score|submitted|filled)\b', q_lower))
-        if asks_about_answers and "ANSWER_DATA" not in sql_upper:
+        uses_inspection_tables = bool(re.search(
+            r'\binspection_(report|corrective_action|schedule|cycle)\b', sql.lower()))
+        if asks_about_answers and "ANSWER_DATA" not in sql_upper and not uses_inspection_tables:
             warnings.append(
                 "WARNING: Question asks about answers/submissions. "
                 "Use resolve_answer_table + query_answers tools instead of generate_sql."
@@ -171,6 +178,37 @@ class SQLValidator:
             )
         return sql
 
+    def fix_reserved_aliases(self, sql: str) -> str:
+        """
+        Fix SQL reserved words used as table aliases.
+        qwen2.5 commonly uses 'is' for inspection_schedule, etc.
+        Replaces both the alias declaration and all column references.
+        """
+        replacements = {
+            'is': 'isch',   # inspection_schedule is → isch
+        }
+        for reserved, safe in replacements.items():
+            # Step 1: Find "table_name <reserved>" used as alias
+            # (after a table name, before ON/WHERE/./comma/newline)
+            alias_pattern = re.compile(
+                r'(\b\w+\s+)' + r'\b' + re.escape(reserved) + r'\b'
+                r'(?=\s*\.|\s+ON\b|\s+WHERE\b|\s+GROUP\b|\s+ORDER\b'
+                r'|\s+LEFT\b|\s+JOIN\b|\s+INNER\b|\s*\n|\s*,)',
+                re.IGNORECASE,
+            )
+            if alias_pattern.search(sql):
+                # Step 2: Replace the alias declaration
+                sql = alias_pattern.sub(
+                    lambda m, s=safe: m.group(1) + s, sql)
+                # Step 3: Replace all "reserved." column references
+                # Use word boundary to avoid replacing inside words
+                sql = re.sub(
+                    r'\b' + re.escape(reserved) + r'\.',
+                    safe + '.',
+                    sql,
+                )
+        return sql
+
     def clean_sql(self, sql: str) -> str:
         """Clean up model output: remove markdown, extract SELECT, fix arrows."""
         # Remove markdown fences ANYWHERE (not just at end)
@@ -180,11 +218,26 @@ class SQLValidator:
         sql = re.sub(r"^###.*$", "", sql, flags=re.MULTILINE)
         # Remove markdown links/references that sqlcoder sometimes appends
         sql = re.sub(r"-\s*\[.*?\]\(.*?\)", "", sql)
+        # Remove preamble lines ending with colon — qwen2.5 often outputs
+        # "SELECT query can be used:" or "The SQL query is:" before the
+        # actual SQL. These lines always end with ':' and contain no SQL.
+        sql = re.sub(r"^[^\n;]*:\s*$", "", sql, flags=re.MULTILINE)
         sql = sql.strip()
 
         if "SELECT" in sql.upper():
-            select_start = sql.upper().index("SELECT")
-            sql = sql[select_start:]
+            # Preserve WITH ... AS (...) CTEs — but only if WITH is followed
+            # by a valid CTE name (identifier + AS), not prose like "with them."
+            sql_upper = sql.upper()
+            select_pos = sql_upper.find("SELECT")
+            # Look for "WITH <identifier> AS" pattern (valid CTE)
+            cte_match = re.search(
+                r'\bWITH\s+(?:RECURSIVE\s+)?\w+\s+AS\s*\(',
+                sql, re.IGNORECASE
+            )
+            if cte_match and cte_match.start() < select_pos:
+                sql = sql[cte_match.start():]
+            else:
+                sql = sql[select_pos:]
 
         # Truncate after the first semicolon — everything after is garbage
         # (handles sqlcoder appending links, comments, references after the SQL)
@@ -194,6 +247,7 @@ class SQLValidator:
 
         sql = self.fix_jsonb_arrows(sql)
         sql = self.fix_jsonb_key_case(sql)
+        sql = self.fix_reserved_aliases(sql)
         sql = re.sub(r"\s*\[/?[A-Z_]+\]\s*$", "", sql, flags=re.IGNORECASE).rstrip()
 
         if sql and not sql.rstrip().endswith(";"):

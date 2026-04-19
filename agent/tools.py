@@ -276,9 +276,38 @@ def execute_sql(db_engine: Engine, validator: SQLValidator, sql: str) -> dict[st
             rows = result.fetchmany(50)
             columns = list(result.keys())
         data = [dict(zip(columns, row)) for row in rows]
+
+        # Detect truncation: if we got exactly 50 rows, there may be more.
+        # Run a COUNT wrapper to get the real total so answers can say
+        # "showing 50 of 249 results" instead of implying 50 is all.
+        truncated = False
+        total_count = len(data)
+        if len(data) == 50:
+            try:
+                # Strip LIMIT from the original SQL before counting —
+                # otherwise COUNT(... LIMIT 100) returns at most 100.
+                stripped = re.sub(r'\bLIMIT\s+\d+\s*;?\s*$', '', sql, flags=re.IGNORECASE).rstrip('; ')
+                count_sql = f"SELECT COUNT(*) AS total FROM ({stripped}) AS _sub"
+                with db_engine.connect() as conn:
+                    count_row = conn.execute(sql_text(count_sql)).fetchone()
+                    if count_row:
+                        total_count = count_row[0]
+                        truncated = total_count > 50
+            except Exception:
+                # If the COUNT wrapper fails (e.g. complex SQL), just flag
+                # as potentially truncated without a total.
+                truncated = True
+                total_count = -1  # unknown
+
         return {
             "success": True,
-            "result": {"rows": data, "row_count": len(data), "columns": columns},
+            "result": {
+                "rows": data,
+                "row_count": len(data),
+                "total_count": total_count,
+                "truncated": truncated,
+                "columns": columns,
+            },
             "error": None,
         }
     except Exception as exc:
@@ -311,6 +340,31 @@ _UUID_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Permissive matcher used by resolve_answer_table to accept a raw module UUID
+# in any shape the user / LLM might paste:
+#   0c65b1cb-a05d-4a79-80f7-7c10d0308458        (canonical, dashes)
+#   0c65b1cb_a05d_4a79_80f7_7c10d0308458        (underscores)
+#   fb_0c65b1cb_a05d_4a79_80f7_7c10d0308458     (already-prefixed table name)
+#   0c65b1cba05d4a7980f77c10d0308458            (no separators)
+# Returns the canonical dash-separated UUID on match, or None.
+_LOOSE_UUID_RE = re.compile(
+    r'^(?:fb[_-])?'
+    r'([0-9a-f]{8})[-_]?([0-9a-f]{4})[-_]?([0-9a-f]{4})[-_]?'
+    r'([0-9a-f]{4})[-_]?([0-9a-f]{12})$',
+    re.IGNORECASE,
+)
+
+
+def _canonicalise_uuid(candidate: str) -> Optional[str]:
+    """Return canonical 8-4-4-4-12 UUID if candidate matches any accepted shape."""
+    if not isinstance(candidate, str):
+        return None
+    m = _LOOSE_UUID_RE.match(candidate.strip())
+    if not m:
+        return None
+    return "{}-{}-{}-{}-{}".format(*m.groups()).lower()
+
+
 _REQUIRED_ANSWER_COLUMNS = {"form_name", "status", "answer_data", "created_on", "modified_on"}
 
 
@@ -329,8 +383,121 @@ def _safe_array(expr: str) -> str:
     )
 
 
-def resolve_answer_table(db_engine: Engine, form_name: str) -> dict[str, Any]:
+def _resolve_by_module_uuid(db_engine: Engine, module_uuid: str) -> dict[str, Any]:
+    """
+    Resolve an answer table when the caller supplied a module UUID directly
+    (as opposed to a form name). Returns the same shape as resolve_answer_table.
+
+    Because one module can host many forms, `form_name` in the result is left
+    empty — the caller should use query_answers without a form_name filter,
+    or pick one of the forms listed in `forms_in_module`.
+    """
     try:
+        query = sql_text("""
+            SELECT m.id AS module_id, m.name AS module_name
+            FROM fb_modules m
+            WHERE m.id::text = :mid
+            LIMIT 1
+        """)
+        with db_engine.connect() as conn:
+            row = conn.execute(query, {"mid": module_uuid}).fetchone()
+
+        if not row:
+            return {
+                "success": False, "result": None,
+                "error": f"No module found with UUID '{module_uuid}'.",
+            }
+
+        module_id, module_name = str(row[0]), row[1]
+        table_name = "fb_" + module_id.replace("-", "_")
+
+        if not _ANSWER_TABLE_RE.match(table_name):
+            return {
+                "success": False, "result": None,
+                "error": f"Derived table name '{table_name}' failed validation.",
+            }
+
+        # Probe existence and introspect columns
+        table_exists = False
+        table_columns: list[str] = []
+        missing_required: list[str] = []
+        try:
+            with db_engine.connect() as conn:
+                conn.execute(sql_text(f"SELECT 1 FROM {table_name} LIMIT 1"))
+            table_exists = True
+        except Exception:
+            pass
+
+        if table_exists:
+            try:
+                inspector = sa_inspect(db_engine)
+                cols = inspector.get_columns(table_name)
+                table_columns = [c["name"] for c in cols]
+                missing_required = sorted(_REQUIRED_ANSWER_COLUMNS - set(table_columns))
+            except Exception:
+                pass
+
+        # List forms hosted by this module — useful when the user later wants
+        # to scope query_answers to a specific form_name.
+        forms_in_module: list[dict[str, Any]] = []
+        try:
+            with db_engine.connect() as conn:
+                result = conn.execute(sql_text(
+                    "SELECT id::text, name FROM fb_forms "
+                    "WHERE module_id::text = :mid "
+                    "AND name IS NOT NULL AND name != '' "
+                    "ORDER BY name LIMIT 20"
+                ), {"mid": module_uuid})
+                forms_in_module = [
+                    {"form_id": r[0], "form_name": r[1]}
+                    for r in result.fetchall()
+                ]
+        except Exception:
+            pass
+
+        best = {
+            "answer_table": table_name,
+            "attachment_table": table_name + "_attachments",
+            "table_exists": table_exists,
+            "module_id": module_id,
+            "module_name": module_name,
+            "form_name": "",        # ambiguous — module can host multiple forms
+            "form_id": "",
+            "columns": table_columns,
+            "missing_required_columns": missing_required,
+            "forms_in_module": forms_in_module,
+            "resolved_via": "module_uuid",
+        }
+        return {
+            "success": True,
+            "result": {**best, "matches": [best], "ambiguous": False},
+            "error": None,
+        }
+
+    except Exception as exc:
+        return {"success": False, "result": None, "error": str(exc)}
+
+
+def resolve_answer_table(db_engine: Engine, form_name: str) -> dict[str, Any]:
+    """
+    Given a form name (or partial) — OR a raw module UUID in any shape —
+    find the module and derive the dynamic answer table name.
+
+    Accepted forms of `form_name`:
+      - "Safety Audit 2024"                         (human-readable form name)
+      - "0c65b1cb-a05d-4a79-80f7-7c10d0308458"      (module UUID, dashes)
+      - "0c65b1cb_a05d_4a79_80f7_7c10d0308458"      (module UUID, underscores)
+      - "fb_0c65b1cb_a05d_4a79_80f7_7c10d0308458"   (full dynamic table name)
+    """
+    try:
+        # First try: does the input look like a module UUID in any shape?
+        # If so, resolve via fb_modules.id and skip fb_forms entirely — a
+        # module may host multiple forms, so we can't pick a single form_name.
+        canonical_uuid = _canonicalise_uuid(form_name)
+        if canonical_uuid:
+            return _resolve_by_module_uuid(db_engine, canonical_uuid)
+
+        # Otherwise, treat as a (fuzzy) form name — original flow.
         query = sql_text("""
             SELECT f.id AS form_id, f.name AS form_name,
                    f.module_id, m.name AS module_name
@@ -347,9 +514,95 @@ def resolve_answer_table(db_engine: Engine, form_name: str) -> dict[str, Any]:
             columns = list(result.keys())
 
         if not rows:
+            # --- Fallback: try matching against fb_modules.name ---
+            # The user may have said "inspection forms module" meaning the
+            # MODULE, not a form.  Strip common filler words before matching.
+            import re as _re
+            cleaned = _re.sub(
+                r'\b(the|a|an|this|that|form|forms|module|modules)\b',
+                '', form_name, flags=_re.IGNORECASE,
+            ).strip()
+            # Also collapse multiple spaces left by stripping
+            cleaned = _re.sub(r'\s+', ' ', cleaned).strip()
+
+            # Try both the raw input and the cleaned version
+            for pattern in dict.fromkeys([form_name, cleaned]):
+                if not pattern:
+                    continue
+                mod_query = sql_text("""
+                    SELECT id::text AS module_id, name AS module_name
+                    FROM fb_modules
+                    WHERE name ILIKE :pattern
+                      AND name IS NOT NULL AND name != ''
+                    ORDER BY name
+                    LIMIT 15
+                """)
+                with db_engine.connect() as conn:
+                    mod_rows = conn.execute(
+                        mod_query, {"pattern": f"%{pattern}%"}
+                    ).fetchall()
+
+                if not mod_rows:
+                    continue
+
+                # If only one match — use it directly
+                if len(mod_rows) == 1:
+                    return _resolve_by_module_uuid(db_engine, mod_rows[0][0])
+
+                # Multiple matches — probe each to find which have standard
+                # answer-table shape (answer_data column). Prefer those,
+                # because workflow tables need different tools.
+                candidates = []
+                for mid, mname in mod_rows:
+                    tname = "fb_" + mid.replace("-", "_")
+                    if not _ANSWER_TABLE_RE.match(tname):
+                        continue
+                    has_answer_data = False
+                    try:
+                        inspector = sa_inspect(db_engine)
+                        cols = [c["name"] for c in inspector.get_columns(tname)]
+                        has_answer_data = "answer_data" in cols
+                    except Exception:
+                        cols = []
+                    candidates.append({
+                        "module_id": mid,
+                        "module_name": mname,
+                        "table_name": tname,
+                        "has_answer_data": has_answer_data,
+                    })
+
+                # Prefer standard answer tables (has answer_data).
+                # Among those, prefer the SHORTEST module name — the base
+                # module ("Inspection Form") is almost always shorter than
+                # its workflow stages ("Inspection Corrective Action Progress
+                # Tracking", "Inspection Mitigative Action Rejection", etc.).
+                standard = sorted(
+                    [c for c in candidates if c["has_answer_data"]],
+                    key=lambda c: len(c["module_name"]),
+                )
+                if standard:
+                    best = standard[0]
+                elif candidates:
+                    best = min(candidates, key=lambda c: len(c["module_name"]))
+                else:
+                    continue
+
+                result = _resolve_by_module_uuid(db_engine, best["module_id"])
+                if result.get("success") and result.get("result"):
+                    # Enrich with the full candidate list so the agent can
+                    # mention alternatives if needed.
+                    result["result"]["all_module_candidates"] = [
+                        {"module_name": c["module_name"],
+                         "table": c["table_name"],
+                         "has_answer_data": c["has_answer_data"]}
+                        for c in candidates
+                    ]
+                    result["result"]["ambiguous"] = len(candidates) > 1
+                return result
+
             return {
                 "success": False, "result": None,
-                "error": f"No form found matching '{form_name}'. Use lookup_form first.",
+                "error": f"No form or module found matching '{form_name}'. Use lookup_form first.",
             }
 
         inspector = sa_inspect(db_engine)
@@ -557,6 +810,128 @@ def get_answer_summary(db_engine: Engine, answer_table: str) -> dict[str, Any]:
         return {"success": False, "result": None, "error": str(exc)}
 
 
+def get_score_stats(
+    db_engine: Engine,
+    answer_table: str,
+    form_name: Optional[str] = None,
+    status: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Aggregate numeric score statistics from the dynamic answer table.
+
+    Scores live at answer_data → forms[] → submissions[] → scores[] → 'score'.
+    The 'score' field is usually a string, so we cast via NULLIF + ::numeric
+    so non-numeric entries don't poison the aggregate.
+
+    Returns: {
+        count:            rows with at least one numeric score contribution,
+        total_scores:     number of individual score entries aggregated,
+        average_score:    AVG across all score entries (NULL if none),
+        min_score, max_score, sum_score,
+        by_score_type:    [{score_type, count, average}, ...]  top 10,
+        table:            echoed answer_table,
+    }
+
+    SECURITY: answer_table validated by UUID regex; filters use bind params.
+    """
+    try:
+        err = _validate_answer_table_name(answer_table)
+        if err:
+            return {"success": False, "result": None, "error": err}
+
+        if status and status.upper() not in ("DRAFT", "PUBLISHED", "DELETED"):
+            return {"success": False, "result": None,
+                    "error": f"Invalid status: '{status}'."}
+
+        where_parts = ["fa.answer_data IS NOT NULL"]
+        params: dict[str, Any] = {}
+        if form_name:
+            where_parts.append("fa.form_name ILIKE :form_pattern")
+            params["form_pattern"] = f"%{form_name}%"
+        if status:
+            where_parts.append("fa.status = :status")
+            params["status"] = status.upper()
+
+        where_clause = "WHERE " + " AND ".join(where_parts)
+
+        forms_elem  = _safe_array("fa.answer_data->'forms'")
+        subs_elem   = _safe_array("form_elem->'submissions'")
+        scores_elem = _safe_array("sub_elem->'scores'")
+
+        # Top-level aggregate
+        agg_sql = f"""
+            SELECT
+                COUNT(*)                                     AS total_scores,
+                COUNT(DISTINCT fa.id)                        AS rows_with_scores,
+                AVG(NULLIF(score_elem->>'score', '')::numeric) AS average_score,
+                MIN(NULLIF(score_elem->>'score', '')::numeric) AS min_score,
+                MAX(NULLIF(score_elem->>'score', '')::numeric) AS max_score,
+                SUM(NULLIF(score_elem->>'score', '')::numeric) AS sum_score
+            FROM {answer_table} fa,
+                 {forms_elem}  AS form_elem,
+                 {subs_elem}   AS sub_elem,
+                 {scores_elem} AS score_elem
+            {where_clause}
+              AND score_elem->>'score' ~ '^-?[0-9]+(\\.[0-9]+)?$'
+        """
+        with db_engine.connect() as conn:
+            row = conn.execute(sql_text(agg_sql), params).fetchone()
+            cols = ["total_scores", "rows_with_scores", "average_score",
+                    "min_score", "max_score", "sum_score"]
+
+        agg = dict(zip(cols, row)) if row else {c: None for c in cols}
+        # Round numeric outputs to 4 dp for clean display; keep None as None
+        for key in ("average_score", "min_score", "max_score", "sum_score"):
+            if agg.get(key) is not None:
+                try:
+                    agg[key] = round(float(agg[key]), 4)
+                except (TypeError, ValueError):
+                    pass
+
+        # Per-scoreType breakdown
+        by_type_sql = f"""
+            SELECT
+                score_elem->>'scoreType' AS score_type,
+                COUNT(*)                 AS count,
+                AVG(NULLIF(score_elem->>'score', '')::numeric) AS average
+            FROM {answer_table} fa,
+                 {forms_elem}  AS form_elem,
+                 {subs_elem}   AS sub_elem,
+                 {scores_elem} AS score_elem
+            {where_clause}
+              AND score_elem->>'score' ~ '^-?[0-9]+(\\.[0-9]+)?$'
+            GROUP BY score_elem->>'scoreType'
+            ORDER BY count DESC
+            LIMIT 10
+        """
+        with db_engine.connect() as conn:
+            by_type_rows = conn.execute(sql_text(by_type_sql), params).fetchall()
+
+        by_type = []
+        for r in by_type_rows:
+            st, cnt, avg = r
+            by_type.append({
+                "score_type": st,
+                "count": cnt,
+                "average": round(float(avg), 4) if avg is not None else None,
+            })
+
+        return {
+            "success": True,
+            "result": {
+                "table": answer_table,
+                "form_name_filter": form_name,
+                "status_filter": status,
+                **agg,
+                "by_score_type": by_type,
+            },
+            "error": None,
+        }
+
+    except Exception as exc:
+        return {"success": False, "result": None, "error": str(exc)}
+
+
 # ---------------------------------------------------------------------------
 # ToolRegistry
 # ---------------------------------------------------------------------------
@@ -565,7 +940,8 @@ class ToolRegistry:
     KNOWN_TOOLS = {
         "list_forms", "lookup_form", "semantic_search",
         "generate_sql", "execute_sql", "get_schema",
-        "resolve_answer_table", "query_answers", "get_answer_summary",
+        "resolve_answer_table", "query_answers",
+        "get_answer_summary", "get_score_stats",
     }
 
     def __init__(self, db_engine: Engine, semantic_index: SemanticQuestionIndex,
@@ -622,6 +998,13 @@ class ToolRegistry:
                 )
             if name == "get_answer_summary":
                 return get_answer_summary(self._db_engine, answer_table=str(args["answer_table"]))
+            if name == "get_score_stats":
+                return get_score_stats(
+                    self._db_engine,
+                    answer_table=str(args["answer_table"]),
+                    form_name=args.get("form_name"),
+                    status=args.get("status"),
+                )
 
         except KeyError as exc:
             return {"success": False, "result": None,

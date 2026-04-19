@@ -1,256 +1,171 @@
+#!/usr/bin/env python3
 """
-NL2SQL Agent — entry point
-===========================
-Run with: python run.py
-
-Options:
-  python run.py              → interactive agent mode (full loop)
-  python run.py --sql-only   → dry-run: print tool calls but do not execute SQL
-  python run.py --test       → test database connection only
+Interactive CLI for the NL2SQL agent.
 """
 
 import sys
-import os
-import json
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import textwrap
+from agent.orchestrator import AgentOrchestrator, ConversationSession
 
 
-# ---------------------------------------------------------------------------
-# Live event handler
-# ---------------------------------------------------------------------------
-
-def _on_event(event) -> None:
-    if isinstance(event, dict) and event.get("_event") == "thinking":
-        forced = event.get("forced", False)
-        label = "forced summary" if forced else "thinking..."
-        print(f"\n[{event['iteration']}] ⟳ {label}", flush=True)
-        return
-
-    step = event
-
-    if step.tool == "[parse_error]":
-        print(f"      ⚠  Parse error — model returned non-JSON", flush=True)
-        if step.result.get("error"):
-            print(f"         {step.result['error']}", flush=True)
-        return
-
-    if step.tool == "final_answer":
-        return
-
-    if step.thought.startswith("[auto]") and step.tool == "execute_sql":
-        sql_full = step.args.get("sql", "")
-        result_summary = _format_result_summary("execute_sql", step.result)
-        label = "auto"
-        if "[review]" in step.thought:
-            label = "auto(reviewed)"
-        print(f"      {label}:  execute_sql", flush=True)
-        for line in sql_full.strip().split("\n"):
-            print(f"              {line}", flush=True)
-        print(f"              → {result_summary}  [{step.duration_ms} ms]", flush=True)
-        return
-
-    if step.thought:
-        wrapped = _wrap(step.thought, width=100, indent="         ")
-        print(f"      thought: {wrapped}", flush=True)
-
-    args_str = _format_args(step.args)
-    print(f"      tool:   {step.tool}({args_str})", flush=True)
-
-    result_summary = _format_result_summary(step.tool, step.result)
-    print(f"      result: {result_summary}  [{step.duration_ms} ms]", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Formatting helpers
-# ---------------------------------------------------------------------------
-
-def _wrap(text: str, width: int = 100, indent: str = "") -> str:
-    words = text.split()
-    lines = []
-    current = ""
-    for word in words:
-        if current and len(current) + 1 + len(word) > width:
-            lines.append(current)
-            current = word
-        else:
-            current = (current + " " + word).lstrip()
-    if current:
-        lines.append(current)
-    return ("\n" + indent).join(lines)
-
-
-def _format_args(args: dict) -> str:
-    parts = []
-    for k, v in args.items():
-        if isinstance(v, str) and len(v) > 72:
-            v = v[:69] + "…"
-        parts.append(f"{k}={v!r}")
-    return ", ".join(parts)
-
-
-def _format_result_summary(tool: str, result: dict) -> str:
+def _format_result_summary(tool, result):
+    """Compact one-line summary for the trace display."""
     if not result.get("success"):
-        err = result.get("error", "unknown")
-        return f"ERROR: {err[:100]}"
+        err = result.get("error", "unknown error")
+        return f"ERROR: {err[:80]}"
 
-    data = result.get("result")
+    data = result.get("result", {})
 
     if tool == "list_forms":
-        return f"{len(data)} forms returned"
-
-    if tool == "lookup_form":
-        return f"found: {', '.join(data[:5])}" if data else "no matches"
-
-    if tool == "semantic_search":
-        if data:
-            top = data[0]
-            return (
-                f"{len(data)} matches — top: \"{top['text'][:50]}\" "
-                f"({top['score']:.0%}, {top['form_name']})"
-            )
-        return "0 matches"
-
-    if tool == "generate_sql":
-        v = data.get("validation", {})
-        status = "✓ valid" if v.get("passed") else "✗ invalid"
-        real_errs = [e for e in v.get("errors", []) if not e.startswith("WARNING:")]
-        suffix = f" — {real_errs[0][:70]}" if real_errs else ""
-        return f"{status}{suffix}"
+        forms = data if isinstance(data, list) else data.get("forms", [])
+        return f"{len(forms)} forms returned"
 
     if tool == "execute_sql":
         if data:
-            return f"{data['row_count']} rows  cols={data['columns']}"
+            trunc = ""
+            if data.get("truncated"):
+                total = data.get("total_count", "?")
+                trunc = f" (of {total} total)"
+            return f"{data['row_count']} rows{trunc}  cols={data['columns']}"
         return "no data"
 
-    if tool == "get_schema":
-        if "tables" in data:
-            return f"{len(data['tables'])} tables"
-        return f"{len(data.get('columns', []))} columns"
+    if tool == "generate_sql":
+        sql_data = data
+        valid = sql_data.get("validation", {}).get("passed", False)
+        if valid:
+            return f"✓ valid"
+        errs = sql_data.get("validation", {}).get("errors", [])
+        return f"✗ invalid — {'; '.join(errs)[:80]}"
 
-    # --- NEW: answer tool summaries ---
+    if tool in ("get_answer_summary", "get_score_stats"):
+        return str(data)[:120]
 
     if tool == "resolve_answer_table":
-        if data:
-            exists = "✓" if data.get("table_exists") else "✗"
-            return (
-                f"{exists} table={data.get('answer_table', '?')[:40]}  "
-                f"module='{data.get('module_name', '?')[:30]}'"
-            )
-        return "no match"
+        tbl = data.get("table_name", "?")
+        mod = data.get("module_name", "?")
+        return f"✓ table={tbl}  module='{mod}'"
+
+    if tool == "lookup_form":
+        name = data.get("form_name") or data.get("name", "?")
+        return f"found: {name}"
+
+    if tool == "semantic_search":
+        matches = data.get("matches", [])
+        return f"{len(matches)} matches"
+
+    if tool == "get_schema":
+        cols = data.get("columns", [])
+        return f"{len(cols)} columns"
 
     if tool == "query_answers":
-        if data:
-            return f"{data.get('row_count', 0)} answer rows  cols={data.get('columns', [])}"
-        return "no data"
+        sub_count = data.get("submission_count", 0)
+        ans_count = data.get("total_answers", 0)
+        return f"{sub_count} submissions, {ans_count} answers"
 
-    if tool == "get_answer_summary":
-        if data:
-            return (
-                f"{data.get('total_rows', 0)} rows, "
-                f"{data.get('distinct_forms', 0)} forms, "
-                f"statuses={data.get('status_breakdown', {})}"
-            )
-        return "empty"
-
-    return str(data)[:100] if data else "ok"
+    return str(data)[:100]
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def on_step(event):
+    """Live trace callback — prints each step as it happens."""
+    # Thinking events are plain dicts; AgentSteps are dataclass instances
+    if isinstance(event, dict):
+        if event.get("_event") == "thinking":
+            it = event["iteration"]
+            forced = " (forced)" if event.get("forced") else ""
+            print(f"[{it}] ⟳ thinking...{forced}")
+        return
 
-def main() -> None:
-    sql_only = "--sql-only" in sys.argv
-    test_only = "--test" in sys.argv
+    # It's an AgentStep (dataclass, not dict) — use attribute access
+    step = event
+    tool = step.tool
+    args = step.args
+    thought = step.thought
+    result = step.result
+    duration = step.duration_ms
 
-    if not os.path.exists(".env"):
-        print("=" * 55)
-        print("  .env file not found!")
-        print("=" * 55)
-        print()
-        print("  1. Copy the template:  copy .env.template .env")
-        print("  2. Edit .env with your database credentials:")
-        print("     DB_HOST=your-server.example.com")
-        print("     DB_PORT=5432")
-        print("     DB_NAME=your_database")
-        print("     DB_USER=your_username")
-        print("     DB_PASSWORD=your_password")
-        print()
-        sys.exit(1)
+    # Thought
+    if thought and thought not in ("[parse error]", "[auto] synthesized"):
+        # Wrap long thoughts
+        lines = textwrap.wrap(thought, width=95)
+        print(f"      thought: {lines[0]}")
+        for line in lines[1:]:
+            print(f"         {line}")
 
-    try:
-        from agent.orchestrator import AgentOrchestrator
-    except ImportError as exc:
-        print(f"Missing dependency: {exc}")
-        print("Install with: pip install -r requirements.txt")
-        sys.exit(1)
+    # Tool call
+    if tool == "final_answer":
+        return
+    if tool == "execute_sql" and "[auto]" in thought:
+        sql = args.get("sql", "")
+        summary = _format_result_summary(tool, result)
+        # Show SQL indented
+        print(f"      auto:  execute_sql")
+        for line in sql.strip().split("\n"):
+            print(f"              {line}")
+        print(f"              → {summary}  [{duration} ms]")
+    else:
+        # Format tool(arg=val, ...)
+        arg_parts = []
+        for k, v in args.items():
+            sv = str(v)
+            if len(sv) > 60:
+                sv = sv[:57] + "…"
+            arg_parts.append(f"{k}={sv!r}")
+        arg_str = ", ".join(arg_parts)
+        summary = _format_result_summary(tool, result)
+        print(f"      tool:   {tool}({arg_str})")
+        print(f"      result: {summary}  [{duration} ms]")
 
-    try:
-        orch = AgentOrchestrator.from_env()
-    except Exception as exc:
-        print(f"\nFailed to initialise agent: {exc}")
-        print("\nCheck your .env and make sure:")
-        print("  - PostgreSQL server is reachable")
-        print("  - Credentials are correct")
-        print("  - Ollama is running (ollama serve)")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
 
-    if test_only:
-        orch.test_connection()
-        sys.exit(0)
+def print_stats(stats):
+    """Print query performance stats."""
+    parts = []
+    if stats.total_wall_ms:
+        parts.append(f"⏱ {stats.total_wall_ms}ms total")
+    if stats.total_llm_calls:
+        parts.append(f"{stats.total_llm_calls} LLM calls")
+    if stats.total_prompt_tokens:
+        parts.append(f"{stats.total_prompt_tokens} prompt tokens")
+    if stats.total_completion_tokens:
+        parts.append(f"{stats.total_completion_tokens} completion tokens")
+    if stats.total_sql_exec_ms:
+        parts.append(f"{stats.total_sql_exec_ms}ms SQL")
+    if stats.total_llm_latency_ms:
+        parts.append(f"{stats.total_llm_latency_ms}ms LLM")
+    if parts:
+        print(f"  [{' | '.join(parts)}]")
 
-    mode = "sql-only (no execution)" if sql_only else "full agent"
-    print(f"Mode: {mode}", flush=True)
-    print("Type a question  ('quit' to exit)", flush=True)
-    print("-" * 55, flush=True)
+
+def main():
+    orch = AgentOrchestrator.from_env()
+    session = ConversationSession()
+
+    print("Mode: full agent")
+    print("Type a question  ('quit' to exit)")
+    print("-" * 55)
 
     while True:
         try:
-            question = input("\n> ").strip()
+            q = input("\n> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nBye!")
             break
 
-        if question.lower() in ("quit", "exit", "q"):
-            break
-        if not question:
+        if not q:
             continue
+        if q.lower() in ("quit", "exit", "q"):
+            print("Bye!")
+            break
 
-        try:
-            if sql_only:
-                original_call = orch.registry.call
+        result = orch.query(q, on_step=on_step, session=session)
 
-                def _no_execute(name, args, _orig=original_call):
-                    if name == "execute_sql":
-                        return {
-                            "success": True,
-                            "result": {"rows": [], "row_count": 0,
-                                       "columns": [], "_note": "Skipped — sql-only mode"},
-                            "error": None,
-                        }
-                    return _orig(name, args)
+        print(f"\n--- Answer ---")
+        print(result.answer)
 
-                orch.registry.call = _no_execute
+        # Show stats
+        print_stats(result.stats)
 
-            result = orch.query(question, on_step=_on_event)
-
-            if sql_only:
-                orch.registry.call = original_call
-
-            print(f"\n--- Answer ---", flush=True)
-            print(result.answer, flush=True)
-
-            if not result.success:
-                print("\n⚠  Agent reached max iterations without a definitive answer.",
-                      flush=True)
-
-        except Exception as exc:
-            print(f"\nError: {exc}", flush=True)
-            import traceback
-            traceback.print_exc()
+        if not result.success:
+            print("⚠  Agent reached max iterations without a definitive answer.")
 
 
 if __name__ == "__main__":
