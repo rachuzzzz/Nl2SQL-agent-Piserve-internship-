@@ -22,7 +22,6 @@ from sqlalchemy.engine import Engine
 
 from core.semantic import SemanticQuestionIndex
 from core.validator import SQLValidator
-from agent.prompts import SQL_GENERATION_PROMPT
 
 
 # Minimum similarity score to accept a semantic match. Raised from the
@@ -230,15 +229,25 @@ def _fetch_key_schemas(db_engine: Engine) -> str:
 def generate_sql(
     sql_llm, validator: SQLValidator, question: str,
     schema_hint: str = "", db_engine: Optional[Engine] = None,
+    sql_prompt_template: str = "",
 ) -> dict[str, Any]:
     try:
         if db_engine and not schema_hint.startswith("Use"):
             auto_schema = _fetch_key_schemas(db_engine)
             schema_hint = f"{auto_schema}\n{schema_hint}" if schema_hint else auto_schema
 
-        prompt = SQL_GENERATION_PROMPT.format(
-            question=question,
-            schema_hint=schema_hint or "No additional context provided.",
+        # Use the passed-in prompt template (dynamically built with introspected schema)
+        # or fall back to the static import
+        if not sql_prompt_template:
+            from agent.prompts import SQL_GENERATION_PROMPT
+            sql_prompt_template = SQL_GENERATION_PROMPT
+
+        # Use .replace() instead of .format() — the template may contain
+        # curly braces from introspected schema that would crash .format()
+        prompt = sql_prompt_template.replace(
+            "{question}", question
+        ).replace(
+            "{schema_hint}", schema_hint or "No additional context provided."
         )
         response = sql_llm.complete(prompt)
         raw_sql = str(response).strip()
@@ -945,11 +954,13 @@ class ToolRegistry:
     }
 
     def __init__(self, db_engine: Engine, semantic_index: SemanticQuestionIndex,
-                 validator: SQLValidator, sql_llm) -> None:
+                 validator: SQLValidator, sql_llm,
+                 sql_prompt: str = "") -> None:
         self._db_engine = db_engine
         self._semantic_index = semantic_index
         self._validator = validator
         self._sql_llm = sql_llm
+        self._sql_prompt = sql_prompt
 
     def call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name not in self.KNOWN_TOOLS:
@@ -978,6 +989,7 @@ class ToolRegistry:
                     question=str(args["question"]),
                     schema_hint=str(args.get("schema_hint", "")),
                     db_engine=self._db_engine,
+                    sql_prompt_template=self._sql_prompt,
                 )
             if name == "execute_sql":
                 return execute_sql(self._db_engine, self._validator, sql=str(args["sql"]))

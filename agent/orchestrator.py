@@ -18,7 +18,8 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from core.semantic import SemanticQuestionIndex
 from core.validator import SQLValidator
-from agent.prompts import SYSTEM_PROMPT, FORCE_SUMMARY_PROMPT
+from core.schema_introspector import introspect_schema
+from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT
 from agent.tools import ToolRegistry
 from agent.tool_dispatcher import parse_tool_call, dispatch
 
@@ -147,81 +148,23 @@ _SCHEDULE_CYCLE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Schema fragments injected into generate_sql schema_hint when intent is detected
-_LOOKUP_TABLES_SCHEMA = """\
-### Lookup tables for resolving UUIDs to names (ALWAYS JOIN these):
-users: id (uuid PK), first_name (varchar), last_name (varchar), email (varchar)
-  → JOIN users u ON ir.inspector_user_id = u.id → u.first_name || ' ' || u.last_name
-facility: id (uuid PK), name (varchar)
-  → JOIN facility fac ON ir.facility_id = fac.id → fac.name
-project: id (uuid PK), name (varchar)
-  → JOIN project proj ON ir.project_id = proj.id → proj.name
-client: id (uuid PK), name (varchar)
-  → JOIN client cl ON ir.client_id = cl.id → cl.name
-entity: id (uuid PK), name (varchar)
-  → JOIN entity ent ON ir.entity_id = ent.id → ent.name
-CRITICAL: NEVER show raw UUIDs. Always JOIN to get names.
-"""
+# Intent detection regexes — used to decide which tables to inject into schema_hint
+# (These stay as regex since they're about question intent, not schema content)
 
-_INSPECTION_REPORT_SCHEMA = """\
-### Relevant table: inspection_report
-Columns: id, inspection_score (numeric), gp_score (numeric),
-total_inspection_hours (numeric), status (varchar), inspection_id (varchar),
-submitted_on (timestamptz), closed_on (timestamptz),
-start_date_time, end_date_time, deleted (bool),
-cycle_id (FK), schedule_id (FK), facility_id (FK), project_id (FK),
-inspector_user_id (FK), inspectee_user_id (FK),
-inspection_type_id (FK), inspection_sub_type_id (FK), client_id (FK)
-### Lookup: inspection_type (id, name), inspection_sub_type (id, name, inspection_type_id)
-""" + _LOOKUP_TABLES_SCHEMA
-
-_CORRECTIVE_ACTION_SCHEMA = """\
-### Relevant table: inspection_corrective_action
-Columns: id, cause (text), correction (text), corrective_action (text),
-responsible (varchar — ENUM: 'CLIENT','INTERNAL_OPERATIONS','SUB_CONTRACTOR' — NOT a FK),
-status (varchar — ENUM: 'OPEN','CLOSED','OVERDUE','CLOSE_WITH_DEFERRED'),
-progress_stage (varchar), adequacy_status (varchar), implementation_status (varchar),
-capex (numeric), opex (numeric), capex_status, opex_status, expenditure,
-target_close_out_date (date), close_on, completed_on, deferred_on,
-age (bigint), pending_with (varchar — NOT a FK),
-corrective_action_id (varchar — human-readable ID like '2026/01/ST064/INS001_MA001'),
-risk_level_id (FK), impact_id (FK),
-inspection_id (FK → inspection_report.id),
-observation_id (FK), submission_id (FK)
-IMPORTANT: 'responsible' and 'pending_with' are plain string enums.
-Do NOT JOIN them to the users table.
-""" + _LOOKUP_TABLES_SCHEMA
-
-_SCHEDULE_CYCLE_SCHEMA = """\
-### Relevant tables: inspection_schedule, inspection_cycle
-inspection_schedule: id, schedule_date (date), due_date (date), status (varchar),
-  schedule_id (varchar), is_admin_triggered, is_contractual_inspection,
-  facility_id (FK), inspector_id (FK), inspectee_id (FK), project_id (FK),
-  inspection_cycle_id (FK), inspection_type_id (FK), inspection_subtype_id (FK)
-inspection_cycle: id, start_date (date), end_date (date), due_date (date), status (varchar)
-inspector_portfolio: id, status, submitted_date, user_id (FK), cycle_id (FK)
-""" + _LOOKUP_TABLES_SCHEMA
-
-
-def _detect_inspection_schema(question: str, existing_hint: str = "") -> str:
+def _detect_inspection_tables(question: str) -> list:
     """
-    If the question is about inspection-domain data, append the relevant
-    table schema to the generate_sql schema_hint so the SQL model knows
-    which tables and columns exist.
-
-    Returns the enriched hint (or the original if no inspection intent).
+    Detect which inspection tables the question is about.
+    Returns a list of table names to include in the schema hint.
     """
-    parts = [existing_hint] if existing_hint else []
+    tables = []
     q = question.lower()
-
     if _INSPECTION_REPORT_RE.search(q):
-        parts.append(_INSPECTION_REPORT_SCHEMA)
+        tables.extend(["inspection_report", "inspection_type", "inspection_sub_type"])
     if _CORRECTIVE_ACTION_RE.search(q):
-        parts.append(_CORRECTIVE_ACTION_SCHEMA)
+        tables.append("inspection_corrective_action")
     if _SCHEDULE_CYCLE_RE.search(q):
-        parts.append(_SCHEDULE_CYCLE_SCHEMA)
-
-    return "\n".join(parts) if parts else existing_hint
+        tables.extend(["inspection_schedule", "inspection_cycle", "inspector_portfolio"])
+    return tables
 
 
 class AgentOrchestrator:
@@ -237,6 +180,21 @@ class AgentOrchestrator:
         with self.db_engine.connect() as conn:
             conn.execute(sql_text("SELECT 1")).fetchone()
         print("  ✓ Database connected")
+
+        # Introspect database schema — replaces all hardcoded schema in prompts
+        self.db_schema = introspect_schema(self.db_engine)
+
+        # Build the actual prompts with introspected schema injected.
+        # Use .replace() not .format() — prompts contain JSON examples
+        # with curly braces that would crash .format().
+        self._system_prompt = SYSTEM_PROMPT.replace(
+            "{inspection_schema}",
+            self.db_schema.for_system_prompt()
+        )
+        self._sql_prompt = SQL_GENERATION_PROMPT.replace(
+            "{inspection_schema_sql}",
+            self.db_schema.for_sql_prompt()
+        )
 
         print(f"  Loading embedding model: {embedding_model}...")
         embed_model = HuggingFaceEmbedding(model_name=embedding_model)
@@ -261,7 +219,7 @@ class AgentOrchestrator:
 
         self.registry = ToolRegistry(db_engine=self.db_engine,
             semantic_index=self.semantic_index, validator=self.validator,
-            sql_llm=self.sql_llm)
+            sql_llm=self.sql_llm, sql_prompt=self._sql_prompt)
 
         print(f"\n{'='*50}")
         print(f"  AgentOrchestrator ready")
@@ -292,7 +250,7 @@ class AgentOrchestrator:
             if on_step: on_step(event)
 
         # Build system prompt — inject conversation history if available
-        system_content = SYSTEM_PROMPT
+        system_content = self._system_prompt
         if session and session.turns:
             system_content += "\n\n" + session.build_context_block()
 
@@ -368,11 +326,16 @@ class AgentOrchestrator:
             # --- Auto-inject inspection schema into generate_sql ---
             if tool == "generate_sql":
                 existing = args.get("schema_hint", "")
-                enriched = _detect_inspection_schema(
-                    args.get("question", question), existing
+                # Detect which inspection tables the question is about
+                insp_tables = _detect_inspection_tables(
+                    args.get("question", question)
                 )
-                if enriched != existing:
-                    args["schema_hint"] = enriched
+                if insp_tables:
+                    schema_hint = self.db_schema.for_schema_hint(insp_tables)
+                    if existing:
+                        args["schema_hint"] = existing + "\n" + schema_hint
+                    else:
+                        args["schema_hint"] = schema_hint
 
                 # Extract numeric LIMIT from the ORIGINAL user question.
                 # "last 10 inspections" / "top 5 corrective actions" / "first 20"
