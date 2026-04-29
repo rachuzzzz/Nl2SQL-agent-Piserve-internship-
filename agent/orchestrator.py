@@ -36,7 +36,6 @@ class AgentStep:
 
 @dataclass
 class QueryStats:
-    """Observability metrics for a single query."""
     total_llm_calls: int = 0
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
@@ -47,20 +46,96 @@ class QueryStats:
 
 @dataclass
 class ConversationTurn:
-    """Compact record of one Q&A turn for conversation memory."""
     question: str
     answer: str
-    tool_used: str           # primary tool that produced the answer
-    sql: str = ""            # if SQL was executed, the query
-    total_count: int = 0     # if truncated, the real total
+    tool_used: str
+    sql: str = ""
+    total_count: int = 0
     columns: list = field(default_factory=list)
+    # Extracted key entities from result rows — used for follow-up context
+    inspection_ids: list = field(default_factory=list)   # e.g. ["2026/04/ST085/INS003"]
+    facility_names: list = field(default_factory=list)   # e.g. ["Golf Gardens"]
+    inspector_names: list = field(default_factory=list)  # e.g. ["neenu extinsp1"]
+    single_row_values: dict = field(default_factory=dict) # col→val when result is 1 row
 
+
+
+
+# UUID pattern — 8-4-4-4-12 hex
+_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE
+)
+
+# Columns whose values should NEVER be raw UUIDs — they need a JOIN
+_NAME_COLUMNS = {
+    "facility_name", "facility", "inspector_name", "inspector",
+    "inspectee_name", "inspectee", "client_name", "client",
+    "project_name", "project", "type_name", "inspection_type_name",
+    "module_name", "subtype_name",
+}
+
+def _has_uuid_leak(rows: list, columns: list) -> list[str]:
+    """
+    Check result rows for UUID values in columns that should be human-readable names.
+    Returns list of offending column names.
+    """
+    leaking = set()
+    for col in columns:
+        col_lower = col.lower()
+        # Only check columns that are supposed to be name-like
+        if not any(n in col_lower for n in ("name", "facility", "inspector",
+                                             "client", "project", "type")):
+            continue
+        # Sample first 5 rows
+        for row in rows[:5]:
+            val = row.get(col)
+            if val and isinstance(val, str) and _UUID_RE.match(val.strip()):
+                leaking.add(col)
+                break
+    return sorted(leaking)
+
+
+def _clean_answer_text(raw: str) -> str:
+    """
+    Clean up encoded answer_text values from the flat ai_answers table.
+
+    The form builder stores option answers as JSON arrays of "Label|uuid" strings,
+    e.g. '["High|42872e5f-...", "Medium|..."]'
+    This extracts just the human-readable labels, comma-joined.
+
+    Also cleans up single "Label|ENUM_VALUE" strings like "Internal Operations|INTERNAL_OPERATIONS".
+    """
+    if not raw:
+        return raw
+    import json as _json
+    stripped = raw.strip()
+
+    # Try to parse as JSON array
+    if stripped.startswith('['):
+        try:
+            items = _json.loads(stripped)
+            labels = []
+            for item in items:
+                if isinstance(item, str) and '|' in item:
+                    labels.append(item.split('|')[0].strip())
+                else:
+                    labels.append(str(item))
+            return ', '.join(labels) if labels else raw
+        except (_json.JSONDecodeError, Exception):
+            pass
+
+    # Single "Label|VALUE" format
+    if '|' in stripped and not stripped.startswith('{'):
+        parts = stripped.split('|')
+        # Only clean if the right side looks like an enum (all caps/underscores) or UUID
+        right = parts[-1].strip()
+        if right.replace('_', '').replace('-', '').isalnum() and            (right.isupper() or len(right) == 36):
+            return parts[0].strip()
+
+    return raw
 
 class ConversationSession:
-    """
-    Maintains conversation state across multiple query() calls.
-    Stores the last N turns as compact summaries (not raw data).
-    """
     MAX_TURNS = 5
 
     def __init__(self):
@@ -76,35 +151,69 @@ class ConversationSession:
         return self.turns[-1] if self.turns else None
 
     def build_context_block(self) -> str:
-        """Build a compact conversation history for the system prompt."""
         if not self.turns:
             return ""
-
-        lines = ["━━━ CONVERSATION HISTORY (last turns) ━━━"]
+        lines = ["━━━ CONVERSATION HISTORY ━━━"]
         for i, t in enumerate(self.turns, 1):
             lines.append(f"Turn {i}:")
             lines.append(f"  User: {t.question}")
-            # Keep answer compact — first 200 chars
-            short_answer = t.answer[:200] + ("..." if len(t.answer) > 200 else "")
-            lines.append(f"  Answer: {short_answer}")
+            short = t.answer[:200] + ("..." if len(t.answer) > 200 else "")
+            lines.append(f"  Answer: {short}")
             if t.sql:
-                lines.append(f"  SQL used: {t.sql[:150]}")
+                lines.append(f"  SQL: {t.sql[:150]}")
             if t.total_count > 0:
-                lines.append(f"  Total rows: {t.total_count} (showed first 50)")
+                lines.append(f"  Total rows: {t.total_count}")
             if t.columns:
                 lines.append(f"  Columns: {t.columns}")
+            # Surface extracted entities so the LLM can use them as exact filters
+            if t.inspection_ids:
+                lines.append(f"  ★ inspection_id(s) from this result: {t.inspection_ids[:5]}")
+            if t.facility_names:
+                lines.append(f"  ★ facility(s) from this result: {t.facility_names[:5]}")
+            if t.inspector_names:
+                lines.append(f"  ★ inspector(s) from this result: {t.inspector_names[:5]}")
+            if t.single_row_values:
+                lines.append(f"  ★ single-row result: {t.single_row_values}")
+        lines.append("")
+
+        # Synthesise the most specific entity context from the last turn
+        last = self.turns[-1]
+        if last.inspection_ids and len(last.inspection_ids) == 1:
+            lines.append(
+                f"CONTEXT — The conversation is about inspection '{last.inspection_ids[0]}'."
+                f" When the user says 'that inspection', 'it', 'that site', 'she filled',"
+                f" 'he filled', 'they filled', 'that form' — use"
+                f" WHERE aa.inspection_id = '{last.inspection_ids[0]}'"
+                f" (or ir.inspection_id = '{last.inspection_ids[0]}') as an exact filter."
+                f" Do NOT filter by facility name or inspector name — use the inspection_id."
+            )
+        elif last.inspection_ids:
+            ids_str = ", ".join(f"'{i}'" for i in last.inspection_ids[:5])
+            lines.append(
+                f"CONTEXT — The conversation involves inspections: {ids_str}."
+                f" When the user references 'those inspections' or 'that data',"
+                f" filter by inspection_id IN ({ids_str})."
+            )
+        elif last.facility_names and len(last.facility_names) == 1:
+            lines.append(
+                f"CONTEXT — The conversation is about facility '{last.facility_names[0]}'."
+                f" If the user asks about 'that facility' or 'that site',"
+                f" filter by fac.name ILIKE '%{last.facility_names[0]}%'."
+            )
+        elif last.single_row_values:
+            lines.append(f"CONTEXT — Last query returned a single result: {last.single_row_values}")
+
         lines.append("")
         lines.append(
-            "If the user says 'show more', 'show the rest', 'continue', 'remaining', "
-            "'next', or 'show all' — they want more rows from the LAST query above. "
-            "Re-use the same SQL with OFFSET to skip already-shown rows, "
-            "or remove the LIMIT to show all. Do NOT generate a new query."
+            "PAGINATION: If the user says 'show more', 'show the rest', 'continue',"
+            " 'remaining', 'next', 'show all' — re-run the LAST SQL with higher LIMIT."
+            " Do NOT generate a new query."
         )
         lines.append(
-            "If the user says 'filter by X', 'only the Y ones', 'sort by Z' — "
-            "modify the LAST SQL by adding/changing WHERE or ORDER BY clauses."
+            "REFINEMENT: If the user says 'filter by X', 'only the Y ones', 'sort by Z'"
+            " — modify the LAST SQL by adding/changing WHERE or ORDER BY."
         )
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         return "\n".join(lines)
 
 
@@ -119,43 +228,31 @@ class AgentResult:
 
 
 # ---------------------------------------------------------------------------
-# Inspection-intent detector — auto-injects schema hints when the agent
-# calls generate_sql for inspection-domain queries so the SQL model knows
-# which tables and columns to use.
+# Inspection intent detection — auto-injects schema hints for generate_sql
 # ---------------------------------------------------------------------------
 
 _INSPECTION_REPORT_RE = re.compile(
     r'\b(inspection.?score|gp.?score|inspection.?hour|total.?hour|'
     r'inspection.?report|inspection.?status|inspector|inspectee|'
     r'inspection.?type|inspection.?sub.?type|facility|'
-    r'inspection.?per|inspections?\s+by\s+type|inspections?\s+per\s+cycle)\b',
+    r'inspections?\s+by\s+type|inspections?\s+per\s+cycle)\b',
     re.IGNORECASE,
 )
-
 _CORRECTIVE_ACTION_RE = re.compile(
     r'\b(corrective.?action|corrective|mitigative|finding|observation|'
-    r'cause|correction|responsible|progress.?stage|adequacy|'
-    r'capex|opex|expenditure|overdue|close.?out|target.?date|'
-    r'pending.?with|implementation.?status|risk.?level|'
+    r'cause|correction|responsible|progress.?stage|capex|opex|expenditure|'
+    r'overdue|close.?out|target.?date|pending.?with|risk.?level|'
     r'open.?action|closed.?action|deferred)\b',
     re.IGNORECASE,
 )
-
 _SCHEDULE_CYCLE_RE = re.compile(
     r'\b(schedule|inspection.?schedule|inspection.?cycle|cycle|'
-    r'due.?date|schedule.?date|portfolio|inspector.?portfolio|'
-    r'cancellation)\b',
+    r'due.?date|schedule.?date|portfolio|inspector.?portfolio)\b',
     re.IGNORECASE,
 )
 
-# Intent detection regexes — used to decide which tables to inject into schema_hint
-# (These stay as regex since they're about question intent, not schema content)
 
 def _detect_inspection_tables(question: str) -> list:
-    """
-    Detect which inspection tables the question is about.
-    Returns a list of table names to include in the schema hint.
-    """
     tables = []
     q = question.lower()
     if _INSPECTION_REPORT_RE.search(q):
@@ -181,19 +278,13 @@ class AgentOrchestrator:
             conn.execute(sql_text("SELECT 1")).fetchone()
         print("  ✓ Database connected")
 
-        # Introspect database schema — replaces all hardcoded schema in prompts
         self.db_schema = introspect_schema(self.db_engine)
 
-        # Build the actual prompts with introspected schema injected.
-        # Use .replace() not .format() — prompts contain JSON examples
-        # with curly braces that would crash .format().
         self._system_prompt = SYSTEM_PROMPT.replace(
-            "{inspection_schema}",
-            self.db_schema.for_system_prompt()
+            "{inspection_schema}", self.db_schema.for_system_prompt()
         )
         self._sql_prompt = SQL_GENERATION_PROMPT.replace(
-            "{inspection_schema_sql}",
-            self.db_schema.for_sql_prompt()
+            "{inspection_schema_sql}", self.db_schema.for_sql_prompt()
         )
 
         print(f"  Loading embedding model: {embedding_model}...")
@@ -208,48 +299,51 @@ class AgentOrchestrator:
         print(f"  Configuring reasoning LLM: {chat_model}...")
         self.reasoning_llm = Ollama(model=chat_model, base_url=ollama_url,
             temperature=0.1, request_timeout=120.0,
-            additional_kwargs={"num_predict": 1024})
-        print(f"  ✓ Reasoning LLM ready ({chat_model})")
+            additional_kwargs={"num_predict": 256, "num_ctx": 8192})
+        print(f"  ✓ Reasoning LLM ({chat_model})")
 
         print(f"  Configuring SQL LLM: {sql_model}...")
         self.sql_llm = Ollama(model=sql_model, base_url=ollama_url,
             temperature=0.0, request_timeout=120.0,
-            additional_kwargs={"num_predict": 512, "top_p": 0.9})
-        print(f"  ✓ SQL LLM ready ({sql_model})")
+            additional_kwargs={
+                "num_predict": 350,
+                "num_ctx": 8192,
+                "top_p": 0.9,
+                # Stop tokens prevent deepseek adding explanation text after SQL
+                "stop": [";", "[/SQL]", "This query", "Note:", "-- Note", "/*"],
+            })
+        print(f"  ✓ SQL LLM ({sql_model})")
 
-        self.registry = ToolRegistry(db_engine=self.db_engine,
-            semantic_index=self.semantic_index, validator=self.validator,
-            sql_llm=self.sql_llm, sql_prompt=self._sql_prompt)
+        self.registry = ToolRegistry(
+            db_engine=self.db_engine,
+            semantic_index=self.semantic_index,
+            validator=self.validator,
+            sql_llm=self.sql_llm,
+            sql_prompt=self._sql_prompt,
+        )
 
         print(f"\n{'='*50}")
         print(f"  AgentOrchestrator ready")
-        print(f"  Reasoning: {chat_model}")
-        print(f"  SQL gen:   {sql_model}")
-        print(f"  Embedding: {embedding_model}")
+        print(f"  Reasoning: {chat_model} | SQL: {sql_model}")
         print(f"{'='*50}\n")
 
     # ------------------------------------------------------------------ #
+    # Terminal tools — synthesize and return immediately on success
+    # ------------------------------------------------------------------ #
+    _TERMINAL_TOOLS = {
+        "list_forms",
+        "get_answers",
+        "get_answer_stats",
+        "execute_sql",
+    }
 
     def query(self, question, max_iterations=8, on_step=None, session=None):
-        """
-        Main query method.
-
-        Args:
-            question:       Natural language question from the user.
-            max_iterations: Max LLM reasoning steps before forced summary.
-            on_step:        Callback for live trace output.
-            session:        ConversationSession for multi-turn context.
-                            Pass the same session object across calls to enable
-                            "show more", "filter by X", and other follow-ups.
-        """
-        import time as _time
-        query_start = _time.time()
+        query_start = time.time()
         stats = QueryStats()
 
         def _emit(event):
             if on_step: on_step(event)
 
-        # Build system prompt — inject conversation history if available
         system_content = self._system_prompt
         if session and session.turns:
             system_content += "\n\n" + session.build_context_block()
@@ -260,47 +354,54 @@ class AgentOrchestrator:
         ]
         steps = []
         gen_sql_failures = 0
-        # Track the last executed SQL and result for session storage
         _last_sql = ""
         _last_total_count = 0
         _last_columns = []
-        _last_tool = ""
 
-        # ============================================================
-        # Deterministic fast-path: pagination ("show the rest", "show
-        # more", "show all", "continue", "remaining", "next").
-        # If the session has a previous SQL query with more rows than
-        # were displayed, re-run it WITHOUT the LLM. Instant, reliable.
-        # ============================================================
+        # ---- Pagination fast-path ----
+        # Only fires when the question is PURELY about seeing more of the last result —
+        # no new subject matter (no content words suggesting a different query).
         if session and session.last_turn and session.last_turn.sql:
             q_lower = question.lower().strip()
-            is_pagination = bool(re.search(
-                r'^(show|see|display|give|list)?\s*(the\s+)?(rest|more|remaining|all'
-                r'|next|continue|full\s+list|other|everything)',
-                q_lower
-            ))
+
+            _PAGINATION_ONLY_RE = re.compile(
+                r'^(show\s+more|show\s+the\s+rest|show\s+remaining|'
+                r'see\s+more|see\s+the\s+rest|'
+                r'more\s+results?|more\s+rows?|'
+                r'continue|next\s+page|next\s+batch|'
+                r'rest\s+of\s+(it|them|the\s+results?)?|'
+                r'show\s+all\s*$|list\s+all\s*$|'
+                r'remaining\s+(ones?|results?|rows?)?)'
+                r'\s*[.!?]?\s*$',
+                re.IGNORECASE,
+            )
+            _HAS_NEW_SUBJECT_RE = re.compile(
+                r'\b(high|low|medium|risk|observation|finding|action|corrective|'
+                r'recommended|facility|inspector|score|form|module|inspection|cause|'
+                r'overdue|open|closed|month|week|today|by\s+\w+|for\s+\w+|'
+                r'at\s+\w+|in\s+\w+|about|from\s+\w+)\b',
+                re.IGNORECASE,
+            )
+            is_pagination = (
+                bool(_PAGINATION_ONLY_RE.match(q_lower)) and
+                not bool(_HAS_NEW_SUBJECT_RE.search(q_lower))
+            )
             if is_pagination:
                 prev = session.last_turn
                 _emit({"_event": "thinking", "iteration": 1})
-
-                # Re-run the previous SQL — it already returns up to 100 rows
                 er = self.registry.call("execute_sql", {"sql": prev.sql})
-                s = AgentStep(1, "[auto] pagination — re-running previous query",
-                    "execute_sql", {"sql": prev.sql}, er, 0)
+                s = AgentStep(1, "[auto] pagination", "execute_sql",
+                              {"sql": prev.sql}, er, 0)
                 steps.append(s); _emit(s)
-
                 if er.get("success"):
-                    ans = self._synthesize(question, "execute_sql", er,
-                                           max_display_rows=100)
+                    ans = self._synthesize(question, "execute_sql", er, max_display_rows=100)
                     stats.total_wall_ms = int((time.time() - query_start) * 1000)
-                    # Update session with the full result
                     exec_data = er.get("result", {})
                     if session is not None:
                         session.add_turn(ConversationTurn(
                             question=question, answer=ans[:300],
                             tool_used="execute_sql", sql=prev.sql,
-                            total_count=exec_data.get("total_count",
-                                                       exec_data.get("row_count", 0)),
+                            total_count=exec_data.get("total_count", exec_data.get("row_count", 0)),
                             columns=exec_data.get("columns", []),
                         ))
                     return AgentResult(question, ans, steps, 1, True, stats)
@@ -318,116 +419,96 @@ class AgentOrchestrator:
                 messages.append(ChatMessage(role=MessageRole.USER, content=
                     f"Not valid JSON: {exc}\nRespond with ONLY a JSON tool call."))
                 s = AgentStep(iteration, "[parse error]", "[parse_error]",
-                    {}, {"error": str(exc)}, int((time.time()-t0)*1000))
+                              {}, {"error": str(exc)}, int((time.time()-t0)*1000))
                 steps.append(s); _emit(s); continue
 
-            thought, tool, args = tc.get("thought",""), tc["tool"], tc["args"]
+            thought, tool, args = tc.get("thought", ""), tc["tool"], tc["args"]
 
-            # --- Auto-inject inspection schema into generate_sql ---
+            # Auto-inject inspection schema hint for generate_sql
             if tool == "generate_sql":
                 existing = args.get("schema_hint", "")
-                # Detect which inspection tables the question is about
-                insp_tables = _detect_inspection_tables(
-                    args.get("question", question)
-                )
+                insp_tables = _detect_inspection_tables(args.get("question", question))
                 if insp_tables:
-                    schema_hint = self.db_schema.for_schema_hint(insp_tables)
-                    if existing:
-                        args["schema_hint"] = existing + "\n" + schema_hint
-                    else:
-                        args["schema_hint"] = schema_hint
+                    hint = self.db_schema.for_schema_hint(insp_tables)
+                    args["schema_hint"] = (existing + "\n" + hint) if existing else hint
 
-                # Extract numeric LIMIT from the ORIGINAL user question.
-                # "last 10 inspections" / "top 5 corrective actions" / "first 20"
-                # The LLM often drops the number when rephrasing, so we inject it.
+                # Preserve explicit LIMIT from user question
                 limit_match = re.search(
                     r'\b(?:last|top|first|recent|latest)\s+(\d+)\b', question, re.IGNORECASE
+                ) or re.search(
+                    r'\b(\d+)\s+(?:most\s+recent|latest|last|inspections?|actions?|reports?)\b',
+                    question, re.IGNORECASE
                 )
-                if not limit_match:
-                    limit_match = re.search(
-                        r'\b(\d+)\s+(?:most\s+recent|latest|last|inspections?|actions?|reports?)\b',
-                        question, re.IGNORECASE
-                    )
                 if limit_match:
                     n = int(limit_match.group(1))
                     if 1 <= n <= 500:
                         args["schema_hint"] = (
                             args.get("schema_hint", "") +
-                            f"\nIMPORTANT: The user asked for exactly {n} results. "
-                            f"Use LIMIT {n} in the query."
+                            f"\nIMPORTANT: user asked for exactly {n} results — use LIMIT {n}."
                         )
-
                 tc["args"] = args
 
             if tool == "final_answer":
                 ans = args.get("answer", "")
                 s = AgentStep(iteration, thought, "final_answer", args,
-                    {"answer": ans}, int((time.time()-t0)*1000))
+                              {"answer": ans}, int((time.time()-t0)*1000))
                 steps.append(s); _emit(s)
-                # Finalize stats
                 stats.total_wall_ms = int((time.time() - query_start) * 1000)
                 if session is not None:
                     session.add_turn(ConversationTurn(
                         question=question, answer=ans[:300],
                         tool_used="final_answer", sql=_last_sql,
                         total_count=_last_total_count, columns=_last_columns,
-                    ))
+                    ))  # Entity extraction happens in _finish for SQL-path turns
                 return AgentResult(question, ans, steps, iteration, True, stats)
 
             result = dispatch(tc, self.registry)
             s = AgentStep(iteration, thought, tool, args, result,
-                int((time.time()-t0)*1000))
+                          int((time.time()-t0)*1000))
             steps.append(s); _emit(s)
 
-            # --- Path A: generate_sql → auto-execute ---
+            # Path A: generate_sql → auto-execute
             if tool == "generate_sql" and result.get("success"):
                 sql_data = result.get("result", {})
                 if sql_data.get("validation", {}).get("passed"):
                     sql = sql_data.get("sql", "")
                     et0 = time.time()
                     er = self.registry.call("execute_sql", {"sql": sql})
-                    auto = AgentStep(iteration,
-                        "[auto] generate_sql validated → executing",
-                        "execute_sql", {"sql": sql}, er,
-                        int((time.time()-et0)*1000))
+                    auto = AgentStep(iteration, "[auto] execute after generate_sql",
+                                     "execute_sql", {"sql": sql}, er,
+                                     int((time.time()-et0)*1000))
                     steps.append(auto); _emit(auto)
 
                     if not er.get("success"):
                         messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
-                        hint = self._schema_hint_for_error(er.get("error",""))
+                        hint = self._schema_hint_for_error(er.get("error", ""))
                         messages.append(ChatMessage(role=MessageRole.USER, content=
-                            f"SQL failed execution.\nError: {er.get('error','')}\n"
-                            f"SQL: {sql}\n{hint}"
-                            f"Fix the query. Use get_schema if unsure about columns."))
+                            f"SQL failed: {er.get('error','')}\nSQL: {sql}\n{hint}"
+                            f"Fix the query or use get_schema to check column names."))
                         continue
 
-                    # Track for session memory
                     exec_data = er.get("result", {})
                     _last_sql = sql
-                    _last_total_count = exec_data.get("total_count",
-                                                       exec_data.get("row_count", 0))
+                    _last_total_count = exec_data.get("total_count", exec_data.get("row_count", 0))
                     _last_columns = exec_data.get("columns", [])
 
                     if self._is_preparatory_result(question, er):
-                        exec_data = er.get("result", {})
                         rows_preview = json.dumps(exec_data.get("rows", [])[:10], default=str)
                         messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
                         messages.append(ChatMessage(role=MessageRole.USER, content=
-                            f"Tool results:\nSQL: {sql}\n"
-                            f"Result: {exec_data.get('row_count', 0)} rows, "
-                            f"columns={exec_data.get('columns', [])}\n"
-                            f"Data (first 10): {rows_preview}\n\n"
-                            f"This looks like a preparatory step — the user's original "
-                            f"question was: \"{question}\"\n"
-                            f"If you have enough data to answer, call final_answer.\n"
-                            f"If you need more data, call the next tool."))
+                            f"SQL: {sql}\nResult: {exec_data.get('row_count',0)} rows, "
+                            f"columns={exec_data.get('columns',[])}\n"
+                            f"Sample: {rows_preview}\n\n"
+                            f"Original question: \"{question}\"\n"
+                            f"If this answers it, call final_answer. Otherwise call the next tool."))
                         continue
 
                     ans = self._synthesize(question, "execute_sql", er)
                     return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
+
                 else:
                     gen_sql_failures += 1
-                    errs = sql_data.get("validation",{}).get("errors",["unknown"])
+                    errs = sql_data.get("validation", {}).get("errors", ["unknown"])
                     messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
 
                     if gen_sql_failures >= 3:
@@ -435,102 +516,138 @@ class AgentOrchestrator:
                         if sql:
                             er = self.registry.call("execute_sql", {"sql": sql})
                             auto = AgentStep(iteration, "[auto] forced exec after 3 failures",
-                                "execute_sql", {"sql": sql}, er, 0)
+                                             "execute_sql", {"sql": sql}, er, 0)
                             steps.append(auto); _emit(auto)
                             if er.get("success"):
                                 ans = self._synthesize(question, "execute_sql", er)
                                 return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
                     messages.append(ChatMessage(role=MessageRole.USER, content=
-                        f"generate_sql failed validation ({gen_sql_failures}x).\n"
-                        f"Errors: {'; '.join(errs)}\n"
-                        f"Try a different approach or use get_schema first."))
+                        f"generate_sql failed ({gen_sql_failures}x). Errors: {'; '.join(errs)}\n"
+                        f"Try a different approach or use get_schema to verify columns."))
                     continue
 
-            # --- Path B: terminal tools → synthesize ---
+            # Path B: terminal tools → synthesize and return
             if tool in self._TERMINAL_TOOLS and result.get("success"):
                 ans = self._synthesize(question, tool, result)
                 return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
-            # --- Path C: non-terminal → continue ---
+            # Path C: non-terminal → continue reasoning
             messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
             messages.append(ChatMessage(role=MessageRole.USER,
                 content=self._context_msg(tool, result, question)))
 
-        # Max iterations
-        _emit({"_event": "thinking", "iteration": max_iterations+1, "forced": True})
+        # Forced summary at max iterations
+        _emit({"_event": "thinking", "iteration": max_iterations + 1, "forced": True})
         messages.append(ChatMessage(role=MessageRole.USER, content=FORCE_SUMMARY_PROMPT))
         raw = self._call_llm(messages, stats)
         try:
-            ans = parse_tool_call(raw).get("args",{}).get("answer","") or raw
+            ans = parse_tool_call(raw).get("args", {}).get("answer", "") or raw
         except ValueError:
             ans = raw
-        s = AgentStep(max_iterations+1, "[forced summary]", "final_answer",
-            {"answer": ans}, {"answer": ans}, 0)
+        s = AgentStep(max_iterations + 1, "[forced summary]", "final_answer",
+                      {"answer": ans}, {"answer": ans}, 0)
         steps.append(s); _emit(s)
         stats.total_wall_ms = int((time.time() - query_start) * 1000)
-        # Save to session
         if session is not None:
             session.add_turn(ConversationTurn(
-                question=question, answer=ans[:300],
-                tool_used="forced_summary", sql=_last_sql,
-                total_count=_last_total_count, columns=_last_columns,
-            ))
+                question=question, answer=ans[:300], tool_used="forced_summary",
+                sql=_last_sql, total_count=_last_total_count, columns=_last_columns,
+            ))  # Note: entity extraction not available in forced-summary path
         return AgentResult(question, ans, steps, max_iterations, False, stats)
 
     def test_connection(self):
         try:
             with self.db_engine.connect() as conn:
-                n = conn.execute(sql_text("SELECT COUNT(*) FROM fb_forms")).fetchone()[0]
-            print(f"  ✓ Connection OK — {n} forms"); return True
+                nq = conn.execute(sql_text("SELECT COUNT(*) FROM ai_questions")).fetchone()[0]
+                na = conn.execute(sql_text("SELECT COUNT(*) FROM ai_answers")).fetchone()[0]
+                nr = conn.execute(sql_text("SELECT COUNT(*) FROM inspection_report")).fetchone()[0]
+            print(f"  ✓ DB OK — {nq} questions, {na} answers, {nr} inspection reports")
+            return True
         except Exception as e:
-            print(f"  ✗ Connection failed: {e}"); return False
+            print(f"  ✗ Connection failed: {e}")
+            return False
 
     @classmethod
     def from_env(cls, env_path=".env"):
         from dotenv import load_dotenv; load_dotenv(env_path)
         g = os.getenv
         return cls(
-            db_connection_string=f"postgresql://{g('DB_USER','postgres')}:{g('DB_PASSWORD','')}@{g('DB_HOST','localhost')}:{g('DB_PORT','5432')}/{g('DB_NAME','postgres')}",
-            db_schema=g("DB_SCHEMA","public"),
-            ollama_url=g("OLLAMA_URL","http://localhost:11434"),
-            sql_model=g("OLLAMA_SQL_MODEL","sqlcoder:7b"),
-            chat_model=g("OLLAMA_CHAT_MODEL","qwen2.5:14b-instruct-q4_K_M"),
-            embedding_model=g("EMBEDDING_MODEL","BAAI/bge-small-en-v1.5"),
+            db_connection_string=(
+                f"postgresql://{g('DB_USER','postgres')}:{g('DB_PASSWORD','')}@"
+                f"{g('DB_HOST','localhost')}:{g('DB_PORT','5432')}/{g('DB_NAME','postgres')}"
+            ),
+            db_schema=g("DB_SCHEMA", "public"),
+            ollama_url=g("OLLAMA_URL", "http://localhost:11434"),
+            sql_model=g("OLLAMA_SQL_MODEL", "sqlcoder:7b"),
+            chat_model=g("OLLAMA_CHAT_MODEL", "qwen2.5:14b-instruct-q4_K_M"),
+            embedding_model=g("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
         )
 
     # ------------------------------------------------------------------ #
-    _TERMINAL_TOOLS = {"list_forms", "execute_sql", "query_answers",
-                       "get_answer_summary"}
+    # Finish helper
+    # ------------------------------------------------------------------ #
 
     def _finish(self, question, answer, steps, iteration, emit_fn=None,
-               stats=None, session=None, query_start=None):
+                stats=None, session=None, query_start=None):
         s = AgentStep(iteration, "[auto] synthesized", "final_answer",
-            {"answer": answer}, {"answer": answer}, 0)
+                      {"answer": answer}, {"answer": answer}, 0)
         steps.append(s)
         if emit_fn: emit_fn(s)
 
-        # Finalize stats
         if stats and query_start:
             stats.total_wall_ms = int((time.time() - query_start) * 1000)
-            # Extract SQL exec time from steps
             for step in steps:
                 if step.tool == "execute_sql":
                     stats.total_sql_exec_ms += step.duration_ms
 
-        # Extract last SQL metadata from steps for session storage
-        last_sql = ""
-        last_total = 0
-        last_cols = []
+        last_sql, last_total, last_cols = "", 0, []
+        last_rows = []
         for step in reversed(steps):
             if step.tool == "execute_sql" and step.result.get("success"):
                 data = step.result.get("result", {})
                 last_sql = step.args.get("sql", "")
                 last_total = data.get("total_count", data.get("row_count", 0))
                 last_cols = data.get("columns", [])
+                last_rows = data.get("rows", [])
                 break
 
-        # Save turn to session
+        # Also check get_answers tool results
+        if not last_rows:
+            for step in reversed(steps):
+                if step.tool == "get_answers" and step.result.get("success"):
+                    data = step.result.get("result", {})
+                    if isinstance(data, dict):
+                        last_rows = data.get("rows", [])
+                    break
+
+        # Extract key entities from result rows for follow-up context
+        insp_ids, fac_names, insp_names = [], [], []
+        single_row_vals = {}
+
+        for row in last_rows[:20]:
+            if not isinstance(row, dict):
+                continue
+            for col in ("inspection_id",):
+                v = row.get(col)
+                if v and str(v) not in insp_ids:
+                    insp_ids.append(str(v))
+            for col in ("facility_name", "facility"):
+                v = row.get(col)
+                if v and str(v) not in fac_names:
+                    fac_names.append(str(v))
+            for col in ("inspector_name", "inspector"):
+                v = row.get(col)
+                if v and str(v) not in insp_names:
+                    insp_names.append(str(v))
+
+        # If only 1 row, store all values for maximum context
+        if len(last_rows) == 1 and last_rows[0]:
+            single_row_vals = {
+                k: str(v) for k, v in last_rows[0].items()
+                if v is not None and str(v).strip()
+            }
+
         if session is not None:
             session.add_turn(ConversationTurn(
                 question=question,
@@ -539,151 +656,207 @@ class AgentOrchestrator:
                 sql=last_sql,
                 total_count=last_total,
                 columns=last_cols,
+                inspection_ids=insp_ids[:5],
+                facility_names=fac_names[:5],
+                inspector_names=insp_names[:5],
+                single_row_values=single_row_vals,
             ))
 
-        return AgentResult(question, answer, steps, iteration, True,
-                           stats or QueryStats())
+        return AgentResult(question, answer, steps, iteration, True, stats or QueryStats())
 
     # ------------------------------------------------------------------ #
     # Synthesis
     # ------------------------------------------------------------------ #
 
-    _COUNT_INTENT_RE = re.compile(
-        r'\b(how\s+many|count|number\s+of|total\s+(?:number\s+of\s+)?)\b',
-        re.IGNORECASE,
-    )
-    _ENUMERATE_INTENT_RE = re.compile(
-        r'\b(show\s+all|list\s+all|all\s+(?:the\s+)?forms|every\s+form|which\s+forms)\b',
-        re.IGNORECASE,
-    )
+    _COUNT_RE = re.compile(
+        r'\b(how\s+many|count|number\s+of|total)\b', re.IGNORECASE)
+    _LIST_ALL_RE = re.compile(
+        r'\b(show\s+all|list\s+all|all\s+forms|every\s+form)\b', re.IGNORECASE)
 
     def _synthesize(self, question, tool_name, tool_result, max_display_rows=20):
         data = tool_result.get("result", {})
         q_lower = question.lower()
 
-        # ---- list_forms fast-paths ----
+        # ---- list_forms ----
         if tool_name == "list_forms" and isinstance(data, list):
-            if self._COUNT_INTENT_RE.search(q_lower):
+            if self._COUNT_RE.search(q_lower):
                 return f"There are {len(data)} forms."
-            if self._ENUMERATE_INTENT_RE.search(q_lower) or not q_lower.strip():
-                if not data:
-                    return "No forms found."
-                lines = [f"Found {len(data)} form(s):"]
-                for i, f in enumerate(data, 1):
-                    name = f.get("name") or "(unnamed)"
-                    status = f.get("status", "?")
-                    active = "active" if f.get("active") else "inactive"
-                    lines.append(f"{i}. {name} — {status}, {active}")
-                return "\n".join(lines)
+            if not data:
+                return "No forms found."
+            lines = [f"Found {len(data)} form(s):"]
+            for i, f in enumerate(data, 1):
+                name = f.get("form_name", f.get("module_name", "(unnamed)"))
+                qcount = f.get("question_count", "?")
+                lines.append(f"{i}. {name} ({qcount} questions)")
+            return "\n".join(lines)
 
-        # ---- get_answer_summary fast-path ----
-        if tool_name == "get_answer_summary" and isinstance(data, dict):
-            total = data.get("total_rows", 0)
-            distinct = data.get("distinct_forms", 0)
-            earliest = data.get("earliest", "?")
-            latest = data.get("latest", "?")
-            statuses = data.get("status_breakdown", {})
-            parts = [f"There are {total} submission(s)."]
-            if distinct and distinct > 1:
-                parts.append(f"Across {distinct} distinct forms.")
-            if statuses:
-                status_str = ", ".join(f"{k}: {v}" for k, v in statuses.items())
-                parts.append(f"Status breakdown: {status_str}.")
-            if earliest and earliest != "?" and latest and latest != "?":
-                parts.append(f"Date range: {earliest} to {latest}.")
-            return " ".join(parts)
+        # ---- semantic_search ----
+        if tool_name == "semantic_search" and isinstance(data, list):
+            if not data:
+                return "No questions found matching that topic."
+            if self._COUNT_RE.search(q_lower):
+                forms = sorted({m["form_name"] for m in data if m.get("form_name")})
+                return f"Found {len(data)} related question(s) across {len(forms)} form(s): {forms}"
+            lines = [f"Found {len(data)} related question(s):"]
+            for i, m in enumerate(data, 1):
+                lines.append(f"  {i}. \"{m.get('question_label', m.get('label','?'))}\" (form: {m['form_name']}, score: {m['score']})")
+            return "\n".join(lines)
 
-        # ---- get_score_stats fast-path ----
-        if tool_name == "get_score_stats" and isinstance(data, dict):
-            avg = data.get("average_score")
-            total = data.get("total_scores", 0)
-            min_s = data.get("min_score")
-            max_s = data.get("max_score")
-            by_type = data.get("by_score_type", [])
-            form_filter = data.get("form_name_filter") or "all forms"
-            status_filter = data.get("status_filter") or "all statuses"
-            if avg is None or total == 0:
-                return f"No numeric scores found (filter: {status_filter}, {form_filter})."
-            parts = [f"Average score: {avg}"]
-            parts.append(f"(from {total} score entries, range {min_s} – {max_s}).")
-            if by_type:
-                type_lines = [
-                    f"  • {t['score_type'] or 'untyped'}: avg {t['average']}, count {t['count']}"
-                    for t in by_type[:5]
-                ]
-                parts.append("By score type:\n" + "\n".join(type_lines))
-            return "\n".join(parts)
+        # ---- search_questions ----
+        if tool_name == "search_questions" and isinstance(data, list):
+            if not data:
+                return "No matching questions found."
+            if self._COUNT_RE.search(q_lower):
+                return f"Found {len(data)} matching question(s)."
+            lines = [f"Found {len(data)} question(s):"]
+            for i, q in enumerate(data, 1):
+                label = q.get("question_label", q.get("label", "?"))
+                form = q.get("form_name", q.get("module_name", "?"))
+                qtype = q.get("question_type", "")
+                suffix = f" [{qtype}]" if qtype else ""
+                lines.append(f"  {i}. {label}{suffix} — form: {form}")
+            return "\n".join(lines)
 
-        # ---- execute_sql deterministic fast-paths ----
+        # ---- get_answers ----
+        if tool_name == "get_answers" and isinstance(data, dict):
+            rows = data.get("rows", [])
+            truncated = data.get("truncated", False)
+            total_count = data.get("total_count", len(rows))
+
+            if not rows:
+                return "No answers found matching the query."
+
+            if truncated and total_count > 0:
+                header = f"Found {total_count} answer(s) (showing first {len(rows)}):"
+            elif truncated:
+                header = f"Showing first {len(rows)} answer(s) (more may exist):"
+            else:
+                header = f"Found {len(rows)} answer(s):"
+
+            lines = [header]
+            for i, row in enumerate(rows[:max_display_rows], 1):
+                q_label = row.get("question_label") or row.get("label") or "?"
+                raw_ans = row.get("answer_value") or row.get("answer_text") or ""
+                if not raw_ans and row.get("answer_numeric") is not None:
+                    raw_ans = str(row["answer_numeric"])
+                ans_val = _clean_answer_text(raw_ans) if raw_ans else "N/A"
+                # Skip rows with no answer (file attachments, empty fields)
+                if ans_val == "N/A" and row.get("score") is None:
+                    continue
+                insp = row.get("inspection_id", "")
+                score = row.get("score")
+                parts = [f"{q_label}: {ans_val}"]
+                if score is not None:
+                    parts.append(f"score: {score}")
+                if insp:
+                    parts.append(f"inspection: {insp}")
+                lines.append(f"  {i}. {' | '.join(parts)}")
+
+            if len(rows) > max_display_rows:
+                lines.append(f"  ... and {len(rows) - max_display_rows} more in this batch")
+            if truncated and total_count > len(rows):
+                lines.append(f"  (Total matching: {total_count})")
+            return "\n".join(lines)
+
+        # ---- get_answer_stats ----
+        if tool_name == "get_answer_stats" and isinstance(data, dict):
+            avg = data.get("average_value")
+            total = data.get("total_answers", 0)
+            breakdown = data.get("value_breakdown", [])
+            filters = data.get("filters", {})
+            q_filter = filters.get("question_label") or ""
+            parts = []
+
+            if avg is not None:
+                label = f"'{q_filter}'" if q_filter else "answers"
+                source = data.get("stats_source", "")
+                scored_count = data.get("scored_count", 0)
+                source_note = ""
+                if source == "score":
+                    source_note = f" (from scoring system, {scored_count} scored answers)"
+                elif source == "answer_numeric":
+                    source_note = f" (from numeric answers)"
+                parts.append(
+                    f"Average score for {label}: {avg}{source_note}"
+                    f" — min: {data.get('min_value')}, max: {data.get('max_value')}"
+                )
+            elif total > 0 and q_filter:
+                parts.append(f"Total answers for '{q_filter}': {total} (no numeric/score data)")
+            elif total > 0:
+                parts.append(f"Total answers: {total}")
+
+            if breakdown:
+                bheader = f"Most common values for '{q_filter}':" if q_filter else "Most common values:"
+                parts.append(bheader)
+                for item in breakdown[:10]:
+                    display_val = _clean_answer_text(str(item["value"])) if item["value"] else "N/A"
+                    parts.append(f"  • {display_val}: {item['count']} time(s)")
+
+            return "\n".join(parts) if parts else "No answer statistics found."
+
+
+
+        # ---- execute_sql ----
         if tool_name == "execute_sql" and isinstance(data, dict):
             rows = data.get("rows", [])
             cols = data.get("columns", [])
             truncated = data.get("truncated", False)
             total_count = data.get("total_count", len(rows))
 
-            # --- Single-row aggregate result (COUNT, AVG, SUM, MIN, MAX) ---
-            # Render deterministically — the LLM misreads these too often.
+            # Single-row aggregate
             if len(rows) == 1 and len(cols) <= 3:
-                row = rows[0]
-                # Check if all columns look like aggregates
-                agg_names = {"count", "total", "avg", "sum", "min", "max",
-                             "average", "avg_score", "avg_inspection_score",
-                             "total_capex", "total_opex", "question_count",
-                             "page_count", "module_count", "form_count",
-                             "action_count", "report_count", "inspection_count"}
+                agg_names = {
+                    "count", "total", "avg", "sum", "min", "max",
+                    "average", "avg_score", "avg_inspection_score",
+                    "total_capex", "total_opex", "question_count",
+                    "answer_count", "report_count", "frequency",
+                }
                 col_lower = [c.lower() for c in cols]
-                is_aggregate = all(
-                    c in agg_names
-                    or c.startswith("avg_") or c.startswith("sum_")
-                    or c.startswith("total_") or c.startswith("count_")
-                    or c.endswith("_count") or c.endswith("_avg")
+                is_agg = all(
+                    c in agg_names or c.startswith(("avg_", "sum_", "total_", "count_"))
+                    or c.endswith(("_count", "_avg"))
                     for c in col_lower
                 )
-                if is_aggregate:
-                    parts = []
-                    for col_name, value in row.items():
-                        if value is None:
-                            parts.append(f"{col_name}: no data")
-                        else:
-                            # Round floats for readability
-                            try:
-                                fval = float(value)
-                                display = f"{fval:,.4f}".rstrip('0').rstrip('.')
-                            except (TypeError, ValueError):
-                                display = str(value)
-                            parts.append(f"{col_name}: {display}")
-                    return "  |  ".join(parts)
+                if is_agg:
+                    return "; ".join(f"{col}: {val}" for col, val in rows[0].items())
 
-            # --- Multi-row grouped results (e.g. status breakdown) ---
-            # When we have 2 columns and one looks like a name/category and
-            # the other is a count, render as a deterministic list.
-            if 2 <= len(rows) <= 30 and len(cols) == 2:
+            # Two-column group-by
+            if rows and len(cols) == 2:
                 col_lower = [c.lower() for c in cols]
-                count_col = None
-                label_col = None
-                for i, c in enumerate(col_lower):
-                    if c in ("count", "action_count", "inspection_count",
-                             "report_count", "cnt") or c.endswith("_count"):
-                        count_col = i
-                    else:
-                        label_col = i
-                if count_col is not None and label_col is not None:
+                has_count = any(
+                    c in {"count", "total", "frequency"}
+                    or c.endswith("_count") for c in col_lower
+                )
+                if has_count:
+                    count_idx = next(
+                        i for i, c in enumerate(col_lower)
+                        if c in {"count", "total", "frequency"} or c.endswith("_count")
+                    )
+                    label_idx = 1 - count_idx
                     lines = []
                     for r in rows:
                         vals = list(r.values())
-                        lines.append(f"  • {vals[label_col]}: {vals[count_col]}")
+                        lines.append(f"  • {vals[label_idx]}: {vals[count_idx]}")
                     header = f"Results ({len(rows)} groups"
                     if truncated:
                         header += f", showing first {len(rows)} of {total_count}"
-                    header += "):"
-                    return header + "\n" + "\n".join(lines)
+                    return header + "):\n" + "\n".join(lines)
 
-            # --- Deterministic multi-row result ---
-            # The LLM consistently misreads multi-row results (e.g. says
-            # "none are overdue" while looking at 50 overdue rows because
-            # a null column confused it). Build the answer directly.
+            # General multi-row
             if rows:
-                # Header with truncation info
+                # Check for UUID leaks in name columns before displaying.
+                # If detected, return an error that triggers the LLM to fix the JOIN.
+                uuid_leaking = _has_uuid_leak(rows, cols)
+                if uuid_leaking:
+                    return (
+                        f"QUERY ERROR: Raw UUID values in column(s) {uuid_leaking} "
+                        f"instead of human-readable names. "
+                        f"You must JOIN the lookup table. Example: "
+                        f"facility_id → JOIN facility fac ON ir.facility_id = fac.id "
+                        f"→ SELECT fac.name AS facility_name. "
+                        f"Regenerate SQL with correct JOINs."
+                    )
+
                 if truncated and total_count > 0:
                     header = f"Found {total_count} result(s) (showing first {len(rows)}):"
                 elif truncated:
@@ -691,55 +864,63 @@ class AgentOrchestrator:
                 else:
                     header = f"Found {len(rows)} result(s):"
 
-                # Format rows as a readable list
-                display_rows = rows[:max_display_rows]
-                num_cols = len(cols)
+                # Detect constant-value columns (same value on every row) and
+                # promote them to the header instead of repeating per row.
+                constant_cols = {}
+                if len(rows) > 1:
+                    for col in list(rows[0].keys()):
+                        vals = {str(r.get(col)) for r in rows}
+                        if len(vals) == 1 and col not in ("inspection_id", "submitted_on"):
+                            constant_cols[col] = _clean_answer_text(str(rows[0].get(col) or ""))
+                if constant_cols:
+                    const_str = ", ".join(f"{k}={v}" for k, v in constant_cols.items())
+                    header += f" ({const_str})"
+
                 lines = [header]
-                for i, row in enumerate(display_rows, 1):
-                    # Build a compact one-line representation
+                for i, row in enumerate(rows[:max_display_rows], 1):
                     parts = []
+                    # Columns to hide from display — internal IDs / raw UUIDs
+                    _HIDE_COLS = {"element_id", "source_row_id", "source_table",
+                                  "module_id", "facility_id", "project_id",
+                                  "client_id", "inspector_user_id", "inspectee_user_id",
+                                  "inspection_report_id", "question_id"}
                     for col, val in row.items():
+                        if col in _HIDE_COLS:
+                            continue
+                        # Skip columns promoted to header (constant across all rows)
+                        if col in constant_cols:
+                            continue
                         if val is None:
-                            # For narrow results (1-2 cols), show nulls
-                            # explicitly — the null IS the answer (e.g.
-                            # "inspection_score: N/A" not a blank line).
-                            # For wide results (3+), skip nulls for readability.
-                            if num_cols <= 2:
+                            if len(cols) <= 2:
                                 parts.append(f"{col}: N/A")
                             continue
-                        # Truncate long values
                         val_str = str(val)
-                        if len(val_str) > 60:
-                            val_str = val_str[:57] + "..."
+                        # Clean encoded answer values like ["High|uuid"] on ANY column —
+                        # LLM may alias the column as risk_level, answer, value, etc.
+                        if isinstance(val, str):
+                            val_str = _clean_answer_text(val_str)
+                        if len(val_str) > 100:
+                            val_str = val_str[:97] + "..."
                         parts.append(f"{col}: {val_str}")
-                    if parts:
-                        lines.append(f"  {i}. {' | '.join(parts)}")
-                    else:
-                        lines.append(f"  {i}. (no data)")
+                    lines.append(f"  {i}. {' | '.join(parts) or '(no data)'}")
 
                 if len(rows) > max_display_rows:
-                    lines.append(f"  ... and {len(rows) - max_display_rows} more rows shown")
+                    lines.append(f"  ... and {len(rows) - max_display_rows} more shown")
                 if truncated and total_count > len(rows):
                     lines.append(f"  (Total matching: {total_count})")
-
                 return "\n".join(lines)
 
-            # Empty result
             return "The query returned no results."
 
-        # ---- general path ----
         return self._llm_answer(question, tool_name, data)
 
-    def _llm_answer(self, question, tool_name, data, extra_instruction=""):
+    def _llm_answer(self, question, tool_name, data, extra=""):
         prompt = (
-            f"Answer the question using ONLY the exact values from the data. "
-            f"Do not estimate, round, or invent numbers. If asked to list "
-            f"items, enumerate ALL of them — do not truncate or sample. "
-            f"If the data is empty, say so clearly.\n"
-            f"{extra_instruction}\n\n"
-            f"Question: {question}\n\n"
+            f"Answer the question using ONLY the data provided. "
+            f"Do not estimate or invent. If data is empty, say so.\n"
+            f"{extra}\n\nQuestion: {question}\n\n"
             f"Data ({tool_name}):\n{json.dumps(data, default=str, indent=2)}\n\n"
-            f"Give a concise, accurate answer. No JSON or tool references."
+            f"Give a concise, accurate answer. No JSON."
         )
         try:
             return str(self.reasoning_llm.complete(prompt)).strip()
@@ -747,185 +928,88 @@ class AgentOrchestrator:
             return json.dumps(data, default=str)
 
     # ------------------------------------------------------------------ #
-    # Context messages
+    # Context messages for non-terminal tool results
     # ------------------------------------------------------------------ #
 
     def _context_msg(self, tool_name, tool_result, question=""):
         if not tool_result.get("success"):
-            error = tool_result.get('error', 'unknown')
+            error = tool_result.get("error", "unknown")
 
             if tool_name == "generate_sql":
                 q_lower = question.lower()
                 hint = ""
-                # Provide correct fallback patterns based on question type
                 if re.search(r'\b(corrective.?action|cause|correction|capex|opex|overdue)\b', q_lower):
                     hint = (
-                        "\n\nFALLBACK: Call execute_sql directly. Table is "
-                        "inspection_corrective_action with plain columns: "
-                        "cause, correction, corrective_action, responsible, "
-                        "status, progress_stage, capex, opex, target_close_out_date, "
-                        "completed_on. Use ILIKE not LIKE."
+                        "\n\nFALLBACK SQL:\n"
+                        "SELECT corrective_action_id, cause, corrective_action, responsible, status\n"
+                        "FROM inspection_corrective_action WHERE status = 'OPEN' LIMIT 100;"
                     )
-                elif re.search(r'\b(inspection.?score|gp.?score|inspection.?hour|inspector)\b', q_lower):
+                elif re.search(r'\b(inspection.?score|gp.?score|hour|inspector)\b', q_lower):
                     hint = (
-                        "\n\nFALLBACK: Call execute_sql directly. Table is "
-                        "inspection_report with: inspection_score (numeric), "
-                        "gp_score (numeric), total_inspection_hours (numeric), "
-                        "status, inspector_user_id, inspection_type_id. "
-                        "JOIN inspection_type for type names."
+                        "\n\nFALLBACK SQL:\n"
+                        "SELECT inspection_score, gp_score, status, submitted_on\n"
+                        "FROM inspection_report WHERE status != 'DRAFT' LIMIT 50;"
                     )
-                elif re.search(r'\b(question|page)\b', q_lower):
+                elif re.search(r'\b(answer|response|submission)\b', q_lower):
                     hint = (
-                        "\n\nFALLBACK: Call execute_sql with JSONB pattern:\n"
-                        "  SELECT COUNT(*) FROM fb_forms f\n"
-                        "  JOIN fb_modules m ON f.module_id = m.id\n"
-                        "  JOIN fb_translation_json tj ON f.translations_id = tj.id,\n"
-                        "       jsonb_array_elements(tj.translations) AS elem\n"
-                        "  WHERE m.name ILIKE '%MODULE_NAME%'\n"
-                        "    AND elem->>'language' = 'eng'\n"
-                        "    AND elem->>'attribute' = 'NAME'\n"
-                        "    AND elem->>'entityType' = 'QUESTION';"
+                        "\n\nFALLBACK: Use get_answers tool or this SQL:\n"
+                        "SELECT aq.label, aa.answer_text, aa.answer_numeric, aa.inspection_id\n"
+                        "FROM ai_answers aa\n"
+                        "LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
+                        "WHERE aq.label ILIKE '%KEYWORD%' LIMIT 50;"
                     )
-                elif re.search(r'\b(module)\b', q_lower):
-                    hint = (
-                        "\n\nFALLBACK: Call execute_sql:\n"
-                        "  SELECT name FROM fb_modules WHERE name ILIKE '%KEYWORD%' "
-                        "ORDER BY name LIMIT 100;"
-                    )
+                return f"generate_sql failed: {error}{hint}"
 
+            if tool_name == "get_answers":
                 return (
-                    f"Tool 'generate_sql' failed: {error}\n"
-                    f"The SQL model may be overloaded or crashed.{hint}"
+                    f"get_answers failed: {error}\n"
+                    f"FALLBACK: Use execute_sql with:\n"
+                    f"SELECT aq.label, aa.answer_text, aa.answer_numeric, aa.inspection_id\n"
+                    f"FROM ai_answers aa LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
+                    f"WHERE aa.module_name ILIKE '%MODULE%' LIMIT 50;"
                 )
 
-            return f"Tool '{tool_name}' failed: {error}\nTry a different approach."
+            return f"Tool '{tool_name}' failed: {error}. Try a different approach."
 
+        # Successful non-terminal results
         if tool_name == "semantic_search":
             data = tool_result.get("result", [])
             if data:
                 fmt = "\n".join(
-                    f"  - \"{m['text']}\" (form: {m['form_name']}, score: {m['score']})"
+                    f"  - \"{m.get('question_label', m.get('label','?'))}\" (form: {m['form_name']}, score: {m['score']})"
                     for m in data[:5]
                 )
-                distinct_forms = sorted({m["form_name"] for m in data if m.get("form_name")})
-
-                needs_meta = bool(re.search(
-                    r'\b(when|which day|what date|created|modified|timestamp|who created|who made)\b',
+                asks_answers = bool(re.search(
+                    r'\b(answer|response|submission|filled|submitted|responded)\b',
                     question.lower()))
-                asks_submissions = bool(re.search(
-                    r'\b(submission|submitted|response|responded|answer|answered|filled|scored?)\b',
-                    question.lower()))
-
-                if needs_meta:
-                    top = data[0]
-                    return (f"semantic_search found {len(data)} match(es):\n{fmt}\n\n"
-                        f"User needs metadata. Top match in form '{top['form_name']}'.\n"
-                        f"Call generate_sql with schema_hint mentioning form name "
-                        f"'{top['form_name']}' and the metadata needed.")
-
-                if asks_submissions:
-                    return (f"semantic_search found {len(data)} match(es) in "
-                        f"{len(distinct_forms)} form(s): {distinct_forms}\n{fmt}\n\n"
-                        f"User asked about submissions. For EACH form, call "
-                        f"resolve_answer_table then query_answers, then aggregate.")
-
-                return (f"semantic_search found {len(data)} match(es):\n{fmt}\n\n"
+                if asks_answers:
+                    top_form = data[0].get("form_name", data[0].get("module_name",""))
+                    top_q = data[0].get("question_label", data[0].get("label",""))
+                    return (
+                        f"semantic_search found {len(data)} match(es):\n{fmt}\n\n"
+                        f"User asked about answers. Call get_answers with "
+                        f"module_name='{top_form}' and question_label='{top_q}'."
+                    )
+                return (
+                    f"semantic_search found {len(data)} match(es):\n{fmt}\n\n"
                     f"If this answers the question, call final_answer.\n"
-                    f"If user needs counts/metadata, use generate_sql.")
-            return ("semantic_search found no matches above threshold. "
-                    "Call final_answer saying no forms ask about that topic.")
-
-        if tool_name == "lookup_form":
-            names = tool_result.get("result", [])
-            source = tool_result.get("_source", "ilike")
-            if names:
-                source_label = {
-                    "ilike": "exact-substring",
-                    "semantic_form": "semantic form-name",
-                    "semantic_question": "semantic question-label (indirect)",
-                }.get(source, source)
-                return (f"lookup_form found {len(names)} candidate(s) via {source_label}:\n"
-                        f"  {', '.join(repr(n) for n in names)}\n"
-                        f"Use ONE of these exact names. Drop filler words (form/the) from ILIKE.")
-            return ("lookup_form found no matches. "
-                    "Consider list_forms() to show what's available.")
-
-        if tool_name == "resolve_answer_table":
-            info = tool_result.get("result", {})
-            if not info:
-                return "resolve_answer_table found no match. Try lookup_form first."
-
-            ambiguous = info.get("ambiguous", False)
-            missing_cols = info.get("missing_required_columns", [])
-            resolved_via = info.get("resolved_via", "form_name")
-            module_candidates = info.get("all_module_candidates", [])
-            forms_in_module = info.get("forms_in_module", [])
-
-            candidates_block = ""
-            if ambiguous and module_candidates:
-                lines = [f"  - {c['module_name']} ({'standard' if c.get('has_answer_data') else 'workflow'})"
-                         for c in module_candidates[:10]]
-                candidates_block = "\nAll matching modules:\n" + "\n".join(lines)
-
-            forms_block = ""
-            if forms_in_module:
-                fnames = [f["form_name"] for f in forms_in_module[:10]]
-                forms_block = f"\n  Forms in module: {fnames}"
-
-            if info.get("table_exists") and not missing_cols:
-                via = {"module_uuid": "UUID", "module_name": "module name"}.get(resolved_via, "form name")
-                return (
-                    f"resolve_answer_table resolved (via {via}):\n"
-                    f"  Module: '{info['module_name']}'\n"
-                    f"  Table: {info['answer_table']} (standard shape)"
-                    f"{forms_block}{candidates_block}\n\n"
-                    f"Call get_score_stats or query_answers with "
-                    f"answer_table=\"{info['answer_table']}\"."
+                    f"To get submitted answers for these questions, call get_answers."
                 )
+            return "semantic_search found no matches. Call final_answer saying no forms ask about that topic."
 
-            if info.get("table_exists") and missing_cols:
-                return (
-                    f"Table {info['answer_table']} exists but missing: {missing_cols}.\n"
-                    f"Columns: {info.get('columns', [])}\n"
-                    f"This is a WORKFLOW table — use generate_sql/execute_sql."
-                    f"{candidates_block}"
+        if tool_name == "search_questions":
+            data = tool_result.get("result", [])
+            if data:
+                fmt = "\n".join(
+                    f"  - \"{q.get('question_label', q.get('label','?'))}\" (module: {q.get('module_name','?')})"
+                    for q in data[:6]
                 )
-
-            return (
-                f"Table {info.get('answer_table')} does NOT exist.\n"
-                f"{candidates_block}\n"
-                f"No submissions yet."
-            )
-
-        if tool_name == "get_answer_summary":
-            data = tool_result.get("result", {})
-            return (
-                f"Summary: {data.get('total_rows', 0)} rows, "
-                f"{data.get('distinct_forms', 0)} forms, "
-                f"statuses={data.get('status_breakdown', {})}.\n"
-                f"Call final_answer or query_answers for details."
-            )
-
-        if tool_name == "get_score_stats":
-            data = tool_result.get("result", {})
-            avg = data.get("average_score")
-            total = data.get("total_scores", 0)
-            if avg is None or total == 0:
-                stats = "No numeric scores found."
-            else:
-                stats = (f"Average: {avg}, Min: {data.get('min_score')}, "
-                         f"Max: {data.get('max_score')}, Count: {total}")
-                by_type = data.get("by_score_type", [])
-                if by_type:
-                    stats += "\nBy type: " + ", ".join(
-                        f"{t.get('score_type','?')}={t.get('average')}" for t in by_type[:5])
-
-            return (
-                f"get_score_stats for {data.get('table', '?')}:\n  {stats}\n\n"
-                f"If comparing with another module, call resolve_answer_table "
-                f"for the next one, then get_score_stats again.\n"
-                f"If this answers the question, call final_answer."
-            )
+                return (
+                    f"search_questions found {len(data)} question(s):\n{fmt}\n\n"
+                    f"To see submitted answers, call get_answers with question_label (aq.label) "
+                    f"set to one of the labels above."
+                )
+            return "search_questions found no matches. Try a broader keyword or use semantic_search."
 
         return json.dumps(tool_result, default=str)
 
@@ -934,42 +1018,34 @@ class AgentOrchestrator:
         tm = re.search(r'relation "(\w+)" does not exist', error_msg)
         if tm:
             bad = tm.group(1)
-            sr = self.registry.call("get_schema", {})
-            if sr.get("success"):
-                tables = sr["result"].get("tables", [])
-                similar = [t for t in tables if bad.replace("fb_","").split("_")[0] in t]
-                if similar:
-                    parts.append(f"Table '{bad}' doesn't exist. Similar: {similar}")
-                    for t in similar[:2]:
-                        cr = self.registry.call("get_schema", {"table_name": t})
-                        if cr.get("success"):
-                            parts.append(f"  {t} columns: {[c['name'] for c in cr['result'].get('columns',[])]}")
-                else:
-                    parts.append(f"Table '{bad}' doesn't exist. Available: {[t for t in tables if t.startswith('fb_')][:15]}")
+            try:
+                sr = self.registry.call("get_schema", {})
+                tables = sr.get("result", {}).get("tables", [])
+                ai_tables = [t for t in tables if t.startswith("ai_")]
+                insp_tables = [t for t in tables if t.startswith("inspection_")]
+                parts.append(
+                    f"Table '{bad}' doesn't exist.\n"
+                    f"AI tables: {ai_tables}\n"
+                    f"Inspection tables: {insp_tables}"
+                )
+            except Exception:
+                pass
         cm = re.search(r'column "(\w+)" does not exist', error_msg)
         if cm and not tm:
-            parts.append(f"Column '{cm.group(1)}' doesn't exist. Use get_schema to check.")
+            parts.append(f"Column '{cm.group(1)}' doesn't exist. Use get_schema to check columns.")
         return "\n".join(parts) + "\n" if parts else ""
 
     def _call_llm(self, messages, stats=None):
-        """
-        Call the reasoning LLM and return the response text.
-        If stats is provided, accumulates token counts and latency.
-        """
         t0 = time.time()
         response = self.reasoning_llm.chat(messages)
         latency_ms = int((time.time() - t0) * 1000)
-
         content = response.message.content.strip()
-
         if stats:
             stats.total_llm_calls += 1
             stats.total_llm_latency_ms += latency_ms
-            # Ollama returns token counts in the raw response
-            raw = getattr(response, 'raw', {}) or {}
-            stats.total_prompt_tokens += raw.get('prompt_eval_count', 0)
-            stats.total_completion_tokens += raw.get('eval_count', 0)
-
+            raw = getattr(response, "raw", {}) or {}
+            stats.total_prompt_tokens += raw.get("prompt_eval_count", 0)
+            stats.total_completion_tokens += raw.get("eval_count", 0)
         return content
 
     def _is_preparatory_result(self, question: str, exec_result: dict) -> bool:
@@ -979,20 +1055,18 @@ class AgentOrchestrator:
         row_count = data.get("row_count", 0)
 
         wants_content = bool(re.search(
-            r'\b(question|label|title|page|element|content|what.*in)\b', q_lower))
-        # "Content" means the result contains actual data the user asked for,
-        # not just IDs/names for a follow-up step. Includes both form-builder
-        # labels AND inspection-domain data columns.
+            r'\b(question|label|answer|response|what.*in)\b', q_lower))
         has_content = any(c in columns for c in [
-            # Form builder
-            "label", "title", "translatedtext", "text",
-            "question_label", "question_text", "answer",
-            # Inspection domain
+            # Actual DB column names
+            "label", "answer_text", "answer_numeric",
             "inspection_score", "gp_score", "total_inspection_hours",
             "cause", "correction", "corrective_action", "responsible",
-            "status", "progress_stage", "adequacy_status",
-            "capex", "opex", "target_close_out_date",
-            "schedule_date", "due_date",
+            "status", "progress_stage", "capex", "opex",
+            "target_close_out_date", "schedule_date", "due_date",
+            # Common SQL aliases the LLM uses
+            "question", "answer", "question_label", "answer_value",
+            "observation", "finding", "score", "risk_level",
+            "inspector_name", "facility_name", "inspection_type_name",
         ])
 
         if wants_content and not has_content and row_count > 0:
@@ -1001,17 +1075,7 @@ class AgentOrchestrator:
         is_superlative = bool(re.search(
             r'\b(most\s+recent|recently|latest|newest|oldest|first|last)\b', q_lower))
         wants_details = bool(re.search(
-            r'\b(question|page|element|what|show|list|answer|submission|response|score)\b',
-            q_lower))
-
-        # Only treat as preparatory if we asked for details about a form
-        # (labels, questions) and got back metadata (just a name/id).
-        # If we got inspection data back (scores, causes, etc.), it IS the answer.
-        wants_submissions = bool(re.search(
-            r'\b(submission|submitted|response|answer|score|filled)\b', q_lower))
-        if wants_submissions and columns == ["name"] and row_count >= 1:
-            return True
-
+            r'\b(question|what|show|list|answer|submission|response|score)\b', q_lower))
         if is_superlative and wants_details and not has_content:
             return True
 
