@@ -299,7 +299,7 @@ class AgentOrchestrator:
         print(f"  Configuring reasoning LLM: {chat_model}...")
         self.reasoning_llm = Ollama(model=chat_model, base_url=ollama_url,
             temperature=0.1, request_timeout=120.0,
-            additional_kwargs={"num_predict": 256, "num_ctx": 8192})
+            additional_kwargs={"num_predict": 512, "num_ctx": 8192})  # 512 enough for JSON tool call
         print(f"  ✓ Reasoning LLM ({chat_model})")
 
         print(f"  Configuring SQL LLM: {sql_model}...")
@@ -415,9 +415,33 @@ class AgentOrchestrator:
             try:
                 tc = parse_tool_call(raw)
             except ValueError as exc:
-                messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
-                messages.append(ChatMessage(role=MessageRole.USER, content=
-                    f"Not valid JSON: {exc}\nRespond with ONLY a JSON tool call."))
+                parse_fails = sum(1 for step in steps if step.tool == "[parse_error]")
+
+                # After 2 consecutive parse failures, hard-reset context.
+                # The model got confused by accumulated bad output — restart clean.
+                if parse_fails >= 2:
+                    messages = [
+                        ChatMessage(role=MessageRole.SYSTEM, content=self._system_prompt),
+                        ChatMessage(role=MessageRole.USER, content=(
+                            f"RESET after {parse_fails} JSON parse failures. "
+                            f"Answer this question with ONE valid JSON tool call only: {question}\n"
+                            f"Format: "
+                            f'{{"thought":"...", "tool":"generate_sql", "args":{{"question":"...","schema_hint":""}}}}'
+                        )),
+                    ]
+                else:
+                    messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
+                    messages.append(ChatMessage(role=MessageRole.USER, content=(
+                        f"ERROR: Your response was not valid JSON (attempt {parse_fails+1}).\n"
+                        f"You MUST respond with ONLY a JSON object — no prose, no explanation, "
+                        f"no markdown. The ONLY valid response format is:\n"
+                        f'  {{"thought": "brief reasoning", "tool": "<tool_name>", "args": {{...}}}}\n'
+                        f"Available tools: generate_sql, execute_sql, get_answers, get_answer_stats, "
+                        f"search_questions, list_forms, final_answer.\n"
+                        f"Example: "
+                        f'{{"thought": "Need SQL to answer this.", "tool": "generate_sql", '
+                        f'"args": {{"question": "{question[:60]}", "schema_hint": ""}}}}'
+                    )))
                 s = AgentStep(iteration, "[parse error]", "[parse_error]",
                               {}, {"error": str(exc)}, int((time.time()-t0)*1000))
                 steps.append(s); _emit(s); continue

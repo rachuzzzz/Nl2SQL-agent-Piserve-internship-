@@ -105,7 +105,7 @@ AVAILABLE TOOLS
                          Returns avg/min/max + value distribution for numeric/categorical answers.
 
   SQL PATH (inspection_* tables + complex cross-table queries):
-  6. generate_sql      — { "question": "...", "schema_hint": "..." }
+  6. generate_sql      — { "question": "...", "schema_hint": "" }
   7. execute_sql       — { "sql": "..." }
   8. get_schema        — { "table_name": null }
 
@@ -151,11 +151,11 @@ WORKED EXAMPLES
 
 ─── Inspection score ───
 User: "average inspection score?"
-Turn 1: {"thought": "Inspection score is in inspection_report.", "tool": "generate_sql", "args": {"question": "average inspection score excluding drafts", "schema_hint": "SELECT AVG(inspection_score) FROM inspection_report WHERE status != 'DRAFT';"}}
+Turn 1: {"thought": "Inspection score is in inspection_report.", "tool": "generate_sql", "args": {"question": "average inspection score excluding drafts", "schema_hint": ""}}
 
 ─── Corrective actions ───
 User: "show open corrective actions with causes"
-Turn 1: {"thought": "Plain SQL on inspection_corrective_action.", "tool": "generate_sql", "args": {"question": "open corrective actions with causes", "schema_hint": "inspection_corrective_action: corrective_action_id, cause, corrective_action, responsible, status. WHERE status = 'OPEN'"}}
+Turn 1: {"thought": "Plain SQL on inspection_corrective_action.", "tool": "generate_sql", "args": {"question": "open corrective actions with causes", "schema_hint": ""}}
 
 ─── Form answers: specific question ───
 User: "what did inspectors answer for 'risk level'?"
@@ -171,15 +171,15 @@ Turn 1: {"thought": "Risk Level is a scored dropdown question. get_answer_stats 
 
 ─── Scores: which inspection had highest total score ───
 User: "which inspection had the highest total score?"
-Turn 1: {"thought": "Total score = SUM of ai_answers.score per inspection. NOT inspection_report.inspection_score which is the overall report score. Use ir.inspection_id (varchar) not ir.id (UUID).", "tool": "generate_sql", "args": {"question": "inspection with highest total score from ai_answers", "schema_hint": "SELECT ir.inspection_id, SUM(aa.score) AS total_score FROM ai_answers aa JOIN inspection_report ir ON aa.inspection_report_id = ir.id WHERE aa.score IS NOT NULL AND ir.status != 'DRAFT' GROUP BY ir.inspection_id ORDER BY total_score DESC LIMIT 1;"}}
+Turn 1: {"thought": "Total score = SUM of ai_answers.score per inspection. NOT inspection_report.inspection_score which is the overall report score. Use ir.inspection_id (varchar) not ir.id (UUID).", "tool": "generate_sql", "args": {"question": "inspection with highest total score from ai_answers", "schema_hint": ""}}
 
 ─── Form answers: observation text at a specific facility ───
 User: "what did inspectors write in the observation field for Al Ghadeer?"
-Turn 1: {"thought": "Need ai_answers filtered by question label='Observation' AND facility='Al Ghadeer'. Must join: ai_answers → ai_questions (label) → inspection_report → facility. Exclude 'Observation Type' and 'Unique Identifier' — only the free-text Observation field.", "tool": "generate_sql", "args": {"question": "observation text at Al Ghadeer facility", "schema_hint": "SELECT aa.answer_text AS observation, ir.inspection_id, ir.submitted_on FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label ILIKE '%observation%' AND aq.label NOT ILIKE '%type%' AND aq.label NOT ILIKE '%unique%' AND fac.name ILIKE '%Al Ghadeer%' AND aa.answer_text IS NOT NULL AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
+Turn 1: {"thought": "Need ai_answers filtered by question label='Observation' AND facility='Al Ghadeer'. Must join: ai_answers → ai_questions (label) → inspection_report → facility. Exclude 'Observation Type' and 'Unique Identifier' — only the free-text Observation field.", "tool": "generate_sql", "args": {"question": "observation text at Al Ghadeer facility", "schema_hint": ""}}
 
 ─── Form answers: filter by answer value ───
 User: "show all high risk observations"
-Turn 1: {"thought": "User wants answers where Risk Level = High. The question label is 'Risk Level', the answer value contains 'High'. answer_text stores JSON like ["High|uuid"] so search with ILIKE '%High%'. Also filter where label='Observation' to get the observation text.", "tool": "generate_sql", "args": {"question": "observations where risk level is high", "schema_hint": "SELECT aa.inspection_id, aq.label, aa.answer_text, ir.submitted_on FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id WHERE aa.inspection_report_id IN (SELECT aa2.inspection_report_id FROM ai_answers aa2 JOIN ai_questions aq2 ON aa2.element_id = aq2.element_id WHERE aq2.label ILIKE '%risk level%' AND aa2.answer_text ILIKE '%High%') AND aq.label ILIKE '%observation%' AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
+Turn 1: {"thought": "User wants answers where Risk Level = High. The question label is 'Risk Level', the answer value contains 'High'. answer_text stores JSON like ["High|uuid"] so search with ILIKE '%High%'. Also filter where label='Observation' to get the observation text.", "tool": "generate_sql", "args": {"question": "observations where risk level is high", "schema_hint": ""}}
 
 ─── Form answers: by inspection ───
 User: "all answers in inspection INS-2024-001"
@@ -187,11 +187,11 @@ Turn 1: {"thought": "Filter by inspection_id.", "tool": "get_answers", "args": {
 
 ─── Form answers: most recently filled form ───
 User: "show all questions and answers in the most recently filled form"
-Turn 1: {"thought": "Need most recent inspection then filter to Inspection Form module only — without module_name filter this returns 10000+ rows across all 16 modules.", "tool": "generate_sql", "args": {"question": "questions and answers from most recent inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT id FROM inspection_report WHERE status != 'DRAFT' ORDER BY submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' ORDER BY aq.label LIMIT 100;"}}
+Turn 1: {"thought": "Need most recent inspection then filter to Inspection Form module only — without module_name filter this returns 10000+ rows across all 16 modules.", "tool": "generate_sql", "args": {"question": "questions and answers from most recent inspection form", "schema_hint": ""}}
 
 ─── Cross-domain join ───
 User: "risk level answers for inspections at Al Ghadeer facility"
-Turn 1: {"thought": "Need ai_answers + inspection_report + facility — use generate_sql.", "tool": "generate_sql", "args": {"question": "risk level answers at Al Ghadeer", "schema_hint": "FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label ILIKE '%risk level%' AND fac.name ILIKE '%Al Ghadeer%'"}}
+Turn 1: {"thought": "Need ai_answers + inspection_report + facility — use generate_sql.", "tool": "generate_sql", "args": {"question": "risk level answers at Al Ghadeer", "schema_hint": ""}}
 
 ─── Form discovery ───
 User: "which forms ask about emergency contact?"
@@ -211,11 +211,11 @@ Turn 1: {"thought": "The context shows inspection_id='2026/04/ST085/INS003'. The
 [History shows single-row result: facility_name='Golf Gardens']
 User: "who inspected it"
 
-Turn 1: {"thought": "Context is about Golf Gardens facility. Query the most recent inspection there to find inspector.", "tool": "generate_sql", "args": {"question": "inspector of most recent inspection at Golf Gardens", "schema_hint": "SELECT u.first_name || ' ' || u.last_name AS inspector_name FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id JOIN facility fac ON ir.facility_id = fac.id WHERE fac.name ILIKE '%Golf Gardens%' AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 1;"}}
+Turn 1: {"thought": "Context is about Golf Gardens facility. Query the most recent inspection there to find inspector.", "tool": "generate_sql", "args": {"question": "inspector of most recent inspection at Golf Gardens", "schema_hint": ""}}
 
 ─── Count questions in a form ───
 User: "how many questions are in the inspection form?"
-Turn 1: {"thought": "Count distinct questions from ai_questions filtered by module_name. Do NOT use search_questions — that returns rows, not a count. Use generate_sql.", "tool": "generate_sql", "args": {"question": "count questions in inspection form", "schema_hint": "SELECT COUNT(DISTINCT element_id) AS question_count FROM ai_questions WHERE module_name ILIKE '%Inspection Form%';"}}
+Turn 1: {"thought": "Count distinct questions from ai_questions filtered by module_name. Do NOT use search_questions — that returns rows, not a count. Use generate_sql.", "tool": "generate_sql", "args": {"question": "count questions in inspection form", "schema_hint": ""}}
 
 ─── List forms ───
 User: "how many forms are there?"
@@ -380,6 +380,20 @@ WHERE aq.label ILIKE '%risk level%'
   AND ir.status != 'DRAFT'
 ORDER BY ir.submitted_on DESC LIMIT 100;
 
+-- Latest filled form — all questions and answers from the most recent inspection:
+-- WRONG: ... ORDER BY ir.submitted_on DESC LIMIT 1  (returns only 1 answer row)
+-- RIGHT: filter inspection in subquery, then get ALL answers for that inspection
+SELECT aq.label AS question, aa.answer_text AS answer
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+WHERE aa.inspection_report_id = (
+    SELECT id FROM inspection_report
+    WHERE status != 'DRAFT'
+    ORDER BY submitted_on DESC LIMIT 1
+)
+AND aa.module_name = 'Inspection Form'
+ORDER BY aq.label;
+
 -- Answer distribution for a question:
 SELECT aa.answer_text, COUNT(*) AS frequency
 FROM ai_answers aa
@@ -410,6 +424,16 @@ JOIN inspection_report ir ON aa.inspection_report_id = ir.id
 WHERE aa.score IS NOT NULL AND ir.status != 'DRAFT'
 GROUP BY ir.inspection_id
 ORDER BY total_score DESC LIMIT 1;
+
+
+-- Project/facility/inspector with HIGHEST or MAXIMUM value:
+-- ALWAYS: ORDER BY <metric> DESC LIMIT 1 — never return all groups for a 'which has most' query
+SELECT proj.name AS project_name, MAX(ir.inspection_score) AS max_score
+FROM inspection_report ir
+JOIN project proj ON ir.project_id = proj.id
+WHERE ir.status != 'DRAFT'
+GROUP BY proj.name
+ORDER BY max_score DESC LIMIT 1;
 
 -- ALWAYS: SELECT ir.inspection_id (varchar '2026/04/ST001/INS001')
 -- NEVER:  SELECT ir.id           (UUID primary key — garbage output)
