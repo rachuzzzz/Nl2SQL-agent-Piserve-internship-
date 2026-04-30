@@ -40,6 +40,11 @@ class SQLValidator:
         "inspection_report.project_name":    "JOIN project proj ON ir.project_id = proj.id → proj.name",
         "inspection_report.type_name":       "JOIN inspection_type it ON ir.inspection_type_id = it.id → it.name",
         "inspection_report.inspection_type": "JOIN inspection_type it ON ir.inspection_type_id = it.id → it.name",
+        "inspection_report.capex":           "capex is in inspection_corrective_action.capex, not inspection_report. JOIN via ica.inspection_id = ir.id",
+        "inspection_report.start_time":       "column is start_date_time not start_time",
+        "inspection_report.end_time":         "column is end_date_time not end_time",
+        "inspection_report.opex":            "opex is in inspection_corrective_action.opex, not inspection_report. JOIN via ica.inspection_id = ir.id",
+
     }
 
     # ir.id is the UUID PK — selecting it for display produces UUID garbage.
@@ -108,18 +113,36 @@ class SQLValidator:
                     )
                     break
 
+        # Block ica.facility_id — this column does not exist on inspection_corrective_action
+        # facility must be reached via: ica → inspection_report (ir) → facility
+        if re.search(r'ica\.facility_id', sql_lower):
+            errors.append(
+                "WRONG COLUMN: inspection_corrective_action.facility_id does not exist. "
+                "Get facility via: JOIN inspection_report ir ON ica.inspection_id = ir.id "
+                "then JOIN facility fac ON ir.facility_id = fac.id"
+            )
+
         # Block ir.id in SELECT clause — outputs UUID instead of human-readable inspection_id
         # Only check the SELECT clause (not JOIN/WHERE where ir.id is legitimately used)
+        # ALLOW: COUNT(ir.id), MAX(ir.id) etc. — aggregating by UUID is fine
+        # BLOCK: ir.id bare or aliased (SELECT ir.id, SELECT ir.id AS something)
         select_clause_match = self._IR_ID_SELECT_RE.search(sql_lower)
         if select_clause_match:
             select_clause = select_clause_match.group(1)
-            # ir.id appears in SELECT clause AND is not just part of a longer column name
-            if re.search(r'\bir\.id\b', select_clause) and                re.search(r'\binspection_report\b', sql_lower):
-                errors.append(
-                    "WRONG COLUMN: ir.id is the UUID primary key — never use it for display. "
-                    "Use ir.inspection_id instead (varchar like '2026/04/ST001/INS001'). "
-                    "Note: using ir.id in JOIN conditions (ON ... = ir.id) is correct and fine."
+            if re.search(r'\bir\.id\b', select_clause) and \
+               re.search(r'\binspection_report\b', sql_lower):
+                # Allow ir.id inside aggregate functions: COUNT(ir.id), MAX(ir.id), etc.
+                bare_ir_id = re.search(
+                    r'(?<!\w)(?:count|sum|max|min|avg)\s*\(\s*(?:distinct\s+)?ir\.id\s*\)',
+                    select_clause
                 )
+                if not bare_ir_id:
+                    errors.append(
+                        "WRONG COLUMN: ir.id is the UUID primary key — never use it for display. "
+                        "Use ir.inspection_id instead (varchar like '2026/04/ST001/INS001'). "
+                        "To count inspections use COUNT(ir.inspection_id) not COUNT(ir.id). "
+                        "Note: using ir.id in JOIN conditions (ON ... = ir.id) is correct and fine."
+                    )
 
         # Block dynamic fb_{uuid} tables — use ai_answer instead
         if self._DYNAMIC_TABLE_RE.search(sql):
@@ -175,7 +198,11 @@ class SQLValidator:
             col_in_groupby = bool(re.search(
                 rf'\bgroup\s+by\b.*\b{re.escape(fk_col)}\b', sql_lower, re.DOTALL
             ))
-            lookup_joined = lookup_table in sql_lower
+            # Check for the lookup table actually being joined/used as a table source
+            # (not just appearing as a column alias or substring of another column name)
+            lookup_joined = bool(re.search(
+                rf'(?:from|join)\s+{re.escape(lookup_table)}\b', sql_lower
+            ))
 
             if (col_in_select or col_in_groupby) and not lookup_joined:
                 warnings.append(
@@ -203,6 +230,20 @@ class SQLValidator:
         return sql
 
     def clean_sql(self, sql: str) -> str:
+        # Strip deepseek BOS/EOS tokens that sometimes leak into output
+        sql = re.sub(r'<｜begin▁of▁sentence｜>|<｜end▁of▁sentence｜>|<\|begin_of_sentence\|>', '', sql)
+        sql = re.sub(r'<[｜|][^>]{0,30}[｜|]>', '', sql)
+
+        # Replace fullwidth Unicode punctuation deepseek sometimes emits
+        # ！= → !=  ； → ;  ＝ → =  ＜ → <  ＞ → >
+        FULLWIDTH_MAP = {
+            '！': '!', '＝': '=', '；': ';', '，': ',',
+            '＜': '<', '＞': '>', '（': '(', '）': ')',
+            '\uff01': '!', '\uff1d': '=', '\uff1b': ';',
+        }
+        for fw, ascii_ in FULLWIDTH_MAP.items():
+            sql = sql.replace(fw, ascii_)
+
         sql = re.sub(r"```sql\s*", "", sql)
         sql = re.sub(r"```", "", sql)
         sql = re.sub(r"\[/?[A-Z_]+\]", "", sql, flags=re.IGNORECASE)

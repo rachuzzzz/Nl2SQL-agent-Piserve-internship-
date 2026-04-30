@@ -46,7 +46,16 @@ BUSINESS_RULES = [
     "NEVER use SQL reserved words as table aliases (is, as, in, on, by, do, if).",
     "Use ILIKE for text matching, never LIKE.",
     "corrective_action_id is a human-readable ID like '2026/01/ST064/INS001_MA001', not a UUID.",
-    "inspection_corrective_action.inspection_id is the PRIMARY FK to inspection_report.id.",
+    "inspection_corrective_action date columns: "
+    "close_on = when the action was closed (NOT closed_on — that column does not exist). "
+    "created_on = when the action was created. "
+    "Days to close = EXTRACT(DAY FROM (ica.close_on - ica.created_on)). "
+    "The age column is always NULL — never use it.",
+    "inspection_corrective_action.responsible is an ENUM string ('CLIENT', 'INTERNAL_OPERATIONS', 'SUB_CONTRACTOR') — NOT a UUID FK to users. NEVER JOIN responsible to the users table. To break down by responsible party just use GROUP BY ica.responsible.",
+    "CORRECT JOIN: ica.inspection_id = ir.id. "
+    "WRONG JOIN: ir.inspection_id = ica.inspection_id (type mismatch — varchar vs UUID). "
+    "Always start from inspection_corrective_action and join TO inspection_report: "
+    "JOIN inspection_report ir ON ica.inspection_id = ir.id.",
     "Use LEFT JOIN (not INNER JOIN) for optional lookups like inspection_sub_type, "
     "entity, and inspection_report_remark.",
     "VOCABULARY — corrective action status: "
@@ -62,6 +71,24 @@ BUSINESS_RULES = [
     "'id' is the UUID primary key — NEVER select this for display (outputs UUID garbage). "
     "'inspection_id' is the human-readable varchar like '2026/04/ST001/INS001' — ALWAYS use "
     "ir.inspection_id (not ir.id) when showing the inspection identifier to the user.",
+    "CRITICAL — inspection_report has TWO user FK columns: "
+    "inspector_user_id = the person WHO CONDUCTED the inspection (the auditor/inspector). "
+    "inspectee_user_id = the person WHO WAS INSPECTED (the auditee). "
+    "When user asks 'who conducted / who inspected / who did the inspection' → "
+    "JOIN users u ON ir.inspector_user_id = u.id. "
+    "When user asks 'who was inspected / auditee' → "
+    "JOIN users u ON ir.inspectee_user_id = u.id. "
+    "NEVER use inspectee_user_id when the user asks who conducted or performed the inspection.",
+    "CRITICAL — repetitive observations query MUST return a grouped list with observation_text "
+    "and count — NOT a single total count. Always use GROUP BY + HAVING COUNT > 1 + ORDER BY count DESC. "
+    "NEVER wrap in an outer SELECT COUNT(*) or return a single number.",
+    "CRITICAL — corrective action causes/corrections/recommendations live in "
+    "inspection_corrective_action columns: cause, correction, corrective_action, responsible. "
+    "NEVER use get_answer_stats for these — that tool only reads ai_answers form data. "
+    "For 'most common causes of corrective actions' always use generate_sql on "
+    "inspection_corrective_action.cause GROUP BY cause ORDER BY COUNT DESC.",
+    "CRITICAL — 'which month had most X' requires GROUP BY date_trunc('month', ...) + ORDER BY COUNT DESC LIMIT 1. "
+    "Do NOT use COUNT(*) FILTER (WHERE ...) — that pattern is only for 'this month vs last month' comparisons.",
 ]
 
 TABLE_RELATIONSHIPS = """\

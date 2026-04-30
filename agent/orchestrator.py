@@ -299,7 +299,7 @@ class AgentOrchestrator:
         print(f"  Configuring reasoning LLM: {chat_model}...")
         self.reasoning_llm = Ollama(model=chat_model, base_url=ollama_url,
             temperature=0.1, request_timeout=120.0,
-            additional_kwargs={"num_predict": 512, "num_ctx": 8192})  # 512 enough for JSON tool call
+            additional_kwargs={"num_predict": 768, "num_ctx": 8192})  # 768 avoids truncation on longer thoughts
         print(f"  ✓ Reasoning LLM ({chat_model})")
 
         print(f"  Configuring SQL LLM: {sql_model}...")
