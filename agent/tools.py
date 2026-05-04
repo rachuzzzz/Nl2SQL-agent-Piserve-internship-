@@ -427,6 +427,7 @@ def generate_sql(
     sql_llm, validator: SQLValidator, question: str,
     schema_hint: str = "", db_engine=None,
     sql_prompt_template: str = "",
+    _debug_logger=None,
 ) -> dict[str, Any]:
     try:
         if db_engine and not schema_hint.startswith("Use"):
@@ -442,11 +443,35 @@ def generate_sql(
         ).replace(
             "{schema_hint}", schema_hint or "No additional context provided."
         )
+
+        # Log the full prompt sent to deepseek if debug enabled
+        if _debug_logger:
+            _debug_logger.debug(
+                f"\n{'='*70}\n>>> DEEPSEEK PROMPT (question={question!r})\n"
+                f"{'='*70}\n{prompt[-3000:]}\n"  # last 3000 chars — schema_hint is at end
+            )
+
         response = sql_llm.complete(prompt)
         raw_sql = str(response).strip()
+
+        # Log raw deepseek output
+        if _debug_logger:
+            _debug_logger.debug(
+                f"\n{'='*70}\n>>> DEEPSEEK RAW OUTPUT\n{'='*70}\n{raw_sql}\n"
+            )
+
         sql = validator.clean_sql(raw_sql)
         passed, errors = validator.validate(sql)
         semantic_warnings = validator.validate_semantic(sql, question)
+
+        # Log cleaned SQL and validation result
+        if _debug_logger:
+            status = "✓ PASSED" if passed else f"✗ FAILED: {errors}"
+            _debug_logger.debug(
+                f"\n{'='*70}\n>>> DEEPSEEK CLEANED SQL — {status}\n"
+                f"{'='*70}\n{sql}\n"
+            )
+
         return {
             "success": True,
             "result": {
@@ -540,12 +565,14 @@ class ToolRegistry:
     }
 
     def __init__(self, db_engine: Engine, semantic_index: SemanticQuestionIndex,
-                 validator: SQLValidator, sql_llm, sql_prompt: str = "") -> None:
+                 validator: SQLValidator, sql_llm, sql_prompt: str = "",
+                 debug_logger=None) -> None:
         self._db_engine = db_engine
         self._semantic_index = semantic_index
         self._validator = validator
         self._sql_llm = sql_llm
         self._sql_prompt = sql_prompt
+        self._debug_logger = debug_logger
 
     def call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name not in self.KNOWN_TOOLS:
@@ -626,6 +653,7 @@ class ToolRegistry:
                     schema_hint=str(args.get("schema_hint", "")),
                     db_engine=self._db_engine,
                     sql_prompt_template=self._sql_prompt,
+                    _debug_logger=self._debug_logger,
                 )
 
             if name == "execute_sql":

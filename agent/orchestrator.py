@@ -3,10 +3,12 @@ Agent Orchestrator — the main reasoning loop.
 """
 
 import json
+import logging
 import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import create_engine, text as sql_text
@@ -22,6 +24,54 @@ from core.schema_introspector import introspect_schema
 from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT
 from agent.tools import ToolRegistry
 from agent.tool_dispatcher import parse_tool_call, dispatch
+
+
+# ---------------------------------------------------------------------------
+# Debug logger — enable with DEBUG_LLM=1 in environment or .env
+# Writes to debug_llm_YYYYMMDD_HHMMSS.log in the working directory
+# ---------------------------------------------------------------------------
+
+def _make_debug_logger() -> logging.Logger | None:
+    """Return a file logger if DEBUG_LLM=1, else None."""
+    if not os.getenv("DEBUG_LLM", "").strip() in ("1", "true", "yes"):
+        return None
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = f"debug_llm_{ts}.log"
+    logger = logging.getLogger(f"debug_llm_{ts}")
+    logger.setLevel(logging.DEBUG)
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    print(f"  [DEBUG_LLM] Logging to {log_path}")
+    return logger
+
+
+def _dbg(logger, section: str, content: str, iteration: int = 0):
+    """Write a labelled block to the debug log."""
+    if logger is None:
+        return
+    sep = "=" * 70
+    it = f" [iter {iteration}]" if iteration else ""
+    logger.debug(f"\n{sep}\n>>> {section}{it}\n{sep}\n{content}\n")
+
+
+def _detect_truncation(raw: str) -> str | None:
+    """
+    Return a warning string if the raw LLM output looks truncated.
+    Common signs: ends without closing braces, ends mid-string.
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return "EMPTY output"
+    open_b = stripped.count("{") - stripped.count("}")
+    open_q = stripped.count('"') % 2
+    if open_b > 0:
+        return f"TRUNCATED — {open_b} unclosed brace(s)"
+    if open_q:
+        return "TRUNCATED — odd number of quotes (mid-string cut)"
+    if not stripped.endswith(("}","}")):
+        return f"SUSPICIOUS — ends with: {repr(stripped[-30:])}"
+    return None
 
 
 @dataclass
@@ -150,9 +200,30 @@ class ConversationSession:
     def last_turn(self) -> Optional[ConversationTurn]:
         return self.turns[-1] if self.turns else None
 
-    def build_context_block(self) -> str:
+    def build_context_block(self, current_question: str = "") -> str:
         if not self.turns:
             return ""
+
+        # Detect if the current question is a fresh subject vs a follow-up.
+        # Only emit the entity CONTEXT line when the question has clear follow-up signals.
+        _FOLLOWUP_RE = re.compile(
+            r"\b(it|that|this|she|he|they|them|her|his|their|"
+            r"that\s+inspection|that\s+site|that\s+facility|that\s+form|"
+            r"the\s+same|the\s+above|from\s+there|more|rest|remaining|"
+            r"continue|next|previous|last\s+one)\b",
+            re.IGNORECASE,
+        )
+        _FRESH_SUBJECT_RE = re.compile(
+            r"\b(what|which|show|list|give|find|how\s+many|average|total|"
+            r"all\s+\w+|most\s+recent(?!ly)|most\s+common|latest)\b",
+            re.IGNORECASE,
+        )
+        is_followup = bool(_FOLLOWUP_RE.search(current_question))
+        is_clearly_fresh = (
+            bool(_FRESH_SUBJECT_RE.search(current_question))
+            and not is_followup
+        )
+
         lines = ["━━━ CONVERSATION HISTORY ━━━"]
         for i, t in enumerate(self.turns, 1):
             lines.append(f"Turn {i}:")
@@ -176,32 +247,35 @@ class ConversationSession:
                 lines.append(f"  ★ single-row result: {t.single_row_values}")
         lines.append("")
 
-        # Synthesise the most specific entity context from the last turn
-        last = self.turns[-1]
-        if last.inspection_ids and len(last.inspection_ids) == 1:
-            lines.append(
-                f"CONTEXT — The conversation is about inspection '{last.inspection_ids[0]}'."
-                f" When the user says 'that inspection', 'it', 'that site', 'she filled',"
-                f" 'he filled', 'they filled', 'that form' — use"
-                f" WHERE aa.inspection_id = '{last.inspection_ids[0]}'"
-                f" (or ir.inspection_id = '{last.inspection_ids[0]}') as an exact filter."
-                f" Do NOT filter by facility name or inspector name — use the inspection_id."
-            )
-        elif last.inspection_ids:
-            ids_str = ", ".join(f"'{i}'" for i in last.inspection_ids[:5])
-            lines.append(
-                f"CONTEXT — The conversation involves inspections: {ids_str}."
-                f" When the user references 'those inspections' or 'that data',"
-                f" filter by inspection_id IN ({ids_str})."
-            )
-        elif last.facility_names and len(last.facility_names) == 1:
-            lines.append(
-                f"CONTEXT — The conversation is about facility '{last.facility_names[0]}'."
-                f" If the user asks about 'that facility' or 'that site',"
-                f" filter by fac.name ILIKE '%{last.facility_names[0]}%'."
-            )
-        elif last.single_row_values:
-            lines.append(f"CONTEXT — Last query returned a single result: {last.single_row_values}")
+        # Only synthesise entity context for follow-up questions.
+        # For fresh subject queries ("list all Q&A from most recent form") never
+        # inject a facility/inspection filter — that's context pollution.
+        if not is_clearly_fresh:
+            last = self.turns[-1]
+            if last.inspection_ids and len(last.inspection_ids) == 1:
+                lines.append(
+                    f"CONTEXT — The conversation is about inspection '{last.inspection_ids[0]}'."
+                    f" When the user says 'that inspection', 'it', 'that site', 'she filled',"
+                    f" 'he filled', 'they filled', 'that form' — use"
+                    f" WHERE aa.inspection_id = '{last.inspection_ids[0]}'"
+                    f" (or ir.inspection_id = '{last.inspection_ids[0]}') as an exact filter."
+                    f" Do NOT filter by facility name or inspector name — use the inspection_id."
+                )
+            elif last.inspection_ids:
+                ids_str = ", ".join(f"'{i}'" for i in last.inspection_ids[:5])
+                lines.append(
+                    f"CONTEXT — The conversation involves inspections: {ids_str}."
+                    f" When the user references 'those inspections' or 'that data',"
+                    f" filter by inspection_id IN ({ids_str})."
+                )
+            elif last.facility_names and len(last.facility_names) == 1:
+                lines.append(
+                    f"CONTEXT — The conversation is about facility '{last.facility_names[0]}'."
+                    f" If the user asks about 'that facility' or 'that site',"
+                    f" filter by fac.name ILIKE '%{last.facility_names[0]}%'."
+                )
+            elif last.single_row_values:
+                lines.append(f"CONTEXT — Last query returned a single result: {last.single_row_values}")
 
         lines.append("")
         lines.append(
@@ -248,6 +322,15 @@ _CORRECTIVE_ACTION_RE = re.compile(
 _SCHEDULE_CYCLE_RE = re.compile(
     r'\b(schedule|inspection.?schedule|inspection.?cycle|cycle|'
     r'due.?date|schedule.?date|portfolio|inspector.?portfolio)\b',
+    re.IGNORECASE,
+)
+
+# Inspector count query — deepseek reliably generates hardcoded years for this pattern.
+# Auto-inject the exact working SQL template as schema_hint.
+_INSPECTOR_COUNT_RE = re.compile(
+    r'\b(which|who|top|most|count|how\s+many|list).{0,30}'
+    r'(inspector|inspectors?).{0,30}'
+    r'(most|conducted|done|most\s+inspections?|count|number|year)\b',
     re.IGNORECASE,
 )
 
@@ -298,8 +381,8 @@ class AgentOrchestrator:
 
         print(f"  Configuring reasoning LLM: {chat_model}...")
         self.reasoning_llm = Ollama(model=chat_model, base_url=ollama_url,
-            temperature=0.1, request_timeout=120.0,
-            additional_kwargs={"num_predict": 768, "num_ctx": 8192})  # 768 avoids truncation on longer thoughts
+            temperature=0.2, request_timeout=120.0,
+            additional_kwargs={"num_predict": 768, "num_ctx": 16384})
         print(f"  ✓ Reasoning LLM ({chat_model})")
 
         print(f"  Configuring SQL LLM: {sql_model}...")
@@ -307,12 +390,14 @@ class AgentOrchestrator:
             temperature=0.0, request_timeout=120.0,
             additional_kwargs={
                 "num_predict": 350,
-                "num_ctx": 8192,
+                "num_ctx": 16384,
                 "top_p": 0.9,
                 # Stop tokens prevent deepseek adding explanation text after SQL
                 "stop": [";", "[/SQL]", "This query", "Note:", "-- Note", "/*"],
             })
         print(f"  ✓ SQL LLM ({sql_model})")
+
+        self._debug = _make_debug_logger()
 
         self.registry = ToolRegistry(
             db_engine=self.db_engine,
@@ -320,12 +405,8 @@ class AgentOrchestrator:
             validator=self.validator,
             sql_llm=self.sql_llm,
             sql_prompt=self._sql_prompt,
+            debug_logger=self._debug,
         )
-
-        print(f"\n{'='*50}")
-        print(f"  AgentOrchestrator ready")
-        print(f"  Reasoning: {chat_model} | SQL: {sql_model}")
-        print(f"{'='*50}\n")
 
     # ------------------------------------------------------------------ #
     # Terminal tools — synthesize and return immediately on success
@@ -346,7 +427,7 @@ class AgentOrchestrator:
 
         system_content = self._system_prompt
         if session and session.turns:
-            system_content += "\n\n" + session.build_context_block()
+            system_content += "\n\n" + session.build_context_block(question)
 
         messages = [
             ChatMessage(role=MessageRole.SYSTEM, content=system_content),
@@ -389,72 +470,90 @@ class AgentOrchestrator:
             if is_pagination:
                 prev = session.last_turn
                 _emit({"_event": "thinking", "iteration": 1})
-                er = self.registry.call("execute_sql", {"sql": prev.sql})
-                s = AgentStep(1, "[auto] pagination", "execute_sql",
-                              {"sql": prev.sql}, er, 0)
-                steps.append(s); _emit(s)
-                if er.get("success"):
-                    ans = self._synthesize(question, "execute_sql", er, max_display_rows=100)
-                    stats.total_wall_ms = int((time.time() - query_start) * 1000)
-                    exec_data = er.get("result", {})
-                    if session is not None:
-                        session.add_turn(ConversationTurn(
-                            question=question, answer=ans[:300],
-                            tool_used="execute_sql", sql=prev.sql,
-                            total_count=exec_data.get("total_count", exec_data.get("row_count", 0)),
-                            columns=exec_data.get("columns", []),
-                        ))
-                    return AgentResult(question, ans, steps, 1, True, stats)
+
+                # Path A: last turn used execute_sql — re-run the SQL
+                if prev.sql:
+                    er = self.registry.call("execute_sql", {"sql": prev.sql})
+                    s = AgentStep(1, "[auto] pagination", "execute_sql",
+                                  {"sql": prev.sql}, er, 0)
+                    steps.append(s); _emit(s)
+                    if er.get("success"):
+                        ans = self._synthesize(question, "execute_sql", er, max_display_rows=100)
+                        stats.total_wall_ms = int((time.time() - query_start) * 1000)
+                        exec_data = er.get("result", {})
+                        if session is not None:
+                            session.add_turn(ConversationTurn(
+                                question=question, answer=ans[:300],
+                                tool_used="execute_sql", sql=prev.sql,
+                                total_count=exec_data.get("total_count", exec_data.get("row_count", 0)),
+                                columns=exec_data.get("columns", []),
+                            ))
+                        return AgentResult(question, ans, steps, 1, True, stats)
+
+                # Path B: last turn used get_answers — re-call it with same inspection_id
+                elif prev.tool_used == "get_answers" and prev.inspection_ids:
+                    insp_id = prev.inspection_ids[0]
+                    ga_args = {"inspection_id": insp_id, "limit": 500}
+                    er = self.registry.call("get_answers", ga_args)
+                    s = AgentStep(1, "[auto] pagination get_answers",
+                                  "get_answers", ga_args, er, 0)
+                    steps.append(s); _emit(s)
+                    if er.get("success"):
+                        ans = self._synthesize(question, "get_answers", er, max_display_rows=100)
+                        stats.total_wall_ms = int((time.time() - query_start) * 1000)
+                        if session is not None:
+                            session.add_turn(ConversationTurn(
+                                question=question, answer=ans[:300],
+                                tool_used="get_answers", sql="",
+                                inspection_ids=prev.inspection_ids,
+                            ))
+                        return AgentResult(question, ans, steps, 1, True, stats)
 
         for iteration in range(1, max_iterations + 1):
             t0 = time.time()
             _emit({"_event": "thinking", "iteration": iteration})
 
-            raw = self._call_llm(messages, stats)
+            raw = self._call_llm(messages, stats, iteration=iteration)
 
             try:
                 tc = parse_tool_call(raw)
             except ValueError as exc:
-                parse_fails = sum(1 for step in steps if step.tool == "[parse_error]")
-
-                # After 2 consecutive parse failures, hard-reset context.
-                # The model got confused by accumulated bad output — restart clean.
-                if parse_fails >= 2:
-                    messages = [
-                        ChatMessage(role=MessageRole.SYSTEM, content=self._system_prompt),
-                        ChatMessage(role=MessageRole.USER, content=(
-                            f"RESET after {parse_fails} JSON parse failures. "
-                            f"Answer this question with ONE valid JSON tool call only: {question}\n"
-                            f"Format: "
-                            f'{{"thought":"...", "tool":"generate_sql", "args":{{"question":"...","schema_hint":""}}}}'
-                        )),
-                    ]
-                else:
-                    messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
-                    messages.append(ChatMessage(role=MessageRole.USER, content=(
-                        f"ERROR: Your response was not valid JSON (attempt {parse_fails+1}).\n"
-                        f"You MUST respond with ONLY a JSON object — no prose, no explanation, "
-                        f"no markdown. The ONLY valid response format is:\n"
-                        f'  {{"thought": "brief reasoning", "tool": "<tool_name>", "args": {{...}}}}\n'
-                        f"Available tools: generate_sql, execute_sql, get_answers, get_answer_stats, "
-                        f"search_questions, list_forms, final_answer.\n"
-                        f"Example: "
-                        f'{{"thought": "Need SQL to answer this.", "tool": "generate_sql", '
-                        f'"args": {{"question": "{question[:60]}", "schema_hint": ""}}}}'
-                    )))
+                _dbg(self._debug, "PARSE ERROR — could not recover", str(exc), iteration)
+                messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
+                messages.append(ChatMessage(role=MessageRole.USER, content=
+                    f"Not valid JSON: {exc}\nRespond with ONLY a JSON tool call."))
                 s = AgentStep(iteration, "[parse error]", "[parse_error]",
                               {}, {"error": str(exc)}, int((time.time()-t0)*1000))
                 steps.append(s); _emit(s); continue
 
-            thought, tool, args = tc.get("thought", ""), tc["tool"], tc["args"]
+            # Log recovered tool call
+            _dbg(self._debug, "PARSED TOOL CALL",
+                 json.dumps(tc, default=str, indent=2), iteration)
 
-            # Auto-inject inspection schema hint for generate_sql
+            thought, tool, args = tc.get("thought", ""), tc["tool"], tc["args"]            # Auto-inject inspection schema hint for generate_sql
             if tool == "generate_sql":
                 existing = args.get("schema_hint", "")
                 insp_tables = _detect_inspection_tables(args.get("question", question))
                 if insp_tables:
                     hint = self.db_schema.for_schema_hint(insp_tables)
                     args["schema_hint"] = (existing + "\n" + hint) if existing else hint
+
+                # Auto-inject exact SQL template for inspector count queries —
+                # deepseek reliably generates hardcoded years for this pattern.
+                if _INSPECTOR_COUNT_RE.search(question):
+                    inspector_hint = (
+                        "\nUSE THIS EXACT PATTERN for inspector count queries:\n"
+                        "SELECT u.first_name || ' ' || u.last_name AS inspector_name,\n"
+                        "       COUNT(*) AS num_inspections\n"
+                        "FROM inspection_report ir\n"
+                        "JOIN users u ON ir.inspector_user_id = u.id\n"
+                        "WHERE ir.status != 'DRAFT'\n"
+                        "  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)\n"
+                        "GROUP BY u.first_name, u.last_name\n"
+                        "ORDER BY num_inspections DESC LIMIT 1;\n"
+                        "CRITICAL: NEVER write '= 2023' or '= 2026' — always use EXTRACT(YEAR FROM CURRENT_DATE)."
+                    )
+                    args["schema_hint"] = (args.get("schema_hint", "") + inspector_hint)
 
                 # Preserve explicit LIMIT from user question
                 limit_match = re.search(
@@ -848,13 +947,17 @@ class AgentOrchestrator:
             if rows and len(cols) == 2:
                 col_lower = [c.lower() for c in cols]
                 has_count = any(
-                    c in {"count", "total", "frequency"}
-                    or c.endswith("_count") for c in col_lower
+                    c in {"count", "total", "frequency", "improvement"}
+                    or c.endswith("_count")
+                    or c.startswith("num_")
+                    for c in col_lower
                 )
                 if has_count:
                     count_idx = next(
                         i for i, c in enumerate(col_lower)
-                        if c in {"count", "total", "frequency"} or c.endswith("_count")
+                        if c in {"count", "total", "frequency", "improvement"}
+                        or c.endswith("_count")
+                        or c.startswith("num_")
                     )
                     label_idx = 1 - count_idx
                     lines = []
@@ -888,14 +991,28 @@ class AgentOrchestrator:
                 else:
                     header = f"Found {len(rows)} result(s):"
 
-                # Detect constant-value columns (same value on every row) and
+                # Detect constant-value columns (same NON-NULL value on every row) and
                 # promote them to the header instead of repeating per row.
+                # Exclude columns where the single value is None/"" — those are just
+                # missing data (e.g. LAG() producing NULL previous_score) not true constants.
                 constant_cols = {}
+                _HIDE_COLS = {"element_id", "source_row_id", "source_table",
+                              "module_id", "facility_id", "project_id",
+                              "client_id", "inspector_user_id", "inspectee_user_id",
+                              "inspection_report_id", "question_id",
+                              "inspection_type_id", "inspection_sub_type_id",
+                              "cycle_id", "schedule_id", "entity_id"}
+                displayable_cols = [c for c in rows[0].keys() if c not in _HIDE_COLS]
                 if len(rows) > 1:
-                    for col in list(rows[0].keys()):
+                    for col in displayable_cols:
                         vals = {str(r.get(col)) for r in rows}
-                        if len(vals) == 1 and col not in ("inspection_id", "submitted_on"):
-                            constant_cols[col] = _clean_answer_text(str(rows[0].get(col) or ""))
+                        val_str = str(rows[0].get(col) or "")
+                        # Only promote if: same across all rows AND not empty/None AND
+                        # not a meaningful data column that happens to have one value
+                        if (len(vals) == 1
+                                and col not in ("inspection_id", "submitted_on")
+                                and val_str not in ("", "None", "N/A")):
+                            constant_cols[col] = _clean_answer_text(val_str)
                 if constant_cols:
                     const_str = ", ".join(f"{k}={v}" for k, v in constant_cols.items())
                     header += f" ({const_str})"
@@ -903,11 +1020,6 @@ class AgentOrchestrator:
                 lines = [header]
                 for i, row in enumerate(rows[:max_display_rows], 1):
                     parts = []
-                    # Columns to hide from display — internal IDs / raw UUIDs
-                    _HIDE_COLS = {"element_id", "source_row_id", "source_table",
-                                  "module_id", "facility_id", "project_id",
-                                  "client_id", "inspector_user_id", "inspectee_user_id",
-                                  "inspection_report_id", "question_id"}
                     for col, val in row.items():
                         if col in _HIDE_COLS:
                             continue
@@ -915,7 +1027,7 @@ class AgentOrchestrator:
                         if col in constant_cols:
                             continue
                         if val is None:
-                            if len(cols) <= 2:
+                            if len(displayable_cols) <= 2:
                                 parts.append(f"{col}: N/A")
                             continue
                         val_str = str(val)
@@ -1059,7 +1171,7 @@ class AgentOrchestrator:
             parts.append(f"Column '{cm.group(1)}' doesn't exist. Use get_schema to check columns.")
         return "\n".join(parts) + "\n" if parts else ""
 
-    def _call_llm(self, messages, stats=None):
+    def _call_llm(self, messages, stats=None, iteration=0):
         t0 = time.time()
         response = self.reasoning_llm.chat(messages)
         latency_ms = int((time.time() - t0) * 1000)
@@ -1070,6 +1182,15 @@ class AgentOrchestrator:
             raw = getattr(response, "raw", {}) or {}
             stats.total_prompt_tokens += raw.get("prompt_eval_count", 0)
             stats.total_completion_tokens += raw.get("eval_count", 0)
+
+        # Debug logging
+        if self._debug:
+            trunc = _detect_truncation(content)
+            trunc_note = f"\n⚠ {trunc}" if trunc else ""
+            _dbg(self._debug,
+                 f"LLAMA RAW OUTPUT [{latency_ms}ms]{trunc_note}",
+                 content, iteration)
+
         return content
 
     def _is_preparatory_result(self, question: str, exec_result: dict) -> bool:

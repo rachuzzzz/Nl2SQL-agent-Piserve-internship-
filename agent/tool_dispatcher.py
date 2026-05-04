@@ -14,6 +14,12 @@ import json
 import re
 from typing import Any
 
+try:
+    import json_repair
+    _HAS_JSON_REPAIR = True
+except ImportError:
+    _HAS_JSON_REPAIR = False
+
 from agent.tools import ToolRegistry
 
 
@@ -24,78 +30,121 @@ from agent.tools import ToolRegistry
 # Only "tool" is truly required — "args" defaults to {} when absent
 _REQUIRED_KEYS = {"tool"}
 
-# Patterns that LLMs wrap around their JSON output
+# Markdown fence stripper
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
-# Match the outermost {...} block (greedy — captures the longest valid object)
-_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+# Finds the first { and everything after — used to strip leading prose
+_FIRST_BRACE_RE = re.compile(r"\{", re.DOTALL)
+
+# Known tool names — used for regex fallback extraction
+_KNOWN_TOOLS = {
+    "list_forms", "semantic_search", "search_questions",
+    "get_answers", "get_answer_stats",
+    "generate_sql", "execute_sql", "get_schema",
+    "final_answer",
+}
+_TOOL_NAMES_PATTERN = "|".join(re.escape(t) for t in sorted(_KNOWN_TOOLS, key=len, reverse=True))
+_TOOL_RE = re.compile(
+    rf'"tool"\s*:\s*"({_TOOL_NAMES_PATTERN})"',
+    re.IGNORECASE,
+)
+
+
+def _try_parse(text: str, raw_output: str) -> dict[str, Any] | None:
+    """Try json.loads then json_repair on a candidate string. Returns None on failure."""
+    # Standard parse first — zero overhead when the model is well-behaved
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and "tool" in parsed:
+            return _validate_tool_call(parsed, raw_output)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # json_repair: handles truncated JSON, unquoted keys, real newlines in strings,
+    # single quotes, trailing commas, missing closing brackets — all common LLM bugs
+    if _HAS_JSON_REPAIR:
+        try:
+            repaired = json_repair.repair_json(text, return_objects=True)
+            # repair_json may return a list if it found multiple objects; take first dict with "tool"
+            candidates = repaired if isinstance(repaired, list) else [repaired]
+            for obj in candidates:
+                if isinstance(obj, dict) and "tool" in obj:
+                    return _validate_tool_call(obj, raw_output)
+        except Exception:
+            pass
+
+    return None
 
 
 def parse_tool_call(raw_output: str) -> dict[str, Any]:
     """
     Extract a tool-call JSON object from the reasoning LLM's raw text output.
 
-    Handles:
-      - Clean JSON (ideal case)
-      - JSON wrapped in ```json ... ``` fences
-      - JSON with preamble/trailing prose
-      - Nested JSON (finds the outermost {} block)
+    Strategy (in order of cost):
+      1. Strip markdown fences, try direct parse + json_repair on full text
+      2. Find the first '{' — strip leading prose — try parse + json_repair
+      3. Scan all '{' start positions, try each suffix with json_repair
+         (handles truncated JSON where the closing '}' is missing)
+      4. Regex fallback — extract "tool" and reconstruct minimal dict
 
-    Returns a dict with at least:
-      { "thought": str, "tool": str, "args": dict }
-
-    Raises ValueError with a descriptive message if no valid JSON is found
-    or if required keys are missing.
+    Returns a dict with at least { "thought": str, "tool": str, "args": dict }
+    Raises ValueError only if no tool name can be recovered at all.
     """
     if not raw_output or not raw_output.strip():
         raise ValueError("Empty output from reasoning LLM.")
 
     text = raw_output.strip()
 
-    # 1. Try to unwrap markdown fences first
+    # ── Step 1: strip markdown fences ────────────────────────────────────────
     fence_match = _FENCE_RE.search(text)
-    if fence_match:
-        text = fence_match.group(1).strip()
+    candidate = fence_match.group(1).strip() if fence_match else text
 
-    # 2. Try direct parse (ideal case — model output is clean JSON)
-    try:
-        parsed = json.loads(text)
-        return _validate_tool_call(parsed, raw_output)
-    except json.JSONDecodeError:
-        pass
+    result = _try_parse(candidate, raw_output)
+    if result:
+        return result
 
-    # 2b. Fix literal newlines inside JSON string values — LLMs often output
-    #     real newlines instead of \n escape sequences, which breaks json.loads
-    try:
-        fixed = text.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
-        parsed = json.loads(fixed)
-        return _validate_tool_call(parsed, raw_output)
-    except json.JSONDecodeError:
-        pass
+    # ── Step 2: strip leading prose (everything before first '{') ─────────────
+    brace_match = _FIRST_BRACE_RE.search(candidate)
+    if brace_match and brace_match.start() > 0:
+        from_brace = candidate[brace_match.start():]
+        result = _try_parse(from_brace, raw_output)
+        if result:
+            return result
 
-    # 3. Extract the outermost {...} block and retry
-    block_match = _JSON_BLOCK_RE.search(text)
-    if block_match:
-        candidate = block_match.group(0)
-        try:
-            parsed = json.loads(candidate)
-            return _validate_tool_call(parsed, raw_output)
-        except json.JSONDecodeError:
-            pass
+    # ── Step 3: try each '{' position as a start — handles trailing prose and
+    #           truncated JSON (json_repair closes open brackets/strings) ──────
+    for m in _FIRST_BRACE_RE.finditer(candidate):
+        suffix = candidate[m.start():]
+        result = _try_parse(suffix, raw_output)
+        if result:
+            return result
+        # Only scan first 5 '{' positions — avoid O(n) on deeply nested SQL
+        if m.start() > 500:
+            break
 
-    # 4. Last resort — walk through the text trying every possible JSON boundary
-    for start in range(len(text)):
-        if text[start] != "{":
-            continue
-        for end in range(len(text), start, -1):
-            if text[end - 1] != "}":
-                continue
+    # ── Step 4: regex fallback — if we can at least find the tool name, build
+    #           a minimal valid dict so the orchestrator can continue ──────────
+    tool_match = _TOOL_RE.search(raw_output)
+    if tool_match:
+        tool_name = tool_match.group(1)
+
+        # Try to recover args from whatever JSON fragment exists
+        args: dict = {}
+        if _HAS_JSON_REPAIR:
             try:
-                parsed = json.loads(text[start:end])
-                if isinstance(parsed, dict) and "tool" in parsed:
-                    return _validate_tool_call(parsed, raw_output)
-            except json.JSONDecodeError:
-                continue
+                repaired = json_repair.repair_json(raw_output, return_objects=True)
+                objs = repaired if isinstance(repaired, list) else [repaired]
+                for obj in objs:
+                    if isinstance(obj, dict):
+                        args = obj.get("args", {}) or {}
+                        break
+            except Exception:
+                pass
+
+        return _validate_tool_call(
+            {"thought": "[recovered]", "tool": tool_name, "args": args},
+            raw_output,
+        )
 
     raise ValueError(
         f"Could not extract a valid JSON tool call from model output.\n"
