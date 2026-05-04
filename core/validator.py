@@ -128,6 +128,42 @@ class SQLValidator:
                 "Use ai_answer table or the get_answers tool instead."
             )
 
+        # Block treating responsible/pending_with as UUID FKs to users table.
+        # These columns are plain string ENUMs ('CLIENT', 'OPEN', etc.) not foreign keys.
+        if re.search(r'\bjoin\s+users\b', sql_lower):
+            if re.search(r'\b(?:responsible|pending_with)\s*=\s*\w+\.id\b', sql_lower) or \
+               re.search(r'\bON\s+\w+\.(?:responsible|pending_with)\s*=', sql, re.IGNORECASE):
+                errors.append(
+                    "HALLUCINATION: 'responsible' and 'pending_with' are plain string ENUMs, "
+                    "NOT UUID foreign keys. Never JOIN them to users. "
+                    "Use: WHERE ica.responsible = 'CLIENT' (uppercase string literal only). "
+                    "Values: 'CLIENT', 'INTERNAL_OPERATIONS', 'SUB_CONTRACTOR'."
+                )
+
+        # Block hardcoded years — deepseek frequently writes YEAR = 2023 or YEAR = 2026.
+        # Always use EXTRACT(YEAR FROM CURRENT_DATE) for the current year.
+        _HARDCODED_YEAR_RE = re.compile(
+            r"\bextract\s*\(\s*year\s+from\s+\w[\w.]*\s*\)\s*=\s*(20\d\d)\b",
+            re.IGNORECASE,
+        )
+        for m in _HARDCODED_YEAR_RE.finditer(sql_lower):
+            year = m.group(1)
+            errors.append(
+                f"HARDCODED YEAR: '= {year}' must never be used. "
+                f"Always use: EXTRACT(YEAR FROM submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)"
+            )
+
+        # Block close_on arithmetic — this column is NULL for most records.
+        # Use status-based counting instead of date arithmetic on close_on.
+        if re.search(r'\bclose_on\s*[-+]\s*\w', sql_lower) or \
+           re.search(r'\bextract\s*\(.*\bclose_on\b', sql_lower):
+            errors.append(
+                "BLOCKED: Arithmetic on 'close_on' is unreliable — this column is NULL for most records. "
+                "Use status-based counting instead: "
+                "COUNT(*) FILTER (WHERE status IN ('CLOSED','CLOSE_WITH_DEFERRED')) "
+                "grouped by TO_CHAR(date_trunc('quarter', created_on), '\"Q\"Q YYYY')."
+            )
+
         # Warn about missing LIMIT
         has_agg = bool(re.search(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(", sql, re.IGNORECASE))
         if not has_agg and not re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
