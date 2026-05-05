@@ -1,0 +1,239 @@
+# ============================================================
+# Table Descriptions for LlamaIndex ObjectIndex
+# ============================================================
+# These descriptions help the embedding-based retriever pick
+# the right tables for each question. Be specific about what
+# each table stores and when to use it.
+# ============================================================
+
+# --- ALWAYS include these for label/title/name lookups ---
+
+fb_translation_json:
+  description: >
+    Stores ALL labels, titles, names, and descriptions for every form element
+    as a JSONB array in the 'translations' column. This is the ONLY place where
+    question labels, section titles, page names, and sub-form titles exist.
+    MUST be queried using jsonb_array_elements(tj.translations) AS elem.
+    JSONB keys are camelCase: language, attribute, elementId, entityType, translatedText.
+    language='eng', attribute='NAME' for labels, entityType='QUESTION'/'PAGE'/'SECTION'/'FORM'.
+  always_include_when: "user asks about question labels, section titles, page names, any text content"
+
+fb_forms:
+  description: >
+    Represents a specific form version within a module. Contains form name, active status,
+    languages array, status (DRAFT/PUBLISHED/DELETED), version number.
+    One of only two tables with a direct 'name' column. Linked to translations via translations_id.
+  always_include_when: "any question mentioning a form by name"
+
+fb_modules:
+  description: >
+    Stores form modules which group related forms (e.g., HR, Finance, Inspection).
+    Has a direct 'name' column. Supports parent-child hierarchy via parent_module_id.
+  always_include_when: "any question mentioning a module by name"
+
+# --- Core hierarchy ---
+
+fb_page:
+  description: >
+    Represents a page inside a form. Contains page_no for ordering.
+    Page titles/names are NOT in this table — they are in fb_translation_json.
+    Linked to forms via form_id.
+  always_include_when: "questions about pages, page count, page ordering"
+
+fb_form_builder_element:
+  description: >
+    Central polymorphic junction table. Represents any element placed on a form page.
+    Uses entity_type column ('QUESTION', 'SECTION', 'SUB_FORM', 'QUESTION_GROUP', 'MULTI_FIELD')
+    to determine which child table is referenced via question_id, section_id, sub_form_id, etc.
+    Only ONE FK is populated per row based on entity_type.
+    Contains insertion_order for display sequence.
+  always_include_when: "questions about form structure, element ordering, what's on a page"
+
+fb_question:
+  description: >
+    Stores question behavior settings: required, default_value, question_number, read_only_field.
+    Does NOT contain the question label/text — that is in fb_translation_json.
+  always_include_when: "questions about question properties, required fields"
+
+fb_section:
+  description: >
+    Represents a section grouping within a form page. Contains only insertion_order.
+    Section titles are NOT here — they are in fb_translation_json.
+
+fb_sub_form:
+  description: >
+    Represents a repeatable group of fields inside a form.
+    Contains insertion_order and required flag.
+    Sub-form titles are NOT here — they are in fb_translation_json.
+
+fb_question_group:
+  description: >
+    Groups related questions under a common heading.
+    Title stored in fb_translation_json.
+
+fb_multifield:
+  description: >
+    Composite question with one main labeled question and multiple child inputs.
+
+# --- Element configuration ---
+
+fb_form_element:
+  description: >
+    Defines how a question looks and behaves visually. Stores element_type
+    ('CHECK_BOX', 'DROP_DOWN', 'DATE_TIME', 'TEXT_BOX', etc).
+    Linked to fb_question via question_id. Gateway to appearance and validation tables.
+
+fb_form_element_appearance:
+  description: >
+    Base appearance settings for any form element. Linked via form_element_id.
+    Type-specific appearance tables (fb_check_box_appearance, etc.) share their PK with this table.
+
+fb_form_element_validation:
+  description: >
+    Base validation rules for any form element. Linked via form_element_id.
+    Type-specific validation tables (fb_check_box_validation, etc.) share their PK with this table.
+    JOIN pattern: fb_check_box_validation.id = fb_form_element_validation.id (shared PK, NOT form_element_id).
+
+# --- Type-specific tables (only include when that type is mentioned) ---
+
+fb_check_box_appearance:
+  description: "Checkbox display settings: display_options_in_column, selection_type. Shares PK with fb_form_element_appearance."
+fb_check_box_validation:
+  description: "Checkbox validation: maximum_selection, minimum_selection. Shares PK with fb_form_element_validation."
+fb_date_time_appearance:
+  description: "Date/time display: date_type, format, time_format. Shares PK with fb_form_element_appearance."
+fb_date_time_validation:
+  description: "Date/time validation: min_date, max_date, min_time, max_time. Shares PK with fb_form_element_validation."
+fb_drop_down_appearance:
+  description: "Dropdown display: selection_type. Shares PK with fb_form_element_appearance."
+fb_drop_down_validation:
+  description: "Dropdown validation: maximum_selection, minimum_selection. Shares PK with fb_form_element_validation."
+fb_number_appearance:
+  description: "Number field display: allow_negative_values, up_and_down_button."
+fb_number_validation:
+  description: "Number field validation: min, max values."
+fb_text_box_appearance:
+  description: "Text box display: bold, font, font_size, text_align, default_value."
+fb_text_box_validation:
+  description: "Text box validation: regex, validation_type."
+fb_text_area_appearance:
+  description: "Text area display: number_of_rows."
+fb_text_area_validation:
+  description: "Text area validation: count, limited_characters."
+fb_password_appearance:
+  description: "Password field display: confirm_password, display_strong, view_button."
+fb_password_validation:
+  description: "Password validation: min/max length, require uppercase/lowercase/numbers/special chars."
+fb_email_appearance:
+  description: "Email field display settings."
+fb_email_validation:
+  description: "Email validation: regex pattern."
+fb_mobile_appearance:
+  description: "Mobile number display: display_code, display_flag, show_country_name."
+fb_mobile_validation:
+  description: "Mobile validation: allowed/blocked countries, country_wise_validation."
+fb_file_picker_appearance:
+  description: "File upload display settings."
+fb_file_picker_validation:
+  description: "File upload validation: max_file_size, min_file_size, number_of_files."
+fb_signature_appearance:
+  description: "Signature field display: canvas_option."
+fb_signature_validation:
+  description: "Signature validation: max/min file size."
+fb_slider_appearance:
+  description: "Slider display: min_value, max_value, step_value, slider_color."
+fb_slider_validation:
+  description: "Slider validation settings."
+fb_toggle_switch_appearance:
+  description: "Toggle switch display: on/off labels, colors."
+fb_toggle_switch_validation:
+  description: "Toggle switch validation: button_colour."
+fb_radio_button_appearance:
+  description: "Radio button display: display_options_in_column, selection_type."
+fb_radio_button_validation:
+  description: "Radio button validation settings."
+fb_location_appearance:
+  description: "Location/map field: default_zoom_level, latitude, longitude, set_current_position."
+fb_location_validation:
+  description: "Location validation: region, region_boundary."
+fb_selection_matrix_appearance:
+  description: "Selection matrix display settings."
+fb_selection_matrix_validation:
+  description: "Selection matrix validation: min_selection_required."
+fb_rich_text_editor_appearance:
+  description: "Rich text editor display settings."
+fb_rich_text_editor_validation:
+  description: "Rich text editor validation settings."
+fb_url_appearance:
+  description: "URL field display: show_preview_button."
+fb_url_validation:
+  description: "URL validation settings."
+fb_terms_and_condition_appearance:
+  description: "Terms and conditions display: show_accept_button."
+fb_terms_and_condition_validation:
+  description: "Terms validation: prevent_from_proceeding_without_agree."
+fb_iframe_appearance:
+  description: "Iframe display: height, width."
+
+# --- Options system ---
+
+fb_element_option:
+  description: >
+    Defines how options are sourced for dropdowns, checkboxes, radio buttons.
+    option_type: 'CUSTOM', 'API', 'DATABASE', 'LOOKUP'.
+    Linked to fb_form_element via form_element_id.
+fb_element_option_custom:
+  description: "Custom static options: value, insertion_order. Linked to fb_element_option."
+fb_element_option_api:
+  description: "API-sourced options: url, label_field, value_field. Linked to fb_element_option."
+fb_element_option_database:
+  description: "Database-sourced options: table_name, label_field, value_field."
+fb_element_option_database_criteria:
+  description: "Filter criteria for database-sourced options."
+
+# --- Logic ---
+
+fb_logic:
+  description: "Conditional logic rules: show/hide elements based on parent question answer."
+fb_when_clause:
+  description: "Dynamic behavior rules linked to form_builder_element. When conditions are met, actions fire."
+fb_when_clause_conditions:
+  description: "Individual conditions: condition type, logic (AND/OR), value to match."
+fb_when_clause_actions:
+  description: "Actions to perform: SHOW, HIDE, REQUIRED, etc."
+fb_custom_element:
+  description: "Custom identifiers assigned to form elements for external system integration."
+
+# --- Integrations ---
+
+fb_webhooks_master:
+  description: "Module-level webhook definitions: url, request_type, webhook_name."
+fb_form_webhooks:
+  description: "Form-level webhook bindings: links a webhook to a specific form."
+fb_api_variables_master:
+  description: "API variable definitions for webhooks."
+fb_emitters:
+  description: "Event emitters: trigger_event, enable status, linked to forms and modules."
+
+# --- Configuration ---
+
+fb_form_configuration:
+  description: "Form settings: font, question numbering, save_automatically, recaptcha, navigation."
+fb_module_configuration:
+  description: "Module-level configuration settings."
+fb_lookup_table:
+  description: "Lookup tables: named reference data tables."
+fb_lookup_data:
+  description: "Lookup table entries: label, value, sorting_order."
+fb_scores:
+  description: "Scoring configuration for form elements: max_score, scoring_type."
+fb_grid:
+  description: "Grid layout linking: connects questions, sections, sub-forms to rows."
+fb_row:
+  description: "Row definitions within form pages."
+fb_row_json:
+  description: "JSON-based row layout: 12-column grid structure for visual element placement."
+fb_translations:
+  description: "Row-based translations (alternative to JSONB). Individual rows per translation with direct FKs to entities."
+fb_application_settings:
+  description: "Global application settings: key-value pairs."
