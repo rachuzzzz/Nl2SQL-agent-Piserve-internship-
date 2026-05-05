@@ -247,6 +247,35 @@ class SQLValidator:
         sql = re.sub(r"^[^\n;]*:\s*$", "", sql, flags=re.MULTILINE)
         sql = sql.strip()
 
+        # Auto-correct the common ICA→IR join mistake.
+        # deepseek generates ON ir.inspection_id = ica.inspection_id (varchar = UUID — type mismatch).
+        # The correct join is ON ica.inspection_id = ir.id (UUID FK = UUID PK).
+        # ir.inspection_id is the human-readable VARCHAR ('2026/04/ST001/INS001').
+        # ica.inspection_id is the UUID FK referencing inspection_report.id.
+        sql = re.sub(
+            r'\bir\.inspection_id\s*=\s*ica\.inspection_id\b',
+            'ica.inspection_id = ir.id',
+            sql, flags=re.IGNORECASE
+        )
+        sql = re.sub(
+            r'\bica\.inspection_id\s*=\s*ir\.inspection_id\b',
+            'ica.inspection_id = ir.id',
+            sql, flags=re.IGNORECASE
+        )
+        # Also handle CAST variants deepseek tries after repeated failures:
+        # CAST(ir.inspection_id AS TEXT) = ica.inspection_id
+        # ir.inspection_id::varchar(255) = ica.inspection_id
+        sql = re.sub(
+            r'CAST\s*\(\s*ir\.inspection_id\s+AS\s+\w+\s*\)\s*=\s*ica\.inspection_id\b',
+            'ica.inspection_id = ir.id',
+            sql, flags=re.IGNORECASE
+        )
+        sql = re.sub(
+            r'\bir\.inspection_id\s*::\s*\w+(?:\(\d+\))?\s*=\s*ica\.inspection_id\b',
+            'ica.inspection_id = ir.id',
+            sql, flags=re.IGNORECASE
+        )
+
         if "SELECT" in sql.upper():
             select_pos = sql.upper().find("SELECT")
             cte_match = re.search(r'\bWITH\s+(?:RECURSIVE\s+)?\w+\s+AS\s*\(', sql, re.IGNORECASE)
