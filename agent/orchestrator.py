@@ -146,45 +146,6 @@ def _has_uuid_leak(rows: list, columns: list) -> list[str]:
     return sorted(leaking)
 
 
-def _clean_answer_text(raw: str) -> str:
-    """
-    Clean up encoded answer_text values from the flat ai_answers table.
-
-    The form builder stores option answers as JSON arrays of "Label|uuid" strings,
-    e.g. '["High|42872e5f-...", "Medium|..."]'
-    This extracts just the human-readable labels, comma-joined.
-
-    Also cleans up single "Label|ENUM_VALUE" strings like "Internal Operations|INTERNAL_OPERATIONS".
-    """
-    if not raw:
-        return raw
-    import json as _json
-    stripped = raw.strip()
-
-    # Try to parse as JSON array
-    if stripped.startswith('['):
-        try:
-            items = _json.loads(stripped)
-            labels = []
-            for item in items:
-                if isinstance(item, str) and '|' in item:
-                    labels.append(item.split('|')[0].strip())
-                else:
-                    labels.append(str(item))
-            return ', '.join(labels) if labels else raw
-        except (_json.JSONDecodeError, Exception):
-            pass
-
-    # Single "Label|VALUE" format
-    if '|' in stripped and not stripped.startswith('{'):
-        parts = stripped.split('|')
-        # Only clean if the right side looks like an enum (all caps/underscores) or UUID
-        right = parts[-1].strip()
-        if right.replace('_', '').replace('-', '').isalnum() and            (right.isupper() or len(right) == 36):
-            return parts[0].strip()
-
-    return raw
-
 class ConversationSession:
     MAX_TURNS = 5
 
@@ -334,6 +295,26 @@ _INSPECTOR_COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Corrective action + facility/grouping queries — deepseek always generates
+# ON ir.inspection_id = ica.inspection_id (varchar=UUID type mismatch).
+# Correct join is ON ica.inspection_id = ir.id (UUID=UUID).
+_ICA_JOIN_RE = re.compile(
+    r'\b(corrective.?action|capex|opex).{0,50}'
+    r'(facility|client|inspector|type|count|by|group|breakdown)\b'
+    r'|\b(facility|client|inspector|type|breakdown).{0,50}'
+    r'(corrective.?action|capex|opex)\b',
+    re.IGNORECASE,
+)
+
+# Most-recent inspection query — llama3.1 sometimes routes through ai_answers
+# looking for "Inspection Facility" label, omitting ir.inspection_id from SELECT.
+# Inject direct inspection_report pattern so deepseek ignores the ai_answers hint.
+_MOST_RECENT_INSPECTION_RE = re.compile(
+    r'\b(most\s+recent|latest|last)\s+(inspection|site|facility|form)\b'
+    r'|\b(which|what)\s+(facility|site).{0,30}(most\s+recent|latest|last)\b',
+    re.IGNORECASE,
+)
+
 
 def _detect_inspection_tables(question: str) -> list:
     tables = []
@@ -366,9 +347,10 @@ class AgentOrchestrator:
         self._system_prompt = SYSTEM_PROMPT.replace(
             "{inspection_schema}", self.db_schema.for_system_prompt()
         )
-        self._sql_prompt = SQL_GENERATION_PROMPT.replace(
-            "{inspection_schema_sql}", self.db_schema.for_sql_prompt()
-        )
+        # {inspection_schema_sql} removed — injecting full DDL exceeded num_ctx:16384,
+        # causing Ollama to truncate the prompt from the front.
+        # Per-query schema context is injected via schema_hint (_detect_inspection_tables).
+        self._sql_prompt = SQL_GENERATION_PROMPT.replace("{inspection_schema_sql}", "")
 
         print(f"  Loading embedding model: {embedding_model}...")
         embed_model = HuggingFaceEmbedding(model_name=embedding_model)
@@ -442,7 +424,19 @@ class AgentOrchestrator:
         # ---- Pagination fast-path ----
         # Only fires when the question is PURELY about seeing more of the last result —
         # no new subject matter (no content words suggesting a different query).
-        if session and session.last_turn and session.last_turn.sql:
+        #
+        # Outer guard: fire when last turn has SQL (Path A) OR when last turn used
+        # get_answers with a stored inspection_id (Path B).  Previously the guard
+        # checked only session.last_turn.sql, which silently blocked Path B — the
+        # get_answers pagination path — because get_answers turns store no SQL.
+        _last = session.last_turn if session else None
+        _has_pageable = bool(
+            _last and (
+                _last.sql or
+                (_last.tool_used == "get_answers" and _last.inspection_ids)
+            )
+        )
+        if session and _last and _has_pageable:
             q_lower = question.lower().strip()
 
             _PAGINATION_ONLY_RE = re.compile(
@@ -530,14 +524,15 @@ class AgentOrchestrator:
             _dbg(self._debug, "PARSED TOOL CALL",
                  json.dumps(tc, default=str, indent=2), iteration)
 
-            thought, tool, args = tc.get("thought", ""), tc["tool"], tc["args"]            # Auto-inject inspection schema hint for generate_sql
-            if tool == "generate_sql":
-                existing = args.get("schema_hint", "")
-                insp_tables = _detect_inspection_tables(args.get("question", question))
-                if insp_tables:
-                    hint = self.db_schema.for_schema_hint(insp_tables)
-                    args["schema_hint"] = (existing + "\n" + hint) if existing else hint
+            thought, tool, args = tc.get("thought", ""), tc["tool"], tc["args"]
 
+            # Auto-inject targeted hints for generate_sql calls.
+            # NOTE: _detect_inspection_tables DDL injection intentionally removed —
+            # for_schema_hint() returns live DB columns (created_by, modified_by, active,
+            # subform_id etc.) that conflict with the simplified schema in the SQL prompt,
+            # causing deepseek to SELECT wrong columns. The SQL prompt's own schema
+            # definitions are sufficient.
+            if tool == "generate_sql":
                 # Auto-inject exact SQL template for inspector count queries —
                 # deepseek reliably generates hardcoded years for this pattern.
                 if _INSPECTOR_COUNT_RE.search(question):
@@ -554,6 +549,41 @@ class AgentOrchestrator:
                         "CRITICAL: NEVER write '= 2023' or '= 2026' — always use EXTRACT(YEAR FROM CURRENT_DATE)."
                     )
                     args["schema_hint"] = (args.get("schema_hint", "") + inspector_hint)
+
+                # Auto-inject correct ICA→IR join — deepseek always generates
+                # ON ir.inspection_id = ica.inspection_id (varchar=UUID mismatch).
+                # The correct join is ON ica.inspection_id = ir.id (UUID=UUID).
+                if _ICA_JOIN_RE.search(question):
+                    ica_hint = (
+                        "\nCRITICAL JOIN — inspection_corrective_action to inspection_report:\n"
+                        "  ica.inspection_id → UUID FK to inspection_report.id (UUID PK)\n"
+                        "  ir.inspection_id  → VARCHAR human-readable ('2026/04/ST001/INS001') — DIFFERENT\n"
+                        "  ALWAYS: JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id\n"
+                        "  NEVER:  ON ir.inspection_id = ica.inspection_id  ← varchar=UUID type mismatch\n"
+                        "Example:\n"
+                        "SELECT fac.name AS facility_name, COUNT(ica.id) AS open_count\n"
+                        "FROM inspection_report ir\n"
+                        "JOIN facility fac ON ir.facility_id = fac.id\n"
+                        "JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id\n"
+                        "WHERE ica.status = 'OPEN'\n"
+                        "GROUP BY fac.name ORDER BY open_count DESC;"
+                    )
+                    args["schema_hint"] = (args.get("schema_hint", "") + ica_hint)
+
+                # Auto-inject most-recent inspection template — llama3.1 sometimes
+                # routes through ai_answers (looking for "Inspection Facility" label),
+                # omitting ir.inspection_id from SELECT.  Force the direct pattern.
+                if _MOST_RECENT_INSPECTION_RE.search(question):
+                    recent_hint = (
+                        "\nDIRECT QUERY — do NOT route through ai_answers for this:\n"
+                        "SELECT ir.inspection_id, fac.name AS facility_name, ir.submitted_on, ir.status\n"
+                        "FROM inspection_report ir\n"
+                        "JOIN facility fac ON ir.facility_id = fac.id\n"
+                        "WHERE ir.status != 'DRAFT'\n"
+                        "ORDER BY ir.submitted_on DESC LIMIT 1;\n"
+                        "CRITICAL: always SELECT ir.inspection_id — needed for multi-turn follow-up."
+                    )
+                    args["schema_hint"] = (args.get("schema_hint", "") + recent_hint)
 
                 # Preserve explicit LIMIT from user question
                 limit_match = re.search(
@@ -772,6 +802,29 @@ class AgentOrchestrator:
             }
 
         if session is not None:
+            # MT-03 fix: if we have a facility name but no inspection_id (e.g. MT-01
+            # returned only facility_name without ir.inspection_id in SELECT), do a quick
+            # DB lookup so the follow-up turn can filter by inspection_id rather than
+            # falling back to the worked-example placeholder "INS-EXAMPLE-001".
+            if fac_names and not insp_ids and len(last_rows) <= 3:
+                try:
+                    fac_escaped = fac_names[0].replace("'", "''")
+                    _lookup = (
+                        "SELECT ir.inspection_id FROM inspection_report ir "
+                        "JOIN facility fac ON ir.facility_id = fac.id "
+                        f"WHERE fac.name ILIKE '%{fac_escaped}%' "
+                        "AND ir.status != 'DRAFT' "
+                        "ORDER BY ir.submitted_on DESC LIMIT 1;"
+                    )
+                    with self.db_engine.connect() as _conn:
+                        _row = _conn.execute(sql_text(_lookup)).fetchone()
+                    if _row and _row[0]:
+                        insp_ids = [str(_row[0])]
+                        _dbg(self._debug, "FINISH — inspection_id lookup",
+                             f"facility={fac_names[0]} → {insp_ids[0]}", 0)
+                except Exception:
+                    pass  # Silently skip — follow-up will have less context
+
             session.add_turn(ConversationTurn(
                 question=question,
                 answer=answer[:300],
@@ -862,7 +915,7 @@ class AgentOrchestrator:
                 raw_ans = row.get("answer_value") or row.get("answer_text") or ""
                 if not raw_ans and row.get("answer_numeric") is not None:
                     raw_ans = str(row["answer_numeric"])
-                ans_val = _clean_answer_text(raw_ans) if raw_ans else "N/A"
+                ans_val = raw_ans if raw_ans else "N/A"
                 # Skip rows with no answer (file attachments, empty fields)
                 if ans_val == "N/A" and row.get("score") is None:
                     continue
@@ -912,7 +965,7 @@ class AgentOrchestrator:
                 bheader = f"Most common values for '{q_filter}':" if q_filter else "Most common values:"
                 parts.append(bheader)
                 for item in breakdown[:10]:
-                    display_val = _clean_answer_text(str(item["value"])) if item["value"] else "N/A"
+                    display_val = str(item["value"]) if item["value"] else "N/A"
                     parts.append(f"  • {display_val}: {item['count']} time(s)")
 
             return "\n".join(parts) if parts else "No answer statistics found."
@@ -1012,7 +1065,7 @@ class AgentOrchestrator:
                         if (len(vals) == 1
                                 and col not in ("inspection_id", "submitted_on")
                                 and val_str not in ("", "None", "N/A")):
-                            constant_cols[col] = _clean_answer_text(val_str)
+                            constant_cols[col] = val_str
                 if constant_cols:
                     const_str = ", ".join(f"{k}={v}" for k, v in constant_cols.items())
                     header += f" ({const_str})"
@@ -1031,10 +1084,6 @@ class AgentOrchestrator:
                                 parts.append(f"{col}: N/A")
                             continue
                         val_str = str(val)
-                        # Clean encoded answer values like ["High|uuid"] on ANY column —
-                        # LLM may alias the column as risk_level, answer, value, etc.
-                        if isinstance(val, str):
-                            val_str = _clean_answer_text(val_str)
                         if len(val_str) > 100:
                             val_str = val_str[:97] + "..."
                         parts.append(f"{col}: {val_str}")

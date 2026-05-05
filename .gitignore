@@ -17,3 +17,9 @@ build/
 .claude/
 *.DS_Store
 Thumbs.db
+
+# Logs
+*.log
+
+# Evaluation outputs
+eval_results_*.json
