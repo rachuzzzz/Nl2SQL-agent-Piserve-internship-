@@ -1,5 +1,13 @@
 """
 Agent Orchestrator — the main reasoning loop.
+
+Changes vs original:
+  Problem 4 — SeedExampleIndex initialised from SEED_EXAMPLES and passed to
+              ToolRegistry so generate_sql() receives it for dynamic retrieval.
+
+  Problem 5 — _DEFERRED_CHAIN_RE added; when matched, the correct
+              CLOSE_WITH_DEFERRED SQL pattern is injected as schema_hint so
+              deepseek generates the right temporal chain query.
 """
 
 import json
@@ -18,10 +26,17 @@ from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-from core.semantic import SemanticQuestionIndex
+from core.business_rules import get_engine as _get_rules_engine
+from core.semantic import SemanticQuestionIndex, SeedExampleIndex
 from core.validator import SQLValidator
 from core.schema_introspector import introspect_schema
-from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT
+from agent.prompts import (
+    SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT, SEED_EXAMPLES
+)
+try:
+    from agent.prompts import SQL_GENERATION_PROMPT_SQLCODER
+except ImportError:
+    SQL_GENERATION_PROMPT_SQLCODER = SQL_GENERATION_PROMPT
 from agent.tools import ToolRegistry
 from agent.tool_dispatcher import parse_tool_call, dispatch
 
@@ -69,7 +84,7 @@ def _detect_truncation(raw: str) -> str | None:
         return f"TRUNCATED — {open_b} unclosed brace(s)"
     if open_q:
         return "TRUNCATED — odd number of quotes (mid-string cut)"
-    if not stripped.endswith(("}","}")):
+    if not stripped.endswith(("}", "}")):
         return f"SUSPICIOUS — ends with: {repr(stripped[-30:])}"
     return None
 
@@ -165,8 +180,6 @@ class ConversationSession:
         if not self.turns:
             return ""
 
-        # Detect if the current question is a fresh subject vs a follow-up.
-        # Only emit the entity CONTEXT line when the question has clear follow-up signals.
         _FOLLOWUP_RE = re.compile(
             r"\b(it|that|this|she|he|they|them|her|his|their|"
             r"that\s+inspection|that\s+site|that\s+facility|that\s+form|"
@@ -197,7 +210,6 @@ class ConversationSession:
                 lines.append(f"  Total rows: {t.total_count}")
             if t.columns:
                 lines.append(f"  Columns: {t.columns}")
-            # Surface extracted entities so the LLM can use them as exact filters
             if t.inspection_ids:
                 lines.append(f"  ★ inspection_id(s) from this result: {t.inspection_ids[:5]}")
             if t.facility_names:
@@ -208,32 +220,41 @@ class ConversationSession:
                 lines.append(f"  ★ single-row result: {t.single_row_values}")
         lines.append("")
 
-        # Only synthesise entity context for follow-up questions.
-        # For fresh subject queries ("list all Q&A from most recent form") never
-        # inject a facility/inspection filter — that's context pollution.
         if not is_clearly_fresh:
             last = self.turns[-1]
-            if last.inspection_ids and len(last.inspection_ids) == 1:
+            # Look back through all recent turns — not just the last one.
+            # MT-01 may have stored the inspection_id, but MT-02 only returned inspector_name,
+            # which clears the per-turn inspection_id. Without this look-back, MT-03 loses context.
+            _insp_turn = next(
+                (t for t in reversed(self.turns) if t.inspection_ids),
+                None
+            )
+            _fac_turn = next(
+                (t for t in reversed(self.turns) if t.facility_names),
+                None
+            )
+
+            if _insp_turn and len(_insp_turn.inspection_ids) == 1:
                 lines.append(
-                    f"CONTEXT — The conversation is about inspection '{last.inspection_ids[0]}'."
+                    f"CONTEXT — The conversation is about inspection '{_insp_turn.inspection_ids[0]}'."
                     f" When the user says 'that inspection', 'it', 'that site', 'she filled',"
                     f" 'he filled', 'they filled', 'that form' — use"
-                    f" WHERE aa.inspection_id = '{last.inspection_ids[0]}'"
-                    f" (or ir.inspection_id = '{last.inspection_ids[0]}') as an exact filter."
+                    f" WHERE aa.inspection_id = '{_insp_turn.inspection_ids[0]}'"
+                    f" (or ir.inspection_id = '{_insp_turn.inspection_ids[0]}') as an exact filter."
                     f" Do NOT filter by facility name or inspector name — use the inspection_id."
                 )
-            elif last.inspection_ids:
-                ids_str = ", ".join(f"'{i}'" for i in last.inspection_ids[:5])
+            elif _insp_turn and _insp_turn.inspection_ids:
+                ids_str = ", ".join(f"'{i}'" for i in _insp_turn.inspection_ids[:5])
                 lines.append(
                     f"CONTEXT — The conversation involves inspections: {ids_str}."
                     f" When the user references 'those inspections' or 'that data',"
                     f" filter by inspection_id IN ({ids_str})."
                 )
-            elif last.facility_names and len(last.facility_names) == 1:
+            elif _fac_turn and len(_fac_turn.facility_names) == 1:
                 lines.append(
-                    f"CONTEXT — The conversation is about facility '{last.facility_names[0]}'."
+                    f"CONTEXT — The conversation is about facility '{_fac_turn.facility_names[0]}'."
                     f" If the user asks about 'that facility' or 'that site',"
-                    f" filter by fac.name ILIKE '%{last.facility_names[0]}%'."
+                    f" filter by fac.name ILIKE '%{_fac_turn.facility_names[0]}%'."
                 )
             elif last.single_row_values:
                 lines.append(f"CONTEXT — Last query returned a single result: {last.single_row_values}")
@@ -286,8 +307,15 @@ _SCHEDULE_CYCLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Problem 5: deferred / recurring action chain queries
+_DEFERRED_CHAIN_RE = re.compile(
+    r'\b(deferred|recurring|recur|carried.?forward|repeated.?finding|'
+    r'same.?issue|chronic|persistent|repeat.?observation|'
+    r'close.?with.?deferred|multiple.?cycles?)\b',
+    re.IGNORECASE,
+)
+
 # Inspector count query — deepseek reliably generates hardcoded years for this pattern.
-# Auto-inject the exact working SQL template as schema_hint.
 _INSPECTOR_COUNT_RE = re.compile(
     r'\b(which|who|top|most|count|how\s+many|list).{0,30}'
     r'(inspector|inspectors?).{0,30}'
@@ -295,9 +323,17 @@ _INSPECTOR_COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Corrective action + facility/grouping queries — deepseek always generates
-# ON ir.inspection_id = ica.inspection_id (varchar=UUID type mismatch).
-# Correct join is ON ica.inspection_id = ir.id (UUID=UUID).
+# Percentage of inspections with corrective action — DeepSeek always fails this.
+# Inject exact working SQL as schema_hint.
+_PCT_WITH_CA_RE = re.compile(
+    r'\b(percentage|percent|pct|proportion|ratio).{0,40}'
+    r'(corrective.?action|mitigative|finding)\b'
+    r'|\b(corrective.?action|mitigative|finding).{0,40}'
+    r'(percentage|percent|pct|proportion|ratio)\b',
+    re.IGNORECASE,
+)
+
+# Corrective action + facility/grouping queries
 _ICA_JOIN_RE = re.compile(
     r'\b(corrective.?action|capex|opex).{0,50}'
     r'(facility|client|inspector|type|count|by|group|breakdown)\b'
@@ -306,9 +342,7 @@ _ICA_JOIN_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Most-recent inspection query — llama3.1 sometimes routes through ai_answers
-# looking for "Inspection Facility" label, omitting ir.inspection_id from SELECT.
-# Inject direct inspection_report pattern so deepseek ignores the ai_answers hint.
+# Most-recent inspection query
 _MOST_RECENT_INSPECTION_RE = re.compile(
     r'\b(most\s+recent|latest|last)\s+(inspection|site|facility|form)\b'
     r'|\b(which|what)\s+(facility|site).{0,30}(most\s+recent|latest|last)\b',
@@ -347,10 +381,11 @@ class AgentOrchestrator:
         self._system_prompt = SYSTEM_PROMPT.replace(
             "{inspection_schema}", self.db_schema.for_system_prompt()
         )
-        # {inspection_schema_sql} removed — injecting full DDL exceeded num_ctx:16384,
-        # causing Ollama to truncate the prompt from the front.
-        # Per-query schema context is injected via schema_hint (_detect_inspection_tables).
-        self._sql_prompt = SQL_GENERATION_PROMPT.replace("{inspection_schema_sql}", "")
+        # Pick SQL prompt based on model — SQLCoder uses native DDL schema format,
+        # generic deepseek uses the instruction-heavy prose format.
+        _is_sqlcoder = "sqlcoder" in sql_model.lower()
+        base_sql_prompt = SQL_GENERATION_PROMPT_SQLCODER if _is_sqlcoder else SQL_GENERATION_PROMPT
+        self._sql_prompt = base_sql_prompt.replace("{inspection_schema_sql}", "")
 
         print(f"  Loading embedding model: {embedding_model}...")
         embed_model = HuggingFaceEmbedding(model_name=embedding_model)
@@ -360,6 +395,10 @@ class AgentOrchestrator:
         self.semantic_index = SemanticQuestionIndex(
             db_engine=self.db_engine, embed_model=embed_model)
         self.validator = SQLValidator()
+
+        # Problem 4: initialise seed example index from SEED_EXAMPLES in prompts.py
+        print(f"  Initialising seed example index ({len(SEED_EXAMPLES)} examples)...")
+        self.seed_index = SeedExampleIndex(embed_model=embed_model, examples=SEED_EXAMPLES)
 
         print(f"  Configuring reasoning LLM: {chat_model}...")
         self.reasoning_llm = Ollama(model=chat_model, base_url=ollama_url,
@@ -374,7 +413,6 @@ class AgentOrchestrator:
                 "num_predict": 350,
                 "num_ctx": 16384,
                 "top_p": 0.9,
-                # Stop tokens prevent deepseek adding explanation text after SQL
                 "stop": [";", "[/SQL]", "This query", "Note:", "-- Note", "/*"],
             })
         print(f"  ✓ SQL LLM ({sql_model})")
@@ -387,6 +425,7 @@ class AgentOrchestrator:
             validator=self.validator,
             sql_llm=self.sql_llm,
             sql_prompt=self._sql_prompt,
+            seed_index=self.seed_index,   # Problem 4: pass seed index
             debug_logger=self._debug,
         )
 
@@ -422,13 +461,6 @@ class AgentOrchestrator:
         _last_columns = []
 
         # ---- Pagination fast-path ----
-        # Only fires when the question is PURELY about seeing more of the last result —
-        # no new subject matter (no content words suggesting a different query).
-        #
-        # Outer guard: fire when last turn has SQL (Path A) OR when last turn used
-        # get_answers with a stored inspection_id (Path B).  Previously the guard
-        # checked only session.last_turn.sql, which silently blocked Path B — the
-        # get_answers pagination path — because get_answers turns store no SQL.
         _last = session.last_turn if session else None
         _has_pageable = bool(
             _last and (
@@ -446,7 +478,7 @@ class AgentOrchestrator:
                 r'continue|next\s+page|next\s+batch|'
                 r'rest\s+of\s+(it|them|the\s+results?)?|'
                 r'show\s+all\s*$|list\s+all\s*$|'
-                r'remaining\s+(ones?|results?|rows?)?)'
+                r'remaining\s+(ones?|results?|rows?)?)' 
                 r'\s*[.!?]?\s*$',
                 re.IGNORECASE,
             )
@@ -520,72 +552,21 @@ class AgentOrchestrator:
                               {}, {"error": str(exc)}, int((time.time()-t0)*1000))
                 steps.append(s); _emit(s); continue
 
-            # Log recovered tool call
             _dbg(self._debug, "PARSED TOOL CALL",
                  json.dumps(tc, default=str, indent=2), iteration)
 
             thought, tool, args = tc.get("thought", ""), tc["tool"], tc["args"]
 
             # Auto-inject targeted hints for generate_sql calls.
-            # NOTE: _detect_inspection_tables DDL injection intentionally removed —
-            # for_schema_hint() returns live DB columns (created_by, modified_by, active,
-            # subform_id etc.) that conflict with the simplified schema in the SQL prompt,
-            # causing deepseek to SELECT wrong columns. The SQL prompt's own schema
-            # definitions are sufficient.
+            # All domain-specific patterns now live in business_rules.REGISTRY (INJECT rules).
+            # The engine matches the question and returns combined hints in priority order.
             if tool == "generate_sql":
-                # Auto-inject exact SQL template for inspector count queries —
-                # deepseek reliably generates hardcoded years for this pattern.
-                if _INSPECTOR_COUNT_RE.search(question):
-                    inspector_hint = (
-                        "\nUSE THIS EXACT PATTERN for inspector count queries:\n"
-                        "SELECT u.first_name || ' ' || u.last_name AS inspector_name,\n"
-                        "       COUNT(*) AS num_inspections\n"
-                        "FROM inspection_report ir\n"
-                        "JOIN users u ON ir.inspector_user_id = u.id\n"
-                        "WHERE ir.status != 'DRAFT'\n"
-                        "  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)\n"
-                        "GROUP BY u.first_name, u.last_name\n"
-                        "ORDER BY num_inspections DESC LIMIT 1;\n"
-                        "CRITICAL: NEVER write '= 2023' or '= 2026' — always use EXTRACT(YEAR FROM CURRENT_DATE)."
-                    )
-                    args["schema_hint"] = (args.get("schema_hint", "") + inspector_hint)
+                registry_hint = _get_rules_engine().hint_for_question(question)
+                if registry_hint:
+                    args["schema_hint"] = registry_hint + args.get("schema_hint", "")
 
-                # Auto-inject correct ICA→IR join — deepseek always generates
-                # ON ir.inspection_id = ica.inspection_id (varchar=UUID mismatch).
-                # The correct join is ON ica.inspection_id = ir.id (UUID=UUID).
-                if _ICA_JOIN_RE.search(question):
-                    ica_hint = (
-                        "\nCRITICAL JOIN — inspection_corrective_action to inspection_report:\n"
-                        "  ica.inspection_id → UUID FK to inspection_report.id (UUID PK)\n"
-                        "  ir.inspection_id  → VARCHAR human-readable ('2026/04/ST001/INS001') — DIFFERENT\n"
-                        "  ALWAYS: JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id\n"
-                        "  NEVER:  ON ir.inspection_id = ica.inspection_id  ← varchar=UUID type mismatch\n"
-                        "Example:\n"
-                        "SELECT fac.name AS facility_name, COUNT(ica.id) AS open_count\n"
-                        "FROM inspection_report ir\n"
-                        "JOIN facility fac ON ir.facility_id = fac.id\n"
-                        "JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id\n"
-                        "WHERE ica.status = 'OPEN'\n"
-                        "GROUP BY fac.name ORDER BY open_count DESC;"
-                    )
-                    args["schema_hint"] = (args.get("schema_hint", "") + ica_hint)
-
-                # Auto-inject most-recent inspection template — llama3.1 sometimes
-                # routes through ai_answers (looking for "Inspection Facility" label),
-                # omitting ir.inspection_id from SELECT.  Force the direct pattern.
-                if _MOST_RECENT_INSPECTION_RE.search(question):
-                    recent_hint = (
-                        "\nDIRECT QUERY — do NOT route through ai_answers for this:\n"
-                        "SELECT ir.inspection_id, fac.name AS facility_name, ir.submitted_on, ir.status\n"
-                        "FROM inspection_report ir\n"
-                        "JOIN facility fac ON ir.facility_id = fac.id\n"
-                        "WHERE ir.status != 'DRAFT'\n"
-                        "ORDER BY ir.submitted_on DESC LIMIT 1;\n"
-                        "CRITICAL: always SELECT ir.inspection_id — needed for multi-turn follow-up."
-                    )
-                    args["schema_hint"] = (args.get("schema_hint", "") + recent_hint)
-
-                # Preserve explicit LIMIT from user question
+                # Preserve explicit LIMIT from user question — kept here because it
+                # requires parsing a number from the question, not just pattern matching.
                 limit_match = re.search(
                     r'\b(?:last|top|first|recent|latest)\s+(\d+)\b', question, re.IGNORECASE
                 ) or re.search(
@@ -612,7 +593,7 @@ class AgentOrchestrator:
                         question=question, answer=ans[:300],
                         tool_used="final_answer", sql=_last_sql,
                         total_count=_last_total_count, columns=_last_columns,
-                    ))  # Entity extraction happens in _finish for SQL-path turns
+                    ))
                 return AgentResult(question, ans, steps, iteration, True, stats)
 
             result = dispatch(tc, self.registry)
@@ -706,7 +687,7 @@ class AgentOrchestrator:
             session.add_turn(ConversationTurn(
                 question=question, answer=ans[:300], tool_used="forced_summary",
                 sql=_last_sql, total_count=_last_total_count, columns=_last_columns,
-            ))  # Note: entity extraction not available in forced-summary path
+            ))
         return AgentResult(question, ans, steps, max_iterations, False, stats)
 
     def test_connection(self):
@@ -765,7 +746,6 @@ class AgentOrchestrator:
                 last_rows = data.get("rows", [])
                 break
 
-        # Also check get_answers tool results
         if not last_rows:
             for step in reversed(steps):
                 if step.tool == "get_answers" and step.result.get("success"):
@@ -774,7 +754,6 @@ class AgentOrchestrator:
                         last_rows = data.get("rows", [])
                     break
 
-        # Extract key entities from result rows for follow-up context
         insp_ids, fac_names, insp_names = [], [], []
         single_row_vals = {}
 
@@ -794,7 +773,6 @@ class AgentOrchestrator:
                 if v and str(v) not in insp_names:
                     insp_names.append(str(v))
 
-        # If only 1 row, store all values for maximum context
         if len(last_rows) == 1 and last_rows[0]:
             single_row_vals = {
                 k: str(v) for k, v in last_rows[0].items()
@@ -802,10 +780,6 @@ class AgentOrchestrator:
             }
 
         if session is not None:
-            # MT-03 fix: if we have a facility name but no inspection_id (e.g. MT-01
-            # returned only facility_name without ir.inspection_id in SELECT), do a quick
-            # DB lookup so the follow-up turn can filter by inspection_id rather than
-            # falling back to the worked-example placeholder "INS-EXAMPLE-001".
             if fac_names and not insp_ids and len(last_rows) <= 3:
                 try:
                     fac_escaped = fac_names[0].replace("'", "''")
@@ -823,7 +797,7 @@ class AgentOrchestrator:
                         _dbg(self._debug, "FINISH — inspection_id lookup",
                              f"facility={fac_names[0]} → {insp_ids[0]}", 0)
                 except Exception:
-                    pass  # Silently skip — follow-up will have less context
+                    pass
 
             session.add_turn(ConversationTurn(
                 question=question,
@@ -853,7 +827,6 @@ class AgentOrchestrator:
         data = tool_result.get("result", {})
         q_lower = question.lower()
 
-        # ---- list_forms ----
         if tool_name == "list_forms" and isinstance(data, list):
             if self._COUNT_RE.search(q_lower):
                 return f"There are {len(data)} forms."
@@ -866,7 +839,6 @@ class AgentOrchestrator:
                 lines.append(f"{i}. {name} ({qcount} questions)")
             return "\n".join(lines)
 
-        # ---- semantic_search ----
         if tool_name == "semantic_search" and isinstance(data, list):
             if not data:
                 return "No questions found matching that topic."
@@ -878,7 +850,6 @@ class AgentOrchestrator:
                 lines.append(f"  {i}. \"{m.get('question_label', m.get('label','?'))}\" (form: {m['form_name']}, score: {m['score']})")
             return "\n".join(lines)
 
-        # ---- search_questions ----
         if tool_name == "search_questions" and isinstance(data, list):
             if not data:
                 return "No matching questions found."
@@ -893,7 +864,6 @@ class AgentOrchestrator:
                 lines.append(f"  {i}. {label}{suffix} — form: {form}")
             return "\n".join(lines)
 
-        # ---- get_answers ----
         if tool_name == "get_answers" and isinstance(data, dict):
             rows = data.get("rows", [])
             truncated = data.get("truncated", False)
@@ -916,7 +886,6 @@ class AgentOrchestrator:
                 if not raw_ans and row.get("answer_numeric") is not None:
                     raw_ans = str(row["answer_numeric"])
                 ans_val = raw_ans if raw_ans else "N/A"
-                # Skip rows with no answer (file attachments, empty fields)
                 if ans_val == "N/A" and row.get("score") is None:
                     continue
                 insp = row.get("inspection_id", "")
@@ -934,7 +903,6 @@ class AgentOrchestrator:
                 lines.append(f"  (Total matching: {total_count})")
             return "\n".join(lines)
 
-        # ---- get_answer_stats ----
         if tool_name == "get_answer_stats" and isinstance(data, dict):
             avg = data.get("average_value")
             total = data.get("total_answers", 0)
@@ -970,16 +938,12 @@ class AgentOrchestrator:
 
             return "\n".join(parts) if parts else "No answer statistics found."
 
-
-
-        # ---- execute_sql ----
         if tool_name == "execute_sql" and isinstance(data, dict):
             rows = data.get("rows", [])
             cols = data.get("columns", [])
             truncated = data.get("truncated", False)
             total_count = data.get("total_count", len(rows))
 
-            # Single-row aggregate
             if len(rows) == 1 and len(cols) <= 3:
                 agg_names = {
                     "count", "total", "avg", "sum", "min", "max",
@@ -996,7 +960,6 @@ class AgentOrchestrator:
                 if is_agg:
                     return "; ".join(f"{col}: {val}" for col, val in rows[0].items())
 
-            # Two-column group-by
             if rows and len(cols) == 2:
                 col_lower = [c.lower() for c in cols]
                 has_count = any(
@@ -1022,10 +985,7 @@ class AgentOrchestrator:
                         header += f", showing first {len(rows)} of {total_count}"
                     return header + "):\n" + "\n".join(lines)
 
-            # General multi-row
             if rows:
-                # Check for UUID leaks in name columns before displaying.
-                # If detected, return an error that triggers the LLM to fix the JOIN.
                 uuid_leaking = _has_uuid_leak(rows, cols)
                 if uuid_leaking:
                     return (
@@ -1044,10 +1004,6 @@ class AgentOrchestrator:
                 else:
                     header = f"Found {len(rows)} result(s):"
 
-                # Detect constant-value columns (same NON-NULL value on every row) and
-                # promote them to the header instead of repeating per row.
-                # Exclude columns where the single value is None/"" — those are just
-                # missing data (e.g. LAG() producing NULL previous_score) not true constants.
                 constant_cols = {}
                 _HIDE_COLS = {"element_id", "source_row_id", "source_table",
                               "module_id", "facility_id", "project_id",
@@ -1060,8 +1016,6 @@ class AgentOrchestrator:
                     for col in displayable_cols:
                         vals = {str(r.get(col)) for r in rows}
                         val_str = str(rows[0].get(col) or "")
-                        # Only promote if: same across all rows AND not empty/None AND
-                        # not a meaningful data column that happens to have one value
                         if (len(vals) == 1
                                 and col not in ("inspection_id", "submitted_on")
                                 and val_str not in ("", "None", "N/A")):
@@ -1076,7 +1030,6 @@ class AgentOrchestrator:
                     for col, val in row.items():
                         if col in _HIDE_COLS:
                             continue
-                        # Skip columns promoted to header (constant across all rows)
                         if col in constant_cols:
                             continue
                         if val is None:
@@ -1156,7 +1109,6 @@ class AgentOrchestrator:
 
             return f"Tool '{tool_name}' failed: {error}. Try a different approach."
 
-        # Successful non-terminal results
         if tool_name == "semantic_search":
             data = tool_result.get("result", [])
             if data:
@@ -1232,7 +1184,6 @@ class AgentOrchestrator:
             stats.total_prompt_tokens += raw.get("prompt_eval_count", 0)
             stats.total_completion_tokens += raw.get("eval_count", 0)
 
-        # Debug logging
         if self._debug:
             trunc = _detect_truncation(content)
             trunc_note = f"\n⚠ {trunc}" if trunc else ""
@@ -1251,13 +1202,11 @@ class AgentOrchestrator:
         wants_content = bool(re.search(
             r'\b(question|label|answer|response|what.*in)\b', q_lower))
         has_content = any(c in columns for c in [
-            # Actual DB column names
             "label", "answer_text", "answer_numeric",
             "inspection_score", "gp_score", "total_inspection_hours",
             "cause", "correction", "corrective_action", "responsible",
             "status", "progress_stage", "capex", "opex",
             "target_close_out_date", "schedule_date", "due_date",
-            # Common SQL aliases the LLM uses
             "question", "answer", "question_label", "answer_value",
             "observation", "finding", "score", "risk_level",
             "inspector_name", "facility_name", "inspection_type_name",
