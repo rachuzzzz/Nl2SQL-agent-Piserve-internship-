@@ -7,6 +7,12 @@ This file only exposes tools that work with those flat tables + inspection_* tab
 
 Tool return contract:
   Every tool returns {"success": bool, "result": <any>, "error": str | None}
+
+Problem 4 fix:
+  generate_sql() now accepts a seed_index (SeedExampleIndex) parameter.
+  When present, the top 3-4 most relevant seed examples are retrieved by cosine
+  similarity and injected into the {seed_examples} placeholder in the SQL prompt,
+  replacing the previous approach of injecting all 26 static patterns unconditionally.
 """
 
 import re
@@ -15,7 +21,7 @@ from typing import Any, Optional
 from sqlalchemy import inspect as sa_inspect, text as sql_text
 from sqlalchemy.engine import Engine
 
-from core.semantic import SemanticQuestionIndex
+from core.semantic import SemanticQuestionIndex, SeedExampleIndex
 from core.validator import SQLValidator
 
 
@@ -289,10 +295,6 @@ def get_answer_stats(
 
         where = " AND ".join(filters)
 
-        # Numeric stats — aggregates over answer_numeric (for text-entered numbers)
-        # AND over score (for questions with scoring config from the form builder).
-        # answer_numeric: NULL for dropdowns (Risk Level, Impact etc.) — use score instead.
-        # score: populated by migration backfill for scored questions only.
         num_sql = sql_text(f"""
             SELECT COUNT(*)               AS total_answers,
                    AVG(aa.answer_numeric) AS avg_answer_numeric,
@@ -311,7 +313,6 @@ def get_answer_stats(
               )
         """)
 
-        # Categorical breakdown — use answer_text
         cat_sql = sql_text(f"""
             SELECT aa.answer_text, COUNT(*) AS frequency
             FROM ai_answers aa
@@ -325,9 +326,6 @@ def get_answer_stats(
         """)
 
         with db_engine.connect() as conn:
-            # Only run numeric aggregation when filtered to a specific question.
-            # Even then, skip if the question label suggests text answers
-            # (observations, regulations, actions, notes, descriptions).
             _TEXT_QUESTION_HINTS = (
                 "observation", "regulation", "action", "recommend",
                 "comment", "note", "description", "identifier", "name",
@@ -354,14 +352,12 @@ def get_answer_stats(
             avg_sc = mn_sc = mx_sc = None
             scored_count = 0
 
-        # Prefer score stats when available (scored questions like Risk Level, Impact)
-        # Fall back to answer_numeric stats (text-input numeric questions like CAPEX Amount)
         if avg_sc is not None:
             avg, mn, mx = avg_sc, mn_sc, mx_sc
             stats_source = "score"
         else:
             avg, mn, mx = avg_an, mn_an, mx_an
-            stats_source = "answer_numeric" 
+            stats_source = "answer_numeric"
 
         def _round(v):
             try:
@@ -381,8 +377,8 @@ def get_answer_stats(
                 "average_value": _round(avg),
                 "min_value": _round(mn),
                 "max_value": _round(mx),
-                "stats_source": stats_source,   # "score" or "answer_numeric"
-                "scored_count": scored_count,   # how many answers have a score
+                "stats_source": stats_source,
+                "scored_count": scored_count,
                 "value_breakdown": [
                     {"value": r[0], "count": r[1]} for r in cat_rows
                 ],
@@ -427,8 +423,19 @@ def generate_sql(
     sql_llm, validator: SQLValidator, question: str,
     schema_hint: str = "", db_engine=None,
     sql_prompt_template: str = "",
+    seed_index: Optional["SeedExampleIndex"] = None,
     _debug_logger=None,
 ) -> dict[str, Any]:
+    """
+    Generate SQL for the given question using the SQL LLM.
+
+    Parameters
+    ----------
+    seed_index : SeedExampleIndex | None
+        When provided, retrieves the top 3-4 most relevant seed examples by
+        cosine similarity and injects them into the {seed_examples} placeholder.
+        This replaces the previous static 26-example block (Problem 4 fix).
+    """
     try:
         if db_engine and not schema_hint.startswith("Use"):
             auto_schema = _fetch_key_schemas(db_engine)
@@ -438,10 +445,20 @@ def generate_sql(
             from agent.prompts import SQL_GENERATION_PROMPT
             sql_prompt_template = SQL_GENERATION_PROMPT
 
+        # ------------------------------------------------------------------ #
+        # Problem 4: dynamic seed example retrieval                           #
+        # ------------------------------------------------------------------ #
+        if seed_index is not None:
+            seed_examples_str = seed_index.format_for_prompt(question, top_k=4)
+        else:
+            seed_examples_str = "-- No seed examples available."
+
         prompt = sql_prompt_template.replace(
             "{question}", question
         ).replace(
             "{schema_hint}", schema_hint or "No additional context provided."
+        ).replace(
+            "{seed_examples}", seed_examples_str
         )
 
         # Log the full prompt sent to deepseek if debug enabled
@@ -566,12 +583,14 @@ class ToolRegistry:
 
     def __init__(self, db_engine: Engine, semantic_index: SemanticQuestionIndex,
                  validator: SQLValidator, sql_llm, sql_prompt: str = "",
+                 seed_index: Optional[SeedExampleIndex] = None,
                  debug_logger=None) -> None:
         self._db_engine = db_engine
         self._semantic_index = semantic_index
         self._validator = validator
         self._sql_llm = sql_llm
         self._sql_prompt = sql_prompt
+        self._seed_index = seed_index  # Problem 4: dynamic example retrieval
         self._debug_logger = debug_logger
 
     def call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -653,6 +672,7 @@ class ToolRegistry:
                     schema_hint=str(args.get("schema_hint", "")),
                     db_engine=self._db_engine,
                     sql_prompt_template=self._sql_prompt,
+                    seed_index=self._seed_index,   # Problem 4: pass seed index
                     _debug_logger=self._debug_logger,
                 )
 
