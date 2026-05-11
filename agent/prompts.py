@@ -443,6 +443,21 @@ ORDER BY total_score DESC LIMIT 1;
 
 -- ALWAYS: SELECT ir.inspection_id (varchar '2026/04/ST001/INS001')
 -- NEVER:  SELECT ir.id           (UUID primary key — garbage output)
+-- BUT: ir.id IS correct in JOIN conditions and WHERE subqueries:
+--   WHERE aa.inspection_report_id = (SELECT ir.id FROM inspection_report ir ...)  ← CORRECT
+--   JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id            ← CORRECT
+--   The rule only applies to the outermost SELECT column list.
+
+-- CRITICAL — submission_id type mismatch (common source of join errors):
+-- ai_answers.submission_id          is TEXT  (string)
+-- inspection_corrective_action.*_submission_id columns are UUID
+-- If you must join them: CAST(aa.submission_id AS UUID) = ica.submission_id
+-- BUT: for most cause/corrective_action queries, you do NOT need this join.
+-- ica.cause is already a direct column on inspection_corrective_action — query it directly:
+SELECT cause, COUNT(*) AS frequency
+FROM inspection_corrective_action
+WHERE cause IS NOT NULL AND cause != ''
+GROUP BY cause ORDER BY frequency DESC LIMIT 10;
 
 -- Inspections per type:
 SELECT it.name AS type_name, COUNT(*) AS count
@@ -546,6 +561,8 @@ FROM (
 ) subq;
 
 -- Repetitive observations in last 6 months:
+-- Use simple GROUP BY aggregation — do NOT use recursive CTEs.
+-- "Recurring" means same observation text appearing across multiple inspections.
 SELECT aa.answer_text AS observation,
        COUNT(DISTINCT aa.inspection_report_id) AS inspection_count
 FROM ai_answers aa
@@ -558,6 +575,20 @@ WHERE aq.label ILIKE '%observation%'
 GROUP BY aa.answer_text
 HAVING COUNT(DISTINCT aa.inspection_report_id) > 1
 ORDER BY inspection_count DESC LIMIT 20;
+
+-- Deferred corrective actions (CLOSE_WITH_DEFERRED) — recurring issues by facility:
+-- Do NOT use recursive CTEs for this — simple aggregation is sufficient and correct.
+SELECT ica.cause,
+       fac.name AS facility_name,
+       COUNT(*) AS times_deferred,
+       MAX(ir.submitted_on) AS last_inspection_date
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE ica.status = 'CLOSE_WITH_DEFERRED'
+  AND ica.cause IS NOT NULL AND ica.cause != ''
+GROUP BY ica.cause, fac.name
+ORDER BY times_deferred DESC LIMIT 20;
 
 -- Most frequent observation text among high risk inspections:
 SELECT obs.answer_text AS observation, COUNT(*) AS frequency
@@ -647,11 +678,13 @@ WHERE previous_score IS NOT NULL
 ORDER BY score_drop DESC LIMIT 50;
 
 -- Questions and scores for the last inspection by a named inspector (e.g. George):
+-- NOTE: ir.id in the subquery WHERE clause is CORRECT — it is a UUID join key,
+-- not a displayed value. Only ir.id in the outer SELECT list is wrong.
 SELECT aq.label AS question, aa.answer_text AS answer, aa.score
 FROM ai_answers aa
 JOIN ai_questions aq ON aa.element_id = aq.element_id
 WHERE aa.inspection_report_id = (
-    SELECT ir.id
+    SELECT ir.id                          -- ← ir.id here is CORRECT (UUID FK key)
     FROM inspection_report ir
     JOIN users u ON ir.inspector_user_id = u.id
     WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%George%')

@@ -661,7 +661,25 @@ class AgentOrchestrator:
 
                 else:
                     gen_sql_failures += 1
-                    errs = sql_data.get("validation", {}).get("errors", ["unknown"])
+                    val_data = sql_data.get("validation", {})
+                    errs = val_data.get("errors", ["unknown"])
+
+                    # Use structured retry_message() when available — concise codes only.
+                    # Falls back to joining raw error strings for backward compat.
+                    vresult = val_data.get("_vresult")
+                    if vresult is not None:
+                        retry_reason = vresult.retry_message()
+                    else:
+                        # Legacy path: filter out WARNING: prefixed strings
+                        hard_errs = [e for e in errs if not e.startswith("WARNING:")]
+                        retry_reason = "; ".join(hard_errs[:3]) if hard_errs else "unknown"
+
+                    # Log soft warnings for observability — never send to LLM
+                    soft_warns = val_data.get("warnings", [])
+                    if soft_warns and self._debug:
+                        _dbg(self._debug, "SOFT_WARNS (not in retry prompt)",
+                             "\n".join(soft_warns))
+
                     messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
 
                     if gen_sql_failures >= 3:
@@ -676,8 +694,8 @@ class AgentOrchestrator:
                                 return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
                     messages.append(ChatMessage(role=MessageRole.USER, content=
-                        f"generate_sql failed ({gen_sql_failures}x). Errors: {'; '.join(errs)}\n"
-                        f"Try a different approach or use get_schema to verify columns."))
+                        f"generate_sql failed ({gen_sql_failures}x). Fix required: {retry_reason}\n"
+                        f"Correct the SQL or use get_schema to verify column names."))
                     continue
 
             # Path B: terminal tools → synthesize and return

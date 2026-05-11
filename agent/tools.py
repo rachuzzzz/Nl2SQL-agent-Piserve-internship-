@@ -461,22 +461,45 @@ def generate_sql(
             )
 
         sql = validator.clean_sql(raw_sql)
-        passed, errors = validator.validate(sql)
-        semantic_warnings = validator.validate_semantic(sql, question)
+
+        # validate() returns ValidationResult — hard fails block, soft warns are advisory only.
+        vresult = validator.validate(sql)
+
+        # validate_semantic() returns SOFT_WARN issues only.
+        # These are logged for observability but NEVER injected into the retry prompt.
+        # This is the core fix for validator poisoning: semantic heuristics must not
+        # cause retries or appear in the errors list that the orchestrator reads.
+        sem_warns = validator.validate_semantic(sql, question)
 
         # Log cleaned SQL and validation result
         if _debug_logger:
-            status = "✓ PASSED" if passed else f"✗ FAILED: {errors}"
+            if vresult.passed:
+                status = "✓ PASSED"
+            else:
+                status = f"✗ FAILED: {vresult.retry_message()}"
             _debug_logger.debug(
                 f"\n{'='*70}\n>>> DEEPSEEK CLEANED SQL — {status}\n"
                 f"{'='*70}\n{sql}\n"
             )
+            if sem_warns:
+                _debug_logger.debug(
+                    f"  Semantic warns (not forwarded to LLM): "
+                    f"{'; '.join(str(w) for w in sem_warns)}"
+                )
 
+        # errors: concise hard-fail codes only — no soft warn prose, no semantic hints.
+        # warnings: soft warns + semantic warns — logged by caller, never in retry prompt.
         return {
             "success": True,
             "result": {
                 "sql": sql,
-                "validation": {"passed": passed, "errors": errors + semantic_warnings},
+                "validation": {
+                    "passed": vresult.passed,
+                    "errors": [str(i) for i in vresult.hard_fails],
+                    "warnings": [str(i) for i in vresult.soft_warns + sem_warns],
+                    # _vresult: structured object for orchestrator retry_message()
+                    "_vresult": vresult,
+                },
             },
             "error": None,
         }
@@ -490,11 +513,15 @@ def generate_sql(
 
 def execute_sql(db_engine: Engine, validator: SQLValidator, sql: str) -> dict[str, Any]:
     try:
-        passed, errors = validator.validate(sql)
-        real_errors = [e for e in errors if not e.startswith("WARNING:")]
-        if real_errors:
-            return {"success": False, "result": None,
-                    "error": "SQL failed validation: " + "; ".join(real_errors)}
+        # validate() returns ValidationResult.
+        # Only hard fails block execution — soft warns are advisory and ignored here.
+        vresult = validator.validate(sql)
+        if not vresult.passed:
+            return {
+                "success": False,
+                "result": None,
+                "error": "SQL failed validation: " + vresult.retry_message(),
+            }
 
         with db_engine.connect() as conn:
             result = conn.execute(sql_text(sql))
