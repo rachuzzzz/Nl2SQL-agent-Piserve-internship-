@@ -310,6 +310,27 @@ REGISTRY: list[dict] = [
         "message":     "[autocorrect] Fixed typecast ICA→IR join",
     },
     {
+        "id":          "autocorrect_close_on_quarter_scope",
+        "type":        AUTOCORRECT,
+        "description": (
+            "close_on is NULL for all OPEN/OVERDUE rows. When deepseek uses "
+            "date_trunc('quarter', close_on) or EXTRACT(QUARTER FROM close_on) "
+            "to scope 'this quarter's actions', replace with created_on which "
+            "is always populated."
+        ),
+        "sql_pattern": r"date_trunc\s*\(\s*'quarter'\s*,\s*(?:ica\.)?close_on\s*\)",
+        "replacement": "date_trunc('quarter', created_on)",
+        "message":     "[autocorrect] close_on→created_on for quarter scope (close_on NULL on OPEN rows)",
+    },
+    {
+        "id":          "autocorrect_extract_quarter_close_on",
+        "type":        AUTOCORRECT,
+        "description": "EXTRACT(QUARTER FROM close_on) → EXTRACT(QUARTER FROM created_on)",
+        "sql_pattern": r"EXTRACT\s*\(\s*(?:QUARTER|quarter)\s+FROM\s+(?:ica\.)?close_on\s*\)",
+        "replacement": "EXTRACT(QUARTER FROM created_on)",
+        "message":     "[autocorrect] EXTRACT(QUARTER FROM close_on)→created_on",
+    },
+    {
         "id":          "autocorrect_reserved_alias_is",
         "type":        AUTOCORRECT,
         "description": "Replace 'is' as table alias (SQL reserved word) with 'isch'.",
@@ -369,6 +390,39 @@ REGISTRY: list[dict] = [
         ),
     },
     {
+        "id":             "inject_ica_risk_level",
+        "type":           INJECT,
+        "priority":       85,
+        "description":    "ICA risk/impact level queries — must use JOIN lookup, not bare column or string compare.",
+        "question_pattern": (
+            r"\b(high|medium|low|no\s+active)\s+risk\b"
+            r"|\brisk\s+(level|breakdown|distribution|count|ranking|group)\b"
+            r"|\bby\s+risk\s+level\b"
+            r"|\bhigh.{0,20}(corrective|action|finding)\b"
+            r"|\b(corrective|action|finding).{0,20}high\s+risk\b"
+        ),
+        "hint": (
+            "\nICA RISK LEVEL — risk_level_id is a UUID FK, not a string column:\n"
+            "  WRONG: WHERE ica.risk_level = 'High'          ← column does not exist\n"
+            "  WRONG: WHERE ica.risk_level_id = 'High'       ← comparing UUID FK to string\n"
+            "  WRONG: WHERE ica.cause ILIKE '%High Risk%'    ← cause is free text, not risk level\n"
+            "  WRONG: WHERE ica.capex_status = 'High Risk'   ← capex_status is not risk level\n"
+            "  CORRECT: JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
+            "           WHERE rl.name ILIKE '%High%'\n"
+            "Risk level values (exact): 'High', 'Medium', 'Low', 'No Active Risk'\n"
+            "Example — filter high risk:\n"
+            "SELECT ica.corrective_action_id, ica.cause, ica.status, rl.name AS risk_level\n"
+            "FROM inspection_corrective_action ica\n"
+            "JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
+            "WHERE rl.name ILIKE '%High%' LIMIT 100;\n"
+            "Example — count by risk level:\n"
+            "SELECT rl.name AS risk_level, COUNT(*) AS action_count\n"
+            "FROM inspection_corrective_action ica\n"
+            "JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
+            "GROUP BY rl.name ORDER BY action_count DESC;\n"
+        ),
+    },
+    {
         "id":             "inject_ica_join",
         "type":           INJECT,
         "priority":       80,
@@ -397,13 +451,35 @@ REGISTRY: list[dict] = [
             r"|\b(which|what)\s+(facility|site).{0,30}(most\s+recent|latest|last)\b"
         ),
         "hint": (
-            "\nDIRECT QUERY — do NOT route through ai_answers for this:\n"
-            "SELECT ir.inspection_id, fac.name AS facility_name, ir.submitted_on, ir.status\n"
+            "\nMOST-RECENT INSPECTION WITH FORM DATA — anchor on ai_answers.submitted_on:\n"
+            "The most recent inspection_report.submitted_on may have NO linked ai_answers.\n"
+            "Always use the ai_answers table to find the most recently answered inspection.\n"
+            "\nFor 'most recent inspection form questions and answers':\n"
+            "SELECT ir.inspection_id, fac.name AS facility_name,\n"
+            "       aq.label AS question, aa.answer_text AS answer, aa.module_name\n"
+            "FROM ai_answers aa\n"
+            "JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
+            "JOIN inspection_report ir ON aa.inspection_report_id = ir.id\n"
+            "JOIN facility fac ON ir.facility_id = fac.id\n"
+            "WHERE aa.inspection_report_id = (\n"
+            "    SELECT inspection_report_id FROM ai_answers\n"
+            "    WHERE inspection_report_id IS NOT NULL\n"
+            "      AND module_name = 'Inspection Form'\n"
+            "    ORDER BY submitted_on DESC LIMIT 1\n"
+            ")\n"
+            "ORDER BY aq.label LIMIT 100;\n"
+            "\nFor 'show most recent inspection' (metadata only):\n"
+            "SELECT ir.inspection_id, fac.name AS facility_name,\n"
+            "       ir.submitted_on, ir.status, ir.inspection_score\n"
             "FROM inspection_report ir\n"
             "JOIN facility fac ON ir.facility_id = fac.id\n"
-            "WHERE ir.status != 'DRAFT'\n"
-            "ORDER BY ir.submitted_on DESC LIMIT 1;\n"
-            "CRITICAL: always SELECT ir.inspection_id — needed for multi-turn follow-up.\n"
+            "WHERE ir.id = (\n"
+            "    SELECT inspection_report_id FROM ai_answers\n"
+            "    WHERE inspection_report_id IS NOT NULL\n"
+            "    ORDER BY submitted_on DESC LIMIT 1\n"
+            ");\n"
+            "CRITICAL: join aa.inspection_report_id = ir.id (UUID FK), NOT ir.inspection_id.\n"
+            "CRITICAL: always SELECT ir.inspection_id (varchar) not ir.id (UUID) for display.\n"
         ),
     },
     {
@@ -420,6 +496,9 @@ REGISTRY: list[dict] = [
             "\nCLOSE_WITH_DEFERRED — deferred/recurring action pattern:\n"
             "  Status value: 'CLOSE_WITH_DEFERRED' (exact uppercase)\n"
             "  ALWAYS join: ica → ir (ON ica.inspection_id = ir.id) → facility\n"
+            "SCHEMA CONSTRAINT: corrective_action_id is UNIQUE per row — there is NO\n"
+            "  history/audit table. There is no way to count 'how many times' a single\n"
+            "  action was carried forward. Instead, count DISTINCT occurrences by cause:\n"
             "Example (recurring issues at a facility):\n"
             "SELECT ica.cause, COUNT(*) AS recurrence_count, fac.name AS facility_name\n"
             "FROM inspection_corrective_action ica\n"
@@ -427,6 +506,13 @@ REGISTRY: list[dict] = [
             "JOIN facility fac ON ir.facility_id = fac.id\n"
             "WHERE ica.status = 'CLOSE_WITH_DEFERRED'\n"
             "GROUP BY ica.cause, fac.name ORDER BY recurrence_count DESC LIMIT 20;\n"
+            "Example (facility with most deferred issues):\n"
+            "SELECT fac.name AS facility_name, COUNT(*) AS deferred_count\n"
+            "FROM inspection_corrective_action ica\n"
+            "JOIN inspection_report ir ON ica.inspection_id = ir.id\n"
+            "JOIN facility fac ON ir.facility_id = fac.id\n"
+            "WHERE ica.status = 'CLOSE_WITH_DEFERRED'\n"
+            "GROUP BY fac.name ORDER BY deferred_count DESC LIMIT 10;\n"
         ),
     },
     {

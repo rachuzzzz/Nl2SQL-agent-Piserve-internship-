@@ -24,6 +24,8 @@ from core.schema_introspector import introspect_schema
 from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT
 from agent.tools import ToolRegistry
 from agent.tool_dispatcher import parse_tool_call, dispatch
+from core.business_rules import get_engine as _get_rules_engine
+
 
 
 # ---------------------------------------------------------------------------
@@ -286,32 +288,13 @@ _SCHEDULE_CYCLE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Inspector count query — deepseek reliably generates hardcoded years for this pattern.
-# Auto-inject the exact working SQL template as schema_hint.
-_INSPECTOR_COUNT_RE = re.compile(
-    r'\b(which|who|top|most|count|how\s+many|list).{0,30}'
-    r'(inspector|inspectors?).{0,30}'
-    r'(most|conducted|done|most\s+inspections?|count|number|year)\b',
-    re.IGNORECASE,
-)
-
-# Corrective action + facility/grouping queries — deepseek always generates
-# ON ir.inspection_id = ica.inspection_id (varchar=UUID type mismatch).
-# Correct join is ON ica.inspection_id = ir.id (UUID=UUID).
+# _ICA_JOIN_RE retained for _detect_inspection_tables only — hint injection
+# now handled by business_rules.RulesEngine.hint_for_question().
 _ICA_JOIN_RE = re.compile(
     r'\b(corrective.?action|capex|opex).{0,50}'
     r'(facility|client|inspector|type|count|by|group|breakdown)\b'
     r'|\b(facility|client|inspector|type|breakdown).{0,50}'
     r'(corrective.?action|capex|opex)\b',
-    re.IGNORECASE,
-)
-
-# Most-recent inspection query — llama3.1 sometimes routes through ai_answers
-# looking for "Inspection Facility" label, omitting ir.inspection_id from SELECT.
-# Inject direct inspection_report pattern so deepseek ignores the ai_answers hint.
-_MOST_RECENT_INSPECTION_RE = re.compile(
-    r'\b(most\s+recent|latest|last)\s+(inspection|site|facility|form)\b'
-    r'|\b(which|what)\s+(facility|site).{0,30}(most\s+recent|latest|last)\b',
     re.IGNORECASE,
 )
 
@@ -360,6 +343,8 @@ class AgentOrchestrator:
         self.semantic_index = SemanticQuestionIndex(
             db_engine=self.db_engine, embed_model=embed_model)
         self.validator = SQLValidator()
+        self._rules_engine = _get_rules_engine()
+        print(f"  ✓ Business rules engine ({self._rules_engine.summary()})")
 
         print(f"  Configuring reasoning LLM: {chat_model}...")
         self.reasoning_llm = Ollama(model=chat_model, base_url=ollama_url,
@@ -533,57 +518,18 @@ class AgentOrchestrator:
             # causing deepseek to SELECT wrong columns. The SQL prompt's own schema
             # definitions are sufficient.
             if tool == "generate_sql":
-                # Auto-inject exact SQL template for inspector count queries —
-                # deepseek reliably generates hardcoded years for this pattern.
-                if _INSPECTOR_COUNT_RE.search(question):
-                    inspector_hint = (
-                        "\nUSE THIS EXACT PATTERN for inspector count queries:\n"
-                        "SELECT u.first_name || ' ' || u.last_name AS inspector_name,\n"
-                        "       COUNT(*) AS num_inspections\n"
-                        "FROM inspection_report ir\n"
-                        "JOIN users u ON ir.inspector_user_id = u.id\n"
-                        "WHERE ir.status != 'DRAFT'\n"
-                        "  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)\n"
-                        "GROUP BY u.first_name, u.last_name\n"
-                        "ORDER BY num_inspections DESC LIMIT 1;\n"
-                        "CRITICAL: NEVER write '= 2023' or '= 2026' — always use EXTRACT(YEAR FROM CURRENT_DATE)."
-                    )
-                    args["schema_hint"] = (args.get("schema_hint", "") + inspector_hint)
-
-                # Auto-inject correct ICA→IR join — deepseek always generates
-                # ON ir.inspection_id = ica.inspection_id (varchar=UUID mismatch).
-                # The correct join is ON ica.inspection_id = ir.id (UUID=UUID).
-                if _ICA_JOIN_RE.search(question):
-                    ica_hint = (
-                        "\nCRITICAL JOIN — inspection_corrective_action to inspection_report:\n"
-                        "  ica.inspection_id → UUID FK to inspection_report.id (UUID PK)\n"
-                        "  ir.inspection_id  → VARCHAR human-readable ('2026/04/ST001/INS001') — DIFFERENT\n"
-                        "  ALWAYS: JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id\n"
-                        "  NEVER:  ON ir.inspection_id = ica.inspection_id  ← varchar=UUID type mismatch\n"
-                        "Example:\n"
-                        "SELECT fac.name AS facility_name, COUNT(ica.id) AS open_count\n"
-                        "FROM inspection_report ir\n"
-                        "JOIN facility fac ON ir.facility_id = fac.id\n"
-                        "JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id\n"
-                        "WHERE ica.status = 'OPEN'\n"
-                        "GROUP BY fac.name ORDER BY open_count DESC;"
-                    )
-                    args["schema_hint"] = (args.get("schema_hint", "") + ica_hint)
-
-                # Auto-inject most-recent inspection template — llama3.1 sometimes
-                # routes through ai_answers (looking for "Inspection Facility" label),
-                # omitting ir.inspection_id from SELECT.  Force the direct pattern.
-                if _MOST_RECENT_INSPECTION_RE.search(question):
-                    recent_hint = (
-                        "\nDIRECT QUERY — do NOT route through ai_answers for this:\n"
-                        "SELECT ir.inspection_id, fac.name AS facility_name, ir.submitted_on, ir.status\n"
-                        "FROM inspection_report ir\n"
-                        "JOIN facility fac ON ir.facility_id = fac.id\n"
-                        "WHERE ir.status != 'DRAFT'\n"
-                        "ORDER BY ir.submitted_on DESC LIMIT 1;\n"
-                        "CRITICAL: always SELECT ir.inspection_id — needed for multi-turn follow-up."
-                    )
-                    args["schema_hint"] = (args.get("schema_hint", "") + recent_hint)
+                # Inject question-level schema hints from the business rules registry.
+                # CRITICAL: hints are PREPENDED, not appended, so deepseek sees the
+                # structural constraint (correct JOIN pattern, correct column names)
+                # BEFORE Qwen's schema_hint — Qwen sometimes generates incorrect hints
+                # (e.g. capex_status='High Risk', cause ILIKE '%High Risk%') that
+                # override injected corrections when appended after them.
+                rules_hint = self._rules_engine.hint_for_question(question)
+                if rules_hint:
+                    args["schema_hint"] = rules_hint + "\n" + args.get("schema_hint", "")
+                    matched = self._rules_engine.matching_inject_ids(question)
+                    _dbg(self._debug, "RULES ENGINE INJECT",
+                         f"fired rules: {matched}\nhint length: {len(rules_hint)} chars (prepended)")
 
                 # Preserve explicit LIMIT from user question
                 limit_match = re.search(

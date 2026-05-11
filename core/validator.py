@@ -365,7 +365,74 @@ class SQLValidator:
                 ))
                 ValidatorStats.record("WRONG_JOIN", is_retry_trigger=True)
 
-        # ── 9. Hardcoded year — SOFT_WARN only ───────────────────────────
+        # ── 9. ICA bare column + UUID-vs-string BLOCK rules ──────────────────
+        # inspection_corrective_action.risk_level_id and impact_id are UUID FKs.
+        # Deepseek generates two wrong patterns:
+        #   (a) ica.risk_level / ica.impact  — columns don't exist (only *_id variants)
+        #   (b) WHERE ica.risk_level_id = 'High'  — UUID FK compared to a string
+        # Both fail silently or crash at DB time and require a JOIN through the lookup table.
+        ica_used = bool(re.search(
+            r'\b(inspection_corrective_action|ica)\b', sql_lower))
+        if ica_used:
+            # (a) bare column without _id suffix
+            if re.search(
+                r'\b(ica|inspection_corrective_action)\.risk_level\b(?!_id)',
+                sql_lower,
+            ):
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "WRONG_COLUMN",
+                    "ica.risk_level does not exist — JOIN risk_level rl ON ica.risk_level_id = rl.id",
+                    detail="Filter: WHERE rl.name ILIKE '%High%'  "
+                           "Values: High, Medium, Low, No Active Risk",
+                ))
+                ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+
+            if re.search(
+                r'\b(ica|inspection_corrective_action)\.impact\b(?!_id)',
+                sql_lower,
+            ):
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "WRONG_COLUMN",
+                    "ica.impact does not exist — JOIN impact im ON ica.impact_id = im.id",
+                    detail="Typo in live data: 'Non Confirmity' (not 'Conformity')",
+                ))
+                ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+
+            # (b) UUID FK column compared to a string literal (not a UUID)
+            if re.search(
+                r"\brisk_level_id\s*(?:=|ilike|like|!=|<>)\s*"
+                r"'(?![0-9a-f]{8}-)[^']*'",
+                sql_lower,
+            ):
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "WRONG_COLUMN",
+                    "risk_level_id is a UUID FK — cannot compare to 'High'; join risk_level table instead",
+                    detail="JOIN risk_level rl ON ica.risk_level_id = rl.id WHERE rl.name ILIKE '%High%'",
+                ))
+                ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+
+            if re.search(
+                r"\bimpact_id\s*(?:=|ilike|like|!=|<>)\s*"
+                r"'(?![0-9a-f]{8}-)[^']*'",
+                sql_lower,
+            ):
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "WRONG_COLUMN",
+                    "impact_id is a UUID FK — cannot compare to string; note: live data spells 'Non Confirmity'",
+                    detail="JOIN impact im ON ica.impact_id = im.id WHERE im.name ILIKE '%Non Confirmity%'",
+                ))
+                ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+
+        # (c) conformity spelling error when querying the impact table
+        if "impact" in sql_lower and re.search(r'\bconformity\b', sql_lower):
+            issues.append(ValidationIssue(
+                "HARD_FAIL", "WRONG_COLUMN",
+                "impact table spells 'Non Confirmity' (with 'i') — 'conformity' always returns zero rows",
+                detail="Use: WHERE im.name ILIKE '%Non Confirmity%'",
+            ))
+            ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+
+        # ── 10. Hardcoded year — SOFT_WARN only ───────────────────────────
         # Moved from HARD_FAIL: a user may intentionally query a specific
         # historical year (e.g. "inspector with most inspections in 2024").
         # Blocking that is validator overreach — it caused Qwen to corrupt
@@ -383,7 +450,7 @@ class SQLValidator:
             ))
             ValidatorStats.record("HARDCODED_YEAR", is_retry_trigger=False)
 
-        # ── 10. close_on arithmetic — SOFT_WARN (not a hard fail) ─────────
+        # ── 11. close_on arithmetic — SOFT_WARN (not a hard fail) ─────────
         # close_on is NULL for most records but arithmetic IS valid for the
         # subset where it is populated. Block only with a soft advisory.
         if self._CLOSE_ON_ARITH_RE.search(sql):
@@ -395,7 +462,7 @@ class SQLValidator:
             ))
             ValidatorStats.record("UNRELIABLE_COLUMN", is_retry_trigger=False)
 
-        # ── 11. Missing LIMIT — SOFT_WARN ─────────────────────────────────
+        # ── 12. Missing LIMIT — SOFT_WARN ─────────────────────────────────
         has_agg = bool(self._AGG_RE.search(sql))
         if not has_agg and not self._LIMIT_RE.search(sql):
             issues.append(ValidationIssue(

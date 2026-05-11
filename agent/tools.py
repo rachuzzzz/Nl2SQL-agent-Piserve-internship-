@@ -185,6 +185,12 @@ def get_answers(
         filters = ["1=1"]
         params: dict[str, Any] = {"limit": limit}
 
+        # inspection_id is the VARCHAR human-readable key (e.g. '2026/04/ST001/INS001')
+        # It lives on inspection_report.inspection_id, NOT on ai_answers directly.
+        # ai_answers links to inspection_report via aa.inspection_report_id = ir.id (UUID).
+        # We must join inspection_report and filter on ir.inspection_id.
+        needs_ir_join = bool(inspection_id)
+
         if form_name:
             filters.append("aq.module_name ILIKE :form_name")
             params["form_name"] = f"%{form_name}%"
@@ -195,7 +201,7 @@ def get_answers(
             filters.append("aq.label ILIKE :q_label")
             params["q_label"] = f"%{question_label}%"
         if inspection_id:
-            filters.append("aa.inspection_id = :insp_id")
+            filters.append("ir.inspection_id = :insp_id")
             params["insp_id"] = inspection_id
         if answer_value:
             filters.append(
@@ -205,10 +211,25 @@ def get_answers(
 
         where = " AND ".join(filters)
 
+        # Conditionally JOIN inspection_report only when needed (inspection_id filter).
+        # This avoids a cross-join cost on every get_answers call.
+        ir_join = (
+            "JOIN inspection_report ir ON aa.inspection_report_id = ir.id"
+            if needs_ir_join
+            else ""
+        )
+        # SELECT the human-readable inspection_id for display.
+        # When ir is joined, use ir.inspection_id; otherwise fall back to aa.inspection_report_id.
+        insp_id_col = (
+            "ir.inspection_id"
+            if needs_ir_join
+            else "aa.inspection_report_id::text"
+        )
+
         # answer_text for categorical, answer_numeric for scores/numbers.
         # COALESCE so we always get one displayable value.
         sql = sql_text(f"""
-            SELECT aa.inspection_id,
+            SELECT {insp_id_col}                                       AS inspection_id,
                    aa.module_name,
                    aq.label                                          AS question_label,
                    COALESCE(aa.answer_text, aa.answer_numeric::text) AS answer_value,
@@ -216,6 +237,7 @@ def get_answers(
                    aa.submitted_on
             FROM ai_answers aa
             LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id
+            {ir_join}
             WHERE {where}
             ORDER BY aa.submitted_on DESC
             LIMIT :limit
