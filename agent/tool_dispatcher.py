@@ -50,6 +50,81 @@ _TOOL_RE = re.compile(
 )
 
 
+# SQL clause keywords that appear as fragment keys when Qwen emits Python-style
+# multiline string concatenation.  Example of the corruption:
+#
+#   Qwen intent (Python source):
+#       "schema_hint": (
+#           "SELECT ...\n"
+#           + "FROM inspection_report ir\n"
+#           + "WHERE ir.status != 'DRAFT'"
+#       )
+#
+#   JSON received by parser (json_repair sees separate string literals):
+#       "schema_hint": "SELECT ...",
+#       "FROM inspection_report ir": "WHERE ir.status != 'DRAFT'",
+#       ...
+#
+# We reconstruct the full schema_hint by detecting these SQL fragment keys and
+# appending them in document order to the first "schema_hint" value.
+
+_SQL_FRAGMENT_PREFIXES = (
+    "FROM ", "JOIN ", "LEFT JOIN ", "RIGHT JOIN ", "INNER JOIN ", "OUTER JOIN ",
+    "WHERE ", "GROUP BY ", "HAVING ", "ORDER BY ", "LIMIT ", "OFFSET ",
+    "UNION ALL", "UNION ", "EXCEPT ", "INTERSECT ",
+    "ON ", "AND ", "OR ",
+    "WITH ", "AS (", "AS(",
+    "SELECT ",  # second SELECT in UNION
+)
+
+
+def _reconstruct_fragmented_schema_hint(args: dict) -> dict:
+    """
+    Detect and repair fragmented schema_hint caused by Python-style string
+    concatenation in Qwen's JSON output.
+
+    When Qwen writes:
+        "schema_hint": "SELECT x\n" + "FROM t\n" + "WHERE ..."
+    the parser receives THREE separate keys instead of one full string.
+
+    We detect keys that look like SQL clause continuations (starting with
+    FROM, WHERE, GROUP BY, etc.) and append them to schema_hint in order.
+
+    Returns a cleaned args dict with the full schema_hint and fragment keys removed.
+    """
+    if "schema_hint" not in args:
+        return args
+
+    # Collect keys in insertion order — Python dicts preserve insertion order
+    fragment_keys = [
+        k for k in args
+        if k != "schema_hint"
+        and isinstance(k, str)
+        and any(k.upper().startswith(prefix.upper()) for prefix in _SQL_FRAGMENT_PREFIXES)
+    ]
+
+    if not fragment_keys:
+        return args  # no corruption detected
+
+    # Reconstruct: start with existing (partial) schema_hint, append each fragment
+    parts = [str(args["schema_hint"])]
+    for key in fragment_keys:
+        # The fragment value is the clause that follows this key
+        # e.g. key="FROM inspection_report ir", value="WHERE ir.status != 'DRAFT'"
+        # → append "\nFROM inspection_report ir\nWHERE ir.status != 'DRAFT'"
+        parts.append("\n" + key)
+        val = args[key]
+        if val and str(val).strip():
+            parts.append("\n" + str(val))
+
+    cleaned = dict(args)  # shallow copy preserving other args
+    cleaned["schema_hint"] = "".join(parts)
+    for key in fragment_keys:
+        cleaned.pop(key, None)
+
+    return cleaned
+
+
 def _try_parse(text: str, raw_output: str) -> dict[str, Any] | None:
     """Try json.loads then json_repair on a candidate string. Returns None on failure."""
     # Standard parse first — zero overhead when the model is well-behaved
@@ -177,6 +252,11 @@ def _validate_tool_call(parsed: Any, raw_output: str) -> dict[str, Any]:
         raise ValueError(
             f"'args' must be a JSON object, got: {parsed.get('args')!r}"
         )
+
+    # Repair fragmented schema_hint before returning — Qwen sometimes emits
+    # Python-style multiline string concatenation which the JSON parser splits
+    # into separate keys (FROM, WHERE, GROUP BY become top-level args keys).
+    parsed["args"] = _reconstruct_fragmented_schema_hint(parsed["args"])
 
     # Normalise: ensure "thought" key exists (model sometimes omits it)
     parsed.setdefault("thought", "")

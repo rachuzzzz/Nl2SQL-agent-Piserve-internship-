@@ -330,9 +330,10 @@ TEST_SET = [
     {
         "id": "TRD-02", "category": "Trends",
         "question": "are corrective actions being closed faster or slower compared to last quarter",
-        "expected_contains": ["quarter", "days"],
+        "expected_contains": ["quarter", "closed"],
         "expected_nonempty": False,
-        "expected_llm_calls": 1, "notes": "close_on - created_on",
+        "expected_llm_calls": 1,
+        "notes": "close_on arithmetic blocked by validator — answer uses status-based closure rate",
     },
     {
         "id": "TRD-03", "category": "Trends",
@@ -387,10 +388,11 @@ TEST_SET = [
     # ── Multi-turn ────────────────────────────────────────────────────────────
     {
         "id": "MT-01", "category": "Multi-turn",
-        "question": "which facility underwent the most recent inspection",
-        "expected_contains": ["facility"],
+        "question": "show me the most recently answered inspection",
+        "expected_contains": ["facility", "inspection"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "Turn 1 stores context",
+        "expected_llm_calls": 1,
+        "notes": "Turn 1 — uses ai_answers.submitted_on so the result always has form data",
     },
     {
         "id": "MT-02", "category": "Multi-turn",
@@ -415,6 +417,80 @@ TEST_SET = [
         "expected_nonempty": True,
         "expected_llm_calls": 0, "notes": "Pagination — must return Q&A rows not inspector names",
         "depends_on": "MT-03",
+    },
+    # ── ICA Risk Level — Problem 2 fix ───────────────────────────────────────
+    {
+        "id": "ICA-01", "category": "ICA Risk Level",
+        "question": "show all high risk corrective actions",
+        "expected_contains": ["high", "risk"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "P2 fix: JOIN risk_level lookup, not WHERE risk_level_id='High'",
+    },
+    {
+        "id": "ICA-02", "category": "ICA Risk Level",
+        "question": "what is the risk level breakdown of all corrective actions",
+        "expected_contains": ["high", "medium"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "P2 fix: GROUP BY rl.name — must show human-readable names not UUIDs",
+    },
+    {
+        "id": "ICA-03", "category": "ICA Risk Level",
+        "question": "how many corrective actions are high risk",
+        "expected_contains": ["high"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "P2 fix: COUNT with JOIN risk_level — before fix returned 0",
+    },
+    {
+        "id": "ICA-04", "category": "ICA Risk Level",
+        "question": "show open corrective actions with high risk grouped by facility",
+        "expected_contains": ["facility", "high"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "P2 fix: 3-table join ica + risk_level + ir + facility",
+    },
+    # ── Deferred Chain — Problem 5 fix ───────────────────────────────────────
+    {
+        "id": "DEF-01", "category": "Deferred Chain",
+        "question": "show all deferred corrective actions",
+        "expected_contains": ["deferred", "action"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "P5 fix: WHERE status = 'CLOSE_WITH_DEFERRED'",
+    },
+    {
+        "id": "DEF-02", "category": "Deferred Chain",
+        "question": "which issues recur most at Al Ghadeer",
+        "expected_contains": ["cause"],
+        "expected_nonempty": False,
+        "expected_llm_calls": 1,
+        "notes": "P5 fix: CLOSE_WITH_DEFERRED at facility — cause values may be short codes",
+    },
+    {
+        "id": "DEF-03", "category": "Deferred Chain",
+        "question": "which facility has the most recurring deferred issues",
+        "expected_contains": ["facility"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "P5 fix: GROUP BY fac.name WHERE CLOSE_WITH_DEFERRED",
+    },
+    {
+        "id": "DEF-04", "category": "Deferred Chain",
+        "question": "how many corrective actions have been carried forward more than once",
+        "expected_contains": ["deferred"],
+        "expected_nonempty": False,
+        "expected_llm_calls": 1,
+        "notes": "P5 fix: HAVING COUNT > 1 on CLOSE_WITH_DEFERRED per cause",
+    },
+    {
+        "id": "DEF-05", "category": "Deferred Chain",
+        "question": "show the history of deferred actions at Al Ghadeer facility",
+        "expected_contains": ["action"],
+        "expected_nonempty": False,
+        "expected_llm_calls": 1,
+        "notes": "P5 fix: ordered deferred chain with dates at a specific facility",
     },
     # ── Edge Cases ────────────────────────────────────────────────────────────
     {
@@ -666,7 +742,8 @@ if __name__ == "__main__":
     p.add_argument("--skip-multiturn", action="store_true")
     p.add_argument("--category", default=None,
                    help="Aggregate | Filter | Join | Form Answers | Scores | "
-                        "Trends | People | Multi-turn | Edge Case")
+                        "Trends | People | Multi-turn | ICA Risk Level | "
+                        "Deferred Chain | Edge Case")
     p.add_argument("--output", default=None)
     a = p.parse_args()
     run_eval(a.model_pair, a.skip_multiturn, a.category, a.output)

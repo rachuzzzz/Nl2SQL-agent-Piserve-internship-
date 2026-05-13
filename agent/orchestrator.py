@@ -18,12 +18,13 @@ from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-from core.semantic import SemanticQuestionIndex
+from core.semantic import SemanticQuestionIndex, SeedExampleIndex
 from core.validator import SQLValidator
 from core.schema_introspector import introspect_schema
 from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT
 from agent.tools import ToolRegistry
 from agent.tool_dispatcher import parse_tool_call, dispatch
+from core.business_rules import get_engine as get_rules_engine
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +362,13 @@ class AgentOrchestrator:
             db_engine=self.db_engine, embed_model=embed_model)
         self.validator = SQLValidator()
 
+        # Build seed example index — embeds NL questions for retrieval-based injection
+        from agent.seed_examples import SEED_EXAMPLES
+        self.seed_index = SeedExampleIndex(
+            embed_model=embed_model,
+            examples=SEED_EXAMPLES,
+        )
+
         print(f"  Configuring reasoning LLM: {chat_model}...")
         self.reasoning_llm = Ollama(model=chat_model, base_url=ollama_url,
             temperature=0.2, request_timeout=120.0,
@@ -384,6 +392,7 @@ class AgentOrchestrator:
         self.registry = ToolRegistry(
             db_engine=self.db_engine,
             semantic_index=self.semantic_index,
+            seed_index=self.seed_index,
             validator=self.validator,
             sql_llm=self.sql_llm,
             sql_prompt=self._sql_prompt,
@@ -533,6 +542,19 @@ class AgentOrchestrator:
             # causing deepseek to SELECT wrong columns. The SQL prompt's own schema
             # definitions are sufficient.
             if tool == "generate_sql":
+                # ── Business rules inject hints ───────────────────────────────
+                # Apply INJECT rules from business_rules.py registry.
+                # Also collect matching rule IDs for dynamic example selection.
+                try:
+                    _rules = get_rules_engine()
+                    _inject_hint = _rules.hint_for_question(question)
+                    _inject_ids  = _rules.matching_inject_ids(question)
+                    if _inject_hint:
+                        args["schema_hint"] = (args.get("schema_hint", "") + _inject_hint)
+                    args["_inject_rule_ids"] = _inject_ids
+                except Exception:
+                    args["_inject_rule_ids"] = []
+
                 # Auto-inject exact SQL template for inspector count queries —
                 # deepseek reliably generates hardcoded years for this pattern.
                 if _INSPECTOR_COUNT_RE.search(question):
@@ -661,7 +683,25 @@ class AgentOrchestrator:
 
                 else:
                     gen_sql_failures += 1
-                    errs = sql_data.get("validation", {}).get("errors", ["unknown"])
+                    val_data = sql_data.get("validation", {})
+                    errs = val_data.get("errors", ["unknown"])
+
+                    # Use structured retry_message() when available — concise codes only.
+                    # Falls back to joining raw error strings for backward compat.
+                    vresult = val_data.get("_vresult")
+                    if vresult is not None:
+                        retry_reason = vresult.retry_message()
+                    else:
+                        # Legacy path: filter out WARNING: prefixed strings
+                        hard_errs = [e for e in errs if not e.startswith("WARNING:")]
+                        retry_reason = "; ".join(hard_errs[:3]) if hard_errs else "unknown"
+
+                    # Log soft warnings for observability — never send to LLM
+                    soft_warns = val_data.get("warnings", [])
+                    if soft_warns and self._debug:
+                        _dbg(self._debug, "SOFT_WARNS (not in retry prompt)",
+                             "\n".join(soft_warns))
+
                     messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
 
                     if gen_sql_failures >= 3:
@@ -676,8 +716,8 @@ class AgentOrchestrator:
                                 return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
                     messages.append(ChatMessage(role=MessageRole.USER, content=
-                        f"generate_sql failed ({gen_sql_failures}x). Errors: {'; '.join(errs)}\n"
-                        f"Try a different approach or use get_schema to verify columns."))
+                        f"generate_sql failed ({gen_sql_failures}x). Fix required: {retry_reason}\n"
+                        f"Correct the SQL or use get_schema to verify column names."))
                     continue
 
             # Path B: terminal tools → synthesize and return
