@@ -52,6 +52,10 @@ ROUTING — INSPECTION QUERIES:
 
 IMPORTANT — inspection_report.status:
   SUBMITTED, CLOSED, UNDER_REVIEW, RETURN_FOR_MODIFICATION → have scores
+  "completed inspections" = status IN ('CLOSED', 'SUBMITTED')
+  SUBMITTED = inspector filed — counts as completed for reporting purposes
+  CLOSED = fully reviewed and approved — also completed
+  UNDER_REVIEW / RETURN_FOR_MODIFICATION / DRAFT — NOT completed
   DRAFT → usually NULL scores
   Always add WHERE status != 'DRAFT' when querying scores unless the user asks about drafts.
 
@@ -69,13 +73,21 @@ FORM ANSWERS — flat ai_* tables
     JOIN to ai_questions: ON ai_answers.element_id = ai_questions.element_id
     JOIN to inspection:  ON ai_answers.inspection_report_id = inspection_report.id
 
+  DATA COVERAGE NOTE — ai_answers is a denormalized ETL snapshot, not a live mirror.
+    Newly submitted inspections appear in inspection_report immediately, but their
+    form answers only appear in ai_answers after the ETL pipeline runs.
+    The most recent inspections in the database may NOT have rows in ai_answers yet.
+    If a query returns no form answers for a recent inspection, tell the user:
+    "This inspection was submitted recently and its form answers have not yet been
+    indexed into the system. Try querying an earlier inspection."
+
   IMPORTANT — answer_text encoding:
     Dropdown/checkbox answers are stored as plain strings — NOT JSON.
     e.g. Risk Level answer is stored as:       High
          Observation Type answer is stored as: Deviation
     Use exact match for known values: aa.answer_text ILIKE '%High%'
     Use ILIKE only for partial/unknown values: aa.answer_text ILIKE '%keyword%'
-    The question label is separate: aq.label ILIKE '%risk level%'
+    The question label is separate: aq.label = 'Risk Level'
 
 ROUTING — FORM ANSWER QUERIES:
   "what questions are in form X"           → search_questions(form_name="X")
@@ -176,11 +188,11 @@ Turn 1: {"thought": "Total score = SUM of ai_answers.score per inspection. NOT i
 
 ─── Form answers: observation text at a specific facility ───
 User: "what did inspectors write in the observation field for Al Ghadeer?"
-Turn 1: {"thought": "Need ai_answers filtered by question label='Observation' AND facility='Al Ghadeer'. Must join: ai_answers → ai_questions (label) → inspection_report → facility. Exclude 'Observation Type' and 'Unique Identifier' — only the free-text Observation field.", "tool": "generate_sql", "args": {"question": "observation text at Al Ghadeer facility", "schema_hint": "SELECT aa.answer_text AS observation, ir.inspection_id, ir.submitted_on FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label ILIKE '%observation%' AND aq.label NOT ILIKE '%type%' AND aq.label NOT ILIKE '%unique%' AND fac.name ILIKE '%Al Ghadeer%' AND aa.answer_text IS NOT NULL AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
+Turn 1: {"thought": "Need ai_answers filtered by question label='Observation' AND facility='Al Ghadeer'. Must join: ai_answers → ai_questions (label) → inspection_report → facility. Exclude 'Observation Type' and 'Unique Identifier' — only the free-text Observation field.", "tool": "generate_sql", "args": {"question": "observation text at Al Ghadeer facility", "schema_hint": "SELECT aa.answer_text AS observation, ir.inspection_id, ir.submitted_on FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Observation' AND fac.name ILIKE '%Al Ghadeer%' AND aa.answer_text IS NOT NULL AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
 
 ─── Form answers: filter by answer value ───
 User: "show all high risk observations"
-Turn 1: {"thought": "User wants answers where Risk Level = High. Use ILIKE '%High%' on answer_text. Also filter where label='Observation' to get the observation text.", "tool": "generate_sql", "args": {"question": "observations where risk level is high", "schema_hint": "SELECT aa.inspection_id, aq.label, aa.answer_text, ir.submitted_on FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id WHERE aa.inspection_report_id IN (SELECT aa2.inspection_report_id FROM ai_answers aa2 JOIN ai_questions aq2 ON aa2.element_id = aq2.element_id WHERE aq2.label ILIKE '%risk level%' AND aa2.answer_text ILIKE '%High%') AND aq.label ILIKE '%observation%' AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
+Turn 1: {"thought": "User wants answers where Risk Level = High. Use ILIKE '%High%' on answer_text. Also filter where label='Observation' to get the observation text.", "tool": "generate_sql", "args": {"question": "observations where risk level is high", "schema_hint": "SELECT aa.inspection_id, aq.label, aa.answer_text, ir.submitted_on FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id WHERE aa.inspection_report_id IN (SELECT aa2.inspection_report_id FROM ai_answers aa2 JOIN ai_questions aq2 ON aa2.element_id = aq2.element_id WHERE aq2.label = 'Risk Level' AND aa2.answer_text ILIKE '%High%') AND aq.label = 'Observation' AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
 
 ─── Form answers: by inspection ───
 User: "all answers in inspection INS-2024-001"
@@ -188,7 +200,7 @@ Turn 1: {"thought": "Filter by inspection_id.", "tool": "get_answers", "args": {
 
 ─── Form answers: most recently filled form ───
 User: "show all questions and answers in the most recently filled form"
-Turn 1: {"thought": "Need most recent inspection then filter to Inspection Form module only — without module_name filter this returns 10000+ rows across all 16 modules.", "tool": "generate_sql", "args": {"question": "questions and answers from most recent inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT id FROM inspection_report WHERE status != 'DRAFT' ORDER BY submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' ORDER BY aq.label LIMIT 100;"}}
+Turn 1: {"thought": "Need most recent inspection that has Inspection Form answers — using aa subquery, NOT inspection_report subquery (newest ir row may have no answers yet).", "tool": "generate_sql", "args": {"question": "questions and answers from most recent inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT aa2.inspection_report_id FROM ai_answers aa2 WHERE aa2.module_name = 'Inspection Form' ORDER BY aa2.submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' ORDER BY aq.label LIMIT 100;"}}
 
 ─── Scores for a named inspector's last inspection ───
 User: "show questions and scores for the last inspection by George"
@@ -197,7 +209,7 @@ Turn 1: {"thought": "Need ai_answers.score filtered to George's last inspection.
 
 ─── Cross-domain join ───
 User: "risk level answers for inspections at Al Ghadeer facility"
-Turn 1: {"thought": "Need ai_answers + inspection_report + facility — use generate_sql.", "tool": "generate_sql", "args": {"question": "risk level answers at Al Ghadeer", "schema_hint": "FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label ILIKE '%risk level%' AND fac.name ILIKE '%Al Ghadeer%'"}}
+Turn 1: {"thought": "Need ai_answers + inspection_report + facility — use generate_sql.", "tool": "generate_sql", "args": {"question": "risk level answers at Al Ghadeer", "schema_hint": "FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Risk Level' AND fac.name ILIKE '%Al Ghadeer%'"}}
 
 ─── Form discovery ───
 User: "which forms ask about emergency contact?"
@@ -230,7 +242,7 @@ ROUTING RULE: This asks for OBSERVATION TEXT where risk level = High.
 Do NOT call get_answer_stats(label="Risk Level") — that returns the risk level distribution.
 Do NOT call get_answer_stats(label="Observation") — that ignores the high-risk filter.
 MUST use generate_sql with a subquery joining risk level answers to observation answers.
-Turn 1: {"thought": "Need observations filtered to inspections where Risk Level = High. Must use SQL subquery — get_answer_stats cannot cross-filter between two questions.", "tool": "generate_sql", "args": {"question": "observation text most frequent in high risk inspections", "schema_hint": "SELECT obs.answer_text AS observation, COUNT(*) AS frequency FROM ai_answers risk_aa JOIN ai_questions risk_aq ON risk_aa.element_id = risk_aq.element_id JOIN inspection_report ir ON risk_aa.inspection_report_id = ir.id JOIN ai_answers obs ON obs.inspection_report_id = ir.id JOIN ai_questions obs_q ON obs.element_id = obs_q.element_id WHERE risk_aq.label ILIKE '%risk level%' AND risk_aa.answer_text ILIKE '%High%' AND obs_q.label ILIKE '%observation%' AND obs_q.label NOT ILIKE '%type%' AND obs.answer_text IS NOT NULL AND ir.status != 'DRAFT' GROUP BY obs.answer_text ORDER BY frequency DESC LIMIT 1;"}}
+Turn 1: {"thought": "Need observations filtered to inspections where Risk Level = High. Must use SQL subquery — get_answer_stats cannot cross-filter between two questions.", "tool": "generate_sql", "args": {"question": "observation text most frequent in high risk inspections", "schema_hint": "SELECT obs.answer_text AS observation, COUNT(*) AS frequency FROM ai_answers risk_aa JOIN ai_questions risk_aq ON risk_aa.element_id = risk_aq.element_id JOIN inspection_report ir ON risk_aa.inspection_report_id = ir.id JOIN ai_answers obs ON obs.inspection_report_id = ir.id JOIN ai_questions obs_q ON obs.element_id = obs_q.element_id WHERE risk_aq.label = 'Risk Level' AND risk_aa.answer_text ILIKE '%High%' AND obs_q.label = 'Observation' AND obs.answer_text IS NOT NULL AND ir.status != 'DRAFT' GROUP BY obs.answer_text ORDER BY frequency DESC LIMIT 1;"}}
 
 ─── Count questions in a form ───
 User: "how many questions are in the inspection form?"
@@ -275,6 +287,14 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
   GROUP BY the name column (e.g. GROUP BY fac.name). NEVER GROUP BY a UUID FK column.
 - For month display, ALWAYS use TO_CHAR(date_trunc('month', col), 'Month YYYY') AS month.
   NEVER use EXTRACT(MONTH FROM col) — that returns a number, not a name.
+- CALENDAR YEAR filter: EXTRACT(YEAR FROM col) = EXTRACT(YEAR FROM CURRENT_DATE)
+  or: col >= date_trunc('year', CURRENT_DATE)
+  NEVER: col > CURRENT_DATE - INTERVAL '1 year' — that is a rolling 365-day window, not a calendar year.
+- EXACT QUESTION LABELS (use = not ILIKE for known labels):
+  'Observation'      — free-text observation field
+  'Observation Type' — dropdown: Deviation, Good Practice
+  'Risk Level'       — dropdown: High, Medium, Low, No Active Risk  (form answers only — NOT ICA risk)
+  'Impact'           — multi-select impact categories
 
 ### AI FLAT TABLES — use these for all form question/answer data:
 
@@ -339,455 +359,7 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
 ### Additional context
 {schema_hint}
 
-### COMMON PATTERNS:
-
--- Projects with NO inspections this year — use NOT EXISTS (NOT IN fails on NULLs):
-SELECT proj.name AS project_name
-FROM project proj
-WHERE NOT EXISTS (
-    SELECT 1 FROM inspection_report ir
-    WHERE ir.project_id = proj.id
-      AND ir.status != 'DRAFT'
-      AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
-);
-
--- Average inspection score (no drafts):
-SELECT AVG(inspection_score) AS avg_score
-FROM inspection_report WHERE status != 'DRAFT';
-
--- Open corrective actions:
-SELECT corrective_action_id, cause, corrective_action, responsible, status
-FROM inspection_corrective_action WHERE status = 'OPEN' LIMIT 100;
-
--- All answers for a specific question:
-SELECT aa.inspection_id, aa.answer_text, aa.submitted_on
-FROM ai_answers aa
-JOIN ai_questions aq ON aa.element_id = aq.element_id
-WHERE aq.label ILIKE '%risk level%'
-ORDER BY aa.submitted_on DESC LIMIT 100;
-
--- Observation text for a specific facility (cross-domain join):
-SELECT aa.answer_text AS observation,
-       ir.inspection_id,
-       ir.submitted_on,
-       u.first_name || ' ' || u.last_name AS inspector_name
-FROM ai_answers aa
-JOIN ai_questions aq ON aa.element_id = aq.element_id
-JOIN inspection_report ir ON aa.inspection_report_id = ir.id
-JOIN facility fac ON ir.facility_id = fac.id
-JOIN users u ON ir.inspector_user_id = u.id
-WHERE aq.label ILIKE '%observation%'
-  AND aq.label NOT ILIKE '%type%'
-  AND aq.label NOT ILIKE '%unique%'
-  AND fac.name ILIKE '%Al Ghadeer%'
-  AND aa.answer_text IS NOT NULL
-  AND aa.answer_text != ''
-  AND ir.status != 'DRAFT'
-ORDER BY ir.submitted_on DESC
-LIMIT 100;
-
--- High risk observations (use ILIKE '%High%' on answer_text):
-SELECT DISTINCT aa.inspection_id, obs.answer_text AS observation,
-       aa.answer_text AS risk_level, ir.submitted_on
-FROM ai_answers aa
-JOIN ai_questions aq ON aa.element_id = aq.element_id
-JOIN inspection_report ir ON aa.inspection_report_id = ir.id
-JOIN ai_answers obs ON obs.inspection_report_id = ir.id
-JOIN ai_questions obs_q ON obs.element_id = obs_q.element_id
-WHERE aq.label ILIKE '%risk level%'
-  AND aa.answer_text ILIKE '%High%'
-  AND obs_q.label ILIKE '%observation%'
-  AND obs_q.label NOT ILIKE '%type%'
-  AND ir.status != 'DRAFT'
-ORDER BY ir.submitted_on DESC LIMIT 100;
-
--- Simpler version — all answers where risk level = High:
-SELECT aa.inspection_id, aq.label, aa.answer_text, ir.submitted_on
-FROM ai_answers aa
-JOIN ai_questions aq ON aa.element_id = aq.element_id
-JOIN inspection_report ir ON aa.inspection_report_id = ir.id
-WHERE aq.label ILIKE '%risk level%'
-  AND aa.answer_text ILIKE '%High%'
-  AND ir.status != 'DRAFT'
-ORDER BY ir.submitted_on DESC LIMIT 100;
-
--- Answer distribution for a question:
-SELECT aa.answer_text, COUNT(*) AS frequency
-FROM ai_answers aa
-JOIN ai_questions aq ON aa.element_id = aq.element_id
-WHERE aq.label ILIKE '%condition%'
-GROUP BY aa.answer_text ORDER BY frequency DESC LIMIT 20;
-
--- Answers joined with facility (cross-domain):
-SELECT ir.inspection_id, fac.name AS facility,
-       aq.label, aa.answer_text
-FROM ai_answers aa
-LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id
-JOIN inspection_report ir ON aa.inspection_report_id = ir.id
-LEFT JOIN facility fac ON ir.facility_id = fac.id
-WHERE aq.label ILIKE '%risk%' AND ir.status != 'DRAFT'
-ORDER BY ir.submitted_on DESC LIMIT 100;
-
--- Count questions in a specific form (use DISTINCT element_id):
-SELECT COUNT(DISTINCT element_id) AS question_count
-FROM ai_questions
-WHERE module_name ILIKE '%Inspection Form%';
-
--- Inspection with highest TOTAL score (SUM of per-question scores from ai_answers):
-SELECT ir.inspection_id, SUM(aa.score) AS total_score
-FROM ai_answers aa
-JOIN inspection_report ir ON aa.inspection_report_id = ir.id
-WHERE aa.score IS NOT NULL AND ir.status != 'DRAFT'
-GROUP BY ir.inspection_id
-ORDER BY total_score DESC LIMIT 1;
-
--- ALWAYS: SELECT ir.inspection_id (varchar '2026/04/ST001/INS001')
--- NEVER:  SELECT ir.id           (UUID primary key — garbage output)
--- BUT: ir.id IS correct in JOIN conditions and WHERE subqueries:
---   WHERE aa.inspection_report_id = (SELECT ir.id FROM inspection_report ir ...)  ← CORRECT
---   JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id            ← CORRECT
---   The rule only applies to the outermost SELECT column list.
-
--- CRITICAL — submission_id type mismatch (common source of join errors):
--- ai_answers.submission_id          is TEXT  (string)
--- inspection_corrective_action.*_submission_id columns are UUID
--- If you must join them: CAST(aa.submission_id AS UUID) = ica.submission_id
--- BUT: for most cause/corrective_action queries, you do NOT need this join.
--- ica.cause is already a direct column on inspection_corrective_action — query it directly:
-SELECT cause, COUNT(*) AS frequency
-FROM inspection_corrective_action
-WHERE cause IS NOT NULL AND cause != ''
-GROUP BY cause ORDER BY frequency DESC LIMIT 10;
-
--- Inspections per type:
-SELECT it.name AS type_name, COUNT(*) AS count
-FROM inspection_report ir
-JOIN inspection_type it ON ir.inspection_type_id = it.id
-GROUP BY it.name ORDER BY count DESC;
-
--- Inspection scores grouped by facility:
-SELECT fac.name AS facility_name,
-       AVG(ir.inspection_score) AS avg_score,
-       COUNT(*) AS inspection_count
-FROM inspection_report ir
-JOIN facility fac ON ir.facility_id = fac.id
-WHERE ir.status != 'DRAFT'
-GROUP BY fac.name ORDER BY avg_score DESC LIMIT 100;
-
--- This month vs last month comparison:
-SELECT
-  COUNT(*) FILTER (WHERE date_trunc('month', submitted_on) = date_trunc('month', NOW())) AS this_month,
-  COUNT(*) FILTER (WHERE date_trunc('month', submitted_on) = date_trunc('month', NOW() - INTERVAL '1 month')) AS last_month
-FROM inspection_report WHERE status != 'DRAFT';
-
--- Inspections done on weekends (ISODOW: 6=Saturday 7=Sunday):
-SELECT COUNT(*) AS weekend_count
-FROM inspection_report
-WHERE EXTRACT(ISODOW FROM submitted_on) IN (6, 7)
-  AND status != 'DRAFT';
-
--- Overdue inspections this quarter:
-SELECT COUNT(*) AS overdue_count
-FROM inspection_schedule
-WHERE status = 'OVERDUE'
-  AND due_date >= date_trunc('quarter', NOW())
-  AND due_date < date_trunc('quarter', NOW()) + INTERVAL '3 months';
-
--- Month names — use TO_CHAR not EXTRACT for display:
-SELECT TO_CHAR(date_trunc('month', ir.submitted_on), 'Month YYYY') AS month,
-       COUNT(*) AS count
-FROM inspection_report ir
-WHERE ir.status != 'DRAFT'
-  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
-GROUP BY date_trunc('month', ir.submitted_on)
-ORDER BY date_trunc('month', ir.submitted_on);
-
--- capex and opex by facility (3-table chain: ica -> ir -> facility):
-SELECT fac.name AS facility_name,
-       SUM(ica.capex) AS total_capex,
-       SUM(ica.opex) AS total_opex
-FROM inspection_corrective_action ica
-JOIN inspection_report ir ON ica.inspection_id = ir.id
-JOIN facility fac ON ir.facility_id = fac.id
-GROUP BY fac.name ORDER BY total_capex DESC NULLS LAST LIMIT 50;
-
--- Client with most overdue corrective actions (ica -> ir -> client):
-SELECT cl.name AS client_name, COUNT(*) AS overdue_count
-FROM inspection_corrective_action ica
-JOIN inspection_report ir ON ica.inspection_id = ir.id
-JOIN client cl ON ir.client_id = cl.id
-WHERE ica.status = 'OVERDUE'
-GROUP BY cl.name ORDER BY overdue_count DESC LIMIT 10;
-
--- Corrective actions with facility and inspector (4-table join):
-SELECT ica.corrective_action_id, ica.cause, ica.corrective_action,
-       ica.responsible, ica.status,
-       fac.name AS facility_name,
-       u.first_name || ' ' || u.last_name AS inspector_name
-FROM inspection_corrective_action ica
-JOIN inspection_report ir ON ica.inspection_id = ir.id
-JOIN facility fac ON ir.facility_id = fac.id
-JOIN users u ON ir.inspector_user_id = u.id
-LIMIT 100;
-
--- Corrective actions by inspection type (ica -> ir -> inspection_type):
-SELECT it.name AS inspection_type, COUNT(*) AS action_count
-FROM inspection_corrective_action ica
-JOIN inspection_report ir ON ica.inspection_id = ir.id
-JOIN inspection_type it ON ir.inspection_type_id = it.id
-GROUP BY it.name ORDER BY action_count DESC LIMIT 20;
-
--- Most common observation types (answer_text = plain string — use = for known values):
-SELECT aa.answer_text AS observation_type, COUNT(*) AS frequency
-FROM ai_answers aa
-JOIN ai_questions aq ON aa.element_id = aq.element_id
-WHERE aq.label ILIKE '%observation type%'
-  AND aa.answer_text IS NOT NULL AND aa.answer_text != ''
-GROUP BY aa.answer_text ORDER BY frequency DESC LIMIT 20;
-
--- Average number of observations PER inspection:
--- CRITICAL: must use subquery to count per-inspection FIRST, then AVG.
-SELECT AVG(obs_count) AS avg_obs_per_inspection
-FROM (
-    SELECT aa.inspection_report_id, COUNT(*) AS obs_count
-    FROM ai_answers aa
-    JOIN ai_questions aq ON aa.element_id = aq.element_id
-    JOIN inspection_report ir ON aa.inspection_report_id = ir.id
-    WHERE aq.label ILIKE '%observation%'
-      AND aq.label NOT ILIKE '%type%'
-      AND aq.label NOT ILIKE '%unique%'
-      AND ir.status != 'DRAFT'
-    GROUP BY aa.inspection_report_id
-) subq;
-
--- Repetitive observations in last 6 months:
--- Use simple GROUP BY aggregation — do NOT use recursive CTEs.
--- "Recurring" means same observation text appearing across multiple inspections.
-SELECT aa.answer_text AS observation,
-       COUNT(DISTINCT aa.inspection_report_id) AS inspection_count
-FROM ai_answers aa
-JOIN ai_questions aq ON aa.element_id = aq.element_id
-WHERE aq.label ILIKE '%observation%'
-  AND aq.label NOT ILIKE '%type%'
-  AND aq.label NOT ILIKE '%unique%'
-  AND aa.answer_text IS NOT NULL AND aa.answer_text != ''
-  AND aa.submitted_on >= NOW() - INTERVAL '6 months'
-GROUP BY aa.answer_text
-HAVING COUNT(DISTINCT aa.inspection_report_id) > 1
-ORDER BY inspection_count DESC LIMIT 20;
-
--- Deferred corrective actions (CLOSE_WITH_DEFERRED) — recurring issues by facility:
--- Do NOT use recursive CTEs for this — simple aggregation is sufficient and correct.
-SELECT ica.cause,
-       fac.name AS facility_name,
-       COUNT(*) AS times_deferred,
-       MAX(ir.submitted_on) AS last_inspection_date
-FROM inspection_corrective_action ica
-JOIN inspection_report ir ON ica.inspection_id = ir.id
-JOIN facility fac ON ir.facility_id = fac.id
-WHERE ica.status = 'CLOSE_WITH_DEFERRED'
-  AND ica.cause IS NOT NULL AND ica.cause != ''
-GROUP BY ica.cause, fac.name
-ORDER BY times_deferred DESC LIMIT 20;
-
--- Most frequent observation text among high risk inspections:
-SELECT obs.answer_text AS observation, COUNT(*) AS frequency
-FROM ai_answers risk_aa
-JOIN ai_questions risk_aq ON risk_aa.element_id = risk_aq.element_id
-JOIN inspection_report ir ON risk_aa.inspection_report_id = ir.id
-JOIN ai_answers obs ON obs.inspection_report_id = ir.id
-JOIN ai_questions obs_q ON obs.element_id = obs_q.element_id
-WHERE risk_aq.label ILIKE '%risk level%'
-  AND risk_aa.answer_text ILIKE '%High%'
-  AND obs_q.label ILIKE '%observation%'
-  AND obs_q.label NOT ILIKE '%type%'
-  AND obs.answer_text IS NOT NULL AND obs.answer_text != ''
-  AND ir.status != 'DRAFT'
-GROUP BY obs.answer_text ORDER BY frequency DESC LIMIT 1;
-
--- All Q&A from the most recent inspection (filter to Inspection Form module only):
-SELECT aq.label AS question, aa.answer_text AS answer, aa.score
-FROM ai_answers aa
-JOIN ai_questions aq ON aa.element_id = aq.element_id
-WHERE aa.inspection_report_id = (
-    SELECT id FROM inspection_report
-    WHERE status != 'DRAFT'
-    ORDER BY submitted_on DESC LIMIT 1)
-  AND aa.module_name = 'Inspection Form'
-ORDER BY aq.label LIMIT 100;
-
--- Inspector with most inspections this year:
-SELECT u.first_name || ' ' || u.last_name AS inspector_name,
-       COUNT(*) AS inspection_count
-FROM inspection_report ir
-JOIN users u ON ir.inspector_user_id = u.id
-WHERE ir.status != 'DRAFT'
-  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
-GROUP BY u.first_name, u.last_name
-ORDER BY inspection_count DESC LIMIT 10;
-
--- Corrective actions where responsible = CLIENT:
-SELECT corrective_action_id, cause, corrective_action, status
-FROM inspection_corrective_action
-WHERE responsible = 'CLIENT'
-LIMIT 100;
--- responsible values: 'CLIENT', 'INTERNAL_OPERATIONS', 'SUB_CONTRACTOR' (always uppercase)
-
--- Corrective action status breakdown by responsible party:
-SELECT responsible AS responsible_party,
-       COUNT(*) FILTER (WHERE status = 'OPEN')    AS open_count,
-       COUNT(*) FILTER (WHERE status = 'CLOSED')  AS closed_count,
-       COUNT(*) FILTER (WHERE status = 'OVERDUE') AS overdue_count
-FROM inspection_corrective_action
-GROUP BY responsible
-ORDER BY responsible;
-
--- Month with most high risk observations:
-SELECT TO_CHAR(date_trunc('month', ir.submitted_on), 'Month YYYY') AS month,
-       COUNT(*) AS high_risk_count
-FROM ai_answers aa
-JOIN ai_questions aq ON aa.element_id = aq.element_id
-JOIN inspection_report ir ON aa.inspection_report_id = ir.id
-WHERE aq.label ILIKE '%risk level%'
-  AND aa.answer_text ILIKE '%High%'
-  AND ir.status != 'DRAFT'
-  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
-GROUP BY date_trunc('month', ir.submitted_on)
-ORDER BY high_risk_count DESC LIMIT 1;
-
--- Score drop vs previous inspection at same facility (LAG window function):
-WITH scored AS (
-  SELECT ir.inspection_id,
-         fac.name AS facility_name,
-         ir.submitted_on,
-         ir.inspection_score,
-         LAG(ir.inspection_score) OVER (
-           PARTITION BY ir.facility_id ORDER BY ir.submitted_on
-         ) AS previous_score
-  FROM inspection_report ir
-  JOIN facility fac ON ir.facility_id = fac.id
-  WHERE ir.status != 'DRAFT' AND ir.inspection_score IS NOT NULL
-)
-SELECT inspection_id, facility_name, submitted_on,
-       inspection_score AS current_score,
-       previous_score,
-       previous_score - inspection_score AS score_drop
-FROM scored
-WHERE previous_score IS NOT NULL
-  AND inspection_score < previous_score
-ORDER BY score_drop DESC LIMIT 50;
-
--- Questions and scores for the last inspection by a named inspector (e.g. George):
--- NOTE: ir.id in the subquery WHERE clause is CORRECT — it is a UUID join key,
--- not a displayed value. Only ir.id in the outer SELECT list is wrong.
-SELECT aq.label AS question, aa.answer_text AS answer, aa.score
-FROM ai_answers aa
-JOIN ai_questions aq ON aa.element_id = aq.element_id
-WHERE aa.inspection_report_id = (
-    SELECT ir.id                          -- ← ir.id here is CORRECT (UUID FK key)
-    FROM inspection_report ir
-    JOIN users u ON ir.inspector_user_id = u.id
-    WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%George%')
-      AND ir.status != 'DRAFT'
-    ORDER BY ir.submitted_on DESC
-    LIMIT 1
-)
-AND aa.module_name = 'Inspection Form'
-AND aa.score IS NOT NULL
-ORDER BY aa.score DESC LIMIT 100;
-
--- Inspector with LOWEST average inspection score:
-SELECT u.first_name || ' ' || u.last_name AS inspector_name,
-       AVG(ir.inspection_score) AS avg_score
-FROM inspection_report ir
-JOIN users u ON ir.inspector_user_id = u.id
-WHERE ir.status != 'DRAFT' AND ir.inspection_score IS NOT NULL
-GROUP BY u.first_name, u.last_name
-ORDER BY avg_score ASC LIMIT 1;
-
--- TRD-02: closure speed — close_on is often NULL; compare counts instead:
-SELECT
-  TO_CHAR(date_trunc('quarter', ica.created_on), '"Q"Q YYYY') AS quarter,
-  COUNT(*) AS total_raised,
-  COUNT(*) FILTER (WHERE ica.status IN ('CLOSED','CLOSE_WITH_DEFERRED')) AS total_closed,
-  ROUND(
-    100.0 * COUNT(*) FILTER (WHERE ica.status IN ('CLOSED','CLOSE_WITH_DEFERRED'))
-    / NULLIF(COUNT(*), 0), 1
-  ) AS pct_closed
-FROM inspection_corrective_action ica
-WHERE ica.created_on >= date_trunc('quarter', NOW() - INTERVAL '3 months')
-GROUP BY date_trunc('quarter', ica.created_on)
-ORDER BY date_trunc('quarter', ica.created_on);
-
--- Facility most improved in score vs last quarter:
-WITH quarterly AS (
-  SELECT fac.name AS facility_name,
-         AVG(CASE WHEN ir.submitted_on >= date_trunc('quarter', NOW())
-                  THEN ir.inspection_score END) AS this_q,
-         AVG(CASE WHEN ir.submitted_on >= date_trunc('quarter', NOW() - INTERVAL '3 months')
-                   AND ir.submitted_on  <  date_trunc('quarter', NOW())
-                  THEN ir.inspection_score END) AS last_q
-  FROM inspection_report ir
-  JOIN facility fac ON ir.facility_id = fac.id
-  WHERE ir.status != 'DRAFT' AND ir.inspection_score IS NOT NULL
-  GROUP BY fac.name
-)
-SELECT facility_name,
-       ROUND(this_q::numeric, 1) AS this_quarter_avg,
-       ROUND(last_q::numeric, 1) AS last_quarter_avg,
-       ROUND((this_q - last_q)::numeric, 1) AS improvement
-FROM quarterly
-WHERE this_q IS NOT NULL AND last_q IS NOT NULL
-ORDER BY improvement DESC LIMIT 1;
-
--- Last N inspections — NEVER add status='CLOSED', only exclude DRAFT:
-SELECT ir.inspection_id, fac.name AS facility_name, ir.submitted_on,
-       ir.status, ir.inspection_score
-FROM inspection_report ir
-JOIN facility fac ON ir.facility_id = fac.id
-WHERE ir.status != 'DRAFT'
-ORDER BY ir.submitted_on DESC LIMIT 5;
-
--- Most recent single inspection — ALWAYS SELECT ir.inspection_id even if user
--- only asked for facility name (needed for follow-up context in multi-turn):
-SELECT ir.inspection_id, fac.name AS facility_name, ir.submitted_on, ir.status
-FROM inspection_report ir
-JOIN facility fac ON ir.facility_id = fac.id
-WHERE ir.status != 'DRAFT'
-ORDER BY ir.submitted_on DESC LIMIT 1;
-
--- Percentage of inspections with at least one corrective action:
--- CRITICAL: use COUNT(DISTINCT ir.id) for BOTH numerator and denominator.
--- Do NOT divide CA count by inspection count — that gives > 100%.
-SELECT
-  ROUND(
-    100.0 * COUNT(DISTINCT CASE WHEN ica.id IS NOT NULL THEN ir.id END)
-    / NULLIF(COUNT(DISTINCT ir.id), 0),
-    1
-  ) AS pct_with_corrective_action
-FROM inspection_report ir
-LEFT JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id
-WHERE ir.status != 'DRAFT';
-
--- Corrective actions raised vs closed THIS quarter:
-SELECT
-  COUNT(*) AS total_raised,
-  COUNT(*) FILTER (WHERE status IN ('CLOSED','CLOSE_WITH_DEFERRED')) AS total_closed,
-  COUNT(*) FILTER (WHERE status IN ('OPEN','OVERDUE')) AS still_open
-FROM inspection_corrective_action
-WHERE created_on >= date_trunc('quarter', NOW());
-
--- Top N facilities by score:
-SELECT fac.name AS facility_name,
-       AVG(ir.inspection_score) AS avg_inspection_score
-FROM inspection_report ir
-JOIN facility fac ON ir.facility_id = fac.id
-WHERE ir.status != 'DRAFT'
-  AND fac.name IS NOT NULL
-  AND ir.inspection_score IS NOT NULL
-GROUP BY fac.name
-ORDER BY avg_inspection_score DESC LIMIT 5;
-
+{dynamic_examples}
 ### Answer
 Given the database schema, here is the SQL query that answers \
 [QUESTION]{question}[/QUESTION]

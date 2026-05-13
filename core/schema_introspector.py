@@ -122,6 +122,14 @@ LOOKUP_TABLES = {
     "organisation":        {"name_expr": None, "name_col": "name"},
     "inspection_type":     {"name_expr": None, "name_col": "name"},
     "inspection_sub_type": {"name_expr": None, "name_col": "name"},
+    # Frequency/cadence lookup — defines how often inspections happen in a portfolio
+    # columns: id, name, repeat_count (int), repeat_interval (int), repeat_unit (DAY/WEEK/MONTH)
+    # e.g. 'Quarterly Twice' = repeat_count=2, repeat_interval=3, repeat_unit=MONTH
+    # JOIN via: inspector_portfolio_details.frequency_definition_id → frequency_definition.id
+    "frequency_definition": {"name_expr": None, "name_col": "name"},
+    # Risk/impact lookup tables
+    "risk_level":          {"name_expr": None, "name_col": "name"},
+    "impact":              {"name_expr": None, "name_col": "name"},
 }
 
 FK_RESOLUTION = {
@@ -133,6 +141,20 @@ FK_RESOLUTION = {
     "entity_id":             ("entity",   "ent",  "ent.name AS entity_name"),
     "inspection_type_id":    ("inspection_type",     "it",  "it.name AS inspection_type_name"),
     "inspection_sub_type_id":("inspection_sub_type", "ist", "ist.name AS inspection_subtype_name"),
+    # Frequency/cadence FK — inspector_portfolio_details only
+    "frequency_definition_id": (
+        "frequency_definition", "fd",
+        "fd.name AS frequency_name, fd.repeat_count, fd.repeat_interval, fd.repeat_unit"
+    ),
+    # Risk and impact FKs — inspection_corrective_action only
+    "risk_level_id":         ("risk_level", "rl",  "rl.name AS risk_level_name"),
+    "impact_id":             ("impact",     "imp", "imp.name AS impact_name"),
+    # Schedule → portfolio_details FK (critical: the column is portfolio_details_id, not portfolio_id)
+    "portfolio_details_id":  ("inspector_portfolio_details", "ipd", "ipd.id"),
+    # inspection_schedule → inspection_cycle FK
+    "inspection_cycle_id":   ("inspection_cycle", "ic", "ic.id"),
+    # inspector_portfolio → cycle
+    "cycle_id":              ("inspection_cycle", "ic", "ic.id"),
 }
 
 OPTIONAL_FKS = {
@@ -204,6 +226,7 @@ class DatabaseSchema:
     tables: dict = field(default_factory=dict)       # inspection_* tables
     ai_tables: dict = field(default_factory=dict)    # ai_question, ai_answer
     lookup_tables: dict = field(default_factory=dict)
+    enum_values: dict = field(default_factory=dict)  # table → list of name values (dynamic)
     _system_cache: Optional[str] = field(default=None, repr=False)
     _sql_cache: Optional[str] = field(default=None, repr=False)
 
@@ -302,7 +325,25 @@ class DatabaseSchema:
             if not ts:
                 continue
             expr = info["name_expr"] or info["name_col"]
-            lines.append(f"  {tname}: {expr}")
+            # Append live enum values if available
+            ev = self.enum_values.get(tname)
+            if ev and isinstance(ev[0], str):
+                vals = ", ".join(repr(v) for v in ev[:20])  # cap at 20
+                lines.append(f"  {tname}: {expr}  [values: {vals}]")
+            elif ev and isinstance(ev[0], dict):
+                # frequency_definition — show names only in the lookup section
+                names = ", ".join(repr(d["name"]) for d in ev[:10])
+                lines.append(f"  {tname}: {expr}  [definitions: {names}]")
+            else:
+                lines.append(f"  {tname}: {expr}")
+
+        # Show live status enum values for key tables
+        for col_key in ("inspection_report.status", "inspection_cycle.status",
+                        "inspection_schedule.status"):
+            vals = self.enum_values.get(col_key)
+            if vals:
+                lines.append(f"  {col_key}: {', '.join(repr(v) for v in vals)}")
+
         lines.append("")
         lines.append("JOIN patterns:")
         for fk_col, (table, alias, sel) in FK_RESOLUTION.items():
@@ -397,9 +438,62 @@ def introspect_schema(db_engine: Engine) -> DatabaseSchema:
         if ts:
             schema.lookup_tables[tname] = ts
 
+    # ── Dynamic enum extraction ───────────────────────────────────────────────
+    # Query actual values from lookup tables and key enum columns at startup.
+    # This means new risk_level tiers, inspection types, frequency definitions,
+    # etc. are automatically visible without any code changes.
+    _ENUM_QUERIES = {
+        # Lookup tables — query their name column
+        "risk_level":           ("SELECT name FROM risk_level ORDER BY name", "name"),
+        "impact":               ("SELECT name FROM impact ORDER BY name", "name"),
+        "inspection_type":      ("SELECT name FROM inspection_type ORDER BY name", "name"),
+        "frequency_definition": (
+            "SELECT name, repeat_count, repeat_interval, repeat_unit "
+            "FROM frequency_definition ORDER BY name", "name"
+        ),
+        # Enum columns on main tables — query DISTINCT values
+        "inspection_report.status": (
+            "SELECT DISTINCT status FROM inspection_report WHERE status IS NOT NULL ORDER BY status",
+            "status"
+        ),
+        "inspection_cycle.status": (
+            "SELECT DISTINCT status FROM inspection_cycle WHERE status IS NOT NULL ORDER BY status",
+            "status"
+        ),
+        "inspection_schedule.status": (
+            "SELECT DISTINCT status FROM inspection_schedule WHERE status IS NOT NULL ORDER BY status",
+            "status"
+        ),
+    }
+    try:
+        from sqlalchemy import text as sa_text
+        with db_engine.connect() as conn:
+            for key, (query, col) in _ENUM_QUERIES.items():
+                try:
+                    rows = conn.execute(sa_text(query)).fetchall()
+                    if key == "frequency_definition":
+                        # Store full definition for richer context
+                        schema.enum_values[key] = [
+                            {"name": r[0], "repeat_count": r[1],
+                             "repeat_interval": r[2], "repeat_unit": r[3]}
+                            for r in rows
+                        ]
+                    else:
+                        schema.enum_values[key] = [r[0] for r in rows if r[0]]
+                except Exception as e:
+                    pass  # Non-fatal: hardcoded values in ENUM_COLUMNS still apply
+    except Exception:
+        pass  # DB not available — degrade gracefully
+
     print(
         f"  ✓ Schema: {len(schema.tables)} inspection tables, "
         f"{len(schema.ai_tables)} ai tables, "
         f"{len(schema.lookup_tables)} lookup tables"
     )
+    if schema.enum_values:
+        extracted = ", ".join(
+            f"{k}={len(v)}" for k, v in schema.enum_values.items()
+            if isinstance(v[0], str) if v
+        )
+        print(f"  ✓ Dynamic enums: {extracted}")
     return schema

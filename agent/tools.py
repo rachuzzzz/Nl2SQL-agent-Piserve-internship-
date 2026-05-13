@@ -185,12 +185,6 @@ def get_answers(
         filters = ["1=1"]
         params: dict[str, Any] = {"limit": limit}
 
-        # inspection_id is the VARCHAR human-readable key (e.g. '2026/04/ST001/INS001')
-        # It lives on inspection_report.inspection_id, NOT on ai_answers directly.
-        # ai_answers links to inspection_report via aa.inspection_report_id = ir.id (UUID).
-        # We must join inspection_report and filter on ir.inspection_id.
-        needs_ir_join = bool(inspection_id)
-
         if form_name:
             filters.append("aq.module_name ILIKE :form_name")
             params["form_name"] = f"%{form_name}%"
@@ -201,7 +195,7 @@ def get_answers(
             filters.append("aq.label ILIKE :q_label")
             params["q_label"] = f"%{question_label}%"
         if inspection_id:
-            filters.append("ir.inspection_id = :insp_id")
+            filters.append("aa.inspection_id = :insp_id")
             params["insp_id"] = inspection_id
         if answer_value:
             filters.append(
@@ -211,25 +205,10 @@ def get_answers(
 
         where = " AND ".join(filters)
 
-        # Conditionally JOIN inspection_report only when needed (inspection_id filter).
-        # This avoids a cross-join cost on every get_answers call.
-        ir_join = (
-            "JOIN inspection_report ir ON aa.inspection_report_id = ir.id"
-            if needs_ir_join
-            else ""
-        )
-        # SELECT the human-readable inspection_id for display.
-        # When ir is joined, use ir.inspection_id; otherwise fall back to aa.inspection_report_id.
-        insp_id_col = (
-            "ir.inspection_id"
-            if needs_ir_join
-            else "aa.inspection_report_id::text"
-        )
-
         # answer_text for categorical, answer_numeric for scores/numbers.
         # COALESCE so we always get one displayable value.
         sql = sql_text(f"""
-            SELECT {insp_id_col}                                       AS inspection_id,
+            SELECT aa.inspection_id,
                    aa.module_name,
                    aq.label                                          AS question_label,
                    COALESCE(aa.answer_text, aa.answer_numeric::text) AS answer_value,
@@ -237,7 +216,6 @@ def get_answers(
                    aa.submitted_on
             FROM ai_answers aa
             LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id
-            {ir_join}
             WHERE {where}
             ORDER BY aa.submitted_on DESC
             LIMIT :limit
@@ -450,6 +428,8 @@ def generate_sql(
     schema_hint: str = "", db_engine=None,
     sql_prompt_template: str = "",
     _debug_logger=None,
+    _inject_rule_ids: list | None = None,
+    _seed_index=None,
 ) -> dict[str, Any]:
     try:
         if db_engine and not schema_hint.startswith("Use"):
@@ -460,10 +440,21 @@ def generate_sql(
             from agent.prompts import SQL_GENERATION_PROMPT
             sql_prompt_template = SQL_GENERATION_PROMPT
 
+        # Retrieval-based example injection via SeedExampleIndex (cosine similarity)
+        # Falls back to empty string if index not available.
+        from agent.seed_examples import CORE_CONTEXT
+        if _seed_index is not None:
+            retrieved = _seed_index.format_for_prompt(question, top_k=4)
+        else:
+            retrieved = "-- No seed examples available."
+        dynamic_examples = CORE_CONTEXT + "\n" + retrieved
+
         prompt = sql_prompt_template.replace(
             "{question}", question
         ).replace(
             "{schema_hint}", schema_hint or "No additional context provided."
+        ).replace(
+            "{dynamic_examples}", dynamic_examples
         )
 
         # Log the full prompt sent to deepseek if debug enabled
@@ -615,13 +606,14 @@ class ToolRegistry:
 
     def __init__(self, db_engine: Engine, semantic_index: SemanticQuestionIndex,
                  validator: SQLValidator, sql_llm, sql_prompt: str = "",
-                 debug_logger=None) -> None:
+                 debug_logger=None, seed_index=None) -> None:
         self._db_engine = db_engine
         self._semantic_index = semantic_index
         self._validator = validator
         self._sql_llm = sql_llm
         self._sql_prompt = sql_prompt
         self._debug_logger = debug_logger
+        self._seed_index = seed_index  # SeedExampleIndex for retrieval-based injection
 
     def call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name not in self.KNOWN_TOOLS:
@@ -703,6 +695,8 @@ class ToolRegistry:
                     db_engine=self._db_engine,
                     sql_prompt_template=self._sql_prompt,
                     _debug_logger=self._debug_logger,
+                    _inject_rule_ids=args.get("_inject_rule_ids", []),
+                    _seed_index=self._seed_index,
                 )
 
             if name == "execute_sql":

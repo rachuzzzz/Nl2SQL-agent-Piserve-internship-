@@ -205,7 +205,31 @@ class SQLValidator:
         "project_name":    "JOIN project proj ON ir.project_id = proj.id → proj.name",
         "type_name":       "JOIN inspection_type it ON ir.inspection_type_id = it.id → it.name",
         "inspection_type": "JOIN inspection_type it ON ir.inspection_type_id = it.id → it.name",
+        # Quarter-comparison ghost columns — deepseek hallucinates these when
+        # Qwen writes bad schema_hints like AVG(ir.current_qtr_score)
+        "current_qtr_score": "does not exist — compute with CASE WHEN ir.submitted_on >= date_trunc('quarter', NOW()) THEN ir.inspection_score END",
+        "last_qtr_score":    "does not exist — compute with CASE WHEN ir.submitted_on >= date_trunc('quarter', NOW()-INTERVAL '3 months') AND ir.submitted_on < date_trunc('quarter', NOW()) THEN ir.inspection_score END",
+        "score_improvement": "does not exist as a column — compute as this_q - last_q in a CTE",
     }
+
+    # Columns that do not exist on inspection_corrective_action.
+    # deepseek hallucinates these when given vague schema_hints about risk/deferral.
+    HALLUCINATED_ICA_COLUMNS: dict[str, str] = {
+        # Deferral ghost columns — 'times_deferred' was seen in ORDER BY in trace
+        "times_deferred":     "does not exist — use COUNT(*) GROUP BY cause or fac.name to count deferrals",
+        # Risk-level ghost columns — risk is via risk_level_id FK, not a direct column.
+        # NOTE: risk_level and impact are also TABLE names — only catch qualified refs (ica.risk_level)
+        "capex_status":       "does not exist — for risk filtering: JOIN risk_level rl ON ica.risk_level_id = rl.id WHERE rl.name = 'High'",
+        "adequacy_status":    "does not exist — for risk filtering: JOIN risk_level rl ON ica.risk_level_id = rl.id WHERE rl.name = 'High'",
+        "risk_level":         "does not exist as a column — risk_level_id is a UUID FK; JOIN risk_level rl ON ica.risk_level_id = rl.id → rl.name",
+        "impact":             "does not exist as a column — impact_id is a UUID FK; JOIN impact i ON ica.impact_id = i.id → i.name",
+        # Other ghost columns seen in traces
+        "corrective_action_description": "does not exist — use ica.corrective_action (the text field)",
+    }
+
+    # Subset of ICA ghost columns that are also table names — only check qualified refs.
+    # If we check unqualified, we'd false-positive on "JOIN risk_level rl" clauses.
+    _ICA_QUALIFIED_ONLY_COLS: frozenset = frozenset({"risk_level", "impact"})
 
     # UUID FK columns — SOFT_WARN if selected without their lookup JOIN
     UUID_FK_COLUMNS: dict[str, tuple] = {
@@ -321,6 +345,42 @@ class SQLValidator:
                         ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
                         break
 
+        # ── 5b. Hallucinated columns on inspection_corrective_action ──────
+        # deepseek confabulates risk/deferral columns that don't exist on ICA.
+        # Proven in traces: capex_status, adequacy_status, times_deferred.
+        # Also guards ir.current_qtr_score / ir.last_qtr_score ghost columns.
+        ica_used = bool(re.search(
+            r'\b(inspection_corrective_action|ica|ic)\b', sql_lower
+        ))
+        if ica_used:
+            for col, hint in self.HALLUCINATED_ICA_COLUMNS.items():
+                qualified_only = col in self._ICA_QUALIFIED_ONLY_COLS
+                hit = False
+                for alias in ("ica", "ic", "inspection_corrective_action", "icr", "ca"):
+                    if re.search(rf"\b{re.escape(alias)}\.{re.escape(col)}\b", sql_lower):
+                        hit = True
+                        break
+                if not hit and not qualified_only:
+                    # Unqualified bare reference — only flag in clause positions
+                    # (ORDER BY, WHERE, SELECT column list) to avoid matching aliases/comments.
+                    # Exclude occurrences that follow AS (alias declarations).
+                    col_pattern = rf"(?<!as\s)(?<!as  )\b{re.escape(col)}\b"
+                    if re.search(
+                        rf"(?:order\s+by|where\s|select\s)[^;]*\b{re.escape(col)}\b",
+                        sql_lower, re.DOTALL
+                    ) and not re.search(
+                        rf"\bAS\s+{re.escape(col)}\b",
+                        sql, re.IGNORECASE
+                    ):
+                        hit = True
+                if hit:
+                    issues.append(ValidationIssue(
+                        "HARD_FAIL", "WRONG_COLUMN",
+                        f"Column '{col}' does not exist on inspection_corrective_action — {hint}",
+                        detail=f"Hallucinated ICA column: {col}",
+                    ))
+                    ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+
         # ── 6. ir.id in SELECT clause (UUID PK exposed for display) ───────
         # IMPORTANT: ir.id is CORRECT and required as a JOIN key, e.g.:
         #   WHERE aa.inspection_report_id = (SELECT ir.id FROM ...)  ← valid
@@ -365,74 +425,7 @@ class SQLValidator:
                 ))
                 ValidatorStats.record("WRONG_JOIN", is_retry_trigger=True)
 
-        # ── 9. ICA bare column + UUID-vs-string BLOCK rules ──────────────────
-        # inspection_corrective_action.risk_level_id and impact_id are UUID FKs.
-        # Deepseek generates two wrong patterns:
-        #   (a) ica.risk_level / ica.impact  — columns don't exist (only *_id variants)
-        #   (b) WHERE ica.risk_level_id = 'High'  — UUID FK compared to a string
-        # Both fail silently or crash at DB time and require a JOIN through the lookup table.
-        ica_used = bool(re.search(
-            r'\b(inspection_corrective_action|ica)\b', sql_lower))
-        if ica_used:
-            # (a) bare column without _id suffix
-            if re.search(
-                r'\b(ica|inspection_corrective_action)\.risk_level\b(?!_id)',
-                sql_lower,
-            ):
-                issues.append(ValidationIssue(
-                    "HARD_FAIL", "WRONG_COLUMN",
-                    "ica.risk_level does not exist — JOIN risk_level rl ON ica.risk_level_id = rl.id",
-                    detail="Filter: WHERE rl.name ILIKE '%High%'  "
-                           "Values: High, Medium, Low, No Active Risk",
-                ))
-                ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
-
-            if re.search(
-                r'\b(ica|inspection_corrective_action)\.impact\b(?!_id)',
-                sql_lower,
-            ):
-                issues.append(ValidationIssue(
-                    "HARD_FAIL", "WRONG_COLUMN",
-                    "ica.impact does not exist — JOIN impact im ON ica.impact_id = im.id",
-                    detail="Typo in live data: 'Non Confirmity' (not 'Conformity')",
-                ))
-                ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
-
-            # (b) UUID FK column compared to a string literal (not a UUID)
-            if re.search(
-                r"\brisk_level_id\s*(?:=|ilike|like|!=|<>)\s*"
-                r"'(?![0-9a-f]{8}-)[^']*'",
-                sql_lower,
-            ):
-                issues.append(ValidationIssue(
-                    "HARD_FAIL", "WRONG_COLUMN",
-                    "risk_level_id is a UUID FK — cannot compare to 'High'; join risk_level table instead",
-                    detail="JOIN risk_level rl ON ica.risk_level_id = rl.id WHERE rl.name ILIKE '%High%'",
-                ))
-                ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
-
-            if re.search(
-                r"\bimpact_id\s*(?:=|ilike|like|!=|<>)\s*"
-                r"'(?![0-9a-f]{8}-)[^']*'",
-                sql_lower,
-            ):
-                issues.append(ValidationIssue(
-                    "HARD_FAIL", "WRONG_COLUMN",
-                    "impact_id is a UUID FK — cannot compare to string; note: live data spells 'Non Confirmity'",
-                    detail="JOIN impact im ON ica.impact_id = im.id WHERE im.name ILIKE '%Non Confirmity%'",
-                ))
-                ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
-
-        # (c) conformity spelling error when querying the impact table
-        if "impact" in sql_lower and re.search(r'\bconformity\b', sql_lower):
-            issues.append(ValidationIssue(
-                "HARD_FAIL", "WRONG_COLUMN",
-                "impact table spells 'Non Confirmity' (with 'i') — 'conformity' always returns zero rows",
-                detail="Use: WHERE im.name ILIKE '%Non Confirmity%'",
-            ))
-            ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
-
-        # ── 10. Hardcoded year — SOFT_WARN only ───────────────────────────
+        # ── 9. Hardcoded year — SOFT_WARN only ───────────────────────────
         # Moved from HARD_FAIL: a user may intentionally query a specific
         # historical year (e.g. "inspector with most inspections in 2024").
         # Blocking that is validator overreach — it caused Qwen to corrupt
@@ -450,7 +443,7 @@ class SQLValidator:
             ))
             ValidatorStats.record("HARDCODED_YEAR", is_retry_trigger=False)
 
-        # ── 11. close_on arithmetic — SOFT_WARN (not a hard fail) ─────────
+        # ── 10. close_on arithmetic — SOFT_WARN (not a hard fail) ─────────
         # close_on is NULL for most records but arithmetic IS valid for the
         # subset where it is populated. Block only with a soft advisory.
         if self._CLOSE_ON_ARITH_RE.search(sql):
@@ -462,7 +455,7 @@ class SQLValidator:
             ))
             ValidatorStats.record("UNRELIABLE_COLUMN", is_retry_trigger=False)
 
-        # ── 12. Missing LIMIT — SOFT_WARN ─────────────────────────────────
+        # ── 11. Missing LIMIT — SOFT_WARN ─────────────────────────────────
         has_agg = bool(self._AGG_RE.search(sql))
         if not has_agg and not self._LIMIT_RE.search(sql):
             issues.append(ValidationIssue(
