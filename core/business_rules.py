@@ -207,6 +207,77 @@ REGISTRY: list[dict] = [
         "sql_pattern": r"\b(ica|inspection_corrective_action)\.impact\b(?!_id)",
         "message":     "WRONG COLUMN: ica.impact does not exist. JOIN impact im ON ica.impact_id = im.id WHERE im.name ILIKE '%Non Confirmity%'",
     },
+    # ICA ghost columns proven in debug traces — never exist on inspection_corrective_action
+    {
+        "id":          "block_col_ica_times_deferred",
+        "type":        BLOCK,
+        "description": "times_deferred does not exist on inspection_corrective_action.",
+        "sql_pattern": r"\btimes_deferred\b(?!\s+FROM|\s+AS\s+times_deferred)",
+        "table_guard": "inspection_corrective_action",
+        "message":     "WRONG COLUMN: times_deferred does not exist on inspection_corrective_action. Use COUNT(*) AS times_deferred in GROUP BY aggregation instead.",
+    },
+    {
+        "id":          "block_col_ica_capex_status",
+        "type":        BLOCK,
+        "description": "capex_status does not exist on inspection_corrective_action.",
+        "sql_pattern": r"\b(ica|ics?|ca|inspection_corrective_action)\.capex_status\b",
+        "message":     "WRONG COLUMN: capex_status does not exist on inspection_corrective_action. For risk filtering: JOIN risk_level rl ON ica.risk_level_id = rl.id WHERE rl.name = 'High'",
+    },
+    {
+        "id":          "block_col_ica_adequacy_status",
+        "type":        BLOCK,
+        "description": "adequacy_status does not exist on inspection_corrective_action.",
+        "sql_pattern": r"\badequacy_status\b",
+        "table_guard": "inspection_corrective_action",
+        "message":     "WRONG COLUMN: adequacy_status does not exist on inspection_corrective_action. For risk filtering: JOIN risk_level rl ON ica.risk_level_id = rl.id WHERE rl.name = 'High'",
+    },
+
+    # ── Hallucinated quarter-comparison columns on inspection_report ──────────
+    {
+        "id":          "block_col_ir_current_qtr_score",
+        "type":        BLOCK,
+        "description": "ir.current_qtr_score does not exist — use CTE with CASE WHEN date_trunc.",
+        "sql_pattern": r"\bir\.current_qtr_score\b",
+        "message":     "WRONG COLUMN: ir.current_qtr_score does not exist. Use: AVG(CASE WHEN ir.submitted_on >= date_trunc('quarter', NOW()) THEN ir.inspection_score END) AS this_q",
+    },
+    {
+        "id":          "block_col_ir_last_qtr_score",
+        "type":        BLOCK,
+        "description": "ir.last_qtr_score does not exist — use CTE with CASE WHEN date_trunc.",
+        "sql_pattern": r"\bir\.last_qtr_score\b",
+        "message":     "WRONG COLUMN: ir.last_qtr_score does not exist. Use: AVG(CASE WHEN ir.submitted_on >= date_trunc('quarter', NOW()-INTERVAL '3 months') AND ir.submitted_on < date_trunc('quarter', NOW()) THEN ir.inspection_score END) AS last_q",
+    },
+    {
+        "id":          "block_col_ir_score_improvement",
+        "type":        BLOCK,
+        "description": "ir.score_improvement does not exist — compute as this_q - last_q in a CTE.",
+        "sql_pattern": r"\bir\.score_improvement\b",
+        "message":     "WRONG COLUMN: ir.score_improvement does not exist. Compute it in a CTE: ROUND((this_q - last_q)::numeric, 1) AS improvement",
+    },
+
+    # ── Hallucinated schedule/portfolio join columns ──────────────────────────
+    {
+        "id":          "block_col_ipd_cycle_id",
+        "type":        BLOCK,
+        "description": "inspector_portfolio_details.cycle_id does not exist — cycle link goes through inspector_portfolio.",
+        "sql_pattern": r"\bipd\.cycle_id\b",
+        "message":     (
+            "WRONG COLUMN: inspector_portfolio_details has no cycle_id. "
+            "The cycle chain is: inspection_schedule.inspection_cycle_id → inspection_cycle.id "
+            "OR: inspector_portfolio_details.portfolio_id → inspector_portfolio.cycle_id → inspection_cycle.id"
+        ),
+    },
+    {
+        "id":          "block_col_isched_inspection_schedule_id",
+        "type":        BLOCK,
+        "description": "inspection_schedule.inspection_schedule_id does not exist — use portfolio_details_id.",
+        "sql_pattern": r"\bisched\.inspection_schedule_id\b",
+        "message":     (
+            "WRONG COLUMN: inspection_schedule has no inspection_schedule_id column. "
+            "To join to inspector_portfolio_details: "
+            "JOIN inspector_portfolio_details ipd ON isched.portfolio_details_id = ipd.id"
+        ),
+    },
 
     # ── UUID FK compared to string literal ───────────────────────────────────
     {
@@ -234,7 +305,43 @@ REGISTRY: list[dict] = [
         "message":     "DATA TYPO: impact table stores 'Non Confirmity' (NOT 'Non Conformity'). ILIKE '%conformity%' always returns zero rows. Use: WHERE im.name ILIKE '%Non Confirmity%'",
     },
 
-    # ── responsible is a plain ENUM, not a FK ────────────────────────────────
+    # ── Date string arithmetic (AGG-02 bad first attempt) ────────────────────
+    {
+        "id":          "block_date_string_cast",
+        "type":        BLOCK,
+        "description": "Never construct date strings with ::TEXT || '-01-01' — use date_trunc or EXTRACT.",
+        "sql_pattern": r"\bEXTRACT\s*\(.*CURRENT_DATE.*\)\s*::TEXT\s*\|\|",
+        "message":     "BLOCKED: Date string arithmetic via ::TEXT || is fragile. Use: EXTRACT(YEAR FROM col) = EXTRACT(YEAR FROM CURRENT_DATE) or date_trunc('year', col) = date_trunc('year', NOW())",
+    },
+    {
+        "id":          "block_date_concat_year",
+        "type":        BLOCK,
+        "description": "Never concatenate year strings to build date literals.",
+        "sql_pattern": r"TO_CHAR\s*\(\s*CURRENT_DATE.*\)\s*\|\|\s*['\-]",
+        "message":     "BLOCKED: String date construction. Use: EXTRACT(YEAR FROM col) = EXTRACT(YEAR FROM CURRENT_DATE)",
+    },
+    {
+        "id":          "block_rolling_365_day_year",
+        "type":        BLOCK,
+        "description": "CURRENT_DATE - INTERVAL '1 year' is a rolling window, not a calendar year.",
+        "sql_pattern": r"CURRENT_DATE\s*-\s*INTERVAL\s*'1\s*year'",
+        "message":     (
+            "BLOCKED: CURRENT_DATE - INTERVAL '1 year' gives a rolling 365-day window, not calendar year. "
+            "Use: EXTRACT(YEAR FROM col) = EXTRACT(YEAR FROM CURRENT_DATE) "
+            "or: col >= date_trunc('year', CURRENT_DATE)"
+        ),
+    },
+    {
+        "id":          "block_interval_30_days_for_month",
+        "type":        BLOCK,
+        "description": "INTERVAL '30 days' is not 'this month' — it's a rolling window.",
+        "sql_pattern": r"INTERVAL\s*'30\s*days?'",
+        "message":     (
+            "BLOCKED: INTERVAL '30 days' is a rolling 30-day window, NOT 'this month'. "
+            "For 'this month' use: date_trunc('month', col) = date_trunc('month', NOW()). "
+            "Only use INTERVAL '30 days' if the question literally says 'last 30 days' or 'past 30 days'."
+        ),
+    },
     {
         "id":          "block_responsible_fk_join",
         "type":        BLOCK,
@@ -453,6 +560,196 @@ REGISTRY: list[dict] = [
             "\nUSE: SELECT COUNT(*) AS overdue_count FROM inspection_schedule\n"
             "WHERE status = 'OVERDUE'\n"
             "  AND due_date >= date_trunc('quarter', CURRENT_DATE);\n"
+        ),
+    },
+    {
+        "id":             "inject_raised_vs_closed_quarter",
+        "type":           INJECT,
+        "priority":       85,
+        "description":    "Raised vs closed corrective actions — must use FILTER, not GROUP BY.",
+        "question_pattern": (
+            r"\b(raised|created|opened).{0,30}(closed|completed|resolved)\b"
+            r"|\b(closed|completed|resolved).{0,30}(raised|created|opened)\b"
+            r"|\bhow\s+many.{0,30}corrective.{0,20}(raised|closed|quarter)\b"
+        ),
+        "hint": (
+            "\nUSE THIS EXACT SINGLE-ROW FORM — NOT GROUP BY status:\n"
+            "SELECT COUNT(*) AS total_raised,\n"
+            "       COUNT(*) FILTER (WHERE status IN ('CLOSED','CLOSE_WITH_DEFERRED')) AS total_closed,\n"
+            "       COUNT(*) FILTER (WHERE status IN ('OPEN','OVERDUE')) AS still_open\n"
+            "FROM inspection_corrective_action\n"
+            "WHERE created_on >= date_trunc('quarter', NOW());\n"
+            "CRITICAL: NEVER use GROUP BY status — that gives multiple rows. Return ONE row.\n"
+        ),
+    },
+    {
+        "id":             "inject_avg_inspection_duration",
+        "type":           INJECT,
+        "priority":       80,
+        "description":    "Average inspection duration — EPOCH extraction with IS NOT NULL guard.",
+        "question_pattern": (
+            r"\b(average|avg|mean).{0,20}(duration|time|hours?|length)\b"
+            r"|\b(duration|time|hours?|length).{0,20}(average|avg|inspection)\b"
+        ),
+        "hint": (
+            "\nUSE THIS EXACT PATTERN — start_date_time has NULLs, filter them out:\n"
+            "SELECT ROUND(\n"
+            "    AVG(EXTRACT(EPOCH FROM (ir.submitted_on - ir.start_date_time)) / 3600)::numeric,\n"
+            "    2\n"
+            ") AS avg_duration_hours\n"
+            "FROM inspection_report ir\n"
+            "WHERE ir.status != 'DRAFT'\n"
+            "  AND ir.start_date_time IS NOT NULL;\n"
+            "NEVER use: AVG(ir.submitted_on - ir.start_date_time) — returns interval not hours.\n"
+        ),
+    },
+    {
+        "id":             "inject_most_recent_form_answers",
+        "type":           INJECT,
+        "priority":       90,
+        "description":    "Most recent inspection form Q&A — use aa subquery not ir subquery.",
+        "question_pattern": (
+            r"\b(list|show|get|fetch|display).{0,30}"
+            r"(question|answer|form).{0,30}"
+            r"(most\s+recent|latest|last)\b"
+            r"|\b(most\s+recent|latest|last).{0,30}"
+            r"(question|answer|form)\b"
+        ),
+        "hint": (
+            "\nCRITICAL: The most recent inspection_report row may NOT have ai_answers yet.\n"
+            "Use the aa subquery to find the most recent inspection WITH Inspection Form answers:\n"
+            "SELECT aq.label AS question, aa.answer_text AS answer\n"
+            "FROM ai_answers aa\n"
+            "JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
+            "WHERE aa.inspection_report_id = (\n"
+            "    SELECT aa2.inspection_report_id\n"
+            "    FROM ai_answers aa2\n"
+            "    WHERE aa2.module_name = 'Inspection Form'\n"
+            "    ORDER BY aa2.submitted_on DESC LIMIT 1\n"
+            ")\n"
+            "  AND aa.module_name = 'Inspection Form'\n"
+            "ORDER BY aq.label LIMIT 100;\n"
+            "NEVER: (SELECT id FROM inspection_report WHERE status != 'DRAFT' "
+            "ORDER BY submitted_on DESC LIMIT 1) — that row may have no form answers.\n"
+        ),
+    },
+    # Fault 1 — "completed" semantic mapping
+    {
+        "id":             "inject_completed_inspections",
+        "type":           INJECT,
+        "priority":       75,
+        "description":    "Completed inspections — canonical mapping to CLOSED and SUBMITTED.",
+        "question_pattern": (
+            r"\b(completed|finished|done|finalized)\s+(inspection|inspections?)\b"
+            r"|\binspections?\s+(completed|finished|done)\b"
+            r"|\bhow\s+many\s+inspections?.{0,20}(completed|finished)\b"
+        ),
+        "hint": (
+            "\nSEMANTIC MAPPING: 'completed inspection' = status IN ('CLOSED', 'SUBMITTED').\n"
+            "  SUBMITTED = inspector filed and submitted — counts as completed.\n"
+            "  CLOSED = fully reviewed and approved — counts as completed.\n"
+            "  UNDER_REVIEW = still being reviewed — NOT completed.\n"
+            "  RETURN_FOR_MODIFICATION = sent back — NOT completed.\n"
+            "  DRAFT = not yet submitted — NOT completed.\n"
+            "USE: WHERE ir.status IN ('CLOSED', 'SUBMITTED')\n"
+        ),
+    },
+    # Fault 3/4/9 — Single-row comparison queries
+    {
+        "id":             "inject_this_vs_last_comparison",
+        "type":           INJECT,
+        "priority":       85,
+        "description":    "This X vs last X comparison — single-row FILTER aggregate, not GROUP BY.",
+        "question_pattern": (
+            r"\b(this|current)\s+(month|quarter|year|week).{0,20}"
+            r"(vs\.?|versus|compared?\s+to|against).{0,20}"
+            r"(last|previous|prior)\s+(month|quarter|year|week)\b"
+            r"|\b(last|previous|prior)\s+(month|quarter|year|week).{0,20}"
+            r"(vs\.?|versus|compared?\s+to)\b"
+        ),
+        "hint": (
+            "\nSINGLE-ROW COMPARISON — use FILTER aggregate, NOT GROUP BY:\n"
+            "SELECT\n"
+            "  COUNT(*) FILTER (WHERE date_trunc('month', col) = date_trunc('month', NOW())) AS this_month,\n"
+            "  COUNT(*) FILTER (WHERE date_trunc('month', col) = date_trunc('month', NOW()-INTERVAL '1 month')) AS last_month\n"
+            "FROM table WHERE ...;\n"
+            "CRITICAL: Do NOT add GROUP BY or TO_CHAR. This returns EXACTLY ONE ROW.\n"
+        ),
+    },
+    # ICA risk level — prevent UUID drift (ICA-02/03 regression fix)
+    {
+        "id":             "inject_ica_risk_level",
+        "type":           INJECT,
+        "priority":       95,
+        "description":    "ICA risk level queries — ALWAYS JOIN risk_level table, never select UUID.",
+        "question_pattern": (
+            # Must mention corrective action, ICA, or risk breakdown in context of actions/counts
+            r"\b(high|medium|low)\s*risk\s*(corrective.?action|action|count|breakdown|all\s+corrective)\b"
+            r"|\b(corrective.?action|ica).{0,40}(risk|high.?risk|medium.?risk|low.?risk)\b"
+            r"|\brisk.?level.{0,30}(corrective|action|breakdown|all\s+corrective)\b"
+            r"|\b(how\s+many|count|show|list).{0,20}(high|medium|low)\s*risk\s*(corrective|action)\b"
+        ),
+        "hint": (
+            "\nICA RISK LEVEL — risk_level_id is a UUID FK, NEVER a string:\n"
+            "  ALWAYS: JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
+            "  ALWAYS: SELECT rl.name AS risk_level_name\n"
+            "  ALWAYS: WHERE rl.name = 'High'  (for high-risk filter)\n"
+            "  NEVER:  WHERE ica.risk_level_id = 'High'\n"
+            "  NEVER:  SELECT ica.risk_level_id  ← outputs UUID garbage\n"
+            "  NEVER:  GROUP BY ica.risk_level_id  ← UUID groups, not readable names\n"
+            "\nCount by risk level (ICA-02 canonical form):\n"
+            "SELECT rl.name AS risk_level_name, COUNT(*) AS count\n"
+            "FROM inspection_corrective_action ica\n"
+            "JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
+            "GROUP BY rl.name ORDER BY count DESC;\n"
+            "\nCount only High risk (ICA-03 canonical form):\n"
+            "SELECT COUNT(*) AS high_risk_count\n"
+            "FROM inspection_corrective_action ica\n"
+            "JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
+            "WHERE rl.name = 'High';\n"
+        ),
+    },
+    # Join registry — schedule/cycle/frequency tables
+    # These tables are visible in the schema but their join paths are non-obvious.
+    # Without explicit guidance deepseek will hallucinate joins or miss the chain.
+    {
+        "id":             "inject_inspection_schedule_joins",
+        "type":           INJECT,
+        "priority":       80,
+        "description":    "Schedule/cycle/frequency queries — correct join chain and column names.",
+        "question_pattern": (
+            r"\b(schedule[ds]?|due\s+date|upcoming|overdue\s+inspection)\b"
+            r"|\b(frequency|cycle|recurring|period)\s+(of\s+)?(inspection|visit|audit)\b"
+            r"|\b(inspection|visit|audit).{0,30}(frequency|cycle|recurring|period)\b"
+            r"|\bhow\s+(often|frequent)\b"
+        ),
+        "hint": (
+            "\nINSPECTION CYCLE / FREQUENCY — EXACT column names (errors occur with wrong names):\n"
+            "  inspection_schedule.inspection_cycle_id  → inspection_cycle.id\n"
+            "  inspection_schedule.portfolio_details_id → inspector_portfolio_details.id\n"
+            "    NEVER: isched.portfolio_id or isched.inspection_schedule_id (don't exist)\n"
+            "  inspector_portfolio_details.frequency_definition_id → frequency_definition.id\n"
+            "  inspector_portfolio_details.portfolio_id → inspector_portfolio.id\n"
+            "    NEVER: ipd.cycle_id (does not exist — cycle goes through inspector_portfolio)\n"
+            "  inspector_portfolio.cycle_id → inspection_cycle.id\n"
+            "\nfrequency_definition columns: id, name, repeat_count, repeat_interval,\n"
+            "  repeat_unit (DAY/WEEK/MONTH)\n"
+            "  'Daily'=repeat_count=1,repeat_interval=1,DAY\n"
+            "  'Alternate Days'=repeat_count=1,repeat_interval=2,DAY\n"
+            "\nFor frequency breakdown of a specific cycle (use GROUP BY, not flat join):\n"
+            "SELECT fd.name AS frequency_name, fd.repeat_count, fd.repeat_interval,\n"
+            "       fd.repeat_unit, COUNT(*) AS schedule_count\n"
+            "FROM inspection_schedule isched\n"
+            "JOIN inspector_portfolio_details ipd ON isched.portfolio_details_id = ipd.id\n"
+            "JOIN frequency_definition fd ON ipd.frequency_definition_id = fd.id\n"
+            "WHERE isched.inspection_cycle_id = '<cycle_id>'\n"
+            "GROUP BY fd.name, fd.repeat_count, fd.repeat_interval, fd.repeat_unit\n"
+            "ORDER BY schedule_count DESC;\n"
+            "\nFor overdue schedule count:\n"
+            "SELECT COUNT(*) AS overdue_count FROM inspection_schedule\n"
+            "WHERE status = 'OVERDUE'\n"
+            "  AND due_date >= date_trunc('quarter', NOW())\n"
+            "  AND due_date < date_trunc('quarter', NOW()) + INTERVAL '3 months';\n"
         ),
     },
 ]
