@@ -521,6 +521,238 @@ TEST_SET = [
         "expected_nonempty": False,
         "expected_llm_calls": 1, "notes": "Garbage input graceful decline",
     },
+
+    # ── Frequency / Schedule ──────────────────────────────────────────────────
+    {
+        "id": "FREQ-01", "category": "Schedule",
+        "question": "how many inspections are pending this quarter",
+        "expected_contains": ["pending"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "inspection_schedule status=PENDING",
+    },
+    {
+        "id": "FREQ-02", "category": "Schedule",
+        "question": "what is the most common inspection frequency in our portfolio",
+        "expected_contains": ["daily", "monthly", "weekly", "frequency", "quarterly", "annual"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "frequency_definition → inspector_portfolio_details join",
+    },
+    {
+        "id": "FREQ-03", "category": "Schedule",
+        "question": "which facilities are scheduled for daily inspections",
+        "expected_contains": ["daily", "facility"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "frequency_definition.name = 'Daily' → inspector_portfolio_details → facility",
+    },
+    {
+        "id": "FREQ-04", "category": "Schedule",
+        "question": "show me the inspection schedule for the next 30 days",
+        "expected_contains": ["facility", "due"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "inspection_schedule due_date BETWEEN NOW AND NOW+30d",
+    },
+    {
+        "id": "FREQ-05", "category": "Schedule",
+        "question": "how many completed vs overdue inspections in the schedule this year",
+        "expected_contains": ["completed", "overdue"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "inspection_schedule GROUP BY status filter this year",
+    },
+
+    # ── Cross-domain Complexity ───────────────────────────────────────────────
+    {
+        "id": "CROSS-01", "category": "Cross-domain",
+        "question": "which facilities have the most overdue corrective actions and the lowest inspection scores",
+        "expected_contains": ["facility", "overdue", "score"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 2,
+        "notes": "ICA OVERDUE count + avg inspection_score, both joined to facility",
+    },
+    {
+        "id": "CROSS-02", "category": "Cross-domain",
+        "question": "which inspection types generate the most high risk corrective actions",
+        "expected_contains": ["inspection", "high", "risk"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "inspection_type → ir → ica → risk_level JOIN chain",
+    },
+    {
+        "id": "CROSS-03", "category": "Cross-domain",
+        "question": "list facilities that were inspected this year but have zero corrective actions",
+        "expected_contains": ["facility"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "LEFT JOIN ica WHERE ica.id IS NULL",
+    },
+    {
+        "id": "CROSS-04", "category": "Cross-domain",
+        "question": "which facilities have high risk observations but no corrective actions raised",
+        "expected_contains": ["facility"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 2,
+        "notes": "ai_answers risk_level=High LEFT JOIN ica IS NULL",
+    },
+
+    # ── ETL Boundary Awareness ────────────────────────────────────────────────
+    {
+        "id": "ETL-01", "category": "ETL Boundary",
+        "question": "show me the most recent inspection that has form data available",
+        "expected_contains": ["inspection", "facility"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "Must use aa subquery NOT ir.submitted_on — ETL gap awareness",
+    },
+    {
+        "id": "ETL-02", "category": "ETL Boundary",
+        "question": "list the last 10 inspections that have form answers indexed",
+        "expected_contains": ["inspection", "facility"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "SELECT DISTINCT inspection_report_id FROM ai_answers ORDER BY submitted_on DESC LIMIT 10",
+    },
+    {
+        "id": "ETL-03", "category": "ETL Boundary",
+        "question": "how many inspections have been submitted but not yet indexed with form answers",
+        "expected_contains": [],
+        "expected_nonempty": False,
+        "expected_llm_calls": 1,
+        "notes": "ir NOT IN (SELECT DISTINCT inspection_report_id FROM ai_answers) — may be 0 or more",
+    },
+
+    # ── Portfolio / Assignment ────────────────────────────────────────────────
+    {
+        "id": "PORT-01", "category": "Portfolio",
+        "question": "how many inspectors are currently assigned portfolios",
+        "expected_contains": ["inspector"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "COUNT DISTINCT inspector_portfolio.inspector_id",
+    },
+    {
+        "id": "PORT-02", "category": "Portfolio",
+        "question": "which inspector has the most facilities in their portfolio",
+        "expected_contains": ["inspector", "facility"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "inspector_portfolio_details GROUP BY portfolio → inspector",
+    },
+    {
+        "id": "PORT-03", "category": "Portfolio",
+        "question": "what facilities are assigned to each inspection frequency type",
+        "expected_contains": ["facility", "frequency", "daily", "monthly", "weekly", "quarterly", "annual"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "frequency_definition JOIN inspector_portfolio_details JOIN facility",
+    },
+
+    # ── Conversational / Natural Phrasing ────────────────────────────────────
+    {
+        "id": "CONV-01", "category": "Conversational",
+        "question": "show me the worst performing facilities",
+        "expected_contains": ["facility", "score"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "ORDER BY avg_score ASC — natural phrasing",
+    },
+    {
+        "id": "CONV-02", "category": "Conversational",
+        "question": "what needs attention right now",
+        "expected_contains": ["overdue", "risk", "corrective", "facility"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 2,
+        "notes": "Ambiguous — expect overdue CA or high risk observations",
+    },
+    {
+        "id": "CONV-03", "category": "Conversational",
+        "question": "how are we doing overall",
+        "expected_contains": ["score", "inspection", "corrective", "average"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 2, "notes": "High-level summary — avg score or completion rate",
+    },
+    {
+        "id": "CONV-04", "category": "Conversational",
+        "question": "any critical issues I should know about",
+        "expected_contains": ["high", "risk", "overdue", "corrective"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 2, "notes": "Should surface high risk + overdue items",
+    },
+    {
+        "id": "CONV-05", "category": "Conversational",
+        "question": "give me a breakdown of this quarter",
+        "expected_contains": ["quarter", "inspection", "corrective"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 2, "notes": "Quarter summary — inspections done, CAs raised",
+    },
+
+    # ── Comparison / Ranking ─────────────────────────────────────────────────
+    {
+        "id": "COMP-01", "category": "Comparison",
+        "question": "which month had the best average inspection score this year",
+        "expected_contains": ["month", "score"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "ORDER BY avg_score DESC LIMIT 1 grouped by month",
+    },
+    {
+        "id": "COMP-02", "category": "Comparison",
+        "question": "rank inspection types by their average corrective actions per inspection",
+        "expected_contains": ["inspection"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "GROUP BY inspection_type ORDER BY avg_ca DESC",
+    },
+    {
+        "id": "COMP-03", "category": "Comparison",
+        "question": "which inspection type has the highest corrective action rate",
+        "expected_contains": ["inspection"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "CA count / inspection count by type",
+    },
+    {
+        "id": "COMP-04", "category": "Comparison",
+        "question": "compare overdue corrective action counts between CLIENT and INTERNAL_OPERATIONS",
+        "expected_contains": ["client", "internal"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "FILTER aggregate by responsible enum — two-column comparison",
+    },
+
+    # ── Extended Aggregates ───────────────────────────────────────────────────
+    {
+        "id": "AGG-EXT-01", "category": "Extended Aggregate",
+        "question": "what is the average number of corrective actions per inspection",
+        "expected_contains": ["average", "avg", "corrective"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "Subquery: COUNT per inspection, then AVG",
+    },
+    {
+        "id": "AGG-EXT-02", "category": "Extended Aggregate",
+        "question": "how many corrective actions were closed on time vs late",
+        "expected_contains": ["closed", "time", "late", "on_time", "overdue"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "FILTER: status=CLOSED AND close_on <= target vs > target",
+    },
+    {
+        "id": "AGG-EXT-03", "category": "Extended Aggregate",
+        "question": "what percentage of corrective actions are currently overdue",
+        "expected_contains": ["overdue", "%", "percent"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "OVERDUE / total * 100",
+    },
+    {
+        "id": "AGG-EXT-04", "category": "Extended Aggregate",
+        "question": "how many facilities have had zero inspections this year",
+        "expected_contains": ["facility", "zero", "no inspection", "0"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "facility LEFT JOIN ir WHERE EXTRACT(YEAR)... IS NULL — zero-inspection facilities",
+    },
+    {
+        "id": "AGG-EXT-05", "category": "Extended Aggregate",
+        "question": "what is the total number of observations recorded across all inspections",
+        "expected_contains": ["observation", "total", "count"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "COUNT ai_answers WHERE label='Observation'",
+    },
 ]
 
 

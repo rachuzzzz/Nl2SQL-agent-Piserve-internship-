@@ -21,10 +21,11 @@ The system self-improves as new query patterns are identified.
 # ── Always-injected schema invariants ────────────────────────────────────────
 # Not embedded — prepended unconditionally to every SQL call.
 CORE_CONTEXT = """\
--- inspection_report: use ir.inspection_id (VARCHAR) for display, ir.id (UUID) only in JOINs/subqueries
--- ICA join: JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id  (NOT ir.inspection_id = ica.inspection_id)
--- completed inspection = status IN ('CLOSED','SUBMITTED') | responsible: 'CLIENT','INTERNAL_OPERATIONS','SUB_CONTRACTOR'
--- NEVER: ir.id in SELECT list | NEVER: ica.risk_level_id compared to string | NEVER: GROUP BY ica.risk_level_id
+### SQL RULES FOR DEEPSEEK (not for end user):
+-- ir.inspection_id (VARCHAR) = display id | ir.id (UUID) = JOIN/subquery only, NEVER SELECT
+-- ICA join: ON ica.inspection_id = ir.id  (NOT ir.inspection_id = ica.inspection_id)
+-- completed = status IN ('CLOSED','SUBMITTED') | responsible: 'CLIENT','INTERNAL_OPERATIONS','SUB_CONTRACTOR'
+-- NEVER: ir.id in SELECT | NEVER: ica.risk_level_id vs string | NEVER: GROUP BY ica.risk_level_id
 """
 
 # ── Seed corpus ───────────────────────────────────────────────────────────────
@@ -547,6 +548,9 @@ ORDER BY avg_score ASC LIMIT 1;""",
     (
         "show me the most recently answered inspection",
         """\
+-- CRITICAL: use ai_answers subquery NOT inspection_report ORDER BY submitted_on
+-- The newest inspection_report row may have NO ai_answers yet (ETL gap).
+-- Always find the most recent inspection WITH form data via ai_answers:
 SELECT ir.inspection_id, fac.name AS facility_name,
        it.name AS inspection_type_name,
        u.first_name || ' ' || u.last_name AS inspector_name,
@@ -559,7 +563,28 @@ WHERE ir.id = (
     SELECT aa.inspection_report_id FROM ai_answers aa
     WHERE aa.module_name = 'Inspection Form'
     ORDER BY aa.submitted_on DESC LIMIT 1
+);
+-- NEVER: ORDER BY ir.submitted_on DESC LIMIT 1 — newest ir may have no form data""",
+    ),
+    (
+        "latest inspection with answers",
+        """\
+-- Use ai_answers to find most recent inspection WITH form data (not inspection_report):
+SELECT ir.inspection_id, fac.name AS facility_name, ir.submitted_on, ir.status
+FROM inspection_report ir
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE ir.id = (
+    SELECT aa.inspection_report_id FROM ai_answers aa
+    WHERE aa.module_name = 'Inspection Form'
+    ORDER BY aa.submitted_on DESC LIMIT 1
 );""",
+    ),
+    (
+        "most recent inspection that has form answers",
+        """\
+SELECT aa.inspection_report_id FROM ai_answers aa
+WHERE aa.module_name = 'Inspection Form'
+ORDER BY aa.submitted_on DESC LIMIT 1;""",
     ),
 
     # ── People ───────────────────────────────────────────────────────────────
@@ -598,6 +623,33 @@ WHERE status = 'OVERDUE'
   AND due_date < date_trunc('quarter', NOW()) + INTERVAL '3 months';""",
     ),
     (
+        "show me the inspection schedule for the next 30 days",
+        """\
+-- inspection_schedule columns: id, status, due_date, scheduled_date,
+--   facility_id, inspector_id, inspection_cycle_id, portfolio_details_id, inspection_report_id
+-- NEVER: inspection_schedule.inspection_id (does not exist — use inspection_report_id FK)
+SELECT isched.due_date, isched.status AS schedule_status,
+       fac.name AS facility_name,
+       u.first_name || ' ' || u.last_name AS inspector_name
+FROM inspection_schedule isched
+JOIN facility fac ON isched.facility_id = fac.id
+LEFT JOIN users u ON isched.inspector_id = u.id
+WHERE isched.due_date >= CURRENT_DATE
+  AND isched.due_date < CURRENT_DATE + INTERVAL '30 days'
+  AND isched.status != 'COMPLETED'
+ORDER BY isched.due_date ASC LIMIT 100;""",
+    ),
+    (
+        "how many pending or scheduled inspections this month",
+        """\
+SELECT status, COUNT(*) AS count
+FROM inspection_schedule
+WHERE status IN ('PENDING', 'ONGOING')
+  AND due_date >= date_trunc('month', NOW())
+  AND due_date < date_trunc('month', NOW()) + INTERVAL '1 month'
+GROUP BY status;""",
+    ),
+    (
         "what is the frequency breakdown of inspections in a cycle",
         """\
 -- EXACT column names (wrong names caused errors):
@@ -625,5 +677,75 @@ JOIN facility fac ON isched.facility_id = fac.id
 LEFT JOIN inspection_report ir ON isched.inspection_report_id = ir.id
 WHERE fac.name ILIKE '%facility_name%'
 ORDER BY isched.due_date DESC LIMIT 50;""",
+    ),
+
+    # ── Portfolio / Inspector assignment ─────────────────────────────────────
+    (
+        "how many inspectors are assigned portfolios",
+        """\
+-- inspector_portfolio: id, inspector_id (FK→users.id), status, cycle_id
+-- inspector_portfolio_details: id, portfolio_id (FK→inspector_portfolio.id), facility_id, frequency_definition_id
+SELECT COUNT(DISTINCT ip.inspector_id) AS inspector_count
+FROM inspector_portfolio ip
+WHERE ip.status != 'DRAFT';""",
+    ),
+    (
+        "which inspector has the most facilities in their portfolio",
+        """\
+SELECT u.first_name || ' ' || u.last_name AS inspector_name,
+       COUNT(DISTINCT ipd.facility_id) AS facility_count
+FROM inspector_portfolio ip
+JOIN inspector_portfolio_details ipd ON ipd.portfolio_id = ip.id
+JOIN users u ON ip.inspector_id = u.id
+WHERE ip.status != 'DRAFT'
+GROUP BY u.id, u.first_name, u.last_name
+ORDER BY facility_count DESC LIMIT 10;""",
+    ),
+    (
+        "list inspector portfolio assignments with facility and frequency",
+        """\
+SELECT u.first_name || ' ' || u.last_name AS inspector_name,
+       fac.name AS facility_name,
+       fd.name AS frequency_name,
+       it.name AS inspection_type_name
+FROM inspector_portfolio ip
+JOIN inspector_portfolio_details ipd ON ipd.portfolio_id = ip.id
+JOIN users u ON ip.inspector_id = u.id
+JOIN facility fac ON ipd.facility_id = fac.id
+JOIN frequency_definition fd ON ipd.frequency_definition_id = fd.id
+LEFT JOIN inspection_type it ON ipd.inspection_type_id = it.id
+WHERE ip.status != 'DRAFT'
+ORDER BY u.last_name, fac.name LIMIT 100;""",
+    ),
+
+    # ── ETL boundary (phrase variants) ───────────────────────────────────────
+    (
+        "most recent inspection with form data available",
+        """\
+-- Must use ai_answers subquery — inspection_report.submitted_on may point to
+-- an inspection with NO ai_answers yet (ETL gap).
+SELECT ir.inspection_id, fac.name AS facility_name, ir.submitted_on, ir.status
+FROM inspection_report ir
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE ir.id = (
+    SELECT aa.inspection_report_id FROM ai_answers aa
+    WHERE aa.module_name = 'Inspection Form'
+    ORDER BY aa.submitted_on DESC LIMIT 1
+);""",
+    ),
+    (
+        "which inspections are not yet indexed in form answers",
+        """\
+-- Inspections in inspection_report with no matching row in ai_answers (ETL gap):
+SELECT ir.inspection_id, ir.status, ir.submitted_on,
+       fac.name AS facility_name
+FROM inspection_report ir
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE ir.id NOT IN (
+    SELECT DISTINCT aa.inspection_report_id FROM ai_answers aa
+    WHERE aa.inspection_report_id IS NOT NULL
+)
+  AND ir.status != 'DRAFT'
+ORDER BY ir.submitted_on DESC LIMIT 50;""",
     ),
 ]

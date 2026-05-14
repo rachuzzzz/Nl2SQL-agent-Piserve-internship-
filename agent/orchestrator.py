@@ -393,6 +393,7 @@ class AgentOrchestrator:
             db_engine=self.db_engine,
             semantic_index=self.semantic_index,
             seed_index=self.seed_index,
+            db_schema=self.db_schema,
             validator=self.validator,
             sql_llm=self.sql_llm,
             sql_prompt=self._sql_prompt,

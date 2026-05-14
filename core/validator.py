@@ -479,8 +479,80 @@ class SQLValidator:
         return ValidationResult(passed=passed, issues=issues)
 
     # ------------------------------------------------------------------ #
-    # Semantic heuristics — SOFT_WARN only, never blocks, never retries
+    # Shape validation — HARD_FAIL for structural mismatches
+    # Call after generate_sql when the expected shape is known.
     # ------------------------------------------------------------------ #
+
+    # Map of question patterns → expected shape
+    _SINGLE_ROW_PATTERNS = re.compile(
+        r"\b(this\s+(month|quarter|year|week)\s+vs\.?\s+last|"
+        r"last\s+(month|quarter|year|week)\s+vs\.?|"
+        r"how\s+many.{0,30}(vs\.?|versus|compared?\s+to)|"
+        r"raised\s+vs\.?\s+closed|"
+        r"comparison|"
+        r"faster\s+or\s+slower)\b",
+        re.IGNORECASE,
+    )
+
+    def validate_shape(self, sql: str, question: str) -> ValidationResult:
+        """
+        AST-level shape validation. Called when query intent implies a
+        specific result structure that the generated SQL must match.
+
+        Currently enforces:
+          - SINGLE_ROW intent: GROUP BY is forbidden (use FILTER aggregates)
+
+        Returns ValidationResult with HARD_FAIL if shape is violated.
+        This triggers a retry with an explicit structural correction message.
+        """
+        if not _HAS_SQLGLOT:
+            return ValidationResult(passed=True, issues=[])
+
+        issues: list[ValidationIssue] = []
+        q_lower = question.lower()
+
+        # Detect single-row comparison intent
+        is_single_row_intent = bool(self._SINGLE_ROW_PATTERNS.search(q_lower))
+
+        if not is_single_row_intent:
+            return ValidationResult(passed=True, issues=[])
+
+        # Parse SQL AST and check for GROUP BY on the outermost SELECT
+        try:
+            tree = sqlglot.parse_one(sql, dialect="postgres")
+        except Exception:
+            return ValidationResult(passed=True, issues=[])
+
+        # Find outermost SELECT
+        outermost = None
+        for node in tree.walk():
+            if isinstance(node, sqlglot.exp.Select):
+                outermost = node
+                break
+
+        if outermost is None:
+            return ValidationResult(passed=True, issues=[])
+
+        has_group_by = outermost.args.get("group") is not None
+
+        if has_group_by:
+            issue = ValidationIssue(
+                "HARD_FAIL",
+                "WRONG_SHAPE",
+                (
+                    "SHAPE VIOLATION: comparison query must return ONE row. "
+                    "Remove GROUP BY. Use FILTER aggregates instead:\n"
+                    "  SELECT\n"
+                    "    COUNT(*) FILTER (WHERE date_trunc('month', col) = date_trunc('month', NOW())) AS this_month,\n"
+                    "    COUNT(*) FILTER (WHERE date_trunc('month', col) = date_trunc('month', NOW()-INTERVAL '1 month')) AS last_month\n"
+                    "  FROM table WHERE ...;"
+                ),
+                retryable=True,
+            )
+            ValidatorStats.record("WRONG_SHAPE", is_retry_trigger=True)
+            return ValidationResult(passed=False, issues=[issue])
+
+        return ValidationResult(passed=True, issues=[])
 
     def validate_semantic(self, sql: str, question: str) -> list[ValidationIssue]:
         """
@@ -519,6 +591,47 @@ class SQLValidator:
             _check_uuid_leaks_ast(sql, self.UUID_FK_COLUMNS, warns)
         else:
             _check_uuid_leaks_regex(sql_lower, self.UUID_FK_COLUMNS, warns)
+
+        # Required predicate checks — verify semantic constraints are present.
+        # These are SOFT_WARN because the query may still be correct (e.g. user
+        # is explicitly asking about DRAFT inspections).
+
+        # "completed" inspections must include SUBMITTED or CLOSED
+        _COMPLETED_Q = re.compile(
+            r"\b(completed|finished|done|finalized)\s+(inspection|inspections?)\b"
+            r"|\binspections?\s+(were\s+)?(completed|finished|done|finalized)\b"
+            r"|\bhow\s+many\s+inspections?.{0,20}(completed|finished|done)\b",
+            re.IGNORECASE,
+        )
+        if _COMPLETED_Q.search(question):
+            has_submitted = "'SUBMITTED'" in sql.upper() or "\"SUBMITTED\"" in sql
+            has_closed = "'CLOSED'" in sql.upper() or "\"CLOSED\"" in sql
+            if not (has_submitted or has_closed):
+                warns.append(ValidationIssue(
+                    "SOFT_WARN", "MISSING_COMPLETED_STATUS",
+                    "Query asks about 'completed' inspections but SQL has neither 'CLOSED' nor 'SUBMITTED'",
+                    detail="completed_inspection = status IN ('CLOSED','SUBMITTED')",
+                    retryable=False,
+                ))
+                ValidatorStats.record("MISSING_COMPLETED_STATUS", is_retry_trigger=False)
+
+        # "overdue" corrective actions should use status='OVERDUE' not date arithmetic
+        _OVERDUE_CA_Q = re.compile(
+            r"\boverdue\s+(corrective|action)\b|\b(corrective|action).{0,15}overdue\b",
+            re.IGNORECASE,
+        )
+        if _OVERDUE_CA_Q.search(question):
+            uses_overdue_status = "'OVERDUE'" in sql.upper()
+            uses_date_compare = bool(re.search(
+                r"target_close_out_date\s*<\s*(?:NOW|CURRENT_DATE)", sql_lower))
+            if not uses_overdue_status and uses_date_compare:
+                warns.append(ValidationIssue(
+                    "SOFT_WARN", "SEMANTIC_DATE_VS_STATUS",
+                    "Overdue corrective actions: prefer status='OVERDUE' over date arithmetic",
+                    detail="status='OVERDUE' is the authoritative field — do not recompute from target_close_out_date",
+                    retryable=False,
+                ))
+                ValidatorStats.record("SEMANTIC_DATE_VS_STATUS", is_retry_trigger=False)
 
         return warns
 
