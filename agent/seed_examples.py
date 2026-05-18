@@ -26,6 +26,10 @@ CORE_CONTEXT = """\
 -- ICA join: ON ica.inspection_id = ir.id  (NOT ir.inspection_id = ica.inspection_id)
 -- completed = status IN ('CLOSED','SUBMITTED') | responsible: 'CLIENT','INTERNAL_OPERATIONS','SUB_CONTRACTOR'
 -- NEVER: ir.id in SELECT | NEVER: ica.risk_level_id vs string | NEVER: GROUP BY ica.risk_level_id
+-- completed_cycle = status='COMPLETED' (NOT 'CLOSED', NOT status!='DRAFT')
+-- NEVER: ipd.cycle_id (no such column on inspector_portfolio_details)
+-- Cycle->Freq: inspection_cycle.id -> inspector_portfolio.cycle_id
+--   -> inspector_portfolio_details.portfolio_id -> frequency_definition.id
 """
 
 # ── Seed corpus ───────────────────────────────────────────────────────────────
@@ -94,6 +98,29 @@ FROM (
     GROUP BY aa.inspection_report_id
 ) sub;""",
     ),
+    (
+        "rank inspection types by average corrective actions per inspection",
+        """\
+-- TWO-LEVEL SUBQUERY: inner counts CAs per INSPECTION (ir.id), outer AVGs per TYPE
+-- NEVER: AVG(COUNT(...)) — nested aggregates are illegal in PostgreSQL
+-- NEVER: GROUP BY inspection_type_id in inner query — that collapses to 1 row per type,
+--         making AVG meaningless. Must GROUP BY ir.id (individual inspection) first.
+SELECT it.name AS inspection_type_name,
+       COUNT(*) AS inspection_count,
+       SUM(ica_count) AS total_corrective_actions,
+       ROUND(AVG(ica_count)::numeric, 2) AS avg_corrective_actions_per_inspection
+FROM (
+    SELECT ir.id, ir.inspection_type_id, COUNT(ica.id) AS ica_count
+    FROM inspection_report ir
+    LEFT JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id
+    WHERE ir.status != 'DRAFT'
+    GROUP BY ir.id, ir.inspection_type_id
+) AS per_inspection
+JOIN inspection_type it ON per_inspection.inspection_type_id = it.id
+GROUP BY it.name
+ORDER BY avg_corrective_actions_per_inspection DESC
+LIMIT 50;""",
+    ),
 
     # ── Temporal / Comparison ────────────────────────────────────────────────
     (
@@ -146,7 +173,13 @@ ORDER BY high_risk_count DESC LIMIT 1;""",
     (
         "are corrective actions being closed faster or slower compared to last quarter",
         """\
+-- CLOSURE SPEED: use STATUS-BASED closure rate — NOT date arithmetic.
+-- NEVER try: close_on - created_on, AVG(days_to_close), DATEDIFF, or similar.
+-- The correct columns for timing are: created_on (exists), target_close_out_date (exists).
+-- close_on IS NULL for most records — any arithmetic on it returns NULL/empty.
+-- CORRECT: compare closure_rate_pct (closed count / total) between quarters.
 SELECT TO_CHAR(date_trunc('quarter', ica.created_on), '"Q"Q YYYY') AS quarter,
+       COUNT(*) AS total_raised,
        COUNT(*) FILTER (WHERE ica.status IN ('CLOSED','CLOSE_WITH_DEFERRED')) AS closed_count,
        ROUND(
            100.0 * COUNT(*) FILTER (WHERE ica.status IN ('CLOSED','CLOSE_WITH_DEFERRED'))
@@ -338,10 +371,8 @@ FROM ai_answers aa
 JOIN ai_questions aq ON aa.element_id = aq.element_id
 WHERE aa.inspection_report_id = (
     SELECT aa2.inspection_report_id FROM ai_answers aa2
-    WHERE aa2.module_name = 'Inspection Form'
     ORDER BY aa2.submitted_on DESC LIMIT 1
 )
-  AND aa.module_name = 'Inspection Form'
 ORDER BY aq.label LIMIT 100;""",
     ),
     (
@@ -408,7 +439,7 @@ WHERE aa.inspection_report_id = (
       AND ir.status != 'DRAFT'
     ORDER BY ir.submitted_on DESC LIMIT 1
 )
-  AND aa.module_name = 'Inspection Form'
+
 ORDER BY aq.label;""",
     ),
 
@@ -561,7 +592,6 @@ JOIN inspection_type it ON ir.inspection_type_id = it.id
 JOIN users u ON ir.inspector_user_id = u.id
 WHERE ir.id = (
     SELECT aa.inspection_report_id FROM ai_answers aa
-    WHERE aa.module_name = 'Inspection Form'
     ORDER BY aa.submitted_on DESC LIMIT 1
 );
 -- NEVER: ORDER BY ir.submitted_on DESC LIMIT 1 — newest ir may have no form data""",
@@ -575,7 +605,6 @@ FROM inspection_report ir
 JOIN facility fac ON ir.facility_id = fac.id
 WHERE ir.id = (
     SELECT aa.inspection_report_id FROM ai_answers aa
-    WHERE aa.module_name = 'Inspection Form'
     ORDER BY aa.submitted_on DESC LIMIT 1
 );""",
     ),
@@ -583,7 +612,6 @@ WHERE ir.id = (
         "most recent inspection that has form answers",
         """\
 SELECT aa.inspection_report_id FROM ai_answers aa
-WHERE aa.module_name = 'Inspection Form'
 ORDER BY aa.submitted_on DESC LIMIT 1;""",
     ),
 
@@ -683,20 +711,22 @@ ORDER BY isched.due_date DESC LIMIT 50;""",
     (
         "how many inspectors are assigned portfolios",
         """\
--- inspector_portfolio: id, inspector_id (FK→users.id), status, cycle_id
+-- inspector_portfolio: id, user_id (FK→users.id), status, cycle_id
+-- NEVER: ip.inspector_id (does not exist — the FK column is user_id)
 -- inspector_portfolio_details: id, portfolio_id (FK→inspector_portfolio.id), facility_id, frequency_definition_id
-SELECT COUNT(DISTINCT ip.inspector_id) AS inspector_count
+SELECT COUNT(DISTINCT ip.user_id) AS inspector_count
 FROM inspector_portfolio ip
 WHERE ip.status != 'DRAFT';""",
     ),
     (
         "which inspector has the most facilities in their portfolio",
         """\
+-- inspector_portfolio FK to users: ip.user_id = u.id  (NOT inspector_id — does not exist)
 SELECT u.first_name || ' ' || u.last_name AS inspector_name,
        COUNT(DISTINCT ipd.facility_id) AS facility_count
 FROM inspector_portfolio ip
 JOIN inspector_portfolio_details ipd ON ipd.portfolio_id = ip.id
-JOIN users u ON ip.inspector_id = u.id
+JOIN users u ON ip.user_id = u.id
 WHERE ip.status != 'DRAFT'
 GROUP BY u.id, u.first_name, u.last_name
 ORDER BY facility_count DESC LIMIT 10;""",
@@ -704,13 +734,14 @@ ORDER BY facility_count DESC LIMIT 10;""",
     (
         "list inspector portfolio assignments with facility and frequency",
         """\
+-- inspector_portfolio FK to users: ip.user_id = u.id  (NOT inspector_id — does not exist)
 SELECT u.first_name || ' ' || u.last_name AS inspector_name,
        fac.name AS facility_name,
        fd.name AS frequency_name,
        it.name AS inspection_type_name
 FROM inspector_portfolio ip
 JOIN inspector_portfolio_details ipd ON ipd.portfolio_id = ip.id
-JOIN users u ON ip.inspector_id = u.id
+JOIN users u ON ip.user_id = u.id
 JOIN facility fac ON ipd.facility_id = fac.id
 JOIN frequency_definition fd ON ipd.frequency_definition_id = fd.id
 LEFT JOIN inspection_type it ON ipd.inspection_type_id = it.id
@@ -729,7 +760,6 @@ FROM inspection_report ir
 JOIN facility fac ON ir.facility_id = fac.id
 WHERE ir.id = (
     SELECT aa.inspection_report_id FROM ai_answers aa
-    WHERE aa.module_name = 'Inspection Form'
     ORDER BY aa.submitted_on DESC LIMIT 1
 );""",
     ),
@@ -748,4 +778,63 @@ WHERE ir.id NOT IN (
   AND ir.status != 'DRAFT'
 ORDER BY ir.submitted_on DESC LIMIT 50;""",
     ),
+
+    # -- Cycle / Frequency multi-turn --
+    (
+        "what is the frequency of a specific inspection cycle",
+        """\
+-- CYCLE FREQUENCY PATH (ipd has NO cycle_id):
+--   ic.id -> ip.cycle_id -> ipd.portfolio_id -> fd.id
+-- NEVER: ipd.cycle_id  |  completed = status='COMPLETED'
+SELECT ic.id AS cycle_id,
+       TO_CHAR(ic.start_date, 'Month YYYY') AS cycle_month,
+       ic.status, fd.name AS frequency_name,
+       fd.repeat_count, fd.repeat_interval, fd.repeat_unit,
+       COUNT(DISTINCT ipd.id) AS portfolio_detail_count
+FROM inspection_cycle ic
+JOIN inspector_portfolio ip          ON ip.cycle_id = ic.id
+JOIN inspector_portfolio_details ipd ON ipd.portfolio_id = ip.id
+JOIN frequency_definition fd         ON fd.id = ipd.frequency_definition_id
+WHERE ic.id = '<CYCLE_UUID>'
+GROUP BY ic.id, ic.start_date, ic.status,
+         fd.name, fd.repeat_count, fd.repeat_interval, fd.repeat_unit
+ORDER BY portfolio_detail_count DESC;
+""",
+    ),
+    (
+        "frequency of the most recently completed inspection cycle",
+        """\
+-- completed_cycle = status = 'COMPLETED'
+SELECT ic.id AS cycle_id,
+       TO_CHAR(ic.start_date, 'Month YYYY') AS cycle_month,
+       ic.status, fd.name AS frequency_name,
+       fd.repeat_count, fd.repeat_interval, fd.repeat_unit,
+       COUNT(DISTINCT ipd.id) AS portfolio_detail_count
+FROM inspection_cycle ic
+JOIN inspector_portfolio ip          ON ip.cycle_id = ic.id
+JOIN inspector_portfolio_details ipd ON ipd.portfolio_id = ip.id
+JOIN frequency_definition fd         ON fd.id = ipd.frequency_definition_id
+WHERE ic.id = (
+    SELECT id FROM inspection_cycle WHERE status = 'COMPLETED'
+    ORDER BY end_date DESC LIMIT 1
+)
+GROUP BY ic.id, ic.start_date, ic.status,
+         fd.name, fd.repeat_count, fd.repeat_interval, fd.repeat_unit
+ORDER BY portfolio_detail_count DESC;
+""",
+    ),
+    (
+        "most recently completed inspection cycle",
+        """\
+-- completed_cycle: status = 'COMPLETED' only
+SELECT ic.id AS inspection_cycle_id,
+       TO_CHAR(ic.start_date, 'Month YYYY') AS month,
+       ic.status, ic.start_date, ic.end_date, ic.modified_on
+FROM inspection_cycle ic
+WHERE ic.status = 'COMPLETED'
+ORDER BY ic.end_date DESC LIMIT 1;
+""",
+    ),
+
 ]
+# FIX1_CYCLE_SEEDS

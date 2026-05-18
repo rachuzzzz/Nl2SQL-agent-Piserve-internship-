@@ -212,7 +212,13 @@ class SQLValidator:
         "score_improvement": "does not exist as a column — compute as this_q - last_q in a CTE",
     }
 
-    # Columns that do not exist on inspection_corrective_action.
+    # Columns that do not exist on inspector_portfolio.
+    # The FK to users is user_id — deepseek confabulates inspector_id because
+    # the table NAME contains "inspector". Seed examples previously encoded
+    # the wrong column; this guard catches any stale embeddings or prompt drift.
+    HALLUCINATED_PORTFOLIO_COLUMNS: dict[str, str] = {
+        "inspector_id": "does not exist on inspector_portfolio — the FK column is user_id; JOIN users u ON ip.user_id = u.id",
+    }
     # deepseek hallucinates these when given vague schema_hints about risk/deferral.
     HALLUCINATED_ICA_COLUMNS: dict[str, str] = {
         # Deferral ghost columns — 'times_deferred' was seen in ORDER BY in trace
@@ -381,6 +387,24 @@ class SQLValidator:
                     ))
                     ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
 
+        # ── 5c. Hallucinated columns on inspector_portfolio ───────────────
+        # The FK to users is user_id, not inspector_id. This was a seed example
+        # bug that poisoned embeddings; guard catches any residual prompt drift.
+        portfolio_used = bool(re.search(
+            r'\b(inspector_portfolio|ip)\b', sql_lower
+        ))
+        if portfolio_used:
+            for col, hint in self.HALLUCINATED_PORTFOLIO_COLUMNS.items():
+                for alias in ("ip", "inspector_portfolio"):
+                    if re.search(rf"\b{re.escape(alias)}\.{re.escape(col)}\b", sql_lower):
+                        issues.append(ValidationIssue(
+                            "HARD_FAIL", "WRONG_COLUMN",
+                            f"Column '{col}' does not exist on inspector_portfolio — {hint}",
+                            detail=f"Hallucinated portfolio column: {col}",
+                        ))
+                        ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+                        break
+
         # ── 6. ir.id in SELECT clause (UUID PK exposed for display) ───────
         # IMPORTANT: ir.id is CORRECT and required as a JOIN key, e.g.:
         #   WHERE aa.inspection_report_id = (SELECT ir.id FROM ...)  ← valid
@@ -403,6 +427,15 @@ class SQLValidator:
                         detail="ir.inspection_id is the human-readable varchar '2026/04/ST001/INS001'",
                     ))
                     ValidatorStats.record("UUID_IN_SELECT", is_retry_trigger=True)
+
+        # 6b. ipd.cycle_id HARD_FAIL  # FIX9_IPD_CYCLE
+        if re.search(r'\bipd\.cycle_id\b', sql_lower):
+            issues.append(ValidationIssue(
+                "HARD_FAIL", "WRONG_COLUMN",
+                "ipd.cycle_id does not exist; join via inspector_portfolio.cycle_id",
+                detail="ic.id -> ip.cycle_id -> ipd.portfolio_id -> fd.id",
+            ))
+            ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
 
         # ── 7. Dynamic fb_{uuid} table references ─────────────────────────
         if self._DYNAMIC_TABLE_RE.search(sql):

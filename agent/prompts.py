@@ -200,12 +200,12 @@ Turn 1: {"thought": "Filter by inspection_id.", "tool": "get_answers", "args": {
 
 ─── Form answers: most recently filled form ───
 User: "show all questions and answers in the most recently filled form"
-Turn 1: {"thought": "Need most recent inspection that has Inspection Form answers — using aa subquery, NOT inspection_report subquery (newest ir row may have no answers yet).", "tool": "generate_sql", "args": {"question": "questions and answers from most recent inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT aa2.inspection_report_id FROM ai_answers aa2 WHERE aa2.module_name = 'Inspection Form' ORDER BY aa2.submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' ORDER BY aq.label LIMIT 100;"}}
+Turn 1: {"thought": "Need most recent inspection that has any answers — using aa subquery, NOT inspection_report subquery (newest ir row may have no answers yet). No module_name filter — too restrictive.", "tool": "generate_sql", "args": {"question": "questions and answers from most recent inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT aa2.inspection_report_id FROM ai_answers aa2 ORDER BY aa2.submitted_on DESC LIMIT 1) ORDER BY aq.label LIMIT 100;"}}
 
 ─── Scores for a named inspector's last inspection ───
 User: "show questions and scores for the last inspection by George"
 ROUTING RULE: ALWAYS use generate_sql here. NEVER use get_answers — it cannot filter by inspector name.
-Turn 1: {"thought": "Need ai_answers.score filtered to George's last inspection. Must use generate_sql with subquery to find the inspection_report_id first.", "tool": "generate_sql", "args": {"question": "questions and scores for last inspection by George", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer, aa.score FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT ir.id FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%George%') AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' AND aa.score IS NOT NULL ORDER BY aa.score DESC LIMIT 100;"}}
+Turn 1: {"thought": "Need ai_answers.score filtered to George's last inspection. Must use generate_sql with subquery to find the inspection_report_id first.", "tool": "generate_sql", "args": {"question": "questions and scores for last inspection by George", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer, aa.score FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT ir.id FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%George%') AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 1) AND aa.score IS NOT NULL ORDER BY aa.score DESC LIMIT 100;"}}
 
 ─── Cross-domain join ───
 User: "risk level answers for inspections at Al Ghadeer facility"
@@ -256,6 +256,12 @@ Turn 1: {"thought": "list_forms gives distinct form names.", "tool": "list_forms
 ─── Average form answer score ───
 User: "average score in the fire safety form"
 Turn 1: {"thought": "Aggregate over ai_answer.answer_text for fire safety.", "tool": "get_answer_stats", "args": {"form_name": "fire safety", "label": "score"}}
+
+─── Ambiguous operational status questions ───
+User: "any critical issues I should know about"
+ROUTING RULE: This asks about REAL DATA — overdue actions, high risk items — NOT schema documentation.
+NEVER call final_answer with schema rules or technical notes. ALWAYS query for actual operational data.
+Turn 1: {"thought": "User wants operational critical issues — overdue corrective actions and high risk items from the DB, not schema documentation.", "tool": "generate_sql", "args": {"question": "overdue corrective actions and high risk open items summary", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.target_close_out_date, fac.name AS facility_name, rl.name AS risk_level FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id LEFT JOIN risk_level rl ON ica.risk_level_id = rl.id WHERE ica.status IN ('OVERDUE', 'OPEN') AND rl.name IN ('High', 'Medium') ORDER BY ica.target_close_out_date ASC LIMIT 50;"}}
 
 ─── Unknown / nonsense query ───
 User: "xyz abc test 123"
@@ -342,9 +348,11 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
 
   CRITICAL — ai_answers spans ALL 16 modules:
     When user says 'the form', 'the inspection form', 'what they filled' without
-    specifying a module — filter to the main form only:
-      AND aa.module_name = 'Inspection Form'
+    specifying a module — filter to the main inspection form only:
+      AND aa.module_name ILIKE '%Inspection Form%'
     Without this, queries return answers from all 16 modules (~10,000 rows instead of ~50).
+    NEVER use exact match (= 'Inspection Form') — the actual module_name may contain
+    additional words. Use ILIKE '%Inspection Form%' instead.
     Only omit this filter when user explicitly asks about another module.
 
   CRITICAL — most recent inspection subquery:

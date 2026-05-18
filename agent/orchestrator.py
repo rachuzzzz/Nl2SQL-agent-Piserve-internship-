@@ -108,6 +108,7 @@ class ConversationTurn:
     facility_names: list = field(default_factory=list)   # e.g. ["Golf Gardens"]
     inspector_names: list = field(default_factory=list)  # e.g. ["neenu extinsp1"]
     single_row_values: dict = field(default_factory=dict) # col→val when result is 1 row
+    cycle_ids: list = field(default_factory=list)  # FIX3_CYCLE_IDS
 
 
 
@@ -238,6 +239,14 @@ class ConversationSession:
                 )
             elif last.single_row_values:
                 lines.append(f"CONTEXT — Last query returned a single result: {last.single_row_values}")
+            _cyc = getattr(last, 'cycle_ids', [])
+            if _cyc and len(_cyc) == 1:
+                lines.append(
+                    f"CONTEXT — conversation about inspection_cycle id='{_cyc[0]}'."
+                    f" Filter: WHERE ic.id = '{_cyc[0]}' AND ic.status = 'COMPLETED'."
+                    f" NEVER change status to != 'DRAFT'."
+                )
+            # FIX4_CYCLE_CTX
 
         lines.append("")
         lines.append(
@@ -421,12 +430,27 @@ class AgentOrchestrator:
         if session and session.turns:
             system_content += "\n\n" + session.build_context_block(question)
 
-        messages = [
+        _base_messages = [
             ChatMessage(role=MessageRole.SYSTEM, content=system_content),
             ChatMessage(role=MessageRole.USER, content=question),
         ]
+        messages = list(_base_messages)  # working copy — retries may reset this
+
+        def _reset_for_retry(error_hint: str) -> None:
+            """
+            Discard all retry scratchpad messages and restart from [system, user].
+            Retries are scratchpad state, not conversation history — accumulating
+            failed SQL attempts inflates context 400+ tokens per iteration, causing
+            the 60k+ token spikes seen in hard multi-retry queries (e.g. TRD-02,
+            CROSS-04). Keep only the base messages + a single concise error hint.
+            """
+            nonlocal messages
+            messages = list(_base_messages) + [
+                ChatMessage(role=MessageRole.USER, content=error_hint)
+            ]
         steps = []
         gen_sql_failures = 0
+        _failed_patterns: set = set()  # FIX78
         _last_sql = ""
         _last_total_count = 0
         _last_columns = []
@@ -608,6 +632,18 @@ class AgentOrchestrator:
                     )
                     args["schema_hint"] = (args.get("schema_hint", "") + recent_hint)
 
+                _CYC_FREQ_RE = re.compile(
+                    r'\b(frequency|how\s+often|repeat).{0,60}(cycle|portfolio)\b'
+                    r'|\b(cycle|portfolio).{0,60}(frequency|how\s+often)\b',
+                    re.IGNORECASE)
+                if _CYC_FREQ_RE.search(question):
+                    args['schema_hint'] = args.get('schema_hint','') + (
+                        '\nCRITICAL Cycle->Freq (ipd NO cycle_id):'
+                        '\n  ic.id->ip.cycle_id->ipd.portfolio_id->fd.id'
+                        '\nNEVER ipd.cycle_id | completed=\'COMPLETED\''
+                        '\nGROUP BY all non-agg SELECT cols.\n')
+                # FIX5_FREQ_HINT
+
                 # Preserve explicit LIMIT from user question
                 limit_match = re.search(
                     r'\b(?:last|top|first|recent|latest)\s+(\d+)\b', question, re.IGNORECASE
@@ -656,11 +692,24 @@ class AgentOrchestrator:
                     steps.append(auto); _emit(auto)
 
                     if not er.get("success"):
-                        messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
+                        # First execution failure: include the SQL — the model needs to see
+                        # what was close to fix it (column name, join direction, etc.).
+                        # Second+ failure: clean reset — the model is anchored on bad SQL
+                        # and keeps regenerating the same structural mistake (e.g. COMP-02:
+                        # 8 sql_errors, 89k tokens from the "always include SQL" approach).
+                        err_short = er.get("error", "")[:200]
                         hint = self._schema_hint_for_error(er.get("error", ""))
-                        messages.append(ChatMessage(role=MessageRole.USER, content=
-                            f"SQL failed: {er.get('error','')}\nSQL: {sql}\n{hint}"
-                            f"Fix the query or use get_schema to check column names."))
+                        if gen_sql_failures <= 1:
+                            _reset_for_retry(
+                                f"SQL execution failed: {err_short}\n{hint}"
+                                f"Fix this SQL — likely a column name or join direction error:\n"
+                                f"{sql[:400]}"
+                            )
+                        else:
+                            _reset_for_retry(
+                                f"Previous SQL attempts failed ({gen_sql_failures}x): {err_short}\n{hint}"
+                                f"Generate different SQL from scratch."
+                            )
                         continue
 
                     exec_data = er.get("result", {})
@@ -703,8 +752,6 @@ class AgentOrchestrator:
                         _dbg(self._debug, "SOFT_WARNS (not in retry prompt)",
                              "\n".join(soft_warns))
 
-                    messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
-
                     if gen_sql_failures >= 3:
                         sql = sql_data.get("sql", "")
                         if sql:
@@ -716,9 +763,13 @@ class AgentOrchestrator:
                                 ans = self._synthesize(question, "execute_sql", er)
                                 return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
-                    messages.append(ChatMessage(role=MessageRole.USER, content=
-                        f"generate_sql failed ({gen_sql_failures}x). Fix required: {retry_reason}\n"
-                        f"Correct the SQL or use get_schema to verify column names."))
+                    # Reset to base — don't accumulate validation failure blobs.
+                    # Each retry starts fresh: [system, question, error_hint].
+                    _reset_for_retry(
+                        f"generate_sql failed ({gen_sql_failures}x). "
+                        f"Fix required: {retry_reason}\n"
+                        f"Generate SQL from scratch — do NOT patch the previous attempt."
+                    )
                     continue
 
             # Path B: terminal tools → synthesize and return
@@ -835,6 +886,15 @@ class AgentOrchestrator:
                 if v and str(v) not in insp_names:
                     insp_names.append(str(v))
 
+        cycle_ids = []
+        for _cr in last_rows[:5]:
+            if not isinstance(_cr, dict): continue
+            for _cc in ('inspection_cycle_id', 'cycle_id'):
+                _cv = _cr.get(_cc)
+                if _cv and re.match(r'^[0-9a-f-]{36}$', str(_cv), re.I):
+                    if str(_cv) not in cycle_ids: cycle_ids.append(str(_cv))
+        # FIX3B
+
         # If only 1 row, store all values for maximum context
         if len(last_rows) == 1 and last_rows[0]:
             single_row_vals = {
@@ -866,6 +926,18 @@ class AgentOrchestrator:
                 except Exception:
                     pass  # Silently skip — follow-up will have less context
 
+            # Entity carry-forward: if the current turn returned no entity columns
+            # (e.g. a Q&A result with only label/answer_text) don't overwrite the
+            # previous turn's inspection_ids — carry them forward so Turn 3 follow-ups
+            # still have context from Turn 1's entity resolution.
+            prev = session.last_turn
+            if prev and not insp_ids and prev.inspection_ids:
+                insp_ids = prev.inspection_ids
+                _dbg(self._debug, "FINISH — entity carry-forward",
+                     f"carried inspection_ids={insp_ids} from previous turn", 0)
+            if prev and not fac_names and prev.facility_names:
+                fac_names = prev.facility_names
+
             session.add_turn(ConversationTurn(
                 question=question,
                 answer=answer[:300],
@@ -877,6 +949,7 @@ class AgentOrchestrator:
                 facility_names=fac_names[:5],
                 inspector_names=insp_names[:5],
                 single_row_values=single_row_vals,
+                cycle_ids=cycle_ids[:3],
             ))
 
         return AgentResult(question, answer, steps, iteration, True, stats or QueryStats())
@@ -1237,7 +1310,34 @@ class AgentOrchestrator:
                 )
             return "search_questions found no matches. Try a broader keyword or use semantic_search."
 
-        return json.dumps(tool_result, default=str)
+        # get_schema — return compact column summary, not full DDL.
+        # Full DDL is 3-6k tokens. We only need the useful columns for the
+        # tables Qwen is likely confused about — already defined in USEFUL_COLUMNS.
+        if tool_name == "get_schema":
+            if tool_result.get("success"):
+                data = tool_result.get("result", {})
+                tables = data.get("tables", [])
+                # Import USEFUL_COLUMNS to return targeted column hints
+                try:
+                    from core.schema_introspector import USEFUL_COLUMNS
+                    lines = [f"Schema ({len(tables)} tables). Key columns:"]
+                    for tname, cols in USEFUL_COLUMNS.items():
+                        lines.append(f"  {tname}: {', '.join(cols)}")
+                    lines.append("Call generate_sql with the correct table and column names.")
+                    return "\n".join(lines)
+                except Exception:
+                    return (
+                        f"get_schema: {len(tables)} tables: {', '.join(tables[:40])}\n"
+                        f"Column details are in your schema context. Call generate_sql."
+                    )
+            return f"get_schema failed: {tool_result.get('error', 'unknown')}"
+            return f"get_schema failed: {tool_result.get('error', 'unknown')}"
+
+        # Safe fallthrough — cap at 500 chars to prevent other large results polluting context
+        raw_str = json.dumps(tool_result, default=str)
+        if len(raw_str) > 500:
+            return raw_str[:500] + f"\n... (truncated, {len(raw_str)} chars total)"
+        return raw_str
 
     def _schema_hint_for_error(self, error_msg):
         parts = []
@@ -1258,7 +1358,13 @@ class AgentOrchestrator:
                 pass
         cm = re.search(r'column "(\w+)" does not exist', error_msg)
         if cm and not tm:
-            parts.append(f"Column '{cm.group(1)}' doesn't exist. Use get_schema to check columns.")
+            _bc = cm.group(1)
+            if _bc == 'cycle_id':
+                parts.append('inspector_portfolio_details has NO cycle_id.'
+                    ' Path: ic.id->ip.cycle_id->ipd.portfolio_id->fd.id')
+            else:
+                parts.append(f"Column '{_bc}' doesn't exist. Use get_schema.")
+            # FIX6_IPD_MSG
         return "\n".join(parts) + "\n" if parts else ""
 
     def _call_llm(self, messages, stats=None, iteration=0):

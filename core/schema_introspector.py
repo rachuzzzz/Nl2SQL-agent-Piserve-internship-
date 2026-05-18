@@ -211,6 +211,13 @@ USEFUL_COLUMNS = {
         "id", "portfolio_id", "facility_id",
         "frequency_definition_id", "inspection_type_id",
     ],
+    # CRITICAL: inspector_portfolio FK to users is user_id — NOT inspector_id
+    # inspector_id does not exist on this table; deepseek confabulates it from the name
+    "inspector_portfolio": [
+        "id", "user_id", "status", "cycle_id",
+        # user_id (FK→users.id) — JOIN users u ON ip.user_id = u.id
+        # NEVER: ip.inspector_id (column does not exist)
+    ],
     "ai_questions": [
         "element_id", "label", "module_name", "module_id", "entity_type",
     ],
