@@ -430,10 +430,20 @@ def generate_sql(
     _debug_logger=None,
     _inject_rule_ids: list | None = None,
     _seed_index=None,
+    _db_schema=None,
 ) -> dict[str, Any]:
     try:
-        if db_engine and not schema_hint.startswith("Use"):
+        # Schema block — use the slim version to keep context under ~600 tokens.
+        # for_sql_prompt() dumps full introspected column lists (~2000+ tokens) which
+        # inflates deepseek's context 3x and degrades 7B model generation quality.
+        if _db_schema is not None:
+            auto_schema = _db_schema.for_sql_prompt_slim()
+        elif db_engine:
             auto_schema = _fetch_key_schemas(db_engine)
+        else:
+            auto_schema = ""
+
+        if auto_schema and not schema_hint.startswith("Use"):
             schema_hint = f"{auto_schema}\n{schema_hint}" if schema_hint else auto_schema
 
         if not sql_prompt_template:
@@ -441,13 +451,48 @@ def generate_sql(
             sql_prompt_template = SQL_GENERATION_PROMPT
 
         # Retrieval-based example injection via SeedExampleIndex (cosine similarity)
-        # Falls back to empty string if index not available.
-        from agent.seed_examples import CORE_CONTEXT
+        # Falls back to empty string if index not available or seed_examples not deployed.
+        try:
+            from agent.seed_examples import CORE_CONTEXT
+            _core_ctx = CORE_CONTEXT
+        except ImportError:
+            _core_ctx = (
+                "-- ir.id = UUID (JOIN only, never SELECT), ir.inspection_id = VARCHAR display\n"
+                "-- ICA join: ON ica.inspection_id = ir.id | completed = IN ('CLOSED','SUBMITTED')\n"
+                "-- risk_level_id is UUID FK: JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
+            )
         if _seed_index is not None:
-            retrieved = _seed_index.format_for_prompt(question, top_k=4)
+            try:
+                # Domain-selective top_k: prevent cross-domain seed pollution.
+                # Simple aggregates (avg, count, total) don't need cycle/frequency seeds.
+                # Raised vs closed / comparison queries need exactly their FILTER example.
+                _q = question.lower()
+                _is_comparison = bool(re.search(
+                    r'\b(vs\.?|versus|raised.{0,20}closed|faster.{0,20}slower'
+                    r'|this.{0,10}(month|quarter).{0,10}last'
+                    r'|last.{0,10}(month|quarter).{0,10}this)\b', _q))
+                _is_cycle_freq = bool(re.search(
+                    r'\b(cycle|frequency|portfolio|schedule)\b', _q))
+                _is_simple = bool(re.search(
+                    r'^(what is the (average|total)|how many|count of'
+                    r'|show (all|me the)|which (inspector|facility|inspection))',
+                    _q)) and not _is_comparison and not _is_cycle_freq
+
+                if _is_simple:
+                    _top_k = 2   # simple aggregates: 2 examples max
+                elif _is_comparison:
+                    _top_k = 2   # comparison: only FILTER aggregate examples
+                elif _is_cycle_freq:
+                    _top_k = 3   # cycle/frequency: join path examples
+                else:
+                    _top_k = 4   # complex/cross-domain: full retrieval
+
+                retrieved = _seed_index.format_for_prompt(question, top_k=_top_k)
+            except Exception:
+                retrieved = ""
         else:
-            retrieved = "-- No seed examples available."
-        dynamic_examples = CORE_CONTEXT + "\n" + retrieved
+            retrieved = ""
+        dynamic_examples = _core_ctx + ("\n" + retrieved if retrieved else "")
 
         prompt = sql_prompt_template.replace(
             "{question}", question
@@ -483,6 +528,15 @@ def generate_sql(
         # This is the core fix for validator poisoning: semantic heuristics must not
         # cause retries or appear in the errors list that the orchestrator reads.
         sem_warns = validator.validate_semantic(sql, question)
+
+        # validate_shape() — AST shape enforcement (HARD_FAIL if violated).
+        # Only fires when question intent implies a specific result cardinality.
+        # e.g. "this month vs last month" must return ONE row, not grouped rows.
+        if vresult.passed:
+            shape_result = validator.validate_shape(sql, question)
+            if not shape_result.passed:
+                # Merge shape failure into vresult
+                vresult = shape_result
 
         # Log cleaned SQL and validation result
         if _debug_logger:
@@ -606,7 +660,7 @@ class ToolRegistry:
 
     def __init__(self, db_engine: Engine, semantic_index: SemanticQuestionIndex,
                  validator: SQLValidator, sql_llm, sql_prompt: str = "",
-                 debug_logger=None, seed_index=None) -> None:
+                 debug_logger=None, seed_index=None, db_schema=None) -> None:
         self._db_engine = db_engine
         self._semantic_index = semantic_index
         self._validator = validator
@@ -614,6 +668,7 @@ class ToolRegistry:
         self._sql_prompt = sql_prompt
         self._debug_logger = debug_logger
         self._seed_index = seed_index  # SeedExampleIndex for retrieval-based injection
+        self._db_schema = db_schema    # DatabaseSchema with live enum_values
 
     def call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name not in self.KNOWN_TOOLS:
@@ -697,6 +752,7 @@ class ToolRegistry:
                     _debug_logger=self._debug_logger,
                     _inject_rule_ids=args.get("_inject_rule_ids", []),
                     _seed_index=self._seed_index,
+                    _db_schema=self._db_schema,
                 )
 
             if name == "execute_sql":

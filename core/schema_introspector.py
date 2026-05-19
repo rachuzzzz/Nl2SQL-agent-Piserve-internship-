@@ -29,6 +29,12 @@ ENUM_COLUMNS = {
     "inspection_corrective_action.status": [
         "OPEN", "CLOSED", "OVERDUE", "CLOSE_WITH_DEFERRED",
     ],
+    "inspection_corrective_action.expenditure": [
+        "NO_EXPENDITURE", "CAPEX", "OPEX", "CAPEX_AND_OPEX",
+    ],  # STRING ENUM — not a numeric amount; capex/opex columns hold the numeric values
+    "inspection_corrective_action.capex_status": [
+        "ACCEPTED", "REJECTED", "DEFERRED",
+    ],  # NULL = awaiting approval
     "inspection_corrective_action.pending_with": [],
     "inspection_report.status": [
         "DRAFT", "SUBMITTED", "CLOSED", "UNDER_REVIEW", "RETURN_FOR_MODIFICATION",
@@ -189,23 +195,67 @@ AI_TABLES = [
 # inspection_id first in USEFUL_COLUMNS reinforces the correct choice.
 USEFUL_COLUMNS = {
     "inspection_report": [
-        "inspection_id",   # varchar '2026/04/ST001/INS001' — use this NOT ir.id
+        "inspection_id",    # VARCHAR display id — use this NOT ir.id (UUID)
         "inspection_score", "gp_score", "status",
-        "submitted_on", "total_inspection_hours",
+        "submitted_on", "start_date_time",
+        "facility_id", "inspection_type_id", "inspector_user_id", "inspectee_user_id",
+        "project_id", "client_id",
+        # inspectee_user_id = FM Manager (facility manager receiving the inspection)
+        # duration = EPOCH(ir.submitted_on - ir.start_date_time)/3600 — NOT total_inspection_hours
     ],
     "inspection_corrective_action": [
         "corrective_action_id", "cause", "correction", "corrective_action",
         "responsible", "status", "progress_stage", "capex", "opex",
-        "target_close_out_date", "age",
+        "capex_status", "opex_status", "expenditure",
+        "target_close_out_date", "age", "deferred_on",
+        "risk_level_id", "impact_id", "inspection_id",
+        # capex_status: NULL=awaiting approval, ACCEPTED, REJECTED, DEFERRED
+        # expenditure: STRING ENUM — NO_EXPENDITURE | CAPEX | OPEX | CAPEX_AND_OPEX
+        #   (NOT a numeric amount — it is a category flag)
+        # capex and opex are the NUMERIC amounts (decimal)
+        # ica.capex = CAPEX Generated (quoted amount)
+        # po_details.po_amount = CAPEX Converted (actual PO raised by client)
+        # pr_details.pr_amount = OPEX Incurred (actual PR raised internally)
+        # Join: po_details ON po.mitigative_action_uuid = ica.id
+        # Join: pr_details ON pr.mitigative_action_uuid = ica.id
+    ],
+    "inspection_schedule": [
+        "id", "status", "due_date", "scheduled_date",
+        "facility_id", "inspector_id", "inspection_cycle_id", "portfolio_details_id",
+    ],
+    "inspector_portfolio_details": [
+        "id", "portfolio_id", "facility_id",
+        "frequency_definition_id", "inspection_type_id",
     ],
     "ai_questions": [
         "element_id", "label", "module_name", "module_id", "entity_type",
+    ],
+    "po_details": [
+        "id", "po_amount", "po_date", "po_number", "mitigative_action_uuid",
+        # po_amount = CAPEX Converted (actual PO amount client agreed to pay)
+        # JOIN: ON po.mitigative_action_uuid = ica.id
+    ],
+    "pr_details": [
+        "id", "pr_amount", "pr_date", "pr_number", "mitigative_action_uuid",
+        # pr_amount = OPEX Incurred (actual internal spend via PR)
+        # JOIN: ON pr.mitigative_action_uuid = ica.id
     ],
     "ai_answers": [
         "inspection_id", "inspection_report_id", "element_id", "module_name",
         "answer_text", "answer_numeric", "score", "score_type", "max_score",
         "submitted_on",
     ],
+}
+
+# Columns to suppress entirely from the schema block shown to deepseek.
+# These exist in the DB but are either unreliable, blocked, or create noise.
+_SUPPRESS_COLUMNS: set[str] = {
+    "adequacy_status",  # adequacy workflow not in use yet
+    "total_inspection_hours",  # column exists but is always NULL — use EPOCH(submitted_on-start_date_time)
+    "subform_id", "internal_stakeholder_id", "observation_id",
+    "client_details_submission_id", "completion_submission_id",
+    "deferred_submission_id", "pr_submission_id", "return_submission_id",
+    "active", "created_by", "modified_by",  # audit/system columns — no query use
 }
 
 
@@ -240,6 +290,45 @@ class DatabaseSchema:
             self._sql_cache = self._build_sql_block()
         return self._sql_cache
 
+    def for_sql_prompt_slim(self) -> str:
+        """
+        Compact schema block for deepseek — target ~600 tokens.
+        Shows curated key columns + live enum values + critical FKs.
+        Does NOT dump the full introspected column list for every table —
+        that inflates context 3x and degrades 7B model generation quality.
+        """
+        lines = ["### Schema — key columns (get_schema for full DDL):"]
+
+        for tname, cols in USEFUL_COLUMNS.items():
+            ev = self.enum_values.get(f"{tname}.status")
+            status_note = f" | status: {', '.join(repr(v) for v in ev)}" if ev else ""
+            lines.append(f"  {tname}: {', '.join(cols)}{status_note}")
+
+        lines.append("")
+        lines.append("Lookup tables (JOIN by UUID FK, never compare UUID to string):")
+        for tname, info in LOOKUP_TABLES.items():
+            ev = self.enum_values.get(tname)
+            if ev and isinstance(ev[0], str):
+                vals = ", ".join(repr(v) for v in ev[:12])
+                lines.append(f"  {tname}.name → [{vals}]")
+            elif ev and isinstance(ev[0], dict):
+                names = ", ".join(repr(d["name"]) for d in ev[:8])
+                lines.append(f"  {tname}.name → [{names}]")
+            else:
+                lines.append(f"  {tname}.name (UUID FK)")
+
+        CRITICAL_FKS = {
+            "risk_level_id", "impact_id", "facility_id", "inspection_type_id",
+            "inspector_user_id", "frequency_definition_id", "portfolio_details_id",
+        }
+        lines.append("")
+        lines.append("FK joins:")
+        for fk_col, (table, alias, sel) in FK_RESOLUTION.items():
+            if fk_col in CRITICAL_FKS:
+                lines.append(f"  {fk_col} → JOIN {table} {alias} ON ...{fk_col}={alias}.id → {sel}")
+
+        return "\n".join(lines)
+
     def for_schema_hint(self, table_names: list) -> str:
         parts = []
         for tname in table_names:
@@ -254,6 +343,12 @@ class DatabaseSchema:
         lines = [f"### {ts.name}"]
         col_parts = []
         for col in ts.columns:
+            col_name = col["name"]
+
+            # Skip system/audit columns and known noisy columns
+            if col_name in _SUPPRESS_COLUMNS:
+                continue
+
             ctype = str(col["type"]).lower()
             for long, short in [
                 ("character varying", "varchar"),
@@ -264,7 +359,6 @@ class DatabaseSchema:
             ]:
                 ctype = ctype.replace(long, short)
 
-            col_name = col["name"]
             full_key = f"{ts.name}.{col_name}"
 
             if full_key in ENUM_COLUMNS:

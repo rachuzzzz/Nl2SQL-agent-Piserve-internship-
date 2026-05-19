@@ -36,6 +36,10 @@ Rules:
 - NEVER wrap JSON in markdown fences.
 - ALWAYS include "thought", "tool", and "args".
 - If a tool returns an error, reason about a different approach.
+- NEVER call final_answer for a data question without first calling generate_sql
+  (or get_answers / get_answer_stats). You cannot know the answer from memory.
+  Data questions include: how many, average, total, which facility, which inspector,
+  show me, list, what is the score, percentage, count, top, rank, best, worst.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 INSPECTION WORKFLOW — plain relational tables
@@ -164,7 +168,7 @@ WORKED EXAMPLES
 
 ─── Inspection score ───
 User: "average inspection score?"
-Turn 1: {"thought": "Inspection score is in inspection_report.", "tool": "generate_sql", "args": {"question": "average inspection score excluding drafts", "schema_hint": "SELECT AVG(inspection_score) FROM inspection_report WHERE status != 'DRAFT';"}}
+Turn 1: {"thought": "Inspection score is in inspection_report.", "tool": "generate_sql", "args": {"question": "average inspection score excluding drafts", "schema_hint": "table=inspection_report, metric=avg(inspection_score), shape=scalar, filter=status!=DRAFT"}}
 
 ─── Corrective actions ───
 User: "show open corrective actions with causes"
