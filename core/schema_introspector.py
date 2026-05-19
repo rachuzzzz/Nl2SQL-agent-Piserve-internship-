@@ -29,6 +29,12 @@ ENUM_COLUMNS = {
     "inspection_corrective_action.status": [
         "OPEN", "CLOSED", "OVERDUE", "CLOSE_WITH_DEFERRED",
     ],
+    "inspection_corrective_action.expenditure": [
+        "NO_EXPENDITURE", "CAPEX", "OPEX", "CAPEX_AND_OPEX",
+    ],  # STRING ENUM — not a numeric amount; capex/opex columns hold the numeric values
+    "inspection_corrective_action.capex_status": [
+        "ACCEPTED", "REJECTED", "DEFERRED",
+    ],  # NULL = awaiting approval
     "inspection_corrective_action.pending_with": [],
     "inspection_report.status": [
         "DRAFT", "SUBMITTED", "CLOSED", "UNDER_REVIEW", "RETURN_FOR_MODIFICATION",
@@ -192,16 +198,26 @@ USEFUL_COLUMNS = {
         "inspection_id",    # VARCHAR display id — use this NOT ir.id (UUID)
         "inspection_score", "gp_score", "status",
         "submitted_on", "start_date_time",
-        "facility_id", "inspection_type_id", "inspector_user_id",
+        "facility_id", "inspection_type_id", "inspector_user_id", "inspectee_user_id",
         "project_id", "client_id",
-        # NOTE: total_inspection_hours does NOT exist — use EPOCH(submitted_on - start_date_time)
+        # inspectee_user_id = FM Manager (facility manager receiving the inspection)
+        # duration = EPOCH(ir.submitted_on - ir.start_date_time)/3600 — NOT total_inspection_hours
     ],
     "inspection_corrective_action": [
         "corrective_action_id", "cause", "correction", "corrective_action",
         "responsible", "status", "progress_stage", "capex", "opex",
+        "capex_status", "opex_status", "expenditure",
         "target_close_out_date", "age", "deferred_on",
         "risk_level_id", "impact_id", "inspection_id",
-        # adequacy_status / capex_status / opex_status / expenditure exist in DB but are unreliable — do not use
+        # capex_status: NULL=awaiting approval, ACCEPTED, REJECTED, DEFERRED
+        # expenditure: STRING ENUM — NO_EXPENDITURE | CAPEX | OPEX | CAPEX_AND_OPEX
+        #   (NOT a numeric amount — it is a category flag)
+        # capex and opex are the NUMERIC amounts (decimal)
+        # ica.capex = CAPEX Generated (quoted amount)
+        # po_details.po_amount = CAPEX Converted (actual PO raised by client)
+        # pr_details.pr_amount = OPEX Incurred (actual PR raised internally)
+        # Join: po_details ON po.mitigative_action_uuid = ica.id
+        # Join: pr_details ON pr.mitigative_action_uuid = ica.id
     ],
     "inspection_schedule": [
         "id", "status", "due_date", "scheduled_date",
@@ -211,15 +227,18 @@ USEFUL_COLUMNS = {
         "id", "portfolio_id", "facility_id",
         "frequency_definition_id", "inspection_type_id",
     ],
-    # CRITICAL: inspector_portfolio FK to users is user_id — NOT inspector_id
-    # inspector_id does not exist on this table; deepseek confabulates it from the name
-    "inspector_portfolio": [
-        "id", "user_id", "status", "cycle_id",
-        # user_id (FK→users.id) — JOIN users u ON ip.user_id = u.id
-        # NEVER: ip.inspector_id (column does not exist)
-    ],
     "ai_questions": [
         "element_id", "label", "module_name", "module_id", "entity_type",
+    ],
+    "po_details": [
+        "id", "po_amount", "po_date", "po_number", "mitigative_action_uuid",
+        # po_amount = CAPEX Converted (actual PO amount client agreed to pay)
+        # JOIN: ON po.mitigative_action_uuid = ica.id
+    ],
+    "pr_details": [
+        "id", "pr_amount", "pr_date", "pr_number", "mitigative_action_uuid",
+        # pr_amount = OPEX Incurred (actual internal spend via PR)
+        # JOIN: ON pr.mitigative_action_uuid = ica.id
     ],
     "ai_answers": [
         "inspection_id", "inspection_report_id", "element_id", "module_name",
@@ -231,7 +250,8 @@ USEFUL_COLUMNS = {
 # Columns to suppress entirely from the schema block shown to deepseek.
 # These exist in the DB but are either unreliable, blocked, or create noise.
 _SUPPRESS_COLUMNS: set[str] = {
-    "adequacy_status", "capex_status", "opex_status", "expenditure",
+    "adequacy_status",  # adequacy workflow not in use yet
+    "total_inspection_hours",  # column exists but is always NULL — use EPOCH(submitted_on-start_date_time)
     "subform_id", "internal_stakeholder_id", "observation_id",
     "client_details_submission_id", "completion_submission_id",
     "deferred_submission_id", "pr_submission_id", "return_submission_id",

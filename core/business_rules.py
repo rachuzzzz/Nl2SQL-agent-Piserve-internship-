@@ -476,6 +476,63 @@ REGISTRY: list[dict] = [
         ),
     },
     {
+        "id":             "inject_financial_routing",
+        "type":           INJECT,
+        "priority":       88,
+        "description":    "CAPEX/OPEX financial queries — route to po_details/pr_details.",
+        "question_pattern": (
+            r"\b(po[_\s]detail|pr[_\s]detail|purchase\s+order|purchase\s+requisition|"
+            r"capex\s+(generat|convert|lost|loss|incurr)|"
+            r"opex\s+(incurr|facilit|spend)|"
+            r"(generat|convert|lost|incurr).{0,20}(capex|opex)|"
+            r"rival.{0,20}(quote|bid|amount)|financial\s+summary)\b"
+        ),
+        "hint": (
+            "\nFINANCIAL DATA ROUTING:\n"
+            "  CAPEX Generated  = SUM(ica.capex)          — original quoted amount on ICA\n"
+            "  CAPEX Converted  = SUM(po.po_amount)        — actual PO raised by client\n"
+            "  CAPEX Lost       = SUM(ica.capex) WHERE capex_status='REJECTED'\n"
+            "  OPEX Incurred    = SUM(pr.pr_amount)        — actual internal PR spend\n"
+            "\npo_details: id, po_amount, po_date, po_number, mitigative_action_uuid\n"
+            "  JOIN: LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id\n"
+            "  One ICA can have MULTIPLE POs — always SUM(po.po_amount), never assume 1:1\n"
+            "\npr_details: id, pr_amount, pr_date, pr_number, mitigative_action_uuid\n"
+            "  JOIN: LEFT JOIN pr_details pr ON pr.mitigative_action_uuid = ica.id\n"
+            "  One ICA can have MULTIPLE PRs — always SUM(pr.pr_amount)\n"
+            "\nInspector CAPEX = inspector_user_id (who raised the CA)\n"
+            "FM Manager CAPEX = inspectee_user_id (facility manager receiving inspection)\n"
+        ),
+    },
+    {
+        "id":             "inject_fm_manager_routing",
+        "type":           INJECT,
+        "priority":       85,
+        "description":    "FM Manager / inspectee queries — route to inspectee_user_id not inspector_user_id.",
+        "question_pattern": (
+            r"\b(fm\s+manager|facility\s+manager|inspectee|fm\s+engineer|"
+            r"fm\s+auditee|fm\s+leaderboard|capex\s+leaderboard|"
+            r"top.{0,20}(fm|manager|capex|opex).{0,20}(generator|converter|performer|leaderboard)|"
+            r"capex.{0,20}(generator|converter|generat|convert)|"
+            r"(generator|converter).{0,20}capex)\b"
+        ),
+        "hint": (
+            "\nFM MANAGER ROUTING:\n"
+            "  FM Manager = inspectee_user_id on inspection_report (NOT inspector_user_id)\n"
+            "  Inspector   = inspector_user_id on inspection_report\n"
+            "  JOIN: JOIN users u ON ir.inspectee_user_id = u.id → u.first_name || ' ' || u.last_name AS fm_manager\n"
+            "\nCAPEX LEADERBOARD DEFINITIONS:\n"
+            "  CAPEX Generator = FM managers ranked by total capex raised (SUM where capex > 0)\n"
+            "  CAPEX Converter = FM managers ranked by capex that reached ACCEPTED status\n"
+            "\nCAPEX STATUS (inspection_corrective_action.capex_status):\n"
+            "  NULL        = awaiting approval (not yet actioned)\n"
+            "  'ACCEPTED'  = approved / converted\n"
+            "  'REJECTED'  = rejected\n"
+            "  'DEFERRED'  = deferred\n"
+            "  CAPEX Awaiting Approval = capex > 0 AND capex_status IS NULL\n"
+            "\nEXPENDITURE column values: NO_EXPENDITURE, CAPEX, OPEX, CAPEX_AND_OPEX\n"
+        ),
+    },
+    {
         "id":             "inject_ica_join",
         "type":           INJECT,
         "priority":       80,

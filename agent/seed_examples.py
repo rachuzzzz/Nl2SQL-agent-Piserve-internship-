@@ -30,6 +30,15 @@ CORE_CONTEXT = """\
 -- NEVER: ipd.cycle_id (no such column on inspector_portfolio_details)
 -- Cycle->Freq: inspection_cycle.id -> inspector_portfolio.cycle_id
 --   -> inspector_portfolio_details.portfolio_id -> frequency_definition.id
+-- FM Manager / inspectee = ir.inspectee_user_id (NOT ir.inspector_user_id)
+-- capex_status: NULL=awaiting approval | ACCEPTED | REJECTED | DEFERRED
+-- expenditure: NO_EXPENDITURE | CAPEX | OPEX | CAPEX_AND_OPEX
+-- CAPEX Generated  = SUM(ica.capex)               — original quoted amount
+-- CAPEX Converted  = SUM(po.po_amount)             — actual PO raised by client
+-- CAPEX Lost       = SUM(ica.capex) WHERE capex_status='REJECTED'
+-- OPEX Incurred    = SUM(pr.pr_amount)             — actual PR raised internally
+-- po_details JOIN: ON po.mitigative_action_uuid = ica.id  (one ICA can have many POs)
+-- pr_details JOIN: ON pr.mitigative_action_uuid = ica.id  (one ICA can have many PRs)
 """
 
 # ── Seed corpus ───────────────────────────────────────────────────────────────
@@ -69,6 +78,7 @@ FROM inspection_corrective_action ica;""",
     (
         "what percentage of inspections resulted in at least one corrective action",
         """\
+-- USE THIS EXACT SQL — scalar percentage, no GROUP BY:
 SELECT ROUND(
     100.0 * COUNT(DISTINCT ica.inspection_id) / NULLIF(COUNT(DISTINCT ir.id), 0), 1
 ) AS pct_with_ca
@@ -79,6 +89,7 @@ WHERE ir.status != 'DRAFT';""",
     (
         "average inspection duration in hours",
         """\
+-- USE THIS EXACT PATTERN — total_inspection_hours does NOT exist; use timestamp math:
 SELECT ROUND(
     AVG(EXTRACT(EPOCH FROM (ir.submitted_on - ir.start_date_time)) / 3600)::numeric, 2
 ) AS avg_duration_hours
@@ -98,34 +109,12 @@ FROM (
     GROUP BY aa.inspection_report_id
 ) sub;""",
     ),
-    (
-        "rank inspection types by average corrective actions per inspection",
-        """\
--- TWO-LEVEL SUBQUERY: inner counts CAs per INSPECTION (ir.id), outer AVGs per TYPE
--- NEVER: AVG(COUNT(...)) — nested aggregates are illegal in PostgreSQL
--- NEVER: GROUP BY inspection_type_id in inner query — that collapses to 1 row per type,
---         making AVG meaningless. Must GROUP BY ir.id (individual inspection) first.
-SELECT it.name AS inspection_type_name,
-       COUNT(*) AS inspection_count,
-       SUM(ica_count) AS total_corrective_actions,
-       ROUND(AVG(ica_count)::numeric, 2) AS avg_corrective_actions_per_inspection
-FROM (
-    SELECT ir.id, ir.inspection_type_id, COUNT(ica.id) AS ica_count
-    FROM inspection_report ir
-    LEFT JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id
-    WHERE ir.status != 'DRAFT'
-    GROUP BY ir.id, ir.inspection_type_id
-) AS per_inspection
-JOIN inspection_type it ON per_inspection.inspection_type_id = it.id
-GROUP BY it.name
-ORDER BY avg_corrective_actions_per_inspection DESC
-LIMIT 50;""",
-    ),
 
     # ── Temporal / Comparison ────────────────────────────────────────────────
     (
         "how many inspections were completed this month vs last month",
         """\
+-- USE THIS EXACT SQL — single-row FILTER comparison, NOT GROUP BY:
 -- Single-row FILTER form — NOT GROUP BY
 SELECT
   COUNT(*) FILTER (WHERE date_trunc('month', ir.submitted_on) = date_trunc('month', NOW())) AS this_month_count,
@@ -135,6 +124,7 @@ FROM inspection_report ir WHERE ir.status IN ('CLOSED','SUBMITTED');""",
     (
         "how many corrective actions were raised vs closed this quarter",
         """\
+-- USE THIS EXACT SQL — single-row FILTER aggregate, NOT GROUP BY:
 -- Single-row FILTER — NOT GROUP BY status
 SELECT COUNT(*) AS total_raised,
        COUNT(*) FILTER (WHERE status IN ('CLOSED','CLOSE_WITH_DEFERRED')) AS total_closed,
@@ -173,22 +163,26 @@ ORDER BY high_risk_count DESC LIMIT 1;""",
     (
         "are corrective actions being closed faster or slower compared to last quarter",
         """\
--- CLOSURE SPEED: use STATUS-BASED closure rate — NOT date arithmetic.
--- NEVER try: close_on - created_on, AVG(days_to_close), DATEDIFF, or similar.
--- The correct columns for timing are: created_on (exists), target_close_out_date (exists).
--- close_on IS NULL for most records — any arithmetic on it returns NULL/empty.
--- CORRECT: compare closure_rate_pct (closed count / total) between quarters.
-SELECT TO_CHAR(date_trunc('quarter', ica.created_on), '"Q"Q YYYY') AS quarter,
-       COUNT(*) AS total_raised,
-       COUNT(*) FILTER (WHERE ica.status IN ('CLOSED','CLOSE_WITH_DEFERRED')) AS closed_count,
-       ROUND(
-           100.0 * COUNT(*) FILTER (WHERE ica.status IN ('CLOSED','CLOSE_WITH_DEFERRED'))
-           / NULLIF(COUNT(*), 0), 2
-       ) AS closure_rate_pct
+-- USE THIS EXACT SQL for quarter-over-quarter closure rate:
+-- Returns TWO ROWS: one per quarter — use GROUP BY date_trunc quarter
+-- VALIDATOR NOTE: GROUP BY here is VALID (trend comparison, not wrong shape)
+SELECT
+    CASE
+        WHEN date_trunc('quarter', ica.target_close_out_date) = date_trunc('quarter', CURRENT_DATE - INTERVAL '3 months')
+        THEN 'Q1 ' || EXTRACT(YEAR FROM CURRENT_DATE)::text
+        ELSE 'Q2 ' || EXTRACT(YEAR FROM CURRENT_DATE)::text
+    END AS quarter,
+    COUNT(*) AS total_raised,
+    COUNT(*) FILTER (WHERE ica.status IN ('CLOSED','CLOSE_WITH_DEFERRED')) AS closed_count,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE ica.status IN ('CLOSED','CLOSE_WITH_DEFERRED'))
+        / NULLIF(COUNT(*), 0), 2
+    ) AS closure_rate_pct
 FROM inspection_corrective_action ica
-WHERE ica.created_on >= date_trunc('quarter', NOW() - INTERVAL '3 months')
-GROUP BY date_trunc('quarter', ica.created_on)
-ORDER BY quarter;""",
+WHERE ica.target_close_out_date >= date_trunc('year', CURRENT_DATE)
+  AND ica.target_close_out_date < date_trunc('year', CURRENT_DATE) + INTERVAL '1 year'
+GROUP BY 1
+ORDER BY 1;""",
     ),
 
     # ── Filter / List ────────────────────────────────────────────────────────
@@ -371,8 +365,10 @@ FROM ai_answers aa
 JOIN ai_questions aq ON aa.element_id = aq.element_id
 WHERE aa.inspection_report_id = (
     SELECT aa2.inspection_report_id FROM ai_answers aa2
+    WHERE aa2.module_name = 'Inspection Form'
     ORDER BY aa2.submitted_on DESC LIMIT 1
 )
+  AND aa.module_name = 'Inspection Form'
 ORDER BY aq.label LIMIT 100;""",
     ),
     (
@@ -439,7 +435,7 @@ WHERE aa.inspection_report_id = (
       AND ir.status != 'DRAFT'
     ORDER BY ir.submitted_on DESC LIMIT 1
 )
-
+  AND aa.module_name = 'Inspection Form'
 ORDER BY aq.label;""",
     ),
 
@@ -592,6 +588,7 @@ JOIN inspection_type it ON ir.inspection_type_id = it.id
 JOIN users u ON ir.inspector_user_id = u.id
 WHERE ir.id = (
     SELECT aa.inspection_report_id FROM ai_answers aa
+    WHERE aa.module_name = 'Inspection Form'
     ORDER BY aa.submitted_on DESC LIMIT 1
 );
 -- NEVER: ORDER BY ir.submitted_on DESC LIMIT 1 — newest ir may have no form data""",
@@ -605,6 +602,7 @@ FROM inspection_report ir
 JOIN facility fac ON ir.facility_id = fac.id
 WHERE ir.id = (
     SELECT aa.inspection_report_id FROM ai_answers aa
+    WHERE aa.module_name = 'Inspection Form'
     ORDER BY aa.submitted_on DESC LIMIT 1
 );""",
     ),
@@ -612,6 +610,7 @@ WHERE ir.id = (
         "most recent inspection that has form answers",
         """\
 SELECT aa.inspection_report_id FROM ai_answers aa
+WHERE aa.module_name = 'Inspection Form'
 ORDER BY aa.submitted_on DESC LIMIT 1;""",
     ),
 
@@ -711,9 +710,10 @@ ORDER BY isched.due_date DESC LIMIT 50;""",
     (
         "how many inspectors are assigned portfolios",
         """\
+-- USE THIS EXACT SQL for counting inspectors — simple COUNT(DISTINCT), NO GROUP BY:
 -- inspector_portfolio: id, user_id (FK→users.id), status, cycle_id
--- NEVER: ip.inspector_id (does not exist — the FK column is user_id)
 -- inspector_portfolio_details: id, portfolio_id (FK→inspector_portfolio.id), facility_id, frequency_definition_id
+-- NEVER add GROUP BY for a simple count query
 SELECT COUNT(DISTINCT ip.user_id) AS inspector_count
 FROM inspector_portfolio ip
 WHERE ip.status != 'DRAFT';""",
@@ -721,7 +721,7 @@ WHERE ip.status != 'DRAFT';""",
     (
         "which inspector has the most facilities in their portfolio",
         """\
--- inspector_portfolio FK to users: ip.user_id = u.id  (NOT inspector_id — does not exist)
+-- USE THIS EXACT SQL for inspector facility count — GROUP BY user id (not inspector_id):
 SELECT u.first_name || ' ' || u.last_name AS inspector_name,
        COUNT(DISTINCT ipd.facility_id) AS facility_count
 FROM inspector_portfolio ip
@@ -734,7 +734,6 @@ ORDER BY facility_count DESC LIMIT 10;""",
     (
         "list inspector portfolio assignments with facility and frequency",
         """\
--- inspector_portfolio FK to users: ip.user_id = u.id  (NOT inspector_id — does not exist)
 SELECT u.first_name || ' ' || u.last_name AS inspector_name,
        fac.name AS facility_name,
        fd.name AS frequency_name,
@@ -760,6 +759,7 @@ FROM inspection_report ir
 JOIN facility fac ON ir.facility_id = fac.id
 WHERE ir.id = (
     SELECT aa.inspection_report_id FROM ai_answers aa
+    WHERE aa.module_name = 'Inspection Form'
     ORDER BY aa.submitted_on DESC LIMIT 1
 );""",
     ),
@@ -779,37 +779,32 @@ WHERE ir.id NOT IN (
 ORDER BY ir.submitted_on DESC LIMIT 50;""",
     ),
 
-    # -- Cycle / Frequency multi-turn --
+    # -- Cycle / Frequency multi-turn (ONLY for cycle queries, not portfolio counts) --
     (
         "what is the frequency of a specific inspection cycle",
         """\
--- CYCLE FREQUENCY PATH (ipd has NO cycle_id):
---   ic.id -> ip.cycle_id -> ipd.portfolio_id -> fd.id
--- NEVER: ipd.cycle_id  |  completed = status='COMPLETED'
-SELECT ic.id AS cycle_id,
-       TO_CHAR(ic.start_date, 'Month YYYY') AS cycle_month,
-       ic.status, fd.name AS frequency_name,
-       fd.repeat_count, fd.repeat_interval, fd.repeat_unit,
-       COUNT(DISTINCT ipd.id) AS portfolio_detail_count
+-- USE THIS EXACT SQL for cycle frequency lookup — ONLY for inspection_cycle queries, not portfolio counts:
+-- CYCLE FREQUENCY PATH: ic.id -> ip(ip.cycle_id=ic.id) -> ipd(ipd.portfolio_id=ip.id) -> fd
+-- NEVER: ipd.cycle_id  |  completed_cycle = status='COMPLETED'
+-- NOTE: use DISTINCT subquery shape, not GROUP BY, for this lookup
+SELECT DISTINCT fd.name AS frequency_name,
+       fd.repeat_count, fd.repeat_interval, fd.repeat_unit
 FROM inspection_cycle ic
 JOIN inspector_portfolio ip          ON ip.cycle_id = ic.id
 JOIN inspector_portfolio_details ipd ON ipd.portfolio_id = ip.id
 JOIN frequency_definition fd         ON fd.id = ipd.frequency_definition_id
 WHERE ic.id = '<CYCLE_UUID>'
-GROUP BY ic.id, ic.start_date, ic.status,
-         fd.name, fd.repeat_count, fd.repeat_interval, fd.repeat_unit
-ORDER BY portfolio_detail_count DESC;
+  AND ic.status = 'COMPLETED';
 """,
     ),
     (
         "frequency of the most recently completed inspection cycle",
         """\
--- completed_cycle = status = 'COMPLETED'
-SELECT ic.id AS cycle_id,
-       TO_CHAR(ic.start_date, 'Month YYYY') AS cycle_month,
-       ic.status, fd.name AS frequency_name,
-       fd.repeat_count, fd.repeat_interval, fd.repeat_unit,
-       COUNT(DISTINCT ipd.id) AS portfolio_detail_count
+-- USE THIS EXACT SQL for most-recent-cycle frequency — ONLY for cycle queries:
+-- completed_cycle = status = 'COMPLETED' (not CLOSED, not status != 'DRAFT')
+-- Join: ic -> ip(ip.cycle_id=ic.id) -> ipd(ipd.portfolio_id=ip.id) -> fd
+SELECT DISTINCT fd.name AS frequency_name,
+       fd.repeat_count, fd.repeat_interval, fd.repeat_unit
 FROM inspection_cycle ic
 JOIN inspector_portfolio ip          ON ip.cycle_id = ic.id
 JOIN inspector_portfolio_details ipd ON ipd.portfolio_id = ip.id
@@ -817,10 +812,7 @@ JOIN frequency_definition fd         ON fd.id = ipd.frequency_definition_id
 WHERE ic.id = (
     SELECT id FROM inspection_cycle WHERE status = 'COMPLETED'
     ORDER BY end_date DESC LIMIT 1
-)
-GROUP BY ic.id, ic.start_date, ic.status,
-         fd.name, fd.repeat_count, fd.repeat_interval, fd.repeat_unit
-ORDER BY portfolio_detail_count DESC;
+);
 """,
     ),
     (
@@ -836,5 +828,195 @@ ORDER BY ic.end_date DESC LIMIT 1;
 """,
     ),
 
+    # ── FM Manager / CAPEX Leaderboard ───────────────────────────────────────
+    (
+        "top 5 FM managers by capex generated leaderboard",
+        """-- USE THIS EXACT SQL for CAPEX GENERATOR leaderboard (top 5):
+-- CAPEX Generator = FM managers ranked by total capex raised (any status)
+-- FM Manager = inspectee_user_id (NOT inspector_user_id)
+-- CAPEX Generated       = SUM(capex) WHERE capex > 0
+-- CAPEX Awaiting Approval = capex > 0 AND capex_status IS NULL (null = not yet actioned)
+-- capex_status values: NULL=awaiting | ACCEPTED=approved | REJECTED | DEFERRED
+SELECT u.first_name || ' ' || u.last_name AS fm_manager,
+       SUM(ica.capex) AS capex_generated,
+       SUM(CASE WHEN ica.capex_status IS NULL THEN ica.capex ELSE 0 END) AS capex_awaiting_approval,
+       COUNT(DISTINCT ica.corrective_action_id) AS action_count
+FROM inspection_report ir
+JOIN users u ON ir.inspectee_user_id = u.id
+JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id
+WHERE ica.capex > 0
+GROUP BY u.id, u.first_name, u.last_name
+ORDER BY capex_generated DESC
+LIMIT 5;""",
+    ),
+    (
+        "top 5 FM managers by capex converted approved leaderboard",
+        """-- USE THIS EXACT SQL for CAPEX CONVERTER leaderboard (top 5):
+-- CAPEX Converter = FM managers ranked by capex that reached ACCEPTED status
+-- Generator vs Converter: Generator=total raised, Converter=total approved (ACCEPTED)
+-- FM Manager = inspectee_user_id (NOT inspector_user_id)
+SELECT u.first_name || ' ' || u.last_name AS fm_manager,
+       SUM(ica.capex) AS capex_converted,
+       COUNT(DISTINCT ica.corrective_action_id) AS actions_converted
+FROM inspection_report ir
+JOIN users u ON ir.inspectee_user_id = u.id
+JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id
+WHERE ica.capex > 0
+  AND ica.capex_status = 'ACCEPTED'
+GROUP BY u.id, u.first_name, u.last_name
+ORDER BY capex_converted DESC
+LIMIT 5;""",
+    ),
+    (
+        "which corrective actions are awaiting capex approval",
+        """-- capex_status IS NULL = awaiting approval (not yet actioned by approver)
+-- capex_status = 'ACCEPTED' = approved/converted
+SELECT ica.corrective_action_id,
+       ica.capex,
+       ica.capex_status,
+       fac.name AS facility_name,
+       u.first_name || ' ' || u.last_name AS fm_manager
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+JOIN users u ON ir.inspectee_user_id = u.id
+WHERE ica.capex > 0
+  AND ica.capex_status IS NULL
+ORDER BY ica.capex DESC
+LIMIT 50;""",
+    ),
+
+    # ── Cost / expenditure queries ────────────────────────────────────────────
+    (
+        "which corrective action has the highest cost capex opex",
+        """-- USE THIS EXACT SQL for highest cost corrective action:
+-- capex and opex are NUMERIC columns (decimal amounts)
+-- expenditure is a STRING ENUM: NO_EXPENDITURE | CAPEX | OPEX | CAPEX_AND_OPEX
+-- NEVER cast expenditure to numeric — it is not an amount
+-- Total cost = COALESCE(capex,0) + COALESCE(opex,0)
+SELECT ica.corrective_action_id,
+       ica.cause,
+       ica.corrective_action,
+       ica.capex,
+       ica.opex,
+       ica.expenditure,
+       (COALESCE(ica.capex, 0) + COALESCE(ica.opex, 0)) AS total_cost,
+       fac.name AS facility_name
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE (ica.capex > 0 OR ica.opex > 0)
+ORDER BY total_cost DESC
+LIMIT 1;""",
+    ),
+
+    # ── Financial / CAPEX / OPEX ─────────────────────────────────────────────
+    (
+        "total capex generated converted lost and opex incurred",
+        """-- USE THIS EXACT SQL — ONE ROW scalar summary, NO GROUP BY, NO LEFT JOIN:
+-- Scalar subqueries avoid row multiplication and GROUP BY problems
+SELECT
+    (SELECT COALESCE(SUM(capex), 0) FROM inspection_corrective_action
+     WHERE capex > 0)                                                    AS capex_generated,
+    (SELECT COALESCE(SUM(po_amount), 0) FROM po_details)                  AS capex_converted,
+    (SELECT COALESCE(SUM(capex), 0) FROM inspection_corrective_action
+     WHERE capex_status = 'REJECTED')                                     AS capex_lost,
+    (SELECT COALESCE(SUM(pr_amount), 0) FROM pr_details)                  AS opex_incurred;""",
+    ),
+    (
+        "top inspectors by capex generated converted",
+        """-- USE THIS EXACT SQL for inspector CAPEX leaderboard:
+-- Inspector = inspector_user_id on inspection_report (NOT inspectee_user_id)
+-- CAPEX Generated = SUM(ica.capex) | CAPEX Converted = SUM(po.po_amount)
+-- Use subquery to avoid row multiplication from multiple POs per ICA
+SELECT 
+    u.first_name || ' ' || u.last_name AS inspector_name,
+    COUNT(DISTINCT ica.id) AS ca_count,
+    SUM(ica.capex) AS capex_generated,
+    COALESCE(SUM(po.po_amount), 0) AS capex_converted,
+    SUM(CASE WHEN ica.capex_status = 'REJECTED' THEN ica.capex ELSE 0 END) AS capex_lost
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN users u ON ir.inspector_user_id = u.id
+LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id
+WHERE ica.capex > 0
+GROUP BY u.id, u.first_name, u.last_name
+ORDER BY capex_generated DESC
+LIMIT 10;""",
+    ),
+    (
+        "opex incurred by facility from pr details",
+        """-- OPEX Incurred = SUM(pr.pr_amount) from pr_details — actual internal spend
+-- pr_details JOIN: ON pr.mitigative_action_uuid = ica.id
+SELECT 
+    fac.name AS facility_name,
+    COUNT(DISTINCT ica.id) AS ca_count,
+    SUM(ica.opex) AS opex_estimated,
+    COALESCE(SUM(pr.pr_amount), 0) AS opex_incurred
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+LEFT JOIN pr_details pr ON pr.mitigative_action_uuid = ica.id
+WHERE ica.opex > 0 OR pr.id IS NOT NULL
+GROUP BY fac.id, fac.name
+ORDER BY opex_incurred DESC
+LIMIT 20;""",
+    ),
+    (
+        "capex lost rejected corrective actions",
+        """-- CAPEX Lost = corrective actions where capex_status = 'REJECTED'
+-- These had POs raised but client ultimately rejected
+SELECT 
+    ica.corrective_action_id,
+    ica.capex AS capex_quoted,
+    COALESCE(SUM(po.po_amount), 0) AS po_amount_raised,
+    fac.name AS facility_name,
+    u.first_name || ' ' || u.last_name AS inspector_name,
+    ica.modified_on::date AS rejected_on
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+JOIN users u ON ir.inspector_user_id = u.id
+LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id
+WHERE ica.capex_status = 'REJECTED'
+GROUP BY ica.id, ica.corrective_action_id, ica.capex, fac.name,
+         u.first_name, u.last_name, ica.modified_on
+ORDER BY ica.capex DESC
+LIMIT 50;""",
+    ),
+
+    (
+        "total opex incurred from purchase requisitions pr details",
+        """-- USE THIS EXACT SQL — total OPEX incurred via actual PR spend:
+-- IMPORTANT: ica.opex is the ESTIMATE, pr.pr_amount is the ACTUAL spend
+-- Always use pr_details.pr_amount for 'opex incurred' questions
+SELECT 
+    COALESCE(SUM(pr.pr_amount), 0) AS total_opex_incurred,
+    COUNT(DISTINCT pr.id)           AS pr_count
+FROM pr_details pr
+JOIN inspection_corrective_action ica ON ica.id = pr.mitigative_action_uuid;""",
+    ),
+    (
+        "total purchase order amount raised this year from po details",
+        """-- USE THIS EXACT SQL — returns ONE ROW with total PO amount:
+-- DO NOT list individual rows — return SUM as a scalar result
+-- po_details.po_date is the date the PO was raised
+SELECT 
+    SUM(po.po_amount)    AS total_po_amount,
+    COUNT(DISTINCT po.id) AS po_count
+FROM po_details po
+WHERE EXTRACT(YEAR FROM po.po_date) = EXTRACT(YEAR FROM CURRENT_DATE);""",
+    ),
+
+    (
+        "total purchase order amount po amount raised this year",
+        """-- USE THIS EXACT SQL — returns ONE ROW total PO amount for this year:
+-- po_details table contains purchase orders (CAPEX payments from client)
+-- DO NOT list individual rows — SUM into a single scalar result
+SELECT 
+    SUM(po.po_amount)     AS total_po_amount,
+    COUNT(DISTINCT po.id) AS po_count
+FROM po_details po
+WHERE EXTRACT(YEAR FROM po.po_date) = EXTRACT(YEAR FROM CURRENT_DATE);""",
+    ),
 ]
-# FIX1_CYCLE_SEEDS

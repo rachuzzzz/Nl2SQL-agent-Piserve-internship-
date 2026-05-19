@@ -463,7 +463,31 @@ def generate_sql(
             )
         if _seed_index is not None:
             try:
-                retrieved = _seed_index.format_for_prompt(question, top_k=4)
+                # Domain-selective top_k: prevent cross-domain seed pollution.
+                # Simple aggregates (avg, count, total) don't need cycle/frequency seeds.
+                # Raised vs closed / comparison queries need exactly their FILTER example.
+                _q = question.lower()
+                _is_comparison = bool(re.search(
+                    r'\b(vs\.?|versus|raised.{0,20}closed|faster.{0,20}slower'
+                    r'|this.{0,10}(month|quarter).{0,10}last'
+                    r'|last.{0,10}(month|quarter).{0,10}this)\b', _q))
+                _is_cycle_freq = bool(re.search(
+                    r'\b(cycle|frequency|portfolio|schedule)\b', _q))
+                _is_simple = bool(re.search(
+                    r'^(what is the (average|total)|how many|count of'
+                    r'|show (all|me the)|which (inspector|facility|inspection))',
+                    _q)) and not _is_comparison and not _is_cycle_freq
+
+                if _is_simple:
+                    _top_k = 2   # simple aggregates: 2 examples max
+                elif _is_comparison:
+                    _top_k = 2   # comparison: only FILTER aggregate examples
+                elif _is_cycle_freq:
+                    _top_k = 3   # cycle/frequency: join path examples
+                else:
+                    _top_k = 4   # complex/cross-domain: full retrieval
+
+                retrieved = _seed_index.format_for_prompt(question, top_k=_top_k)
             except Exception:
                 retrieved = ""
         else:

@@ -1,5 +1,5 @@
 """
-NL2SQL Agent — Evaluation Test Set (59 queries)
+NL2SQL Agent — Evaluation Test Set (66 queries)
 ================================================
 Usage:
   python3 eval.py
@@ -238,8 +238,8 @@ TEST_SET = [
         "id": "ANS-02", "category": "Form Answers",
         "question": "list all questions and answers from the most recent inspection form",
         "expected_contains": ["question", "answer"],
-        "expected_nonempty": False,
-        "expected_llm_calls": 1, "notes": "ETL gap — most recent inspection_report row may not be indexed in ai_answers yet. Empty result is correct behavior.",
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "module_name filter regression",
     },
     {
         "id": "ANS-03", "category": "Form Answers",
@@ -599,18 +599,18 @@ TEST_SET = [
     {
         "id": "ETL-01", "category": "ETL Boundary",
         "question": "show me the most recent inspection that has form data available",
-        "expected_contains": ["inspection"],
-        "expected_nonempty": False,
+        "expected_contains": ["inspection", "facility"],
+        "expected_nonempty": True,
         "expected_llm_calls": 1,
-        "notes": "ETL gap awareness — agent must use aa subquery not ir.submitted_on. Empty result is valid if ai_answers has no rows yet.",
+        "notes": "Must use aa subquery NOT ir.submitted_on — ETL gap awareness",
     },
     {
         "id": "ETL-02", "category": "ETL Boundary",
         "question": "list the last 10 inspections that have form answers indexed",
-        "expected_contains": ["inspection"],
-        "expected_nonempty": False,
+        "expected_contains": ["inspection", "facility"],
+        "expected_nonempty": True,
         "expected_llm_calls": 1,
-        "notes": "ETL gap — may return empty if module_name filter doesn't match indexed data. Success means SQL ran clean.",
+        "notes": "SELECT DISTINCT inspection_report_id FROM ai_answers ORDER BY submitted_on DESC LIMIT 10",
     },
     {
         "id": "ETL-03", "category": "ETL Boundary",
@@ -752,6 +752,64 @@ TEST_SET = [
         "expected_contains": ["observation", "total", "count"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "COUNT ai_answers WHERE label='Observation'",
+    },
+
+    # ── Financial / CAPEX / OPEX ─────────────────────────────────────────────
+    {
+        "id": "FIN-01", "category": "Financial",
+        "question": "what is the total capex generated converted and lost",
+        "expected_contains": ["capex_generated", "capex_converted", "capex_lost"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "Scalar summary ONE ROW — SUM(ica.capex) vs SUM(po.po_amount) vs REJECTED",
+    },
+    {
+        "id": "FIN-02", "category": "Financial",
+        "question": "what is the total opex incurred from purchase requisitions",
+        "expected_contains": ["opex_incurred", "pr"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "SUM(pr.pr_amount) from pr_details — NOT ica.opex",
+    },
+    {
+        "id": "FIN-03", "category": "Financial",
+        "question": "which inspectors generate the most capex",
+        "expected_contains": ["inspector", "capex"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "inspector_user_id → users JOIN ica JOIN po_details",
+    },
+    {
+        "id": "FIN-04", "category": "Financial",
+        "question": "show capex lost from rejected corrective actions",
+        "expected_contains": ["reject", "capex"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "capex_status=REJECTED — lost quotes",
+    },
+    {
+        "id": "FIN-05", "category": "Financial",
+        "question": "show total capex and opex by facility from po and pr details",
+        "expected_contains": ["facility", "capex", "opex"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "po_details + pr_details joined via ica → ir → facility",
+    },
+    {
+        "id": "FIN-06", "category": "Financial",
+        "question": "what is the total purchase order amount raised this year",
+        "expected_contains": ["total_po_amount", "po_count"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "Scalar: SUM(po.po_amount) WHERE po_date this year — ONE ROW not list",
+    },
+    {
+        "id": "FIN-07", "category": "Financial",
+        "question": "compare capex generated vs capex converted by inspector",
+        "expected_contains": ["inspector", "generated", "converted"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "ica.capex vs SUM(po.po_amount) per inspector",
     },
 ]
 
@@ -975,7 +1033,7 @@ if __name__ == "__main__":
     p.add_argument("--category", default=None,
                    help="Aggregate | Filter | Join | Form Answers | Scores | "
                         "Trends | People | Multi-turn | ICA Risk Level | "
-                        "Deferred Chain | Edge Case")
+                        "Deferred Chain | Edge Case | Financial")
     p.add_argument("--output", default=None)
     a = p.parse_args()
     run_eval(a.model_pair, a.skip_multiturn, a.category, a.output)

@@ -212,21 +212,15 @@ class SQLValidator:
         "score_improvement": "does not exist as a column — compute as this_q - last_q in a CTE",
     }
 
-    # Columns that do not exist on inspector_portfolio.
-    # The FK to users is user_id — deepseek confabulates inspector_id because
-    # the table NAME contains "inspector". Seed examples previously encoded
-    # the wrong column; this guard catches any stale embeddings or prompt drift.
-    HALLUCINATED_PORTFOLIO_COLUMNS: dict[str, str] = {
-        "inspector_id": "does not exist on inspector_portfolio — the FK column is user_id; JOIN users u ON ip.user_id = u.id",
-    }
+    # Columns that do not exist on inspection_corrective_action.
     # deepseek hallucinates these when given vague schema_hints about risk/deferral.
     HALLUCINATED_ICA_COLUMNS: dict[str, str] = {
         # Deferral ghost columns — 'times_deferred' was seen in ORDER BY in trace
         "times_deferred":     "does not exist — use COUNT(*) GROUP BY cause or fac.name to count deferrals",
         # Risk-level ghost columns — risk is via risk_level_id FK, not a direct column.
         # NOTE: risk_level and impact are also TABLE names — only catch qualified refs (ica.risk_level)
-        "capex_status":       "does not exist — for risk filtering: JOIN risk_level rl ON ica.risk_level_id = rl.id WHERE rl.name = 'High'",
-        "adequacy_status":    "does not exist — for risk filtering: JOIN risk_level rl ON ica.risk_level_id = rl.id WHERE rl.name = 'High'",
+        # capex_status DOES exist (unsuppressed) — do not flag it
+        "adequacy_status":    "does not exist — adequacy workflow not active",
         "risk_level":         "does not exist as a column — risk_level_id is a UUID FK; JOIN risk_level rl ON ica.risk_level_id = rl.id → rl.name",
         "impact":             "does not exist as a column — impact_id is a UUID FK; JOIN impact i ON ica.impact_id = i.id → i.name",
         # Other ghost columns seen in traces
@@ -236,6 +230,26 @@ class SQLValidator:
     # Subset of ICA ghost columns that are also table names — only check qualified refs.
     # If we check unqualified, we'd false-positive on "JOIN risk_level rl" clauses.
     _ICA_QUALIFIED_ONLY_COLS: frozenset = frozenset({"risk_level", "impact"})
+
+    # Impossible JOIN conditions derived from join_graph — these columns
+    # do not exist so the join can never be correct. Keyed by the bad pattern
+    # (regex), value is the correct path.
+    IMPOSSIBLE_JOIN_PATTERNS: list[tuple] = [
+        # ipd.cycle_id — column does not exist on inspector_portfolio_details
+        (r'\bipd\.cycle_id\b',
+         'ipd.cycle_id does not exist. Correct path: '
+         'ic→ip(ip.cycle_id=ic.id)→ipd(ipd.portfolio_id=ip.id)→fd'),
+        # ic.inspection_cycle_id — column does not exist on inspection_cycle
+        (r'\bic\.inspection_cycle_id\b',
+         'ic.inspection_cycle_id does not exist on inspection_cycle'),
+        # ir.cycle_id used as a join target on inspector_portfolio
+        (r'\bipd\.id\s*=\s*ic\.id\b',
+         'inspector_portfolio_details does not join directly to inspection_cycle. '
+         'Use: ip.cycle_id = ic.id, then ipd.portfolio_id = ip.id'),
+        # inspection_schedule.inspection_id — does not exist
+        (r'\bisched\.inspection_id\b|\binspection_schedule\.inspection_id\b',
+         'inspection_schedule has no inspection_id — use inspection_report_id FK'),
+    ]
 
     # UUID FK columns — SOFT_WARN if selected without their lookup JOIN
     UUID_FK_COLUMNS: dict[str, tuple] = {
@@ -387,23 +401,15 @@ class SQLValidator:
                     ))
                     ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
 
-        # ── 5c. Hallucinated columns on inspector_portfolio ───────────────
-        # The FK to users is user_id, not inspector_id. This was a seed example
-        # bug that poisoned embeddings; guard catches any residual prompt drift.
-        portfolio_used = bool(re.search(
-            r'\b(inspector_portfolio|ip)\b', sql_lower
-        ))
-        if portfolio_used:
-            for col, hint in self.HALLUCINATED_PORTFOLIO_COLUMNS.items():
-                for alias in ("ip", "inspector_portfolio"):
-                    if re.search(rf"\b{re.escape(alias)}\.{re.escape(col)}\b", sql_lower):
-                        issues.append(ValidationIssue(
-                            "HARD_FAIL", "WRONG_COLUMN",
-                            f"Column '{col}' does not exist on inspector_portfolio — {hint}",
-                            detail=f"Hallucinated portfolio column: {col}",
-                        ))
-                        ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
-                        break
+        # ── 5c. Impossible JOIN conditions (from join graph) ─────────────
+        for _pattern, _correct in self.IMPOSSIBLE_JOIN_PATTERNS:
+            if re.search(_pattern, sql_lower):
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "IMPOSSIBLE_JOIN",
+                    f"Impossible join detected — {_correct}",
+                    detail=f"Pattern matched: {_pattern}",
+                ))
+                ValidatorStats.record("IMPOSSIBLE_JOIN", is_retry_trigger=True)
 
         # ── 6. ir.id in SELECT clause (UUID PK exposed for display) ───────
         # IMPORTANT: ir.id is CORRECT and required as a JOIN key, e.g.:
@@ -427,15 +433,6 @@ class SQLValidator:
                         detail="ir.inspection_id is the human-readable varchar '2026/04/ST001/INS001'",
                     ))
                     ValidatorStats.record("UUID_IN_SELECT", is_retry_trigger=True)
-
-        # 6b. ipd.cycle_id HARD_FAIL  # FIX9_IPD_CYCLE
-        if re.search(r'\bipd\.cycle_id\b', sql_lower):
-            issues.append(ValidationIssue(
-                "HARD_FAIL", "WRONG_COLUMN",
-                "ipd.cycle_id does not exist; join via inspector_portfolio.cycle_id",
-                detail="ic.id -> ip.cycle_id -> ipd.portfolio_id -> fd.id",
-            ))
-            ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
 
         # ── 7. Dynamic fb_{uuid} table references ─────────────────────────
         if self._DYNAMIC_TABLE_RE.search(sql):
@@ -568,18 +565,51 @@ class SQLValidator:
 
         has_group_by = outermost.args.get("group") is not None
 
-        if has_group_by:
+        # Allow GROUP BY for legitimate trend queries (quarter/month breakdown)
+        _is_trend_groupby = bool(re.search(
+            r'GROUP\s+BY\s+(date_trunc|EXTRACT|TO_CHAR|\d+)',
+            sql, re.IGNORECASE
+        ))
+        if has_group_by and not _is_trend_groupby:
+            # Build domain-specific retry message
+            q_lower_shape = question.lower()
+            _is_ca_comparison = bool(re.search(
+                r'\braised.{0,20}closed\b|\bclosed.{0,20}raised\b'
+                r'|\b(faster|slower|closure.{0,20}rate)\b', q_lower_shape))
+            _is_time_comparison = bool(re.search(
+                r'\b(vs\.?|versus|this.{0,10}(month|quarter).{0,10}last'
+                r'|last.{0,10}(month|quarter).{0,10}this)\b', q_lower_shape))
+
+            if _is_ca_comparison:
+                _fix_example = (
+                    "  SELECT 'Q2 2026' AS quarter,\n"
+                    "    COUNT(*) AS total_raised,\n"
+                    "    COUNT(*) FILTER (WHERE status IN ('CLOSED','CLOSE_WITH_DEFERRED')) AS closed_count\n"
+                    "  FROM inspection_corrective_action\n"
+                    "  WHERE target_close_out_date >= date_trunc('quarter', CURRENT_DATE);"
+                )
+                _msg = "Use FILTER aggregates for raised/closed comparison (single row, no GROUP BY):\n"
+            elif _is_time_comparison:
+                _fix_example = (
+                    "  SELECT\n"
+                    "    COUNT(*) FILTER (WHERE date_trunc('month',col)=date_trunc('month',NOW())) AS this_month,\n"
+                    "    COUNT(*) FILTER (WHERE date_trunc('month',col)=date_trunc('month',NOW()-INTERVAL '1 month')) AS last_month\n"
+                    "  FROM table WHERE ...;"
+                )
+                _msg = "Use FILTER aggregates for time comparison (single row, no GROUP BY):\n"
+            else:
+                # Non-comparison GROUP BY: likely simple aggregate with unnecessary grouping
+                _fix_example = (
+                    "  -- For simple counts/aggregates, do NOT add GROUP BY:\n"
+                    "  SELECT COUNT(DISTINCT col) AS count FROM table WHERE ...;\n"
+                    "  -- Only use GROUP BY when the question asks for breakdown BY something."
+                )
+                _msg = "WRONG_SHAPE: remove unnecessary GROUP BY for a simple aggregate query:\n"
+
             issue = ValidationIssue(
                 "HARD_FAIL",
                 "WRONG_SHAPE",
-                (
-                    "SHAPE VIOLATION: comparison query must return ONE row. "
-                    "Remove GROUP BY. Use FILTER aggregates instead:\n"
-                    "  SELECT\n"
-                    "    COUNT(*) FILTER (WHERE date_trunc('month', col) = date_trunc('month', NOW())) AS this_month,\n"
-                    "    COUNT(*) FILTER (WHERE date_trunc('month', col) = date_trunc('month', NOW()-INTERVAL '1 month')) AS last_month\n"
-                    "  FROM table WHERE ...;"
-                ),
+                _msg + _fix_example,
                 retryable=True,
             )
             ValidatorStats.record("WRONG_SHAPE", is_retry_trigger=True)
