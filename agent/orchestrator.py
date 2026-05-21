@@ -107,10 +107,13 @@ class ConversationTurn:
     inspection_ids: list = field(default_factory=list)   # e.g. ["2026/04/ST085/INS003"]
     facility_names: list = field(default_factory=list)   # e.g. ["Golf Gardens"]
     inspector_names: list = field(default_factory=list)  # e.g. ["neenu extinsp1"]
+    cycle_ids: list = field(default_factory=list)        # UUIDs from cycle_id column
     single_row_values: dict = field(default_factory=dict) # col→val when result is 1 row
-    # Typed entity IDs for deterministic WHERE injection (scoped memory)
-    cycle_ids: list = field(default_factory=list)       # inspection_cycle UUIDs
-    fm_manager_ids: list = field(default_factory=list)  # inspectee user UUIDs
+    # Active focal entity — what the user is currently drilling into
+    # type: "inspection"|"facility"|"inspector"|"cycle"|"corrective_action"|None
+    active_subject_type: str = ""
+    active_subject_value: str = ""   # exact value (UUID or name)
+    active_subject_label: str = ""   # human-readable label for context message
 
 
 
@@ -169,13 +172,12 @@ class ConversationSession:
         if not self.turns:
             return ""
 
-        # Detect if the current question is a fresh subject vs a follow-up.
-        # Only emit the entity CONTEXT line when the question has clear follow-up signals.
         _FOLLOWUP_RE = re.compile(
             r"\b(it|that|this|she|he|they|them|her|his|their|"
             r"that\s+inspection|that\s+site|that\s+facility|that\s+form|"
             r"the\s+same|the\s+above|from\s+there|more|rest|remaining|"
-            r"continue|next|previous|last\s+one)\b",
+            r"continue|next|previous|last\s+one|back\s+to|go\s+back|"
+            r"that\s+inspector|that\s+cycle|that\s+person)\b",
             re.IGNORECASE,
         )
         _FRESH_SUBJECT_RE = re.compile(
@@ -201,53 +203,110 @@ class ConversationSession:
                 lines.append(f"  Total rows: {t.total_count}")
             if t.columns:
                 lines.append(f"  Columns: {t.columns}")
-            # Surface extracted entities so the LLM can use them as exact filters
             if t.inspection_ids:
                 lines.append(f"  ★ inspection_id(s) from this result: {t.inspection_ids[:5]}")
+            if t.cycle_ids:
+                lines.append(f"  ★ cycle_id(s) from this result: {t.cycle_ids[:3]}")
             if t.facility_names:
                 lines.append(f"  ★ facility(s) from this result: {t.facility_names[:5]}")
             if t.inspector_names:
                 lines.append(f"  ★ inspector(s) from this result: {t.inspector_names[:5]}")
             if t.single_row_values:
                 lines.append(f"  ★ single-row result: {t.single_row_values}")
+            # Show active subject for each turn
+            if t.active_subject_type and t.active_subject_value:
+                lines.append(
+                    f"  ◆ ACTIVE SUBJECT: {t.active_subject_type} = "
+                    f"'{t.active_subject_label or t.active_subject_value}' "
+                    f"(exact value: {t.active_subject_value})"
+                )
         lines.append("")
 
-        # Only synthesise entity context for follow-up questions.
-        # For fresh subject queries ("list all Q&A from most recent form") never
-        # inject a facility/inspection filter — that's context pollution.
-        if not is_clearly_fresh:
+        # ── Resolve active subject across all turns ──────────────────────────
+        # Walk backwards through turns to find the most recent active subject.
+        # "go back to that inspector" can re-anchor to an earlier turn's subject.
+        active_type = ""
+        active_value = ""
+        active_label = ""
+
+        # "go back" or "back to" signals: re-anchor to the earliest matching subject
+        _BACK_RE = re.compile(r"\b(go\s+back|back\s+to|return\s+to)\b", re.IGNORECASE)
+        if _BACK_RE.search(current_question):
+            # Look for the first (oldest) active subject in history
+            for t in self.turns:
+                if t.active_subject_type and t.active_subject_value:
+                    active_type = t.active_subject_type
+                    active_value = t.active_subject_value
+                    active_label = t.active_subject_label
+                    break
+        else:
+            # Normal: use the most recent active subject
+            for t in reversed(self.turns):
+                if t.active_subject_type and t.active_subject_value:
+                    active_type = t.active_subject_type
+                    active_value = t.active_subject_value
+                    active_label = t.active_subject_label
+                    break
+
+        # ── Emit the scoped context block ────────────────────────────────────
+        if not is_clearly_fresh and active_type and active_value:
+            if active_type == "cycle":
+                lines.append(
+                    f"ACTIVE CONTEXT — The conversation is scoped to cycle "
+                    f"'{active_value}'."
+                    f" All follow-up questions about inspections, corrective actions,"
+                    f" facilities, or inspectors should include WHERE ir.cycle_id = '{active_value}'."
+                    f" When user says 'they', 'that cycle', 'those facilities', 'those inspectors'"
+                    f" — this is the scope."
+                )
+            elif active_type == "inspector":
+                lines.append(
+                    f"ACTIVE CONTEXT — The conversation is about inspector '{active_label}'."
+                    f" When user says 'they', 'that inspector', 'their inspections'"
+                    f" — filter by inspector name ILIKE '%{active_label.split()[0]}%'"
+                    f" on the users table joined via ir.inspector_user_id."
+                    f" Do NOT broaden to all inspectors."
+                )
+            elif active_type == "inspection":
+                lines.append(
+                    f"ACTIVE CONTEXT — The conversation is about inspection '{active_value}'."
+                    f" When the user says 'it', 'that inspection', 'that site'"
+                    f" — use WHERE ir.inspection_id = '{active_value}'"
+                    f" (or aa.inspection_id = '{active_value}' for form answers)."
+                )
+            elif active_type == "facility":
+                lines.append(
+                    f"ACTIVE CONTEXT — The conversation is about facility '{active_label}'."
+                    f" When user says 'that facility', 'that site'"
+                    f" — filter by fac.name ILIKE '%{active_label}%'."
+                )
+            elif active_type == "corrective_action":
+                lines.append(
+                    f"ACTIVE CONTEXT — The conversation is about corrective action '{active_value}'."
+                )
+        elif not is_clearly_fresh:
+            # Fallback: legacy single-entity context
             last = self.turns[-1]
             if last.inspection_ids and len(last.inspection_ids) == 1:
                 lines.append(
                     f"CONTEXT — The conversation is about inspection '{last.inspection_ids[0]}'."
-                    f" When the user says 'that inspection', 'it', 'that site', 'she filled',"
-                    f" 'he filled', 'they filled', 'that form' — use"
-                    f" WHERE aa.inspection_id = '{last.inspection_ids[0]}'"
-                    f" (or ir.inspection_id = '{last.inspection_ids[0]}') as an exact filter."
-                    f" Do NOT filter by facility name or inspector name — use the inspection_id."
+                    f" When the user says 'that inspection', 'it', 'that site' — use"
+                    f" WHERE ir.inspection_id = '{last.inspection_ids[0]}'"
+                    f" as an exact filter."
                 )
             elif last.inspection_ids:
-                ids_str = ", ".join(f"'{i}'" for i in last.inspection_ids[:5])
+                ids_str = ", ".join(f"\'{i}\'" for i in last.inspection_ids[:5])
                 lines.append(
                     f"CONTEXT — The conversation involves inspections: {ids_str}."
-                    f" When the user references 'those inspections' or 'that data',"
-                    f" filter by inspection_id IN ({ids_str})."
+                    f" Filter by inspection_id IN ({ids_str}) when user references 'those'."
                 )
             elif last.facility_names and len(last.facility_names) == 1:
                 lines.append(
                     f"CONTEXT — The conversation is about facility '{last.facility_names[0]}'."
-                    f" If the user asks about 'that facility' or 'that site',"
-                    f" filter by fac.name ILIKE '%{last.facility_names[0]}%'."
+                    f" Filter by fac.name ILIKE '%{last.facility_names[0]}%'."
                 )
             elif last.single_row_values:
                 lines.append(f"CONTEXT — Last query returned a single result: {last.single_row_values}")
-            # Emit cycle_ids explicitly — never let Qwen truncate them
-            _cids = getattr(last, "cycle_ids", [])
-            if _cids:
-                for _cid in _cids:
-                    lines.append(
-                        f"CYCLE_ID (use this EXACT UUID, never truncate): {_cid}"
-                    )
 
         lines.append("")
         lines.append(
@@ -280,10 +339,8 @@ class AgentResult:
 _INSPECTION_REPORT_RE = re.compile(
     r'\b(inspection.?score|gp.?score|inspection.?hour|total.?hour|'
     r'inspection.?report|inspection.?status|inspector|inspectee|'
-    r'inspection.?type|inspection.?sub.?type|facility|facilities|'
-    r'inspections?\s+by\s+type|inspections?\s+per\s+cycle|'
-    r'inspections?|inspection|duration|submitted|score|'
-    r'completed.{0,20}inspect|inspect.{0,20}completed)\b',
+    r'inspection.?type|inspection.?sub.?type|facility|'
+    r'inspections?\s+by\s+type|inspections?\s+per\s+cycle)\b',
     re.IGNORECASE,
 )
 _CORRECTIVE_ACTION_RE = re.compile(
@@ -381,19 +438,6 @@ class AgentOrchestrator:
             examples=SEED_EXAMPLES,
         )
 
-        # Validate join graph against live DB
-        try:
-            from agent.join_graph import validate_join_graph
-            _jg_errors = validate_join_graph(self.db_engine)
-            if _jg_errors:
-                print(f"  ⚠ JOIN_GRAPH validation errors ({len(_jg_errors)}):")
-                for _e in _jg_errors:
-                    print(f"    {_e}")
-            else:
-                print(f"  ✓ Join graph validated")
-        except Exception as _jg_init_err:
-            print(f"  ⚠ Join graph validation skipped: {_jg_init_err}")
-
         print(f"  Configuring reasoning LLM: {chat_model}...")
         self.reasoning_llm = Ollama(model=chat_model, base_url=ollama_url,
             temperature=0.2, request_timeout=120.0,
@@ -446,16 +490,9 @@ class AgentOrchestrator:
         if session and session.turns:
             system_content += "\n\n" + session.build_context_block(question)
 
-        # ── Schema-first: inject compressed column context before Qwen plans ──
-        # Qwen plans against real verified columns, not memory.
-        # This eliminates hallucinated columns like total_inspection_hours.
-        _relevant_tables = _detect_inspection_tables(question)
-        _schema_prefix = self._build_planner_schema_context(question, _relevant_tables)
-        _user_content = (_schema_prefix + "\n\n" + question) if _schema_prefix else question
-
         messages = [
             ChatMessage(role=MessageRole.SYSTEM, content=system_content),
-            ChatMessage(role=MessageRole.USER, content=_user_content),
+            ChatMessage(role=MessageRole.USER, content=question),
         ]
         steps = []
         gen_sql_failures = 0
@@ -588,77 +625,6 @@ class AgentOrchestrator:
                 except Exception:
                     args["_inject_rule_ids"] = []
 
-                # ── Join graph injection ────────────────────────────────────
-                # Only override when Qwen's hint contains a KNOWN IMPOSSIBLE JOIN
-                # or when the question is specifically about a cycle's frequency.
-                # Do NOT strip valid hints for general portfolio/schedule queries.
-                try:
-                    from agent.join_graph import render_join_path, find_join_path
-                    _q_lower_jg = question.lower()
-                    _hint_lower = (args.get("schema_hint", "") or "").lower()
-
-                    # Detect if Qwen emitted an impossible join
-                    _has_bad_join = bool(re.search(
-                        r'ipd\.cycle_id|ic\.inspection_cycle_id',
-                        _hint_lower
-                    ))
-
-                    # Detect cycle-specific frequency question (not general portfolio frequency)
-                    _is_cycle_freq_q = bool(
-                        re.search(r'\b(cycle|most\s+recent\w*\s+completed|completed\s+cycle)\b', _q_lower_jg)
-                        and re.search(r'\b(frequency|how\s+often)\b', _q_lower_jg)
-                    )
-
-                    # Only inject/strip for cycle→frequency path
-                    if _has_bad_join or _is_cycle_freq_q:
-                        _path = find_join_path("inspection_cycle", "frequency_definition")
-                        if _path:
-                            _hint = args.get("schema_hint", "")
-                            # Strip only the bad join conditions, not all joins
-                            _hint = re.sub(
-                                r'(?i)(LEFT\s+)?JOIN\s+inspector_portfolio_details\s+\w+\s+ON\s+[^\n]+\n?',
-                                "", _hint
-                            )
-                            _hint = re.sub(r'\bipd\.cycle_id\b', "", _hint, flags=re.IGNORECASE)
-                            args["schema_hint"] = (
-                                _hint +
-                                "\nGRAPH-RESOLVED PATH (use exactly, NEVER ipd.cycle_id):\n"
-                                + render_join_path(_path) + "\n"
-                            )
-
-                    # ICA → facility: only inject, never strip existing hints
-                    if re.search(r'\b(corrective.?action|capex|opex)\b', _q_lower_jg):
-                        if re.search(r'\b(facility|facilities|site|by\s+facility)\b', _q_lower_jg):
-                            _path = find_join_path("inspection_corrective_action", "facility")
-                            if _path:
-                                args["schema_hint"] = (
-                                    args.get("schema_hint", "") +
-                                    "\nJOIN PATH (ica→ir→facility):\n"
-                                    + render_join_path(_path) + "\n"
-                                )
-
-                    # Scoped memory: inject known cycle_id as hard WHERE
-                    _lt = session.last_turn if session else None
-                    _s_cycles = getattr(_lt, "cycle_ids", []) if _lt else []
-                    if _s_cycles and re.search(
-                        r'\b(frequency|cycle|schedule|its?|that|this)\b', _q_lower_jg
-                    ):
-                        _cid = _s_cycles[0]
-                        _existing_hint = args.get("schema_hint", "") or ""
-                        # Strip truncated UUIDs (e.g. '012095ba-...' with ellipsis)
-                        # Qwen copies truncated UUIDs from conversation display
-                        _existing_hint = re.sub(
-                            r"'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{0,4}\.\.\.'?",
-                            f"'{_cid}'", _existing_hint, flags=re.IGNORECASE
-                        )
-                        args["schema_hint"] = (
-                            _existing_hint +
-                            f"\nHARD FILTER — EXACT UUID (do not truncate):"
-                            f" WHERE ic.id = '{_cid}'\n"
-                        )
-                except Exception as _jg_err:
-                    pass  # join graph optional — never break query execution
-
                 # Auto-inject exact SQL template for inspector count queries —
                 # deepseek reliably generates hardcoded years for this pattern.
                 if _INSPECTOR_COUNT_RE.search(question):
@@ -725,48 +691,16 @@ class AgentOrchestrator:
                             args.get("schema_hint", "") +
                             f"\nIMPORTANT: user asked for exactly {n} results — use LIMIT {n}."
                         )
+                # Inject active cycle UUID for seed substitution
+                if session and session.turns:
+                    for _t in reversed(session.turns):
+                        if _t.active_subject_type == "cycle" and _t.active_subject_value:
+                            args["_active_cycle_uuid"] = _t.active_subject_value
+                            break
                 tc["args"] = args
 
             if tool == "final_answer":
                 ans = args.get("answer", "")
-
-                # ── Hallucination guard ───────────────────────────────────────
-                # Reject final_answer if Qwen skipped execution for a data query.
-                # Detects when Qwen invents a numeric/factual answer without
-                # any prior successful execute_sql or get_answers step.
-                _DATA_Q_RE = re.compile(
-                    r'\b(how many|how much|average|total|count|percentage|'
-                    r'which|show|list|what is the|what are|who|when|'
-                    r'highest|lowest|most|least|best|worst|top|rank)\b',
-                    re.IGNORECASE,
-                )
-                _has_execution = any(
-                    s.tool in ("execute_sql", "get_answers", "get_answer_stats",
-                               "list_forms", "search_questions")
-                    and s.result.get("success")
-                    for s in steps
-                )
-                _looks_like_data_query = bool(_DATA_Q_RE.search(question))
-                _is_nonsense_decline = bool(re.search(
-                    r"couldn't find|can't help|don't have|no data|"
-                    r"rephrase|not related|nonsense",
-                    ans, re.IGNORECASE
-                ))
-
-                if (_looks_like_data_query
-                        and not _has_execution
-                        and not _is_nonsense_decline):
-                    # Qwen called final_answer without any DB execution — reject.
-                    # This fires on any iteration, not just iter 1.
-                    messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
-                    messages.append(ChatMessage(role=MessageRole.USER, content=
-                        "You called final_answer without executing any query. "
-                        "You MUST call generate_sql first (execute_sql runs automatically). "
-                        "Never invent numbers or results from memory. "
-                        f"Re-attempt the question: {question}"))
-                    continue
-                # ── End hallucination guard ───────────────────────────────────
-
                 s = AgentStep(iteration, thought, "final_answer", args,
                               {"answer": ans}, int((time.time()-t0)*1000))
                 steps.append(s); _emit(s)
@@ -813,14 +747,11 @@ class AgentOrchestrator:
                         rows_preview = json.dumps(exec_data.get("rows", [])[:10], default=str)
                         messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
                         messages.append(ChatMessage(role=MessageRole.USER, content=
-                            f"SQL executed. Rows returned: {exec_data.get('row_count',0)}\n"
-                            f"Columns: {exec_data.get('columns',[])}\n"
-                            f"Data: {rows_preview}\n\n"
+                            f"SQL: {sql}\nResult: {exec_data.get('row_count',0)} rows, "
+                            f"columns={exec_data.get('columns',[])}\n"
+                            f"Sample: {rows_preview}\n\n"
                             f"Original question: \"{question}\"\n"
-                            f"RULE: Your final_answer MUST use ONLY the data above.\n"
-                            f"Do NOT invent values not in the rows above.\n"
-                            f"If these rows answer the question, call final_answer now.\n"
-                            f"If you need more data (e.g. a second query), call the next tool."))
+                            f"If this answers it, call final_answer. Otherwise call the next tool."))
                         continue
 
                     ans = self._synthesize(question, "execute_sql", er)
@@ -926,33 +857,7 @@ class AgentOrchestrator:
     # Finish helper
     # ------------------------------------------------------------------ #
 
-    def _build_planner_schema_context(self, question: str, relevant_tables: list) -> str:
-        """Compressed schema context for Qwen — real columns only, ~300-500 tokens."""
-        if not relevant_tables:
-            return ""
-        from core.schema_introspector import USEFUL_COLUMNS
-        lines = ["[VERIFIED SCHEMA — only these columns exist:]",]
-        shown = set()
-        for tname in relevant_tables:
-            if tname not in USEFUL_COLUMNS or tname in shown:
-                continue
-            shown.add(tname)
-            cols = USEFUL_COLUMNS[tname]
-            ev = self.db_schema.enum_values.get(f"{tname}.status")
-            status_note = f" | status: {', '.join(repr(v) for v in ev)}" if ev else ""
-            lines.append(f"  {tname}: {', '.join(cols)}{status_note}")
-        _q = question.lower()
-        if any(w in _q for w in ('inspector', 'manager', 'fm ', 'user', 'who', 'inspectee')):
-            lines.append("  users: id, first_name, last_name, email")
-            lines.append("  inspector_user_id → JOIN users u ON ir.inspector_user_id = u.id")
-            lines.append("  inspectee_user_id → FM Manager: JOIN users u ON ir.inspectee_user_id = u.id")
-        if any(w in _q for w in ('facility', 'facilities', 'site')):
-            lines.append("  facility: id, name, client_id")
-        lines.append("[Use get_schema tool if you need a column not listed above]")
-        return "\n".join(lines)
-
     def _finish(self, question, answer, steps, iteration, emit_fn=None,
-
                 stats=None, session=None, query_start=None):
         s = AgentStep(iteration, "[auto] synthesized", "final_answer",
                       {"answer": answer}, {"answer": answer}, 0)
@@ -986,9 +891,12 @@ class AgentOrchestrator:
                     break
 
         # Extract key entities from result rows for follow-up context
-        insp_ids, fac_names, insp_names = [], [], []
-        cycle_ids, fm_manager_ids = [], []
+        insp_ids, fac_names, insp_names, cycle_ids = [], [], [], []
         single_row_vals = {}
+        _UUID_PAT = re.compile(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+            re.IGNORECASE
+        )
 
         for row in last_rows[:20]:
             if not isinstance(row, dict):
@@ -1005,11 +913,10 @@ class AgentOrchestrator:
                 v = row.get(col)
                 if v and str(v) not in insp_names:
                     insp_names.append(str(v))
-            # Extract typed entity UUIDs for scoped memory
-            for col in ("inspection_cycle_id", "cycle_id"):
+            for col in ("cycle_id", "inspection_cycle_id"):
                 v = row.get(col)
-                if v and re.match(r'^[0-9a-f-]{36}$', str(v), re.I):
-                    if str(v) not in cycle_ids: cycle_ids.append(str(v))
+                if v and str(v) not in cycle_ids and _UUID_PAT.match(str(v).strip()):
+                    cycle_ids.append(str(v).strip())
 
         # If only 1 row, store all values for maximum context
         if len(last_rows) == 1 and last_rows[0]:
@@ -1017,6 +924,42 @@ class AgentOrchestrator:
                 k: str(v) for k, v in last_rows[0].items()
                 if v is not None and str(v).strip()
             }
+            # Also pull cycle_id from single-row result
+            for col in ("cycle_id", "inspection_cycle_id"):
+                v = last_rows[0].get(col)
+                if v and str(v) not in cycle_ids and _UUID_PAT.match(str(v).strip()):
+                    cycle_ids.append(str(v).strip())
+
+        # ── Determine active subject for this turn ───────────────────────────
+        # Priority: cycle > single inspector > single inspection > single facility
+        active_subject_type = ""
+        active_subject_value = ""
+        active_subject_label = ""
+
+        if len(cycle_ids) == 1:
+            active_subject_type = "cycle"
+            active_subject_value = cycle_ids[0]
+            active_subject_label = cycle_ids[0]
+        elif len(insp_names) == 1:
+            active_subject_type = "inspector"
+            active_subject_value = insp_names[0]
+            active_subject_label = insp_names[0]
+        elif len(insp_ids) == 1:
+            active_subject_type = "inspection"
+            active_subject_value = insp_ids[0]
+            active_subject_label = insp_ids[0]
+        elif len(fac_names) == 1:
+            active_subject_type = "facility"
+            active_subject_value = fac_names[0]
+            active_subject_label = fac_names[0]
+        # If previous turn had a cycle scope and this result has no conflicting subject,
+        # inherit the cycle scope so it persists across multi-turn drilldowns
+        elif session and session.turns:
+            prev_turn = session.turns[-1]
+            if prev_turn.active_subject_type == "cycle" and prev_turn.active_subject_value:
+                active_subject_type = "cycle"
+                active_subject_value = prev_turn.active_subject_value
+                active_subject_label = prev_turn.active_subject_label
 
         if session is not None:
             # MT-03 fix: if we have a facility name but no inspection_id (e.g. MT-01
@@ -1052,8 +995,11 @@ class AgentOrchestrator:
                 inspection_ids=insp_ids[:5],
                 facility_names=fac_names[:5],
                 inspector_names=insp_names[:5],
-                single_row_values=single_row_vals,
                 cycle_ids=cycle_ids[:3],
+                single_row_values=single_row_vals,
+                active_subject_type=active_subject_type,
+                active_subject_value=active_subject_value,
+                active_subject_label=active_subject_label,
             ))
 
         return AgentResult(question, answer, steps, iteration, True, stats or QueryStats())

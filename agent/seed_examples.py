@@ -663,7 +663,7 @@ JOIN facility fac ON isched.facility_id = fac.id
 LEFT JOIN users u ON isched.inspector_id = u.id
 WHERE isched.due_date >= CURRENT_DATE
   AND isched.due_date < CURRENT_DATE + INTERVAL '30 days'
-  AND isched.status != 'COMPLETED'
+
 ORDER BY isched.due_date ASC LIMIT 100;""",
     ),
     (
@@ -1019,4 +1019,66 @@ SELECT
 FROM po_details po
 WHERE EXTRACT(YEAR FROM po.po_date) = EXTRACT(YEAR FROM CURRENT_DATE);""",
     ),
+    (
+        "show high risk corrective actions from a specific cycle scoped to cycle",
+        """-- USE THIS EXACT SQL for high risk CAs scoped to a cycle:
+-- When active context has a cycle_id, ALWAYS add WHERE ir.cycle_id = '<UUID>'
+-- Replace <CYCLE_UUID> with the actual cycle UUID from conversation context
+SELECT ica.corrective_action_id, ica.cause, ica.corrective_action,
+       ica.responsible, ica.status, rl.name AS risk_level_name,
+       fac.name AS facility_name, ica.target_close_out_date
+FROM inspection_corrective_action ica
+JOIN risk_level rl ON ica.risk_level_id = rl.id
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE rl.name = 'High'
+  AND ir.cycle_id = '<CYCLE_UUID>'
+ORDER BY ica.target_close_out_date DESC LIMIT 100;""",
+    ),
+    (
+        "show all inspectors in a cycle facilities in a specific cycle",
+        """-- USE THIS EXACT SQL for inspectors/facilities within a cycle:
+-- NEVER use ir.facility_name — it does not exist on inspection_report
+-- Always JOIN facility fac ON ir.facility_id = fac.id to get fac.name
+SELECT DISTINCT u.first_name || ' ' || u.last_name AS inspector_name,
+       fac.name AS facility_name,
+       ir.inspection_id, ir.submitted_on, ir.status
+FROM inspection_report ir
+JOIN users u ON ir.inspector_user_id = u.id
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE ir.cycle_id = '<CYCLE_UUID>'
+  AND ir.status != 'DRAFT'
+ORDER BY fac.name, ir.submitted_on DESC
+LIMIT 50;""",
+    ),
+
+    (
+        "give me a breakdown of this quarter quarterly summary",
+        """-- USE THIS EXACT SQL for quarterly summary — single aggregated row:
+SELECT
+    EXTRACT(YEAR FROM CURRENT_DATE)::int          AS year,
+    EXTRACT(QUARTER FROM CURRENT_DATE)::int        AS quarter,
+    COUNT(*)                                       AS inspection_count,
+    ROUND(AVG(ir.inspection_score)::numeric, 2)    AS avg_score,
+    COUNT(*) FILTER (WHERE ir.status IN ('CLOSED','CLOSE_WITH_DEFERRED')) AS closed_count,
+    COUNT(*) FILTER (WHERE ir.status = 'SUBMITTED')                       AS submitted_count,
+    COUNT(*) FILTER (WHERE ir.status = 'UNDER_REVIEW')                    AS under_review_count,
+    COUNT(*) FILTER (WHERE ir.status = 'RETURNED')                        AS returned_count
+FROM inspection_report ir
+WHERE ir.status != 'DRAFT'
+  AND date_trunc('quarter', ir.submitted_on) = date_trunc('quarter', CURRENT_DATE);""",
+    ),
+
+    (
+        "total capex generated converted lost financial summary",
+        """-- USE THIS EXACT SQL — ONE ROW scalar summary, NO GROUP BY:
+SELECT
+    (SELECT COALESCE(SUM(capex), 0) FROM inspection_corrective_action
+     WHERE capex > 0)                                                    AS capex_generated,
+    (SELECT COALESCE(SUM(po_amount), 0) FROM po_details)                  AS capex_converted,
+    (SELECT COALESCE(SUM(capex), 0) FROM inspection_corrective_action
+     WHERE capex_status = 'REJECTED')                                     AS capex_lost,
+    (SELECT COALESCE(SUM(pr_amount), 0) FROM pr_details)                  AS opex_incurred;""",
+    ),
+
 ]
