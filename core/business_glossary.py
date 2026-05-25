@@ -245,6 +245,96 @@ _RAW: list[dict] = [
         "message": "percentage queries require division — use 100.0 * count / NULLIF(total, 0)",
         "severity": "SOFT_WARN",
     },
+
+    # ── CAPEX / Financial terms ──────────────────────────────────────────────
+
+    {
+        "id": "capex_conversion_rate",
+        "terms": ["conversion rate", "capex conversion", "how much was converted"],
+        "required_pattern": r"po_details|po_by_ica|po\.po_amount",
+        "forbidden_patterns": [
+            # Wrong: using inspection count / CA count as conversion rate
+            r"inspections_with_ca|inspection.*ca.*rate|ca.*inspection.*rate",
+        ],
+        "correct_sql": "ROUND(SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100, 2) AS conversion_rate_pct",
+        "message": "CAPEX conversion rate = SUM(po_amount) / SUM(ica.capex) * 100 — NOT inspection-to-CA percentage",
+        "severity": "HARD_FAIL",
+    },
+
+    {
+        "id": "capex_converted",
+        "terms": ["capex converted", "converted capex", "capex conversion"],
+        "required_pattern": r"po_details|po\.po_amount|po_by_ica",
+        "forbidden_patterns": [
+            r"capex_status\s*=\s*'ACCEPTED'",
+            r"SUM\s*\(\s*ica\.capex\s*\).*LEFT\s+JOIN\s+po_details",
+        ],
+        "correct_sql": "(SELECT SUM(po_amount) FROM po_details) AS capex_converted",
+        "message": "CAPEX Converted = SUM(po_details.po_amount) — NOT ica.capex filtered by capex_status='ACCEPTED'",
+        "severity": "HARD_FAIL",
+    },
+    {
+        "id": "capex_lost",
+        "terms": ["capex lost", "lost capex", "capex loss"],
+        "required_pattern": r"po_details|po\.po_amount|po_by_ica",
+        "forbidden_patterns": [
+            r"capex_status\s*(?:=|IN)\s*['\(]*REJECTED",
+            r"capex_status\s*(?:=|IN)\s*['\(]*DEFERRED",
+        ],
+        "correct_sql": "SUM(ica.capex) - (SELECT SUM(po_amount) FROM po_details) AS capex_lost",
+        "message": "CAPEX Lost = SUM(ica.capex) - SUM(po.po_amount) — NOT WHERE capex_status='REJECTED'",
+        "severity": "HARD_FAIL",
+    },
+    {
+        "id": "capex_generated",
+        "terms": ["capex generated", "generated capex", "total capex generated"],
+        "required_pattern": r"SUM\s*\(\s*(?:ica\.)?capex\s*\)|inspection_corrective_action",
+        "forbidden_patterns": [],
+        "correct_sql": "SUM(ica.capex) AS capex_generated FROM inspection_corrective_action",
+        "message": "CAPEX Generated = SUM(ica.capex) from inspection_corrective_action",
+        "severity": "SOFT_WARN",
+    },
+    {
+        "id": "opex_incurred",
+        "terms": ["opex incurred", "opex spend", "purchase requisition amount", "pr amount"],
+        "required_pattern": r"pr_details|pr\.pr_amount|pr_by_ica",
+        "forbidden_patterns": [
+            r"SUM\s*\(\s*ica\.opex\s*\)",
+        ],
+        "correct_sql": "(SELECT SUM(pr_amount) FROM pr_details) AS opex_incurred",
+        "message": "OPEX Incurred = SUM(pr_details.pr_amount) — NOT SUM(ica.opex) which is just an estimate",
+        "severity": "HARD_FAIL",
+    },
+    {
+        "id": "fm_manager_capex",
+        "terms": [
+            r"capex generator",
+            r"capex converter",
+            r"fm manager.*capex",
+            r"capex.*fm manager",
+            r"top.*capex.*generator",
+            r"top.*capex.*converter",
+        ],
+        "required_pattern": r"inspectee_user_id",
+        "forbidden_patterns": [
+            r"GROUP\s+BY.*corrective_action_id",
+        ],
+        "correct_sql": "JOIN users u ON ir.inspectee_user_id = u.id GROUP BY u.id, u.first_name, u.last_name",
+        "message": "CAPEX Generator/Converter = FM Manager (inspectee_user_id) — GROUP BY person not corrective_action_id",
+        "severity": "HARD_FAIL",
+    },
+    {
+        "id": "capex_row_multiplication",
+        "terms": ["capex generated", "total capex", "capex by facility", "capex by inspector"],
+        "required_pattern": None,
+        "forbidden_patterns": [
+            r"SUM\s*\(\s*ica\.capex\s*\).*LEFT\s+JOIN\s+po_details",
+        ],
+        "correct_sql": "WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) FROM po_details GROUP BY 1) LEFT JOIN po_by_ica p ON p.ica_id = ica.id",
+        "message": "SUM(ica.capex) + LEFT JOIN po_details causes row multiplication — use CTE pre-aggregation",
+        "severity": "HARD_FAIL",
+    },
+
 ]
 
 

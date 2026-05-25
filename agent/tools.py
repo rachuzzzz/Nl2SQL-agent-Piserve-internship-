@@ -619,6 +619,7 @@ def get_schema(db_engine: Engine, table_name: Optional[str] = None) -> dict[str,
         return {"success": False, "result": None, "error": str(exc)}
 
 
+
 # ---------------------------------------------------------------------------
 # ToolRegistry
 # ---------------------------------------------------------------------------

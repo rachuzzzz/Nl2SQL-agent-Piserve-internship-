@@ -181,6 +181,8 @@ INSPECTION_TABLES = [
     "inspection_report_remark",
     "accompanying_inspectors",
     "additional_inspectees",
+    "po_details",    # CAPEX Converted — JOIN via po.mitigative_action_uuid = ica.id
+    "pr_details",    # OPEX Incurred   — JOIN via pr.mitigative_action_uuid = ica.id
 ]
 
 AI_TABLES = [
@@ -213,11 +215,19 @@ USEFUL_COLUMNS = {
         # expenditure: STRING ENUM — NO_EXPENDITURE | CAPEX | OPEX | CAPEX_AND_OPEX
         #   (NOT a numeric amount — it is a category flag)
         # capex and opex are the NUMERIC amounts (decimal)
-        # ica.capex = CAPEX Generated (quoted amount)
-        # po_details.po_amount = CAPEX Converted (actual PO raised by client)
+        # ica.capex = CAPEX Generated (quoted amount by inspectee)
+        # po_details.po_amount = CAPEX Converted (actual PO raised)
         # pr_details.pr_amount = OPEX Incurred (actual PR raised internally)
+        # CAPEX Lost = SUM(ica.capex) - COALESCE(SUM(po.po_amount),0) — arithmetic diff
+        # DO NOT use capex_status='REJECTED' for loss — use arithmetic difference
         # Join: po_details ON po.mitigative_action_uuid = ica.id
         # Join: pr_details ON pr.mitigative_action_uuid = ica.id
+        # close_on is NULL for ALL rows — use modified_on as closure date proxy
+        # CAPEX loss form answers (module: Inspection Mitigative Action Completion):
+        #   'Is CAPEX Lost' — answer_text = 'true'
+        #   'Amount Difference for CPAEX Loss' — answer_numeric (NOTE: typo CPAEX)
+        #   'CAPEX Lost To(Company/Entity/Subcontractor)' — answer_text
+        #   JOIN via: ica.completion_submission_id = ai_answers.inspection_report_id
     ],
     "inspection_schedule": [
         "id", "status", "due_date", "scheduled_date",

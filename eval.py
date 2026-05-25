@@ -773,7 +773,7 @@ TEST_SET = [
     },
     {
         "id": "FIN-03", "category": "Financial",
-        "question": "which inspectors generate the most capex",
+        "question": "which fm managers generate the most capex",
         "expected_contains": ["inspector", "capex"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,

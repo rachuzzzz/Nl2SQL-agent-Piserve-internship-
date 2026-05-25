@@ -284,6 +284,11 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
   Use: ir (inspection_report), ica (inspection_corrective_action),
        ic (inspection_cycle), sched (inspection_schedule),
        aa (ai_answers), aq (ai_questions), fac (facility), u (users), it (inspection_type).
+- SOFT-DELETE — ALWAYS add WHERE active = true (or AND active = true) when querying:
+  inspection_report, inspection_corrective_action, facility, users,
+  inspection_type, inspector_portfolio, inspector_portfolio_details,
+  frequency_definition, po_details, pr_details, risk_level.
+  NEVER return rows where active = false — those are deleted/archived records.
 - ENUM values are ALWAYS uppercase: status = 'OPEN', status = 'CLOSED', status = 'OVERDUE',
   responsible = 'CLIENT', responsible = 'INTERNAL_OPERATIONS', responsible = 'SUB_CONTRACTOR'.
   NEVER use lowercase for enum comparisons.

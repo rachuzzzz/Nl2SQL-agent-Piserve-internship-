@@ -30,6 +30,12 @@ try:
 except ImportError:
     _HAS_SQLGLOT = False
 
+try:
+    from core.buisness_glossary import check_glossary as _check_glossary
+    _HAS_GLOSSARY = True
+except ImportError:
+    _HAS_GLOSSARY = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -695,6 +701,16 @@ class SQLValidator:
                     retryable=False,
                 ))
                 ValidatorStats.record("SEMANTIC_DATE_VS_STATUS", is_retry_trigger=False)
+
+        # ── Business glossary term checks ─────────────────────────────────────
+        if _HAS_GLOSSARY:
+            for severity, msg in _check_glossary(question, sql):
+                warns.append(ValidationIssue(
+                    "SOFT_WARN", "GLOSSARY_VIOLATION", msg,
+                    detail="business_glossary check",
+                    retryable=False,
+                ))
+                ValidatorStats.record("GLOSSARY_VIOLATION", is_retry_trigger=False)
 
         return warns
 

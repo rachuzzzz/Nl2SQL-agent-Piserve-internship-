@@ -116,6 +116,55 @@ REGISTRY: list[dict] = [
         "message":     "BLOCKED: Dynamic fb_<uuid> table. Use ai_answers instead.",
     },
 
+    # ── CAPEX Lost definition — block capex_status=REJECTED as loss proxy ──────
+    {
+        "id":          "block_capex_status_rejected_as_loss",
+        "type":        BLOCK,
+        "description": "capex_status REJECTED/DEFERRED is NOT how CAPEX Lost is calculated.",
+        "sql_pattern": r"capex_status.*(?:=\s*'REJECTED'|IN\s*\([^)]*'REJECTED'[^)]*\)|IN\s*\([^)]*'DEFERRED'[^)]*\))",
+        "message":     (
+            "WRONG: capex_status='REJECTED' or 'DEFERRED' does not mean CAPEX Lost. "
+            "CAPEX Lost = SUM(ica.capex) - COALESCE(SUM(po.po_amount), 0) "
+            "via LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id. "
+            "For loss detail: join ai_answers via ica.completion_submission_id and "
+            "filter HAVING MAX(CASE WHEN label='Is CAPEX Lost' THEN answer_text END) = 'true'."
+        ),
+    },
+    {
+        "id":          "block_po_wrong_join_col",
+        "type":        BLOCK,
+        "description": "po_details has no corrective_action_id column — join via mitigative_action_uuid",
+        "sql_pattern": r"po\.corrective_action_id",
+        "message":     "WRONG JOIN: po_details has no corrective_action_id. Use: po.mitigative_action_uuid = ica.id",
+    },
+    {
+        "id":          "block_capex_left_join_multiplication",
+        "type":        BLOCK,
+        "description": "Direct LEFT JOIN po_details inflates SUM(ica.capex) when one ICA has multiple POs",
+        # Two separate checks — both must be present (order doesn't matter)
+        # Checked via question_pattern match + manual check in validate_sql
+        "sql_pattern": r"(?=.*SUM\s*\(\s*ica\.capex)(?=.*LEFT\s+JOIN\s+po_details)",
+        "message":     (
+            "WRONG: Direct LEFT JOIN po_details inflates SUM(ica.capex) — one ICA can have multiple POs. "
+            "Use scalar subqueries instead: "
+            "SELECT (SELECT SUM(capex) FROM inspection_corrective_action) AS capex_generated, "
+            "(SELECT SUM(po_amount) FROM po_details) AS capex_converted. "
+            "OR use CTE: WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total FROM po_details GROUP BY 1) "
+            "LEFT JOIN po_by_ica p ON p.ica_id = ica.id"
+        ),
+    },
+    {
+        "id":          "block_expenditure_as_conversion",
+        "type":        BLOCK,
+        "description": "expenditure column is a category flag, NOT a conversion indicator",
+        "sql_pattern": r"expenditure.*IN.*CAPEX.*converted|converted.*expenditure.*IN.*CAPEX|CASE.*expenditure.*CAPEX.*capex",
+        "message":     (
+            "WRONG: ica.expenditure is a category enum (CAPEX/OPEX/NO_EXPENDITURE), NOT a conversion indicator. "
+            "CAPEX Converted = SUM(po.po_amount) via LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id. "
+            "NEVER use expenditure to calculate converted amounts."
+        ),
+    },
+
     # ── Hallucinated columns on ai_questions ──────────────────────────────────
     {
         "id":          "block_col_aq_question_label",
@@ -479,28 +528,46 @@ REGISTRY: list[dict] = [
         "id":             "inject_financial_routing",
         "type":           INJECT,
         "priority":       88,
-        "description":    "CAPEX/OPEX financial queries — route to po_details/pr_details.",
+        "description":    "CAPEX/OPEX financial queries — route to po_details/pr_details/ai_answers.",
         "question_pattern": (
             r"\b(po[_\s]detail|pr[_\s]detail|purchase\s+order|purchase\s+requisition|"
+            r"purchase\s+order\s+amount|po\s+amount|total\s+po|"
             r"capex\s+(generat|convert|lost|loss|incurr)|"
             r"opex\s+(incurr|facilit|spend)|"
             r"(generat|convert|lost|incurr).{0,20}(capex|opex)|"
+            r"how\s+much.{0,30}(convert|capex|po|purchase)|"
+            r"conversion\s+rate|capex\s+conversion|"
+            r"(convert|capex).{0,20}(inspectee|fm|manager|facility)|"
             r"rival.{0,20}(quote|bid|amount)|financial\s+summary)\b"
         ),
         "hint": (
             "\nFINANCIAL DATA ROUTING:\n"
-            "  CAPEX Generated  = SUM(ica.capex)          — original quoted amount on ICA\n"
-            "  CAPEX Converted  = SUM(po.po_amount)        — actual PO raised by client\n"
-            "  CAPEX Lost       = SUM(ica.capex) WHERE capex_status='REJECTED'\n"
-            "  OPEX Incurred    = SUM(pr.pr_amount)        — actual internal PR spend\n"
+            "  CAPEX Generated  = SUM(ica.capex)       — inspectee's original estimate on ICA\n"
+            "  CAPEX Converted  = SUM(po.po_amount)    — actual PO raised (via po_details)\n"
+            "  CAPEX Lost       = CAPEX Generated - CAPEX Converted\n"
+            "                     i.e. SUM(ica.capex) - COALESCE(SUM(po.po_amount), 0)\n"
+            "  DO NOT use capex_status for loss calculation — use the arithmetic difference\n"
+            "\n  CAPEX Loss Detail (from form answers — module: 'Inspection Mitigative Action Completion'):\n"
+            "    'Is CAPEX Lost'                        — aa.answer_text = 'true' (boolean flag)\n"
+            "    'Amount Difference for CPAEX Loss'     — aa.answer_numeric (NOTE: typo CPAEX not CAPEX)\n"
+            "    'CAPEX Lost To(Company/Entity/Subcontractor)' — aa.answer_text (who did it cheaper)\n"
+            "    'Justification for CAPEX Loss'         — aa.answer_text (reason)\n"
+            "    JOIN via: ica.completion_submission_id = aa.inspection_report_id\n"
+            "\n  OPEX Incurred    = SUM(pr.pr_amount)    — actual PR spend (via pr_details)\n"
+            "    'PR Amount' / 'PR Date' / 'PR Number' also in form: 'Inspection Mitigative Action PR Entry'\n"
+            "    JOIN via: ica.pr_submission_id = aa.inspection_report_id\n"
             "\npo_details: id, po_amount, po_date, po_number, mitigative_action_uuid\n"
-            "  JOIN: LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id\n"
-            "  One ICA can have MULTIPLE POs — always SUM(po.po_amount), never assume 1:1\n"
+            "  One ICA can have MULTIPLE POs — NEVER direct LEFT JOIN, use CTE pre-aggregation:\n"
+            "  WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po_amount FROM po_details GROUP BY 1)\n"
+            "  LEFT JOIN po_by_ica p ON p.ica_id = ica.id\n"
             "\npr_details: id, pr_amount, pr_date, pr_number, mitigative_action_uuid\n"
             "  JOIN: LEFT JOIN pr_details pr ON pr.mitigative_action_uuid = ica.id\n"
             "  One ICA can have MULTIPLE PRs — always SUM(pr.pr_amount)\n"
-            "\nInspector CAPEX = inspector_user_id (who raised the CA)\n"
-            "FM Manager CAPEX = inspectee_user_id (facility manager receiving inspection)\n"
+            "\nCAPEX is ALWAYS tied to the FM Manager (inspectee_user_id)\n"
+"  Inspectors only raise observations — they have NO role in CAPEX/OPEX\n"
+"  FM Manager (inspectee_user_id) raises the ICA and assigns the CAPEX value\n"
+"  Client raises PO to cover it (CAPEX Converted) or org raises PR (OPEX Incurred)\n"
+            "\nDATE RULE: NEVER hardcode years (2026, 2025). Use CURRENT_DATE or DATE_TRUNC('year', CURRENT_DATE).\n"
         ),
     },
     {
@@ -517,19 +584,25 @@ REGISTRY: list[dict] = [
         ),
         "hint": (
             "\nFM MANAGER ROUTING:\n"
-            "  FM Manager = inspectee_user_id on inspection_report (NOT inspector_user_id)\n"
+            "  FM Manager  = inspectee_user_id on inspection_report (NOT inspector_user_id)\n"
             "  Inspector   = inspector_user_id on inspection_report\n"
-            "  JOIN: JOIN users u ON ir.inspectee_user_id = u.id → u.first_name || ' ' || u.last_name AS fm_manager\n"
-            "\nCAPEX LEADERBOARD DEFINITIONS:\n"
-            "  CAPEX Generator = FM managers ranked by total capex raised (SUM where capex > 0)\n"
-            "  CAPEX Converter = FM managers ranked by capex that reached ACCEPTED status\n"
-            "\nCAPEX STATUS (inspection_corrective_action.capex_status):\n"
-            "  NULL        = awaiting approval (not yet actioned)\n"
-            "  'ACCEPTED'  = approved / converted\n"
-            "  'REJECTED'  = rejected\n"
-            "  'DEFERRED'  = deferred\n"
-            "  CAPEX Awaiting Approval = capex > 0 AND capex_status IS NULL\n"
-            "\nEXPENDITURE column values: NO_EXPENDITURE, CAPEX, OPEX, CAPEX_AND_OPEX\n"
+            "  JOIN: JOIN users u ON ir.inspectee_user_id = u.id\n"
+            "  GROUP BY u.id, u.first_name, u.last_name\n"
+            "\nWARNING — ica.responsible is NOT the FM Manager:\n"
+            "  ica.responsible = CLIENT | INTERNAL_OPERATIONS | SUB_CONTRACTOR\n"
+            "  This is who carries out the fix — NOT the person who generated the CAPEX\n"
+            "  NEVER GROUP BY ica.responsible when asked about FM managers or capex generators\n"
+            "\nCAPEX LEADERBOARD — correct definitions:\n"
+            "  CAPEX Generator = FM managers ranked by SUM(ica.capex)\n"
+            "  CAPEX Converted = SUM(po.po_amount) via po_details — NOT capex_status='ACCEPTED'\n"
+            "  CAPEX Lost      = SUM(ica.capex) - COALESCE(SUM(po.po_amount), 0)\n"
+            "  OPEX Incurred   = SUM(pr.pr_amount) via pr_details — NOT SUM(ica.opex)\n"
+            "  Conversion Rate = SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100\n"
+            "\nNEVER use capex_status for financial metrics — it is a workflow flag only\n"
+            "  capex_status: NULL=awaiting | ACCEPTED=approved | REJECTED | DEFERRED\n"
+            "\nPRE-AGGREGATE po_details to avoid row multiplication (one ICA can have multiple POs):\n"
+            "  WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total FROM po_details GROUP BY 1)\n"
+            "  LEFT JOIN po_by_ica p ON p.ica_id = ica.id\n"
         ),
     },
     {

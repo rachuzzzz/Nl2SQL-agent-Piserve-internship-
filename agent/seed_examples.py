@@ -39,6 +39,10 @@ CORE_CONTEXT = """\
 -- OPEX Incurred    = SUM(pr.pr_amount)             — actual PR raised internally
 -- po_details JOIN: ON po.mitigative_action_uuid = ica.id  (one ICA can have many POs)
 -- pr_details JOIN: ON pr.mitigative_action_uuid = ica.id  (one ICA can have many PRs)
+-- SOFT-DELETE: these tables have an 'active' boolean column — ALWAYS filter WHERE active = true:
+--   inspection_report, inspection_corrective_action, facility, users,
+--   inspection_type, inspector_portfolio, inspector_portfolio_details,
+--   frequency_definition, po_details, pr_details, risk_level
 """
 
 # ── Seed corpus ───────────────────────────────────────────────────────────────
@@ -53,27 +57,32 @@ SEED_EXAMPLES: list[tuple[str, str]] = [
         """\
 SELECT COUNT(*) AS completed_count
 FROM inspection_report ir
-WHERE ir.status IN ('CLOSED','SUBMITTED')
+WHERE ir.active = true
+  AND ir.status IN ('CLOSED','SUBMITTED')
   AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE);""",
     ),
     (
         "how many open corrective actions are there",
         """\
 SELECT COUNT(*) AS open_count
-FROM inspection_corrective_action WHERE status = 'OPEN';""",
+FROM inspection_corrective_action ica
+WHERE ica.active = true AND ica.status = 'OPEN';""",
     ),
     (
         "what is the average inspection score",
         """\
 SELECT ROUND(AVG(ir.inspection_score)::numeric, 2) AS average_score
 FROM inspection_report ir
-WHERE ir.status != 'DRAFT' AND ir.inspection_score IS NOT NULL;""",
+WHERE ir.active = true
+  AND ir.status != 'DRAFT'
+  AND ir.inspection_score IS NOT NULL;""",
     ),
     (
         "total capex and opex across all corrective actions",
         """\
 SELECT SUM(ica.capex) AS total_capex, SUM(ica.opex) AS total_opex
-FROM inspection_corrective_action ica;""",
+FROM inspection_corrective_action ica
+WHERE ica.active = true;""",
     ),
     (
         "what percentage of inspections resulted in at least one corrective action",
@@ -84,7 +93,7 @@ SELECT ROUND(
 ) AS pct_with_ca
 FROM inspection_report ir
 LEFT JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id
-WHERE ir.status != 'DRAFT';""",
+WHERE ir.active = true AND ir.status != 'DRAFT';""",
     ),
     (
         "average inspection duration in hours",
@@ -94,7 +103,9 @@ SELECT ROUND(
     AVG(EXTRACT(EPOCH FROM (ir.submitted_on - ir.start_date_time)) / 3600)::numeric, 2
 ) AS avg_duration_hours
 FROM inspection_report ir
-WHERE ir.status != 'DRAFT' AND ir.start_date_time IS NOT NULL;""",
+WHERE ir.active = true
+  AND ir.status != 'DRAFT'
+  AND ir.start_date_time IS NOT NULL;""",
     ),
     (
         "average number of observations per inspection",
@@ -119,7 +130,8 @@ FROM (
 SELECT
   COUNT(*) FILTER (WHERE date_trunc('month', ir.submitted_on) = date_trunc('month', NOW())) AS this_month_count,
   COUNT(*) FILTER (WHERE date_trunc('month', ir.submitted_on) = date_trunc('month', NOW()-INTERVAL '1 month')) AS last_month_count
-FROM inspection_report ir WHERE ir.status IN ('CLOSED','SUBMITTED');""",
+FROM inspection_report ir
+WHERE ir.active = true AND ir.status IN ('CLOSED','SUBMITTED');""",
     ),
     (
         "how many corrective actions were raised vs closed this quarter",
@@ -130,7 +142,8 @@ SELECT COUNT(*) AS total_raised,
        COUNT(*) FILTER (WHERE status IN ('CLOSED','CLOSE_WITH_DEFERRED')) AS total_closed,
        COUNT(*) FILTER (WHERE status IN ('OPEN','OVERDUE')) AS still_open
 FROM inspection_corrective_action
-WHERE created_on >= date_trunc('quarter', NOW());""",
+WHERE active = true
+  AND created_on >= date_trunc('quarter', NOW());""",
     ),
     (
         "how has the average inspection score changed month by month this year",
@@ -139,7 +152,8 @@ SELECT TO_CHAR(date_trunc('month', ir.submitted_on), 'Month YYYY') AS month,
        COUNT(*) AS inspection_count,
        ROUND(AVG(ir.inspection_score)::numeric, 2) AS avg_score
 FROM inspection_report ir
-WHERE ir.status != 'DRAFT'
+WHERE ir.active = true
+  AND ir.status != 'DRAFT'
   AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
 GROUP BY date_trunc('month', ir.submitted_on)
 ORDER BY date_trunc('month', ir.submitted_on);""",
@@ -844,7 +858,8 @@ SELECT u.first_name || ' ' || u.last_name AS fm_manager,
 FROM inspection_report ir
 JOIN users u ON ir.inspectee_user_id = u.id
 JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id
-WHERE ica.capex > 0
+WHERE ir.active = true AND ica.active = true AND u.active = true
+  AND ica.capex > 0
 GROUP BY u.id, u.first_name, u.last_name
 ORDER BY capex_generated DESC
 LIMIT 5;""",
@@ -861,7 +876,8 @@ SELECT u.first_name || ' ' || u.last_name AS fm_manager,
 FROM inspection_report ir
 JOIN users u ON ir.inspectee_user_id = u.id
 JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id
-WHERE ica.capex > 0
+WHERE ir.active = true AND ica.active = true AND u.active = true
+  AND ica.capex > 0
   AND ica.capex_status = 'ACCEPTED'
 GROUP BY u.id, u.first_name, u.last_name
 ORDER BY capex_converted DESC
@@ -880,7 +896,8 @@ FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
 JOIN facility fac ON ir.facility_id = fac.id
 JOIN users u ON ir.inspectee_user_id = u.id
-WHERE ica.capex > 0
+WHERE ir.active = true AND ica.active = true AND fac.active = true AND u.active = true
+  AND ica.capex > 0
   AND ica.capex_status IS NULL
 ORDER BY ica.capex DESC
 LIMIT 50;""",
@@ -905,7 +922,8 @@ SELECT ica.corrective_action_id,
 FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
 JOIN facility fac ON ir.facility_id = fac.id
-WHERE (ica.capex > 0 OR ica.opex > 0)
+WHERE ir.active = true AND ica.active = true AND fac.active = true
+  AND (ica.capex > 0 OR ica.opex > 0)
 ORDER BY total_cost DESC
 LIMIT 1;""",
     ),
@@ -917,11 +935,13 @@ LIMIT 1;""",
 -- Scalar subqueries avoid row multiplication and GROUP BY problems
 SELECT
     (SELECT COALESCE(SUM(capex), 0) FROM inspection_corrective_action
-     WHERE capex > 0)                                                    AS capex_generated,
-    (SELECT COALESCE(SUM(po_amount), 0) FROM po_details)                  AS capex_converted,
+     WHERE active = true AND capex > 0)                                    AS capex_generated,
+    (SELECT COALESCE(SUM(po_amount), 0) FROM po_details
+     WHERE active = true)                                                   AS capex_converted,
     (SELECT COALESCE(SUM(capex), 0) FROM inspection_corrective_action
-     WHERE capex_status = 'REJECTED')                                     AS capex_lost,
-    (SELECT COALESCE(SUM(pr_amount), 0) FROM pr_details)                  AS opex_incurred;""",
+     WHERE active = true AND capex_status = 'REJECTED')                    AS capex_lost,
+    (SELECT COALESCE(SUM(pr_amount), 0) FROM pr_details
+     WHERE active = true)                                                   AS opex_incurred;""",
     ),
     (
         "top inspectors by capex generated converted",
@@ -938,8 +958,9 @@ SELECT
 FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
 JOIN users u ON ir.inspector_user_id = u.id
-LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id
-WHERE ica.capex > 0
+LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id AND po.active = true
+WHERE ir.active = true AND ica.active = true AND u.active = true
+  AND ica.capex > 0
 GROUP BY u.id, u.first_name, u.last_name
 ORDER BY capex_generated DESC
 LIMIT 10;""",
@@ -956,8 +977,9 @@ SELECT
 FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
 JOIN facility fac ON ir.facility_id = fac.id
-LEFT JOIN pr_details pr ON pr.mitigative_action_uuid = ica.id
-WHERE ica.opex > 0 OR pr.id IS NOT NULL
+LEFT JOIN pr_details pr ON pr.mitigative_action_uuid = ica.id AND pr.active = true
+WHERE ir.active = true AND ica.active = true AND fac.active = true
+  AND (ica.opex > 0 OR pr.id IS NOT NULL)
 GROUP BY fac.id, fac.name
 ORDER BY opex_incurred DESC
 LIMIT 20;""",
@@ -977,8 +999,9 @@ FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
 JOIN facility fac ON ir.facility_id = fac.id
 JOIN users u ON ir.inspector_user_id = u.id
-LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id
-WHERE ica.capex_status = 'REJECTED'
+LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id AND po.active = true
+WHERE ir.active = true AND ica.active = true AND fac.active = true AND u.active = true
+  AND ica.capex_status = 'REJECTED'
 GROUP BY ica.id, ica.corrective_action_id, ica.capex, fac.name,
          u.first_name, u.last_name, ica.modified_on
 ORDER BY ica.capex DESC
