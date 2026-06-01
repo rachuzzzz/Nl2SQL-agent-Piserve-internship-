@@ -498,6 +498,62 @@ def generate_sql(
                 f"\n{'='*70}\n>>> DEEPSEEK RAW OUTPUT\n{'='*70}\n{raw_sql}\n"
             )
 
+        # ── Table guard: if inject rules required specific tables and they're
+        # missing from the generated SQL, force one retry with the requirement
+        # prepended directly to the question (not just in schema_hint).
+        # This turns INJECT rules from suggestions into contracts. ───────────
+        if _inject_rule_ids:
+            try:
+                from core.business_rules import get_engine as _get_rules_engine
+                _guard_engine = _get_rules_engine()   # singleton — no re-init cost
+                required = _guard_engine.required_tables_for(_inject_rule_ids)
+                forbidden = _guard_engine.forbidden_patterns_for(_inject_rule_ids)
+                import re as _re
+
+                missing_req = [t for t in required if t.lower() not in raw_sql.lower()]
+                violated_forbidden = []
+                for fpat in forbidden:
+                    try:
+                        if _re.search(fpat, raw_sql, _re.IGNORECASE):
+                            violated_forbidden.append(fpat)
+                    except _re.error:
+                        pass
+
+                if missing_req or violated_forbidden:
+                    guard_msg_parts = []
+                    if missing_req:
+                        guard_msg_parts.append(f"MUST USE TABLES: {', '.join(missing_req)}")
+                    if violated_forbidden:
+                        guard_msg_parts.append(f"DO NOT USE: {', '.join(violated_forbidden)}")
+                    guard_prefix = " | ".join(guard_msg_parts)
+                    forced_question = f"[{guard_prefix}] {question}"
+                    # Replace both the question AND collapse the schema_hint to
+                    # just the guard message — avoids token overflow on retry
+                    # when the original schema_hint is long (e.g. FM CTE hints).
+                    forced_prompt = prompt.replace(
+                        f"[QUESTION]{question}[/QUESTION]",
+                        f"[QUESTION]{forced_question}[/QUESTION]",
+                    )
+                    # Also slim the schema_hint section to the guard message only
+                    # so deepseek focuses on the constraint, not the original hint
+                    import re as _re2
+                    forced_prompt = _re2.sub(
+                        r'(### Schema Hint \(follow this guidance\)\n).*?(\n### Examples)',
+                        r'\1-- ' + guard_prefix + r'\2',
+                        forced_prompt,
+                        flags=_re2.DOTALL,
+                    )
+                    if _debug_logger:
+                        _debug_logger.debug(
+                            f"  [table-guard] firing retry — missing={missing_req} forbidden_hit={violated_forbidden}"
+                        )
+                    response2 = sql_llm.complete(forced_prompt)
+                    raw_sql = str(response2).strip()
+            except Exception as _guard_exc:
+                if _debug_logger:
+                    _debug_logger.debug(f"  [table-guard] skipped: {_guard_exc}")
+        # ── end table guard ──────────────────────────────────────────────────
+
         sql = validator.clean_sql(raw_sql)
 
         # validate() returns ValidationResult — hard fails block, soft warns are advisory only.

@@ -68,6 +68,12 @@ BUSINESS_RULES = [
     "'id' is the UUID primary key — NEVER select this for display (outputs UUID garbage). "
     "'inspection_id' is the human-readable varchar like '2026/04/ST001/INS001' — ALWAYS use "
     "ir.inspection_id (not ir.id) when showing the inspection identifier to the user.",
+    "USER ROLES — users have multiple roles via user_roles(user_id, role_id) → role(id, name). "
+    "To filter by role use EXISTS not JOIN (JOIN fans out rows): "
+    "WHERE EXISTS (SELECT 1 FROM user_roles ur JOIN role r ON ur.role_id = r.id "
+    "WHERE ur.user_id = u.id AND r.name = 'FM Manager'). "
+    "FM Manager role names: fm_manager, fm_engineer, ad_fm, asst_fm_manager, fm_admin, fm_supervisor. "
+    "Inspector role names: internal_inspector, internal_auditor, external_inspector, external_auditor.",
 ]
 
 TABLE_RELATIONSHIPS = """\
@@ -77,6 +83,8 @@ WHERE CONCEPTS LIVE:
   - Facility names → facility.name (JOIN via facility_id)
   - Project names → project.name (JOIN via project_id)
   - Client names → client.name (JOIN via client_id)
+  - Country names → country.name (JOIN via country_id)
+  - Organisation names → organisation.name (JOIN via organisation_id)
   - Scores, status, dates → inspection_report
   - Causes, costs, overdue → inspection_corrective_action
   - Form question labels → ai_questions.label  (NOT question_label)
@@ -85,16 +93,49 @@ WHERE CONCEPTS LIVE:
   - Form scores → ai_answers.score
 
 HOW TABLES CONNECT (inspection_report is the hub):
-  inspection_report.inspection_type_id → inspection_type.id
-  inspection_report.facility_id → facility.id
-  inspection_report.project_id → project.id
-  inspection_report.client_id → client.id
-  inspection_report.inspector_user_id → users.id
-  inspection_report.cycle_id → inspection_cycle.id
-  inspection_report.schedule_id → inspection_schedule.id
+  inspection_report.inspection_type_id  → inspection_type.id
+  inspection_report.facility_id         → facility.id
+  inspection_report.project_id          → project.id
+  inspection_report.client_id           → client.id
+  inspection_report.country_id          → country.id
+  inspection_report.organisation_id     → organisation.id   ← British spelling on FK column
+  inspection_report.inspector_user_id   → users.id
+  inspection_report.inspectee_user_id   → users.id  (FM Manager — facility manager being inspected)
+  inspection_report.cycle_id            → inspection_cycle.id
+  inspection_report.schedule_id         → inspection_schedule.id
   inspection_corrective_action.inspection_id → inspection_report.id
-  ai_answers.inspection_report_id → inspection_report.id
-  ai_answers.element_id → ai_questions.element_id
+  ai_answers.inspection_report_id       → inspection_report.id
+  ai_answers.element_id                 → ai_questions.element_id
+
+  facility.client_id       → client.id
+  facility.country_id      → country.id
+  facility.organisation_id → organisation.id
+
+  project.organisation_id  → organisation.id
+
+TABLE COLUMNS (lookup tables):
+  country:      id (uuid), active (bool), name (varchar)
+  organisation: id (uuid), active (bool), name (varchar), logo (varchar)
+  project:      id (uuid), active (bool), name (varchar), organisation_id (uuid→organisation.id)
+  client:       id (uuid), active (bool), name (varchar)
+
+  SOFT DELETE — include WHERE active = true for: country, organisation, project, client
+
+USER ROLES:
+  users.id → user_roles.user_id → user_roles.role_id → role.id → role.name
+  user_roles(user_id, role_id) — one user can have MULTIPLE roles
+  role.name values relevant to inspections:
+    FM-side (inspectee):  FM Manager, FM Engineer, AD FM, Asst FM Manager,
+                          FM Admin, FM Supervisor, hse_officer
+    Inspector-side:       internal_inspector, internal_auditor, external_inspector,
+                          external_auditor, hse_officer
+  CRITICAL — use EXISTS subquery (not JOIN) to avoid row fan-out:
+    WHERE EXISTS (
+        SELECT 1 FROM user_roles ur JOIN role r ON ur.role_id = r.id
+        WHERE ur.user_id = ir.inspectee_user_id
+          AND r.name IN ('FM Manager','FM Engineer','AD FM',
+                         'Asst FM Manager','FM Admin','FM Supervisor')
+    )
 
 CRITICAL ai_* JOIN PATTERN:
   FROM ai_answers aa

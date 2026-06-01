@@ -53,6 +53,14 @@ ROUTING — INSPECTION QUERIES:
   schedules, cycles, due dates              → generate_sql on inspection_schedule / inspection_cycle
   inspector assignments, portfolios         → generate_sql on inspector_portfolio
   inspection types, sub-types               → generate_sql on inspection_type / inspection_sub_type
+  "by project" / "by country" / "by org"   → generate_sql — JOIN lookup table via inspection_report FK
+
+LOOKUP TABLES (all have active column — filter WHERE active = true):
+  country:       id, name  — inspection_report.country_id / facility.country_id
+  organisation:  id, name  — inspection_report.organisation_id / facility.organisation_id
+                             NOTE: FK column uses British spelling 'organisation_id'
+  project:       id, name, organisation_id  — inspection_report.project_id
+  client:        id, name  — inspection_report.client_id / facility.client_id
 
 IMPORTANT — inspection_report.status:
   SUBMITTED, CLOSED, UNDER_REVIEW, RETURN_FOR_MODIFICATION → have scores
@@ -62,6 +70,23 @@ IMPORTANT — inspection_report.status:
   UNDER_REVIEW / RETURN_FOR_MODIFICATION / DRAFT — NOT completed
   DRAFT → usually NULL scores
   Always add WHERE status != 'DRAFT' when querying scores unless the user asks about drafts.
+
+CRITICAL — inspection_report has TWO user FK columns (different people):
+  inspector_user_id  → the person who CONDUCTED the inspection (Inspector role)
+  inspectee_user_id  → the person being inspected (FM Manager role)
+
+  "who inspected"          → inspector_user_id
+  "which inspector"        → inspector_user_id
+  "FM manager"             → inspectee_user_id
+  "facility manager"       → inspectee_user_id
+  "who is the FM manager"  → inspectee_user_id
+  "both inspector and FM"  → alias BOTH with distinct names:
+                               JOIN users u_insp ON ir.inspector_user_id  = u_insp.id
+                               JOIN users u_fm   ON ir.inspectee_user_id  = u_fm.id
+
+  NEVER join on one and filter/EXISTS on the other as if they are the same person.
+  Wrong:  JOIN users u ON ir.inspector_user_id = u.id
+          WHERE EXISTS (... ur.user_id = ir.inspectee_user_id ...)  ← two different people
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORM ANSWERS — flat ai_* tables
@@ -77,13 +102,9 @@ FORM ANSWERS — flat ai_* tables
     JOIN to ai_questions: ON ai_answers.element_id = ai_questions.element_id
     JOIN to inspection:  ON ai_answers.inspection_report_id = inspection_report.id
 
-  DATA COVERAGE NOTE — ai_answers is a denormalized ETL snapshot, not a live mirror.
-    Newly submitted inspections appear in inspection_report immediately, but their
-    form answers only appear in ai_answers after the ETL pipeline runs.
-    The most recent inspections in the database may NOT have rows in ai_answers yet.
-    If a query returns no form answers for a recent inspection, tell the user:
-    "This inspection was submitted recently and its form answers have not yet been
-    indexed into the system. Try querying an earlier inspection."
+  DATA COVERAGE NOTE — ai_answers is a complete denormalized snapshot of all
+    submitted inspection form answers. All inspections visible in inspection_report
+    also have rows in ai_answers. No ETL lag applies.
 
   IMPORTANT — answer_text encoding:
     Dropdown/checkbox answers are stored as plain strings — NOT JSON.
@@ -101,6 +122,14 @@ ROUTING — FORM ANSWER QUERIES:
   "answers for inspection INS-001"         → get_answers(inspection_id="INS-001")
   "most common / average answer for Q"    → get_answer_stats(label="Q")
   "answers at facility F (complex join)"  → generate_sql with ai_answers + inspection_report JOIN
+
+KNOWN ANSWER VALUES — route directly to generate_sql, do NOT search for question labels first:
+  "count deviations at X" / "how many deviations"       → generate_sql
+    'Deviation' is a known value of the 'Observation Type' question — no lookup needed
+  "count good practice at X" / "good practice observations" → generate_sql
+    'Good Practice' is a known value of the 'Observation Type' question — no lookup needed
+  "facilities that never had X" / "facilities without X" → generate_sql
+    Requires facility-level NOT IN subquery — cannot be answered with search tools
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AVAILABLE TOOLS
@@ -204,7 +233,7 @@ Turn 1: {"thought": "Filter by inspection_id.", "tool": "get_answers", "args": {
 
 ─── Form answers: most recently filled form ───
 User: "show all questions and answers in the most recently filled form"
-Turn 1: {"thought": "Need most recent inspection that has Inspection Form answers — using aa subquery, NOT inspection_report subquery (newest ir row may have no answers yet).", "tool": "generate_sql", "args": {"question": "questions and answers from most recent inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT aa2.inspection_report_id FROM ai_answers aa2 WHERE aa2.module_name = 'Inspection Form' ORDER BY aa2.submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' ORDER BY aq.label LIMIT 100;"}}
+Turn 1: {"thought": "Need most recent inspection that has Inspection Form answers — using aa subquery, NOT inspection_report subquery (newest ir row may have no answers yet). CRITICAL: module_name filter goes on OUTER query only — NEVER inside the subquery or it returns NULL.", "tool": "generate_sql", "args": {"question": "questions and answers from most recent inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT aa2.inspection_report_id FROM ai_answers aa2 ORDER BY aa2.submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' ORDER BY aq.label LIMIT 100;"}}
 
 ─── Scores for a named inspector's last inspection ───
 User: "show questions and scores for the last inspection by George"
@@ -228,6 +257,11 @@ User: "which facility underwent the most recent inspection"
 ROUTING RULE: Query inspection_report directly. Do NOT route through ai_answers or look for form labels.
 Turn 1: {"thought": "Most recent inspection is in inspection_report ordered by submitted_on. Must SELECT ir.inspection_id for follow-up context.", "tool": "generate_sql", "args": {"question": "most recent inspection facility", "schema_hint": "SELECT ir.inspection_id, fac.name AS facility_name, ir.submitted_on, ir.status FROM inspection_report ir JOIN facility fac ON ir.facility_id = fac.id WHERE ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 1;"}}
 
+─── Inspector AND FM manager in same query ───
+User: "who inspected Al Ghadeer and who is the FM manager there?"
+ROUTING RULE: inspection_report has TWO user FK columns. Use distinct aliases — never join one and filter the other.
+Turn 1: {"thought": "Need both inspector (inspector_user_id) and FM manager (inspectee_user_id) from the same inspection. Must alias both separately.", "tool": "generate_sql", "args": {"question": "inspector and FM manager for inspections at Al Ghadeer", "schema_hint": "SELECT ir.inspection_id, ir.submitted_on, u_insp.first_name || ' ' || u_insp.last_name AS inspector, u_fm.first_name || ' ' || u_fm.last_name AS fm_manager FROM inspection_report ir JOIN users u_insp ON ir.inspector_user_id  = u_insp.id JOIN users u_fm   ON ir.inspectee_user_id = u_fm.id JOIN facility fac ON ir.facility_id = fac.id WHERE fac.name ILIKE '%Al Ghadeer%' AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 10;"}}
+
 ─── Multi-turn: fetch answers for a specific inspection ───
 [History shows: inspection_id = 'INS-EXAMPLE-001', facility = 'Facility X', inspector = 'Inspector Y']
 User: "fetch all questions and answers in the form she filled for that site"
@@ -240,6 +274,13 @@ User: "who inspected it"
 
 Turn 1: {"thought": "Context is about Facility X facility. Query the most recent inspection there to find inspector.", "tool": "generate_sql", "args": {"question": "inspector of most recent inspection at Facility X", "schema_hint": "SELECT u.first_name || ' ' || u.last_name AS inspector_name FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id JOIN facility fac ON ir.facility_id = fac.id WHERE fac.name ILIKE '%Facility X%' AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 1;"}}
 
+─── FM manager CAPEX conversion rate ───
+User: "which FM manager has the highest capex conversion rate?"
+ROUTING RULE: CAPEX conversion rate = SUM(po_details.po_amount) / SUM(ica.capex).
+NEVER use ica.expenditure for this — it is a category flag, not a financial amount.
+NEVER use capex_status='ACCEPTED' — use po_details for actual converted amounts.
+Turn 1: {"thought": "Need FM manager ranked by capex conversion rate = SUM(po.po_amount)/SUM(ica.capex). Must use po_details CTE, not ica.expenditure.", "tool": "generate_sql", "args": {"question": "FM manager with highest capex conversion rate", "schema_hint": "WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po FROM po_details WHERE active = true GROUP BY 1) SELECT u.first_name || \' \' || u.last_name AS fm_manager, COALESCE(SUM(ica.capex),0) AS capex_generated, COALESCE(SUM(p.total_po),0) AS capex_converted, ROUND(COALESCE(SUM(p.total_po),0)*100.0/NULLIF(SUM(ica.capex),0),1) AS conversion_rate FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id=ir.id JOIN users u ON ir.inspectee_user_id=u.id LEFT JOIN po_by_ica p ON p.ica_id=ica.id WHERE ir.active=true AND ica.active=true AND u.active=true AND ica.capex>0 GROUP BY u.id,u.first_name,u.last_name HAVING SUM(ica.capex)>0 ORDER BY conversion_rate DESC NULLS LAST LIMIT 1;"}}
+
 ─── Which observation appears most as high risk ───
 User: "which observation appears most frequently as high risk"
 ROUTING RULE: This asks for OBSERVATION TEXT where risk level = High.
@@ -248,7 +289,23 @@ Do NOT call get_answer_stats(label="Observation") — that ignores the high-risk
 MUST use generate_sql with a subquery joining risk level answers to observation answers.
 Turn 1: {"thought": "Need observations filtered to inspections where Risk Level = High. Must use SQL subquery — get_answer_stats cannot cross-filter between two questions.", "tool": "generate_sql", "args": {"question": "observation text most frequent in high risk inspections", "schema_hint": "SELECT obs.answer_text AS observation, COUNT(*) AS frequency FROM ai_answers risk_aa JOIN ai_questions risk_aq ON risk_aa.element_id = risk_aq.element_id JOIN inspection_report ir ON risk_aa.inspection_report_id = ir.id JOIN ai_answers obs ON obs.inspection_report_id = ir.id JOIN ai_questions obs_q ON obs.element_id = obs_q.element_id WHERE risk_aq.label = 'Risk Level' AND risk_aa.answer_text ILIKE '%High%' AND obs_q.label = 'Observation' AND obs.answer_text IS NOT NULL AND ir.status != 'DRAFT' GROUP BY obs.answer_text ORDER BY frequency DESC LIMIT 1;"}}
 
-─── Count questions in a form ───
+─── Q&A for most recently answered inspection ───
+User: "show me the questions and answers for the most recently answered inspection"
+ROUTING RULE: ONLY use this when the question explicitly asks for both QUESTIONS AND ANSWERS
+(Q&A content from the form). Do NOT use this for "show me the most recently answered
+inspection" — that only needs inspection metadata (inspection_id, score, facility) and
+should use generate_sql on inspection_report directly.
+Turn 1: {"thought": "User wants Q&A content — questions + answers from the form. Must use single SQL with ai_answers + ai_questions JOIN and aa.submitted_on subquery. Do NOT first look up inspection_id separately.", "tool": "generate_sql", "args": {"question": "list all questions and answers from the most recently answered inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer, aa.module_name AS form_section\nFROM ai_answers aa\nJOIN ai_questions aq ON aa.element_id = aq.element_id\nWHERE aa.inspection_report_id = (\n    SELECT aa2.inspection_report_id FROM ai_answers aa2\n    ORDER BY aa2.submitted_on DESC LIMIT 1\n)\nORDER BY aa.module_name, aq.label LIMIT 200;"}}
+
+─── Count deviations at a facility ───
+User: "how many deviations were raised at Al Ghadeer this year?"
+ROUTING RULE: 'Deviation' is a KNOWN answer value for 'Observation Type'. Route directly to generate_sql — do NOT call search_questions or semantic_search first.
+Turn 1: {"thought": "'Deviation' is the known answer value for aq.label='Observation Type'. Route directly to generate_sql — no question lookup needed.", "tool": "generate_sql", "args": {"question": "count deviations at Al Ghadeer this year", "schema_hint": "SELECT COUNT(*) AS deviation_count FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Observation Type' AND aa.answer_text ILIKE '%Deviation%' AND aa.module_name = 'Inspection Form' AND fac.name ILIKE '%Al Ghadeer%' AND ir.active = true AND ir.status != 'DRAFT' AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE);"}}
+
+─── Facilities that never had a good practice ───
+User: "which facilities have never had a good practice observation?"
+ROUTING RULE: This is a facility-level negation query. Route directly to generate_sql — do NOT call search_questions, semantic_search, or get_answers first.
+Turn 1: {"thought": "Facility-level negation — needs NOT IN subquery. 'Good Practice' is a known value of 'Observation Type'. Route directly to generate_sql.", "tool": "generate_sql", "args": {"question": "facilities that have never had a good practice observation", "schema_hint": "SELECT fac.name FROM facility fac WHERE fac.active = true AND fac.id IN (SELECT DISTINCT ir.facility_id FROM inspection_report ir WHERE ir.active = true AND ir.status != 'DRAFT') AND fac.id NOT IN (SELECT DISTINCT ir.facility_id FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id WHERE aq.label = 'Observation Type' AND aa.answer_text ILIKE '%Good Practice%' AND aa.module_name = 'Inspection Form' AND ir.active = true AND ir.status != 'DRAFT') ORDER BY fac.name;"}}
 User: "how many questions are in the inspection form?"
 ROUTING RULE: Do NOT use search_questions or list_forms — those return rows not a count. Use generate_sql.
 Turn 1: {"thought": "Count distinct questions from ai_questions filtered by module_name.", "tool": "generate_sql", "args": {"question": "count questions in inspection form", "schema_hint": "SELECT COUNT(DISTINCT element_id) AS question_count FROM ai_questions WHERE module_name ILIKE '%Inspection Form%';"}}
@@ -287,23 +344,75 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
 - SOFT-DELETE — ALWAYS add WHERE active = true (or AND active = true) when querying:
   inspection_report, inspection_corrective_action, facility, users,
   inspection_type, inspector_portfolio, inspector_portfolio_details,
-  frequency_definition, po_details, pr_details, risk_level.
+  frequency_definition, po_details, pr_details, risk_level,
+  country, organisation, project, client.
   NEVER return rows where active = false — those are deleted/archived records.
+- LOOKUP TABLE JOINS (inspection_report FK columns):
+  inspection_report.country_id      → country.id       (country.name)
+  inspection_report.organisation_id → organisation.id  (organisation.name)  ← British spelling on FK
+  inspection_report.project_id      → project.id       (project.name)
+  inspection_report.client_id       → client.id        (client.name)
+  facility.country_id               → country.id
+  facility.organisation_id          → organisation.id
+  facility.client_id                → client.id
+  project.organisation_id           → organisation.id
 - ENUM values are ALWAYS uppercase: status = 'OPEN', status = 'CLOSED', status = 'OVERDUE',
   responsible = 'CLIENT', responsible = 'INTERNAL_OPERATIONS', responsible = 'SUB_CONTRACTOR'.
   NEVER use lowercase for enum comparisons.
-- When grouping by facility/type/client/inspector, ALWAYS JOIN the lookup table and
-  GROUP BY the name column (e.g. GROUP BY fac.name). NEVER GROUP BY a UUID FK column.
+- When grouping by facility/type/client/inspector/project/country/organisation,
+  ALWAYS JOIN the lookup table and GROUP BY the name column. NEVER GROUP BY a UUID FK column.
 - For month display, ALWAYS use TO_CHAR(date_trunc('month', col), 'Month YYYY') AS month.
   NEVER use EXTRACT(MONTH FROM col) — that returns a number, not a name.
 - CALENDAR YEAR filter: EXTRACT(YEAR FROM col) = EXTRACT(YEAR FROM CURRENT_DATE)
   or: col >= date_trunc('year', CURRENT_DATE)
   NEVER: col > CURRENT_DATE - INTERVAL '1 year' — that is a rolling 365-day window, not a calendar year.
 - EXACT QUESTION LABELS (use = not ILIKE for known labels):
-  'Observation'      — free-text observation field
-  'Observation Type' — dropdown: Deviation, Good Practice
+  'Observation'      — free-text field written by inspector. NOT a type/category.
+  'Observation Type' — dropdown: 'Deviation' | 'Good Practice'  ← use THIS to count deviations or GP
   'Risk Level'       — dropdown: High, Medium, Low, No Active Risk  (form answers only — NOT ICA risk)
   'Impact'           — multi-select impact categories
+
+  CRITICAL: NEVER use aq.label ILIKE '%Observation%' — matches BOTH labels and overcounts.
+  Count Deviations:    WHERE aq.label = 'Observation Type' AND aa.answer_text ILIKE '%Deviation%'
+  Count Good Practice: WHERE aq.label = 'Observation Type' AND aa.answer_text ILIKE '%Good Practice%'
+  Read free-text:      WHERE aq.label = 'Observation'
+
+- FACILITY-LEVEL NEGATION (has NEVER had X across ALL history):
+  WRONG — only checks per inspection:
+    GROUP BY fac.name HAVING COUNT(CASE WHEN ... THEN 1 END) = 0
+  CORRECT — NOT IN subquery at facility level:
+    WHERE fac.id NOT IN (
+        SELECT DISTINCT ir.facility_id FROM ai_answers aa
+        JOIN ai_questions aq ON aa.element_id = aq.element_id
+        JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+        WHERE aq.label = 'Observation Type'
+          AND aa.answer_text ILIKE '%Good Practice%'
+          AND aa.module_name = 'Inspection Form'
+          AND ir.active = true AND ir.status != 'DRAFT'
+    )
+
+### CAPEX CONVERSION — CRITICAL DEFINITIONS:
+  CAPEX Converted = SUM(po_details.po_amount) per FM manager — client actually paid via PO
+  CAPEX Generated = SUM(ica.capex) — the estimated/quoted amount on each ICA
+  Conversion Rate = SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100
+
+  ica.expenditure is a CATEGORY FLAG ('CAPEX','OPEX','CAPEX_AND_OPEX','NO_EXPENDITURE')
+  NEVER use ica.expenditure to compute conversion rate — it is not a financial amount
+  NEVER use capex_status='ACCEPTED' as a proxy for conversion — use po_details
+
+### INSPECTION_REPORT — TWO USER FK COLUMNS (different people, NEVER mix):
+  inspector_user_id  → person who CONDUCTED the inspection (Inspector)
+  inspectee_user_id  → person being inspected (FM Manager / facility manager)
+
+  "who inspected" / "which inspector"          → JOIN users u ON ir.inspector_user_id  = u.id
+  "FM manager" / "facility manager"            → JOIN users u ON ir.inspectee_user_id  = u.id
+  Query needs BOTH inspector and FM manager    → use DISTINCT aliases:
+      JOIN users u_insp ON ir.inspector_user_id  = u_insp.id
+      JOIN users u_fm   ON ir.inspectee_user_id  = u_fm.id
+
+  NEVER join on one column and filter/EXISTS on the other:
+    WRONG: JOIN users u ON ir.inspector_user_id = u.id
+           WHERE ... ur.user_id = ir.inspectee_user_id  ← two different people!
 
 ### AI FLAT TABLES — use these for all form question/answer data:
 
@@ -356,19 +465,20 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
     Without this, queries return answers from all 16 modules (~10,000 rows instead of ~50).
     Only omit this filter when user explicitly asks about another module.
 
-  CRITICAL — most recent inspection subquery:
+  CRITICAL — most recent inspection subquery (use aa.submitted_on, NOT ir.submitted_on):
     CORRECT:   WHERE aa.inspection_report_id = (
-                   SELECT id FROM inspection_report
-                   WHERE status != 'DRAFT'
-                   ORDER BY submitted_on DESC LIMIT 1)
-    WRONG:     SELECT inspection_report_id FROM inspection_report
-               (inspection_report_id is not a column on inspection_report — id is)
+                   SELECT aa2.inspection_report_id FROM ai_answers aa2
+ORDER BY aa2.submitted_on DESC LIMIT 1)
+    WRONG:     WHERE ir.id = (SELECT id FROM inspection_report ORDER BY ir.submitted_on DESC LIMIT 1)
+               (ir.submitted_on and aa.submitted_on differ — use aa.submitted_on for most-recently-answered)
 
 
 ### Additional context
 {schema_hint}
 
+### Examples
 {dynamic_examples}
+
 ### Answer
 Given the database schema, here is the SQL query that answers \
 [QUESTION]{question}[/QUESTION]

@@ -1,17 +1,22 @@
 """
 Chart Advisor
 =============
-Analyses SQL result shape and recommends the best Chart.js chart type.
+Analyses SQL result shape and recommends the best Apache ECharts option object.
 
 Two modes controlled by env var USE_LLM_CHART_ADVISOR:
   - "true"  → ask the local Ollama model (smarter, ~1-2s extra latency)
-  - "false" → pure rule engine (instant, but brittle)
+  - "false" → pure rule engine (instant, recommended default)
 
 If LLM mode fails for any reason, silently falls back to rules.
 
-Public API:
-  advise(columns, rows)                 → dict
-  force_config(columns, rows, type)     → dict | None
+Public API  (unchanged from Chart.js version — fastapi_app.py needs no edits):
+  advise(columns, rows)              → dict  (config is an ECharts option object)
+  force_config(columns, rows, type)  → dict | None
+
+Config format:
+  The "config" key in every returned dict is a plain ECharts option dict.
+  Pass it directly to  chart.setOption(config).
+  A "_lib": "echarts" sentinel is included so the frontend can assert the library.
 """
 
 from __future__ import annotations
@@ -20,28 +25,31 @@ import os
 import re
 from typing import Any
 
-# ── Colour palette ────────────────────────────────────────────────────────────
+
+# ── Colour palette (hex — ECharts prefers hex over rgba) ─────────────────────
 _PALETTE = [
-    "rgba(99,102,241,0.85)",   # indigo
-    "rgba(16,185,129,0.85)",   # emerald
-    "rgba(245,158,11,0.85)",   # amber
-    "rgba(239,68,68,0.85)",    # red
-    "rgba(59,130,246,0.85)",   # blue
-    "rgba(168,85,247,0.85)",   # purple
-    "rgba(20,184,166,0.85)",   # teal
-    "rgba(249,115,22,0.85)",   # orange
-    "rgba(236,72,153,0.85)",   # pink
-    "rgba(132,204,22,0.85)",   # lime
+    "#6366f1",   # indigo
+    "#10b981",   # emerald
+    "#f59e0b",   # amber
+    "#ef4444",   # red
+    "#3b82f6",   # blue
+    "#a855f7",   # purple
+    "#14b8a6",   # teal
+    "#f97316",   # orange
+    "#ec4899",   # pink
+    "#84cc16",   # lime
 ]
-_BORDER = [c.replace("0.85", "1") for c in _PALETTE]
+
+# Theme colours
 _GRID_COLOR  = "rgba(255,255,255,0.06)"
-_TICK_COLOR  = "rgba(255,255,255,0.55)"
-_LABEL_COLOR = "rgba(255,255,255,0.75)"
+_TICK_COLOR  = "#888"
+_LABEL_COLOR = "#bbb"
+_AXIS_LINE   = "#444"
 
 _VALID_TYPES = {"bar", "line", "pie", "doughnut", "scatter"}
 
 
-# ── Column classifier ─────────────────────────────────────────────────────────
+# ── Column classifier (unchanged) ─────────────────────────────────────────────
 
 _DATE_NAME_RE = re.compile(
     r'\b(date|month|year|week|time|period|quarter|day|created|modified|submitted|reported)\b',
@@ -84,82 +92,208 @@ def _label(col: str) -> str:
     return col.replace("_", " ").title()
 
 
-# ── Shared Chart.js options ───────────────────────────────────────────────────
+# ── Shared ECharts building blocks ────────────────────────────────────────────
 
-def _scales() -> dict:
-    axis = lambda: {
-        "grid": {"color": _GRID_COLOR},
-        "ticks": {"color": _TICK_COLOR},
+def _cat_axis(data: list, rotate: int = 0) -> dict:
+    """Category axis (string labels)."""
+    ax: dict = {
+        "type": "category",
+        "data": data,
+        "axisLabel": {"color": _TICK_COLOR, "fontSize": 12},
+        "axisLine":  {"lineStyle": {"color": _AXIS_LINE}},
+        "axisTick":  {"lineStyle": {"color": _AXIS_LINE}},
     }
-    return {"x": axis(), "y": axis()}
+    if rotate:
+        ax["axisLabel"]["rotate"] = rotate
+    return ax
 
-def _base_opts(legend: bool = True) -> dict:
+def _val_axis() -> dict:
+    """Value axis (numeric)."""
     return {
-        "responsive": True,
-        "maintainAspectRatio": False,
-        "plugins": {
-            "legend": {"display": legend, "labels": {"color": _LABEL_COLOR}},
-            "tooltip": {"mode": "index", "intersect": False},
-        },
+        "type": "value",
+        "axisLabel":  {"color": _TICK_COLOR, "fontSize": 12},
+        "axisLine":   {"lineStyle": {"color": _AXIS_LINE}},
+        "splitLine":  {"lineStyle": {"color": _GRID_COLOR}},
     }
 
-def _coerce_row_values(rows: list[dict], cols: list[str]) -> list:
-    """Return numeric values for a column, coercing strings."""
-    return [_coerce_numeric(row.get(cols[0])) for row in rows] if cols else []
+def _grid(left: str = "2%", right: str = "2%", top: str = "60px", bottom: str = "70px") -> dict:
+    return {"left": left, "right": right, "top": top, "bottom": bottom, "containLabel": True}
 
-def _datasets(rows, num_cols, line=False):
-    out = []
-    for i, col in enumerate(num_cols):
-        c, b = _PALETTE[i % len(_PALETTE)], _BORDER[i % len(_BORDER)]
-        vals = [_coerce_numeric(row.get(col)) for row in rows]
-        ds: dict = {"label": _label(col), "data": vals,
-                    "backgroundColor": c, "borderColor": b, "borderWidth": 1}
-        if line:
-            ds.update({"fill": False, "tension": 0.35, "pointRadius": 3, "pointHoverRadius": 5})
-        out.append(ds)
+def _tooltip_axis() -> dict:
+    return {"trigger": "axis", "axisPointer": {"type": "shadow"}}
+
+def _tooltip_item() -> dict:
+    return {"trigger": "item", "formatter": "{b}: {c} ({d}%)"}
+
+def _legend(names: list[str], show: bool = True) -> dict:
+    return {
+        "show": show,
+        "data": names,
+        "top": "8px",
+        "left": "center",
+        "orient": "horizontal",
+        "itemGap": 20,
+        "itemWidth": 14,
+        "itemHeight": 8,
+        "textStyle": {"color": _LABEL_COLOR, "fontSize": 12},
+        "pageTextStyle": {"color": _LABEL_COLOR},
+    }
+
+def _base(extra: dict | None = None) -> dict:
+    """Sentinel + palette, merged with any extra top-level keys."""
+    out: dict = {"_lib": "echarts", "color": _PALETTE}
+    if extra:
+        out.update(extra)
     return out
 
-def _bar(labels, num_cols, rows, horizontal=False):
-    opts = {**_base_opts(len(num_cols) > 1), "scales": _scales()}
+
+# ── ECharts builders ──────────────────────────────────────────────────────────
+
+def _bar(labels: list, num_cols: list[str], rows: list[dict],
+         horizontal: bool = False) -> dict:
+    """Vertical or horizontal grouped bar."""
+    series = [
+        {
+            "name": _label(col),
+            "type": "bar",
+            "data": [_coerce_numeric(r.get(col)) for r in rows],
+            "barMaxWidth": 60,
+            "emphasis": {"focus": "series"},
+        }
+        for col in num_cols
+    ]
+    rotate = 30 if (not horizontal and len(labels) > 12) else 0
+
     if horizontal:
-        opts["indexAxis"] = "y"
-    return {"type": "bar", "data": {"labels": labels, "datasets": _datasets(rows, num_cols)}, "options": opts}
+        # Swap axes for horizontal layout
+        opt: dict = {
+            "tooltip":  _tooltip_axis(),
+            "legend":   _legend([_label(c) for c in num_cols], show=len(num_cols) > 1),
+            "grid":     _grid(left="22%", top="16px", bottom="24px"),
+            "xAxis":    _val_axis(),
+            "yAxis":    _cat_axis(labels),
+            "series":   series,
+        }
+    else:
+        opt = {
+            "tooltip":  _tooltip_axis(),
+            "legend":   _legend([_label(c) for c in num_cols], show=len(num_cols) > 1),
+            "grid":     _grid(),
+            "xAxis":    _cat_axis(labels, rotate=rotate),
+            "yAxis":    _val_axis(),
+            "series":   series,
+        }
+    return _base(opt)
 
-def _line(labels, num_cols, rows):
-    opts = {**_base_opts(len(num_cols) > 1), "scales": _scales()}
-    return {"type": "line", "data": {"labels": labels, "datasets": _datasets(rows, num_cols, line=True)}, "options": opts}
 
-def _pie(labels, values, doughnut=False):
-    n = len(labels)
-    return {
-        "type": "doughnut" if doughnut else "pie",
-        "data": {"labels": labels, "datasets": [{
-            "data": [_coerce_numeric(v) for v in values],
-            "backgroundColor": _PALETTE[:n], "borderColor": _BORDER[:n], "borderWidth": 1,
-        }]},
-        "options": {**_base_opts(), "plugins": {
-            "legend": {"position": "right", "labels": {"color": _LABEL_COLOR}},
-            "tooltip": {},
-        }},
-    }
+def _line(labels: list, num_cols: list[str], rows: list[dict]) -> dict:
+    """Smooth multi-series line chart."""
+    series = [
+        {
+            "name":       _label(col),
+            "type":       "line",
+            "smooth":     True,
+            "data":       [_coerce_numeric(r.get(col)) for r in rows],
+            "symbolSize": 6,
+            "emphasis":   {"focus": "series"},
+        }
+        for col in num_cols
+    ]
+    return _base({
+        "tooltip": _tooltip_axis(),
+        "legend":  _legend([_label(c) for c in num_cols], show=len(num_cols) > 1),
+        "grid":    _grid(),
+        "xAxis":   _cat_axis(labels),
+        "yAxis":   _val_axis(),
+        "series":  series,
+    })
 
-def _scatter(x_col, y_col, rows):
-    return {
-        "type": "scatter",
-        "data": {"datasets": [{"label": f"{_label(x_col)} vs {_label(y_col)}",
-            "data": [{"x": _coerce_numeric(row.get(x_col)),
-                      "y": _coerce_numeric(row.get(y_col))} for row in rows],
-            "backgroundColor": _PALETTE[0], "borderColor": _BORDER[0]}]},
-        "options": {**_base_opts(False), "scales": _scales()},
-    }
 
-def _kpi_bar(num_cols, rows):
-    labels = [_label(c) for c in num_cols]
-    values = [_coerce_numeric(rows[0].get(c)) for c in num_cols]
-    return {"type": "bar",
-        "data": {"labels": labels, "datasets": [{"label": "Value", "data": values,
-            "backgroundColor": _PALETTE[:len(labels)], "borderColor": _BORDER[:len(labels)], "borderWidth": 1}]},
-        "options": {**_base_opts(False), "indexAxis": "y", "scales": _scales()}}
+def _pie(labels: list, values: list, doughnut: bool = False) -> dict:
+    """Pie or doughnut chart."""
+    data = [
+        {"name": str(lbl), "value": _coerce_numeric(val)}
+        for lbl, val in zip(labels, values)
+        if _coerce_numeric(val) is not None
+    ]
+    radius = ["38%", "68%"] if doughnut else "65%"
+    series_extra: dict = {}
+    if doughnut:
+        series_extra["label"] = {"show": True, "formatter": "{b}\n{d}%", "color": _LABEL_COLOR}
+    else:
+        series_extra["label"] = {"show": True, "formatter": "{b}: {d}%", "color": _LABEL_COLOR}
+
+    return _base({
+        "tooltip": _tooltip_item(),
+        "legend":  {
+            "orient":    "vertical",
+            "right":     "3%",
+            "top":       "middle",
+            "itemGap":   12,
+            "itemWidth":  12,
+            "itemHeight": 12,
+            "textStyle": {"color": _LABEL_COLOR, "fontSize": 12},
+        },
+        "series": [{
+            "type":      "pie",
+            "radius":    radius,
+            "center":    ["40%", "50%"],
+            "data":      data,
+            "emphasis":  {
+                "itemStyle": {
+                    "shadowBlur":    10,
+                    "shadowOffsetX": 0,
+                    "shadowColor":   "rgba(0,0,0,0.5)",
+                }
+            },
+            **series_extra,
+        }],
+    })
+
+
+def _scatter(x_col: str, y_col: str, rows: list[dict]) -> dict:
+    """Scatter plot."""
+    data = [
+        [_coerce_numeric(r.get(x_col)), _coerce_numeric(r.get(y_col))]
+        for r in rows
+        if _coerce_numeric(r.get(x_col)) is not None and _coerce_numeric(r.get(y_col)) is not None
+    ]
+    return _base({
+        "tooltip": {
+            "trigger":   "item",
+            "formatter": (
+                f"{_label(x_col)}: {{c[0]}}<br/>{_label(y_col)}: {{c[1]}}"
+            ),
+        },
+        "grid":   _grid(),
+        "xAxis":  {**_val_axis(), "name": _label(x_col),
+                   "nameTextStyle": {"color": _LABEL_COLOR}},
+        "yAxis":  {**_val_axis(), "name": _label(y_col),
+                   "nameTextStyle": {"color": _LABEL_COLOR}},
+        "series": [{
+            "type":       "scatter",
+            "data":       data,
+            "symbolSize": 9,
+            "emphasis":   {"focus": "self"},
+        }],
+    })
+
+
+def _kpi_bar(num_cols: list[str], rows: list[dict]) -> dict:
+    """Single-row KPI summary as a horizontal bar with per-bar colours."""
+    data = [
+        {"value": _coerce_numeric(rows[0].get(col)),
+         "name":  _label(col),
+         "itemStyle": {"color": _PALETTE[i % len(_PALETTE)]}}
+        for i, col in enumerate(num_cols)
+    ]
+    return _base({
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+        "grid":    _grid(left="20%"),
+        "xAxis":   _val_axis(),
+        "yAxis":   _cat_axis([_label(c) for c in num_cols]),
+        "series":  [{"type": "bar", "data": data, "barMaxWidth": 50}],
+    })
 
 
 # ── Rule-based advisor ────────────────────────────────────────────────────────
@@ -172,9 +306,12 @@ def _rules_advise(columns: list[str], rows: list[dict]) -> dict[str, Any]:
     dates, nums, cats = t["date"], t["numeric"], t["category"]
     n = len(rows)
 
+    # Single-row KPI summary
     if n == 1 and len(nums) >= 2:
         return _result("bar", f"Single-row summary with {len(nums)} metrics", "high",
                        None, nums, _kpi_bar(nums, rows))
+
+    # Time-series
     if dates and len(nums) == 1:
         lc = dates[0]
         return _result("line", f"Time-series on '{lc}'", "high",
@@ -183,22 +320,34 @@ def _rules_advise(columns: list[str], rows: list[dict]) -> dict[str, Any]:
         lc = dates[0]
         return _result("line", f"Multi-series time-series on '{lc}'", "high",
                        lc, nums, _line([str(r.get(lc)) for r in rows], nums[:6], rows))
+
+    # Low-cardinality category → doughnut
     if cats and len(nums) == 1 and n <= 8:
         lc, vc = cats[0], nums[0]
         return _result("doughnut", f"Low-cardinality category ('{lc}', {n} slices)", "medium",
-                       lc, nums, _pie([str(r.get(lc)) for r in rows], [r.get(vc) for r in rows], doughnut=True))
+                       lc, nums, _pie([str(r.get(lc)) for r in rows],
+                                      [r.get(vc) for r in rows], doughnut=True))
+
+    # Single numeric → bar (horizontal when many rows)
     if cats and len(nums) == 1:
         lc = cats[0]
         horiz = n > 12
-        return _result("bar", f"Category '{lc}' vs numeric — {'horizontal ' if horiz else ''}bar", "high",
-                       lc, nums, _bar([str(r.get(lc)) for r in rows], nums, rows, horizontal=horiz))
+        return _result("bar", f"Category '{lc}' vs numeric — {'horizontal ' if horiz else ''}bar",
+                       "high", lc, nums,
+                       _bar([str(r.get(lc)) for r in rows], nums, rows, horizontal=horiz))
+
+    # Multiple numerics → grouped bar
     if cats and 2 <= len(nums) <= 5:
         lc = cats[0]
         return _result("bar", f"Multiple metrics per '{lc}' — grouped bar", "high",
                        lc, nums, _bar([str(r.get(lc)) for r in rows], nums, rows))
+
+    # Two numerics, no category/date → scatter
     if len(nums) == 2 and not cats and not dates:
         return _result("scatter", "Two numeric columns — scatter plot", "medium",
                        None, nums, _scatter(nums[0], nums[1], rows))
+
+    # Generic fallback
     if nums:
         lc = cats[0] if cats else (dates[0] if dates else columns[0])
         return _result("bar", "Generic bar chart", "low",
@@ -221,7 +370,6 @@ def _no_chart(reason):
 _llm_client = None
 
 def _get_llm():
-    """Lazy-init the Ollama client, reusing env config."""
     global _llm_client
     if _llm_client is None:
         from llama_index.llms.ollama import Ollama
@@ -254,17 +402,13 @@ Respond ONLY with valid JSON, no explanation, no markdown:
 confidence must be one of: high, medium, low"""
 
         raw = str(_get_llm().complete(prompt)).strip()
-
-        # Strip markdown fences if present
         raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
         raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
-
-        # Extract first JSON object
         m = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
         if not m:
             raise ValueError(f"No JSON found in: {raw[:200]}")
 
-        parsed = json.loads(m.group(0))
+        parsed     = json.loads(m.group(0))
         chart_type = parsed.get("chart_type", "").lower().strip()
         reason     = parsed.get("reason", "LLM recommendation")
         confidence = parsed.get("confidence", "medium")
@@ -274,34 +418,34 @@ confidence must be one of: high, medium, low"""
         if confidence not in ("high", "medium", "low"):
             confidence = "medium"
 
-        # Build the actual Chart.js config using rules engine
+        # Build the ECharts option via rules
         rule_result = _rules_advise(columns, rows)
         t = _classify_cols(columns, rows)
         dates, nums, cats = t["date"], t["numeric"], t["category"]
-        lc = cats[0] if cats else (dates[0] if dates else columns[0])
-        vc = nums if nums else [columns[-1]]
-        labels = [str(r.get(lc)) for r in rows]
+        lc      = cats[0] if cats else (dates[0] if dates else columns[0])
+        vc      = nums if nums else [columns[-1]]
+        labels  = [str(r.get(lc)) for r in rows]
 
         config = _build_config_for_type(chart_type, lc, vc, labels, rows)
         if config is None:
             config = rule_result.get("config")
 
         return {
-            "chart_type": chart_type,
-            "reason": reason,
-            "confidence": confidence,
+            "chart_type":    chart_type,
+            "reason":        reason,
+            "confidence":    confidence,
             "labels_column": lc,
             "values_columns": vc,
-            "config": config,
+            "config":        config,
         }
 
-    except Exception as e:
-        # Silent fallback to rules
+    except Exception:
         return _rules_advise(columns, rows)
 
 
-def _build_config_for_type(chart_type, lc, num_cols, labels, rows):
-    """Build Chart.js config for a specific type."""
+def _build_config_for_type(chart_type: str, lc, num_cols: list,
+                            labels: list, rows: list) -> dict | None:
+    """Build an ECharts option for a specific chart type."""
     if chart_type == "bar":
         return _bar(labels, num_cols, rows, horizontal=len(rows) > 12)
     if chart_type == "line":
@@ -321,9 +465,8 @@ def _build_config_for_type(chart_type, lc, num_cols, labels, rows):
 
 def advise(columns: list[str], rows: list[dict]) -> dict[str, Any]:
     """
-    Main entry point. Uses LLM or rules based on USE_LLM_CHART_ADVISOR env var.
-    NOTE: LLM mode adds ~15s latency per call. Only enable for offline/batch use.
-    Default and recommended: rules mode (instant).
+    Main entry point. Returns an ECharts option under the "config" key.
+    Uses LLM or rules based on USE_LLM_CHART_ADVISOR env var (default: rules).
     """
     use_llm = os.getenv("USE_LLM_CHART_ADVISOR", "false").lower().strip() in ("1", "true", "yes")
     if use_llm:
@@ -332,13 +475,13 @@ def advise(columns: list[str], rows: list[dict]) -> dict[str, Any]:
 
 
 def force_config(columns: list[str], rows: list[dict], chart_type: str) -> dict | None:
-    """Generate a Chart.js config for a specific type regardless of recommendation."""
+    """Generate an ECharts option for a specific type regardless of recommendation."""
     if not rows or not columns or chart_type not in _VALID_TYPES:
         return None
     t = _classify_cols(columns, rows)
     dates, nums, cats = t["date"], t["numeric"], t["category"]
-    lc = cats[0] if cats else (dates[0] if dates else columns[0])
-    labels = [str(r.get(lc)) for r in rows]
+    lc       = cats[0] if cats else (dates[0] if dates else columns[0])
+    labels   = [str(r.get(lc)) for r in rows]
     num_cols = nums if nums else [columns[-1]]
     cfg = _build_config_for_type(chart_type, lc, num_cols, labels, rows)
     return cfg or _bar(labels, num_cols, rows)

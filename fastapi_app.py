@@ -93,6 +93,12 @@ class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
 
+class PageRequest(BaseModel):
+    session_id: str
+    page:       int           # 0-based page index
+    page_size:  int = 50
+    sql:        str | None = None  # if provided, use this SQL instead of last_sql
+
 class StepInfo(BaseModel):
     tool: str
     thought: str
@@ -104,6 +110,11 @@ class ResultData(BaseModel):
     rows: list[dict]
     columns: list[str]
     row_count: int
+    total_count: int | None = None
+    page: int = 0
+    page_size: int = 50
+    has_more: bool = False
+    sql: str | None = None   # base SQL — sent back with every /api/page call
 
 class ChartConfig(BaseModel):
     chart_type: str | None
@@ -144,6 +155,8 @@ def get_or_create_session(session_id: str) -> dict:
             "message_count": 0,
             "last_raw_rows": [],   # cached for chart follow-up fast-path
             "last_cols": [],
+            "last_sql": None,      # cached for pagination — re-run with OFFSET
+            "last_total": None,    # total row count for the last pageable query
         }
     return _sessions[session_id]
 
@@ -395,6 +408,11 @@ async def chat(req: ChatRequest):
                     _result_cols = list(rows[0].keys())
                     _row_count = inner.get("row_count", len(rows))
 
+                    # Cache SQL for pagination — only when SQL was generated this turn
+                    if sql:
+                        sess_data["last_sql"]   = sql
+                        sess_data["last_total"] = _count_total(sql, orch)
+
             elif step.tool == "[parse_error]":
                 info.success = False
 
@@ -402,6 +420,13 @@ async def chat(req: ChatRequest):
 
         if result.steps:
             reasoning = getattr(result.steps[0], "thought", None) or None
+
+        # Resolve pagination metadata now that last_total is populated
+        _total_count = sess_data.get("last_total")
+        _has_more    = (
+            (_total_count is not None and _total_count > 50)
+            or _row_count >= 50
+        )
 
         # Generate a natural-language summary + chart suggestion for multi-row results
         if _result_rows and len(_result_rows) > 1 and not _chart_config:
@@ -432,6 +457,11 @@ async def chat(req: ChatRequest):
                 rows=_result_rows,
                 columns=_result_cols,
                 row_count=_row_count,
+                total_count=_total_count,
+                page=0,
+                page_size=50,
+                has_more=_has_more,
+                sql=sql,   # the base SQL — frontend sends this back for per-message pagination
             ) if _result_rows else None,
             chart_config=_chart_config,
         )
@@ -440,7 +470,101 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/api/sessions/{session_id}", response_model=SessionInfo)
+def _count_total(sql: str, orch) -> int | None:
+    """
+    Count total rows for the SQL query without LIMIT/OFFSET.
+    Works for both plain SELECT and GROUP BY queries by wrapping in a subquery.
+    Returns None only on DB error.
+    """
+    import re as _re
+    # Strip trailing LIMIT / OFFSET / semicolon
+    stripped = _re.sub(
+        r'\bLIMIT\s+\d+(\s+OFFSET\s+\d+)?\s*;?\s*$', '',
+        sql.strip(), flags=_re.IGNORECASE
+    ).strip().rstrip(';')
+
+    # Also strip any WITH ... AS CTEs that are already in the main query —
+    # they're preserved inside the subquery so the count is accurate
+    count_sql = f"SELECT COUNT(*) AS _total FROM ({stripped}) _sub"
+    try:
+        from sqlalchemy import text as sql_text
+        with orch.db_engine.connect() as conn:
+            row = conn.execute(sql_text(count_sql)).fetchone()
+            return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _paginate_sql(sql: str, page: int, page_size: int) -> str:
+    """
+    Replace (or append) LIMIT/OFFSET in an SQL query for the requested page.
+    page is 0-based.
+    """
+    import re as _re
+    offset = page * page_size
+    # Remove existing LIMIT / OFFSET
+    stripped = _re.sub(
+        r'\bLIMIT\s+\d+(\s+OFFSET\s+\d+)?\s*;?\s*$', '',
+        sql.strip(), flags=_re.IGNORECASE
+    ).strip().rstrip(';')
+    return f"{stripped}\nLIMIT {page_size} OFFSET {offset};"
+
+
+@app.post("/api/page")
+async def get_page(req: PageRequest):
+    """
+    Return a specific page of a SQL result without an LLM call.
+    Uses req.sql if provided (preferred — each message carries its own SQL),
+    otherwise falls back to the session's last_sql.
+    """
+    try:
+        # Use the SQL sent by the client if available — this ensures each
+        # message paginates its own query, not the most recent one
+        sql = req.sql
+        total: int | None = None
+
+        if not sql:
+            # Fallback for clients that don't send sql yet
+            sess_data = _sessions.get(req.session_id)
+            if not sess_data or not sess_data.get("last_sql"):
+                raise HTTPException(status_code=404, detail="No cached query. Ask a question first.")
+            sql   = sess_data["last_sql"]
+            total = sess_data.get("last_total")
+        else:
+            # Compute total from the provided SQL
+            total = _count_total(sql, _orch)
+
+        paged_sql = _paginate_sql(sql, req.page, req.page_size)
+
+        from sqlalchemy import text as sql_text
+        with _orch.db_engine.connect() as conn:
+            result  = conn.execute(sql_text(paged_sql))
+            columns = list(result.keys())
+            rows    = [{k: str(v) for k, v in dict(row._mapping).items()} for row in result.fetchall()]
+
+        has_more = (
+            (total is not None and (req.page + 1) * req.page_size < total)
+            or len(rows) >= req.page_size
+        )
+
+        return {
+            "rows":        rows,
+            "columns":     columns,
+            "row_count":   len(rows),
+            "total_count": total,
+            "page":        req.page,
+            "page_size":   req.page_size,
+            "has_more":    has_more,
+            "sql":         sql,   # echo back the base SQL (not paged) for next call
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+
 async def get_session_info(session_id: str):
     data = _sessions.get(session_id)
     if not data:
