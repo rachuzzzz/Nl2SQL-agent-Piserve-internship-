@@ -104,6 +104,154 @@ WHERE ica.active = true;
         'limit':  None,
     },
     {
+        'nl':     'what is the total income cost and net profit from corrective actions P&L profit loss',
+        'sql':    """\
+-- P&L MODEL: income = po_details.po_amount (client paid Khidmah)
+--            cost   = pr_details.pr_amount (Khidmah paid out)
+--            profit = income - cost
+-- ica.capex is a QUOTE only — NOT income. NEVER use ica.capex as revenue.
+-- Pre-aggregate in CTEs to avoid row fan-out from multiple POs/PRs per ICA
+WITH po_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_income
+    FROM po_details WHERE active = true GROUP BY 1
+),
+pr_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_cost
+    FROM pr_details WHERE active = true GROUP BY 1
+)
+SELECT
+    COALESCE(SUM(po.total_income), 0)                                          AS total_income,
+    COALESCE(SUM(pr.total_cost),  0)                                           AS total_cost,
+    COALESCE(SUM(po.total_income), 0) - COALESCE(SUM(pr.total_cost), 0)        AS net_profit
+FROM inspection_corrective_action ica
+LEFT JOIN po_agg po ON po.ica_id = ica.id
+LEFT JOIN pr_agg pr ON pr.ica_id = ica.id
+WHERE ica.active = true;
+""",
+        'domain': 'financial',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'show profit and loss by facility most profitable facility income cost profit',
+        'sql':    """\
+-- P&L by facility: income = SUM(po.po_amount), cost = SUM(pr.pr_amount), profit = income - cost
+WITH po_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_income
+    FROM po_details WHERE active = true GROUP BY 1
+),
+pr_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_cost
+    FROM pr_details WHERE active = true GROUP BY 1
+)
+SELECT
+    fac.name AS facility_name,
+    COALESCE(SUM(po.total_income), 0)                                    AS income,
+    COALESCE(SUM(pr.total_cost),  0)                                     AS cost,
+    COALESCE(SUM(po.total_income), 0) - COALESCE(SUM(pr.total_cost), 0) AS profit
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+LEFT JOIN po_agg po ON po.ica_id = ica.id
+LEFT JOIN pr_agg pr ON pr.ica_id = ica.id
+WHERE ica.active = true AND ir.active = true AND fac.active = true
+GROUP BY fac.id, fac.name
+ORDER BY profit DESC;
+""",
+        'domain': 'financial',
+        'intent': 'ranked_list',
+        'limit':  None,
+    },
+    {
+        'nl':     'show profit and loss by FM manager which FM manager is most profitable',
+        'sql':    """\
+-- P&L by FM manager: inspectee_user_id is the FM manager on inspection_report
+WITH po_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_income
+    FROM po_details WHERE active = true GROUP BY 1
+),
+pr_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_cost
+    FROM pr_details WHERE active = true GROUP BY 1
+)
+SELECT
+    u.first_name || ' ' || u.last_name AS fm_manager,
+    COALESCE(SUM(po.total_income), 0)                                    AS income,
+    COALESCE(SUM(pr.total_cost),  0)                                     AS cost,
+    COALESCE(SUM(po.total_income), 0) - COALESCE(SUM(pr.total_cost), 0) AS profit
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN users u ON ir.inspectee_user_id = u.id
+LEFT JOIN po_agg po ON po.ica_id = ica.id
+LEFT JOIN pr_agg pr ON pr.ica_id = ica.id
+WHERE ica.active = true AND ir.active = true AND u.active = true
+GROUP BY u.id, u.first_name, u.last_name
+ORDER BY profit DESC;
+""",
+        'domain': 'financial',
+        'intent': 'ranked_list',
+        'limit':  None,
+    },
+    {
+        'nl':     'show profit and loss by region income cost profit by region',
+        'sql':    """\
+WITH po_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_income
+    FROM po_details WHERE active = true GROUP BY 1
+),
+pr_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_cost
+    FROM pr_details WHERE active = true GROUP BY 1
+)
+SELECT
+    reg.name AS region_name,
+    COALESCE(SUM(po.total_income), 0)                                    AS income,
+    COALESCE(SUM(pr.total_cost),  0)                                     AS cost,
+    COALESCE(SUM(po.total_income), 0) - COALESCE(SUM(pr.total_cost), 0) AS profit
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+JOIN region reg ON fac.region_id = reg.id
+LEFT JOIN po_agg po ON po.ica_id = ica.id
+LEFT JOIN pr_agg pr ON pr.ica_id = ica.id
+WHERE ica.active = true AND ir.active = true AND fac.active = true AND reg.active = true
+GROUP BY reg.id, reg.name
+ORDER BY profit DESC;
+""",
+        'domain': 'financial',
+        'intent': 'ranked_list',
+        'limit':  None,
+    },
+    {
+        'nl':     'show profit and loss by entity income cost profit by entity',
+        'sql':    """\
+WITH po_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_income
+    FROM po_details WHERE active = true GROUP BY 1
+),
+pr_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_cost
+    FROM pr_details WHERE active = true GROUP BY 1
+)
+SELECT
+    ent.name AS entity_name,
+    COALESCE(SUM(po.total_income), 0)                                    AS income,
+    COALESCE(SUM(pr.total_cost),  0)                                     AS cost,
+    COALESCE(SUM(po.total_income), 0) - COALESCE(SUM(pr.total_cost), 0) AS profit
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN entity ent ON ir.entity_id = ent.id
+LEFT JOIN po_agg po ON po.ica_id = ica.id
+LEFT JOIN pr_agg pr ON pr.ica_id = ica.id
+WHERE ica.active = true AND ir.active = true AND ent.active = true
+GROUP BY ent.id, ent.name
+ORDER BY profit DESC;
+""",
+        'domain': 'financial',
+        'intent': 'ranked_list',
+        'limit':  None,
+    },
+    {
         'nl':     'what percentage of inspections resulted in at least one corrective action',
         'sql':    """\
 -- USE THIS EXACT SQL — scalar percentage, no GROUP BY:
@@ -432,6 +580,39 @@ ORDER BY avg_score DESC;
         'limit':  None,
     },
     {
+        'nl':     'show inspection count grouped by entity',
+        'sql':    """-- entity JOIN: inspection_report.entity_id → entity.id (DIRECT FK)
+-- entity is a standalone business/contract entity — not linked to organisation
+SELECT ent.name AS entity_name,
+       COUNT(*) AS inspection_count,
+       ROUND(AVG(ir.inspection_score)::numeric, 2) AS avg_score
+FROM inspection_report ir
+JOIN entity ent ON ir.entity_id = ent.id
+WHERE ir.active = true AND ir.status != 'DRAFT'
+  AND ent.active = true
+GROUP BY ent.id, ent.name
+ORDER BY inspection_count DESC;
+""",
+        'domain': 'inspection',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'which entity has the most overdue corrective actions',
+        'sql':    """SELECT ent.name AS entity_name, COUNT(*) AS overdue_count
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN entity ent ON ir.entity_id = ent.id
+WHERE ica.status = 'OVERDUE'
+  AND ica.active = true AND ir.active = true AND ent.active = true
+GROUP BY ent.id, ent.name
+ORDER BY overdue_count DESC LIMIT 1;
+""",
+        'domain': 'corrective_action',
+        'intent': 'single_value',
+        'limit':  1,
+    },
+    {
         'nl':     'show inspection count grouped by country',
         'sql':    """\
 -- country JOIN: inspection_report.country_id → country.id
@@ -451,18 +632,67 @@ ORDER BY inspection_count DESC;
         'limit':  None,
     },
     {
+        'nl':     'show inspection count grouped by region',
+        'sql':    """-- region JOIN: facility.region_id → region.id (region has country_id for hierarchy)
+-- No direct region_id on inspection_report — must go via facility
+SELECT reg.name AS region_name,
+       COUNT(*) AS inspection_count,
+       ROUND(AVG(ir.inspection_score)::numeric, 2) AS avg_score
+FROM inspection_report ir
+JOIN facility fac ON ir.facility_id = fac.id
+JOIN region reg ON fac.region_id = reg.id
+WHERE ir.active = true AND ir.status != 'DRAFT'
+  AND fac.active = true AND reg.active = true
+GROUP BY reg.id, reg.name
+ORDER BY inspection_count DESC;
+""",
+        'domain': 'inspection',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'show facilities grouped by region which region has most facilities',
+        'sql':    """SELECT reg.name AS region_name, COUNT(*) AS facility_count
+FROM facility fac
+JOIN region reg ON fac.region_id = reg.id
+WHERE fac.active = true AND reg.active = true
+GROUP BY reg.id, reg.name
+ORDER BY facility_count DESC;
+""",
+        'domain': 'inspection',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'show corrective action count by region',
+        'sql':    """SELECT reg.name AS region_name, COUNT(*) AS ca_count
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+JOIN region reg ON fac.region_id = reg.id
+WHERE ica.active = true AND ir.active = true AND fac.active = true AND reg.active = true
+GROUP BY reg.id, reg.name
+ORDER BY ca_count DESC;
+""",
+        'domain': 'corrective_action',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
         'nl':     'show inspections grouped by organisation',
         'sql':    """\
--- organisation JOIN: inspection_report.organisation_id → organisation.id
--- CRITICAL: FK column is 'organisation_id' (British spelling) on inspection_report
--- ALWAYS GROUP BY org.name, not ir.organisation_id (uuid)
+-- organisation has NO direct FK on inspection_report
+-- ONLY join path: inspection_report → facility (facility_id) → organisation (organization_id)
+-- facility.organization_id uses American spelling; table name 'organisation' uses British spelling
+-- ALWAYS GROUP BY org.name, not the UUID column
 SELECT org.name AS organisation_name,
        COUNT(*) AS inspection_count,
        ROUND(AVG(ir.inspection_score)::numeric, 2) AS avg_score
 FROM inspection_report ir
-JOIN organisation org ON ir.organisation_id = org.id
+JOIN facility fac ON ir.facility_id = fac.id
+JOIN organisation org ON fac.organization_id = org.id
 WHERE ir.active = true AND ir.status != 'DRAFT'
-  AND org.active = true
+  AND fac.active = true AND org.active = true
 GROUP BY org.id, org.name
 ORDER BY inspection_count DESC;
 """,
@@ -792,6 +1022,209 @@ WHERE aa.inspection_report_id = (
 )
   AND aa.module_name = 'Inspection Form'
 ORDER BY aq.label;
+""",
+        'domain': 'form_answers',
+        'intent': 'single_value',
+        'limit':  1,
+    },
+    {
+        'nl':     'which inspector gets the highest form answer scores best scoring inspector',
+        'sql':    """\
+-- aa.score is ONLY populated for: 'Impact', 'Risk Level', 'Observation Type'
+-- 'Observation' free-text has no score — always filter on scored labels
+SELECT u.first_name || ' ' || u.last_name AS inspector_name,
+       ROUND(AVG(aa.score)::numeric, 2) AS avg_answer_score,
+       SUM(aa.score)                    AS total_score,
+       COUNT(aa.id)                     AS answer_count
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+JOIN users u ON ir.inspector_user_id = u.id
+WHERE aa.score IS NOT NULL
+  AND aq.label IN ('Impact', 'Risk Level', 'Observation Type')
+  AND aa.module_name = 'Inspection Form'
+  AND ir.active = true AND ir.status != 'DRAFT'
+  AND u.active = true
+GROUP BY u.id, u.first_name, u.last_name
+ORDER BY avg_answer_score DESC LIMIT 10;
+""",
+        'domain': 'form_answers',
+        'intent': 'ranked_list',
+        'limit':  10,
+    },
+    {
+        'nl':     'which facility has the best form answer scores highest scored observations facility',
+        'sql':    """\
+-- aa.score is ONLY populated for: 'Impact', 'Risk Level', 'Observation Type'
+SELECT fac.name AS facility_name,
+       ROUND(AVG(aa.score)::numeric, 2) AS avg_answer_score,
+       COUNT(aa.id)                     AS answer_count
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE aa.score IS NOT NULL
+  AND aq.label IN ('Impact', 'Risk Level', 'Observation Type')
+  AND aa.module_name = 'Inspection Form'
+  AND ir.active = true AND ir.status != 'DRAFT'
+  AND fac.active = true
+GROUP BY fac.id, fac.name
+ORDER BY avg_answer_score DESC LIMIT 20;
+""",
+        'domain': 'form_answers',
+        'intent': 'ranked_list',
+        'limit':  20,
+    },
+    {
+        'nl':     'which inspector raises the most health and safety impact observations impact category HS',
+        'sql':    """-- Impact is a MULTI-SELECT category field, NOT severity. answer_text contains category names:
+-- 'Client Relationship', 'Health & Safety (HS)', 'Financial', 'Environmental',
+-- 'Legal / Regulatory', 'Reputational', 'Operational - Asset Downtime',
+-- 'Operational - Manpower/Resource Impact', 'Operational - Service Failure', 'Quality'
+-- Multi-select answers are stored as comma-separated strings in a single answer_text row
+-- To count by category: aa.answer_text ILIKE '%category name%'
+-- aa.score = weighted points (higher = more/higher-weight categories); NOT a severity level
+SELECT u.first_name || ' ' || u.last_name AS inspector_name,
+       COUNT(*) AS hs_impact_count
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+JOIN users u ON ir.inspector_user_id = u.id
+WHERE aq.label = 'Impact'
+  AND aa.answer_text ILIKE '%Health & Safety%'
+  AND aa.module_name = 'Inspection Form'
+  AND ir.active = true AND ir.status != 'DRAFT'
+  AND u.active = true
+GROUP BY u.id, u.first_name, u.last_name
+ORDER BY hs_impact_count DESC LIMIT 10;
+""",
+        'domain': 'form_answers',
+        'intent': 'ranked_list',
+        'limit':  10,
+    },
+    {
+        'nl':     'what are the most common impact categories across all inspections impact breakdown',
+        'sql':    """-- Impact answer_text is comma-separated multi-select — individual categories appear as entries
+SELECT aa.answer_text AS impact_categories, COUNT(*) AS frequency
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+WHERE aq.label = 'Impact'
+  AND aa.answer_text IS NOT NULL
+  AND aa.module_name = 'Inspection Form'
+GROUP BY aa.answer_text
+ORDER BY frequency DESC LIMIT 20;
+""",
+        'domain': 'form_answers',
+        'intent': 'ranked_list',
+        'limit':  20,
+    },
+    {
+        'nl':     'show observation with highest impact score impact scored answers',
+        'sql':    """-- 'Impact' is the label for scored impact answers (scores 1-27)
+-- 'Observation' is free-text with NO score — never use aq.label = 'Observation' for scores
+SELECT aa.answer_text AS impact_answer,
+       aa.score       AS impact_score,
+       ir.inspection_id,
+       ir.submitted_on,
+       fac.name       AS facility_name,
+       u.first_name || ' ' || u.last_name AS inspector_name
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+JOIN users u ON ir.inspector_user_id = u.id
+WHERE aq.label = 'Impact'
+  AND aa.score IS NOT NULL
+  AND aa.module_name = 'Inspection Form'
+  AND ir.active = true AND ir.status != 'DRAFT'
+ORDER BY aa.score DESC LIMIT 10;
+""",
+        'domain': 'form_answers',
+        'intent': 'ranked_list',
+        'limit':  10,
+    },
+    {
+        'nl':     'show corrective actions linked to a specific observation CAs for observation',
+        'sql':    """-- CORRECT: filter by ica.observation_id = aa.submission_id::uuid (direct FK — 398 CAs have this)
+-- NOT: WHERE ica.inspection_id = ... (returns ALL CAs for the whole inspection)
+SELECT ica.corrective_action_id,
+       ica.cause,
+       ica.corrective_action,
+       ica.responsible,
+       ica.status,
+       ica.capex,
+       aa.answer_text AS linked_observation
+FROM inspection_corrective_action ica
+JOIN ai_answers aa ON ica.observation_id = aa.submission_id::uuid
+WHERE ica.observation_id IS NOT NULL
+  AND ica.active = true
+ORDER BY ica.corrective_action_id;
+""",
+        'domain': 'corrective_action',
+        'intent': 'filter',
+        'limit':  None,
+    },
+    {
+        'nl':     'which observation triggered the most corrective actions observation with most CAs',
+        'sql':    """-- Use ica.observation_id → ai_answers.submission_id (cast to uuid: ica.observation_id = aa.submission_id::uuid) to group CAs by observation
+SELECT aa.answer_text AS observation,
+       COUNT(ica.id)  AS ca_count,
+       ir.inspection_id
+FROM inspection_corrective_action ica
+JOIN ai_answers aa ON ica.observation_id = aa.submission_id::uuid
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+WHERE ica.active = true AND ica.observation_id IS NOT NULL
+GROUP BY aa.id, aa.answer_text, ir.inspection_id
+ORDER BY ca_count DESC LIMIT 10;
+""",
+        'domain': 'corrective_action',
+        'intent': 'ranked_list',
+        'limit':  10,
+    },
+    {
+        'nl':     'show observation with highest score for a specific inspector highest impact score',
+        'sql':    """\
+-- aa.score is ONLY populated for: 'Impact', 'Risk Level', 'Observation Type'
+-- 'Observation' (free-text field) has NO score — never filter aq.label = 'Observation' for scores
+-- For highest scoring answer use Impact (scores up to 27) or Risk Level or Observation Type
+-- Always wrap OR name conditions in parentheses to avoid precedence bug
+SELECT aq.label AS question_type,
+       aa.answer_text AS answer,
+       aa.score,
+       ir.inspection_id,
+       ir.submitted_on,
+       u.first_name || ' ' || u.last_name AS inspector_name
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+JOIN users u ON ir.inspector_user_id = u.id
+WHERE (u.first_name ILIKE '%inspector_name%' OR u.last_name ILIKE '%inspector_name%')
+  AND aq.label IN ('Impact', 'Risk Level', 'Observation Type')
+  AND aa.score IS NOT NULL
+  AND aa.module_name = 'Inspection Form'
+  AND ir.active = true AND ir.status != 'DRAFT'
+  AND u.active = true
+ORDER BY aa.score DESC LIMIT 10;
+""",
+        'domain': 'form_answers',
+        'intent': 'ranked_list',
+        'limit':  10,
+    },
+    {
+        'nl':     'what is the total form answer score for an inspection',
+        'sql':    """\
+-- SUM(aa.score) = total weighted points for all answers in one inspection
+-- Use ir.inspection_id (varchar) for display, ir.id (UUID) for JOIN only
+SELECT ir.inspection_id,
+       SUM(aa.score)  AS total_score,
+       MAX(aa.max_score) AS max_possible,
+       COUNT(aa.id)   AS questions_answered
+FROM ai_answers aa
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+WHERE ir.inspection_id = 'INS-XXXX'
+  AND aa.score IS NOT NULL
+  AND aa.module_name = 'Inspection Form'
+GROUP BY ir.inspection_id;
 """,
         'domain': 'form_answers',
         'intent': 'single_value',

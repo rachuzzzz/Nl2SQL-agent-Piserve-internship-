@@ -53,6 +53,10 @@ BUSINESS_RULES = [
     "Use ILIKE for text matching, never LIKE.",
     "corrective_action_id is a human-readable ID like '2026/01/ST064/INS001_MA001', not a UUID.",
     "inspection_corrective_action.inspection_id is the PRIMARY FK to inspection_report.id.",
+    "inspection_corrective_action.observation_id → ai_answers.submission_id (cast to uuid: ica.observation_id = aa.submission_id::uuid) (DIRECT FK). "
+    "When user asks CAs for a specific observation, filter: WHERE ica.observation_id = aa.submission_id::uuid. "
+    "Do NOT filter by inspection_id alone — that returns ALL CAs for the inspection. "
+    "398 CAs have a non-NULL observation_id.",
     "Use LEFT JOIN (not INNER JOIN) for optional lookups like inspection_sub_type, "
     "entity, and inspection_report_remark.",
     "VOCABULARY — corrective action status: "
@@ -84,7 +88,10 @@ WHERE CONCEPTS LIVE:
   - Project names → project.name (JOIN via project_id)
   - Client names → client.name (JOIN via client_id)
   - Country names → country.name (JOIN via country_id)
-  - Organisation names → organisation.name (JOIN via organisation_id)
+  - Entity names       → entity.name        (JOIN via inspection_report.entity_id — DIRECT)
+  - Organisation names → organisation.name (JOIN via facility.organization_id)
+  - Country names      → country.name      (JOIN via ir.country_id OR facility.country_id)
+  - Region names       → region.name       (JOIN via facility.region_id → region)
   - Scores, status, dates → inspection_report
   - Causes, costs, overdue → inspection_corrective_action
   - Form question labels → ai_questions.label  (NOT question_label)
@@ -98,7 +105,14 @@ HOW TABLES CONNECT (inspection_report is the hub):
   inspection_report.project_id          → project.id
   inspection_report.client_id           → client.id
   inspection_report.country_id          → country.id
-  inspection_report.organisation_id     → organisation.id   ← British spelling on FK column
+  inspection_report.entity_id   → entity.id    (DIRECT)
+  inspection_report.country_id  → country.id   (DIRECT)
+  inspection_report → facility (facility_id) → organisation (organization_id)
+  inspection_report → facility (facility_id) → region (region_id) → country (country_id)
+  NOTE: inspection_report has NO direct organisation_id or region_id — join via facility
+  facility.organization_id → organisation.id   ← American spelling on FK; British on table name
+  facility.region_id       → region.id
+  region.country_id        → country.id        ← region belongs to a country
   inspection_report.inspector_user_id   → users.id
   inspection_report.inspectee_user_id   → users.id  (FM Manager — facility manager being inspected)
   inspection_report.cycle_id            → inspection_cycle.id
@@ -109,17 +123,20 @@ HOW TABLES CONNECT (inspection_report is the hub):
 
   facility.client_id       → client.id
   facility.country_id      → country.id
-  facility.organisation_id → organisation.id
+  facility.organization_id → organisation.id   ← American spelling on FK column
 
   project.organisation_id  → organisation.id
 
 TABLE COLUMNS (lookup tables):
   country:      id (uuid), active (bool), name (varchar)
   organisation: id (uuid), active (bool), name (varchar), logo (varchar)
+  entity:       id (uuid), active (bool), name (varchar), logo (varchar)
+               — standalone business/contract entity, inspection_report.entity_id → entity.id
+  region:       id (uuid), active (bool), name (varchar), country_id (uuid→country.id)
   project:      id (uuid), active (bool), name (varchar), organisation_id (uuid→organisation.id)
   client:       id (uuid), active (bool), name (varchar)
 
-  SOFT DELETE — include WHERE active = true for: country, organisation, project, client
+  SOFT DELETE — include WHERE active = true for: country, region, organisation, project, client, entity
 
 USER ROLES:
   users.id → user_roles.user_id → user_roles.role_id → role.id → role.name

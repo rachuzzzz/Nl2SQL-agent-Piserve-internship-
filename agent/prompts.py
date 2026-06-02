@@ -57,8 +57,13 @@ ROUTING — INSPECTION QUERIES:
 
 LOOKUP TABLES (all have active column — filter WHERE active = true):
   country:       id, name  — inspection_report.country_id / facility.country_id
-  organisation:  id, name  — inspection_report.organisation_id / facility.organisation_id
-                             NOTE: FK column uses British spelling 'organisation_id'
+  entity:        id, name  — inspection_report.entity_id (DIRECT) — standalone business entity
+  country:       id, name  — inspection_report.country_id (DIRECT) or facility.country_id
+  region:        id, name, country_id  — facility.region_id → region.id → country
+  organisation:  id, name  — NO direct FK on inspection_report
+                             Join path: inspection_report → facility → organisation
+                             facility.organization_id → organisation.id
+                             (American spelling on FK column; British spelling on table name)
   project:       id, name, organisation_id  — inspection_report.project_id
   client:        id, name  — inspection_report.client_id / facility.client_id
 
@@ -297,6 +302,15 @@ inspection" — that only needs inspection metadata (inspection_id, score, facil
 should use generate_sql on inspection_report directly.
 Turn 1: {"thought": "User wants Q&A content — questions + answers from the form. Must use single SQL with ai_answers + ai_questions JOIN and aa.submitted_on subquery. Do NOT first look up inspection_id separately.", "tool": "generate_sql", "args": {"question": "list all questions and answers from the most recently answered inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer, aa.module_name AS form_section\nFROM ai_answers aa\nJOIN ai_questions aq ON aa.element_id = aq.element_id\nWHERE aa.inspection_report_id = (\n    SELECT aa2.inspection_report_id FROM ai_answers aa2\n    ORDER BY aa2.submitted_on DESC LIMIT 1\n)\nORDER BY aa.module_name, aq.label LIMIT 200;"}}
 
+─── Inspector with most high-impact observations ───
+User: "which inspector raises the most high impact observations?"
+ROUTING RULE: Impact is a MULTI-SELECT CATEGORY field. There is NO answer_text value called 'High' for Impact.
+Categories are: 'Client Relationship', 'Health & Safety (HS)', 'Financial', 'Environmental' etc.
+'High impact' = high aa.score (more/heavier categories selected). Count = most Impact answers.
+NEVER generate: aq.label ILIKE '%Impact%' OR aa.answer_text ILIKE '%High%'
+ALWAYS use: aq.label = 'Impact' (exact match) and ORDER BY aa.score DESC or COUNT(*) DESC
+Turn 1: {"thought": "Impact is multi-select category, not severity. 'High impact' = high aa.score. Count Impact answers per inspector ordered by avg score.", "tool": "generate_sql", "args": {"question": "inspector with most high impact score observations", "schema_hint": "SELECT u.first_name || ' ' || u.last_name AS inspector_name, COUNT(*) AS impact_count, ROUND(AVG(aa.score)::numeric, 2) AS avg_impact_score FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN users u ON ir.inspector_user_id = u.id WHERE aq.label = 'Impact' AND aa.score IS NOT NULL AND aa.module_name = 'Inspection Form' AND ir.active = true AND ir.status != 'DRAFT' AND u.active = true GROUP BY u.id, u.first_name, u.last_name ORDER BY avg_impact_score DESC LIMIT 10;"}}
+
 ─── Count deviations at a facility ───
 User: "how many deviations were raised at Al Ghadeer this year?"
 ROUTING RULE: 'Deviation' is a KNOWN answer value for 'Observation Type'. Route directly to generate_sql — do NOT call search_questions or semantic_search first.
@@ -345,21 +359,25 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
   inspection_report, inspection_corrective_action, facility, users,
   inspection_type, inspector_portfolio, inspector_portfolio_details,
   frequency_definition, po_details, pr_details, risk_level,
-  country, organisation, project, client.
+  country, region, organisation, project, client, entity.
   NEVER return rows where active = false — those are deleted/archived records.
 - LOOKUP TABLE JOINS (inspection_report FK columns):
   inspection_report.country_id      → country.id       (country.name)
-  inspection_report.organisation_id → organisation.id  (organisation.name)  ← British spelling on FK
   inspection_report.project_id      → project.id       (project.name)
   inspection_report.client_id       → client.id        (client.name)
+  inspection_report.entity_id       → entity.id        (DIRECT FK)
+  inspection_report.country_id      → country.id       (DIRECT FK — use this for country queries)
+  NOTE: inspection_report has NO organisation_id or region_id — join via facility
+  facility.organization_id          → organisation.id  ← American spelling on column, British on table
+  facility.region_id                → region.id
   facility.country_id               → country.id
-  facility.organisation_id          → organisation.id
   facility.client_id                → client.id
+  region.country_id                 → country.id       (region belongs to country)
   project.organisation_id           → organisation.id
 - ENUM values are ALWAYS uppercase: status = 'OPEN', status = 'CLOSED', status = 'OVERDUE',
   responsible = 'CLIENT', responsible = 'INTERNAL_OPERATIONS', responsible = 'SUB_CONTRACTOR'.
   NEVER use lowercase for enum comparisons.
-- When grouping by facility/type/client/inspector/project/country/organisation,
+- When grouping by facility/type/client/inspector/project/country/region/organisation/entity,
   ALWAYS JOIN the lookup table and GROUP BY the name column. NEVER GROUP BY a UUID FK column.
 - For month display, ALWAYS use TO_CHAR(date_trunc('month', col), 'Month YYYY') AS month.
   NEVER use EXTRACT(MONTH FROM col) — that returns a number, not a name.
@@ -400,6 +418,48 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
   NEVER use ica.expenditure to compute conversion rate — it is not a financial amount
   NEVER use capex_status='ACCEPTED' as a proxy for conversion — use po_details
 
+### P&L (PROFIT & LOSS) MODEL — CRITICAL:
+  INCOME  = SUM(po_details.po_amount)   — client paid Khidmah (PO = Purchase Order received)
+  COST    = SUM(pr_details.pr_amount)   — Khidmah paid out internally (PR = Payment Request)
+  PROFIT  = SUM(po.po_amount) - SUM(pr.pr_amount)
+  LOSS    = when COST > INCOME (negative profit)
+
+  CONFIRMED DATA (as of current DB):
+    Total Income  = 684,243.49
+    Total Cost    = 365,034.16
+    Net Profit    = 319,209.33
+
+  CAPEX Generated (ica.capex) is a QUOTE/ESTIMATE only — no money has moved.
+  NEVER use ica.capex as income or revenue.
+
+  P&L JOIN PATTERN — always pre-aggregate in CTEs to avoid row fan-out:
+    WITH po_agg AS (
+        SELECT mitigative_action_uuid AS ica_id,
+               SUM(po_amount) AS total_income
+        FROM po_details WHERE active = true GROUP BY 1
+    ),
+    pr_agg AS (
+        SELECT mitigative_action_uuid AS ica_id,
+               SUM(pr_amount) AS total_cost
+        FROM pr_details WHERE active = true GROUP BY 1
+    )
+    SELECT ...,
+           COALESCE(SUM(po.total_income), 0) AS income,
+           COALESCE(SUM(pr.total_cost),  0) AS cost,
+           COALESCE(SUM(po.total_income), 0) - COALESCE(SUM(pr.total_cost), 0) AS profit
+    FROM inspection_corrective_action ica
+    LEFT JOIN po_agg po ON po.ica_id = ica.id
+    LEFT JOIN pr_agg pr ON pr.ica_id = ica.id
+    ...GROUP BY ...
+
+  P&L GROUPING — can be broken down by:
+    Facility:   JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id
+    FM Manager: JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN users u ON ir.inspectee_user_id = u.id
+    Region:     ... → facility → region
+    Entity:     JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN entity ent ON ir.entity_id = ent.id
+    Project:    JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN project proj ON ir.project_id = proj.id
+    Country:    JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN country c ON ir.country_id = c.id
+
 ### INSPECTION_REPORT — TWO USER FK COLUMNS (different people, NEVER mix):
   inspector_user_id  → person who CONDUCTED the inspection (Inspector)
   inspectee_user_id  → person being inspected (FM Manager / facility manager)
@@ -413,6 +473,18 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
   NEVER join on one column and filter/EXISTS on the other:
     WRONG: JOIN users u ON ir.inspector_user_id = u.id
            WHERE ... ur.user_id = ir.inspectee_user_id  ← two different people!
+
+### OBSERVATION → CORRECTIVE ACTION LINK:
+  inspection_corrective_action.observation_id → ai_answers.submission_id (cast to uuid: ica.observation_id = aa.submission_id::uuid)  (DIRECT FK)
+  398 CAs have a non-NULL observation_id — directly linked to the form answer that triggered them.
+
+  "corrective actions for this observation" / "CAs linked to that observation":
+    WHERE ica.observation_id = aa.submission_id::uuid   ← filter by the specific answer row, NOT by inspection_id
+
+  "corrective actions for this inspection" / "all CAs for this inspection":
+    WHERE ica.inspection_id = ir.inspection_id  ← all CAs for the whole inspection
+
+  NEVER confuse: one observation ≠ all observations in an inspection.
 
 ### AI FLAT TABLES — use these for all form question/answer data:
 
@@ -433,10 +505,39 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
     inspection_id        varchar
     answer_text          text
     answer_numeric       numeric
-    score                numeric
+    score                numeric  ← weighted points earned for this answer (range 1–27 in data)
     score_type           varchar
-    max_score            numeric
+    max_score            numeric  ← maximum possible points for this question
     module_name          text
+
+  aa.score vs inspection_report.inspection_score:
+    aa.score              = points earned for ONE answer to ONE question (weighted per question)
+    inspection_report.inspection_score = overall % score for the whole inspection report
+    SUM(aa.score) per inspection ≠ inspection_report.inspection_score (different scales)
+
+  aa.score USE CASES:
+    CRITICAL: aa.score is ONLY populated for these question labels:
+      'Impact'           — MULTI-SELECT category field (comma-separated when multiple chosen)
+                           answer_text values: 'Client Relationship', 'Health & Safety (HS)',
+                           'Financial', 'Environmental', 'Legal / Regulatory', 'Reputational',
+                           'Operational - Asset Downtime', 'Operational - Manpower/Resource Impact',
+                           'Operational - Service Failure', 'Quality'
+                           aa.score = weighted points based on which categories were selected (1–27)
+                           Higher score = more/higher-weight categories selected
+                           NEVER treat Impact as High/Medium/Low severity — it is category-based
+                           To filter by category: aa.answer_text ILIKE '%Health & Safety%'
+      'Risk Level'       — risk score (range observed: 1–5)
+                           answer_text values: 'High', 'Medium', 'Low', 'No Active Risk'
+      'Observation Type' — type score (range observed: 1)
+                           answer_text values: 'Deviation', 'Good Practice'
+    'Observation' (free-text) has NO score — NEVER use WHERE aq.label = 'Observation' AND aa.score IS NOT NULL
+
+    "observation with highest impact score" → WHERE aq.label = 'Impact' ORDER BY aa.score DESC LIMIT N
+    "highest scoring answer for inspector X" → ORDER BY aa.score DESC WHERE aq.label IN ('Impact','Risk Level','Observation Type')
+    "inspector with best form scores"        → GROUP BY inspector, AVG(aa.score) WHERE aq.label IN ('Impact','Risk Level','Observation Type')
+    "facility with best scored answers"      → GROUP BY fac.name, AVG(aa.score) WHERE aq.label IN ('Impact','Risk Level','Observation Type')
+    "total score for an inspection"          → SUM(aa.score) WHERE inspection_report_id = X
+    ALWAYS filter: WHERE aa.score IS NOT NULL AND aa.module_name = 'Inspection Form'
     module_id            uuid
     submitted_on         timestamptz
     status               varchar

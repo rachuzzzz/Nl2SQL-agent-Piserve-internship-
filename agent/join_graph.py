@@ -46,6 +46,7 @@ JOIN_GRAPH: dict[str, dict[str, tuple]] = {
         "inspection_sub_type":   ("ist",  "ist.id = ir.inspection_sub_type_id"),
         "project":               ("proj", "proj.id = ir.project_id"),
         "client":                ("cl",   "cl.id = ir.client_id"),
+        "country":               ("c",    "c.id = ir.country_id"),
         "inspection_cycle":      ("ic",   "ic.id = ir.cycle_id"),
         "inspection_schedule":   ("isched","isched.id = ir.schedule_id"),
         # Two user roles — different aliases to allow both in same query
@@ -54,6 +55,8 @@ JOIN_GRAPH: dict[str, dict[str, tuple]] = {
         "inspection_corrective_action": (
             "ica", "ica.inspection_id = ir.id"
         ),
+        # organisation/region reached via facility (no direct FK on inspection_report)
+        "entity":                ("ent", "ent.id = ir.entity_id"),
     },
 
     # ── inspection_corrective_action ──────────────────────────────────────
@@ -108,7 +111,35 @@ JOIN_GRAPH: dict[str, dict[str, tuple]] = {
     },
 
     # ── lookup tables (typically leaf nodes) ──────────────────────────────
-    "facility":            {"inspection_report": ("ir",  "ir.facility_id = fac.id")},
+    "facility": {
+        "inspection_report": ("ir",  "ir.facility_id = fac.id"),
+        "organisation":      ("org", "org.id = fac.organization_id"),   # American spelling on FK
+        "country":           ("c",   "c.id = fac.country_id"),
+        "region":            ("reg", "reg.id = fac.region_id"),
+        "client":            ("cl",  "cl.id = fac.client_id"),
+    },
+    "organisation": {
+        "facility":          ("fac", "fac.organization_id = org.id"),   # American spelling on FK
+    },
+    "country": {
+        "facility":          ("fac", "fac.country_id = c.id"),
+        "region":            ("reg", "reg.country_id = c.id"),
+        "inspection_report": ("ir",  "ir.country_id = c.id"),
+    },
+    "region": {
+        "facility":          ("fac", "fac.region_id = reg.id"),
+        "country":           ("c",   "c.id = reg.country_id"),
+    },
+    "entity": {
+        "inspection_report": ("ir",  "ir.entity_id = ent.id"),
+    },
+    "project": {
+        "inspection_report": ("ir",  "ir.project_id = proj.id"),
+    },
+    "client": {
+        "inspection_report": ("ir",  "ir.client_id = cl.id"),
+        "facility":          ("fac", "fac.client_id = cl.id"),
+    },
     "inspection_type":     {"inspection_report": ("ir",  "ir.inspection_type_id = it.id")},
     "frequency_definition":{"inspector_portfolio_details": ("ipd","ipd.frequency_definition_id = fd.id")},
     "risk_level":          {"inspection_corrective_action": ("ica","ica.risk_level_id = rl.id")},
@@ -140,6 +171,12 @@ CANONICAL_ALIAS: dict[str, str] = {
     "users_inspector":              "u",
     "users_inspectee":              "uinsp",
     "inspector_portfolio":          "ip",
+    "organisation":                 "org",
+    "country":                      "c",
+    "region":                       "reg",
+    "project":                      "proj",
+    "client":                       "cl",
+    "entity":                       "ent",
 }
 
 

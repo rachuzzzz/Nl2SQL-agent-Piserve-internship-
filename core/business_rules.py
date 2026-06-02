@@ -56,6 +56,15 @@ REGISTRY: list[dict] = [
     # BLOCK — hard errors that cause SQL rejection
     # ══════════════════════════════════════════════════════════════════════════
 
+    # ── Organisation join always returns empty (FK unpopulated) ─────────────
+    {
+        "id":          "block_organisation_join",
+        "type":        BLOCK,
+        "description": "facility.organization_id is unpopulated (all NULL) — joining to organisation always returns zero rows.",
+        "sql_pattern": r"\bJOIN\s+organisation\b",
+        "message":     "UNSUPPORTED: facility.organization_id is not populated in the current dataset. All facilities belong to a single organisation (Khidmah). Grouping by organisation is not meaningful — use facility, region, country, project, or entity instead.",
+    },
+
     # ── DML / DDL ────────────────────────────────────────────────────────────
     {
         "id":          "block_dml",
@@ -481,6 +490,15 @@ REGISTRY: list[dict] = [
         "sql_pattern": r"(\b\w+\s+)is\b(?=\s*\.|\s+ON\b|\s+WHERE\b|\s+GROUP\b|\s+ORDER\b|\s+LEFT\b|\s+JOIN\b|\s+INNER\b|\s*\n|\s*,)",
         "replacement": r"\1isch",
         "message":     "[autocorrect] Replaced reserved alias 'is' with 'isch'",
+    },
+
+    {
+        "id":          "autocorrect_impact_ilike",
+        "type":        AUTOCORRECT,
+        "description": "aq.label ILIKE '%impact%' matches wrong labels — use exact match",
+        "sql_pattern": r"aq\.label\s+ILIKE\s+'%[Ii]mpact%'",
+        "replacement": "aq.label = 'Impact'",
+        "message":     "[autocorrect] Replaced ILIKE Impact with exact aq.label = 'Impact'",
     },
 
     # ══════════════════════════════════════════════════════════════════════════
