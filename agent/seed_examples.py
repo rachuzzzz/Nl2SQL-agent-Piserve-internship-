@@ -15,6 +15,12 @@ CORE_CONTEXT = """\
 -- ir.inspection_id (VARCHAR) = display id | ir.id (UUID) = JOIN/subquery only, NEVER SELECT
 -- ICA join: ON ica.inspection_id = ir.id  (NOT ir.inspection_id = ica.inspection_id)
 -- completed = status IN ('CLOSED','SUBMITTED') | responsible: 'CLIENT','INTERNAL_OPERATIONS','SUB_CONTRACTOR'
+-- completed inspections filter: ALWAYS use status IN ('CLOSED','SUBMITTED') — NOT status != 'DRAFT'
+--   status != 'DRAFT' includes IN_PROGRESS, UNDER_REVIEW, RETURN_FOR_MODIFICATION — NOT completed
+--
+-- inspection_schedule columns: schedule_date (NOT scheduled_date), due_date, schedule_id, status
+--   NEVER: sched.scheduled_date — column is schedule_date
+--   NEVER: sched.active — inspection_schedule has no active column
 -- NEVER: ir.id in SELECT | NEVER: ica.risk_level_id vs string | NEVER: GROUP BY ica.risk_level_id
 -- completed_cycle = status='COMPLETED' (NOT 'CLOSED', NOT status!='DRAFT')
 -- NEVER: ipd.cycle_id (no such column on inspector_portfolio_details)
@@ -52,9 +58,44 @@ CORE_CONTEXT = """\
 --   frequency_definition, po_details, pr_details, risk_level
 -- NO active column: ai_answers, ai_questions, role, user_roles, inspection_schedule
 --   NEVER use aa.active or aq.active — these columns do not exist
+--
+-- DATE FILTERING — month/year specific:
+--   CORRECT:  EXTRACT(MONTH FROM ir.submitted_on) = 1 AND EXTRACT(YEAR ...) = EXTRACT(YEAR FROM CURRENT_DATE)
+--   CORRECT:  ir.submitted_on >= '2026-01-01' AND ir.submitted_on < '2026-02-01'  (only when year explicit)
+--   WRONG:    TO_CHAR(ir.submitted_on, 'Month YYYY') = 'January 2026'
+--             ↑ NEVER use for WHERE filters — TO_CHAR pads month with spaces → 0 rows
+--   WRONG:    date_trunc('month', ir.submitted_on) = date_trunc('month', DATE '2023-01-01')
+--             ↑ NEVER hardcode a year like 2023 or 2024 in date literals — use CURRENT_DATE
+--   TO_CHAR is ONLY valid for GROUP BY labels / SELECT display, never WHERE filters
 """
 
 SEED_EXAMPLES: list[dict] = [
+    {
+        # Lookup inspector or details for a specific inspection by its full ID.
+        # inspection_id format is always 'YYYY/MM/STXXX/INSXXX' — NEVER truncate it.
+        # ir.inspection_id is VARCHAR — always match the FULL string as given by the user.
+        'nl':     'who inspected inspection 2026/01/ST074/INS002 inspector for specific inspection details about inspection by id inspector of first inspection in the list who did this inspection',
+        'sql':    """\
+-- inspection_id is the FULL VARCHAR: '2026/01/ST074/INS002' — NEVER truncate to 'ST074/INS002'
+SELECT ir.inspection_id,
+       u.first_name || ' ' || u.last_name AS inspector_name,
+       fac.name AS facility_name,
+       it.name  AS inspection_type_name,
+       ir.inspection_score,
+       ir.gp_score,
+       ir.status,
+       ir.submitted_on
+FROM inspection_report ir
+JOIN users u   ON ir.inspector_user_id = u.id
+JOIN facility fac ON ir.facility_id = fac.id
+JOIN inspection_type it ON ir.inspection_type_id = it.id
+WHERE ir.inspection_id = '2026/01/ST074/INS002'
+  AND ir.active = true;
+""",
+        'domain': 'inspection',
+        'intent': 'single_value',
+        'limit':  1,
+    },
     {
         'nl':     'how many inspections were completed this year',
         'sql':    """\
@@ -346,6 +387,36 @@ ORDER BY date_trunc('month', ir.submitted_on);
         'domain': 'inspection',
         'intent': 'trend',
         'limit':  None,
+    },
+    {
+        # CRITICAL: date range filter for a specific month.
+        # TO_CHAR(submitted_on, 'Month YYYY') = 'January 2026' ALWAYS RETURNS 0 ROWS
+        # because TO_CHAR pads month names with spaces ('January   2026' ≠ 'January 2026').
+        # Use EXTRACT(MONTH/YEAR) for dynamic month filters — NEVER hardcode a year like DATE '2023-01-01'
+        'nl':     'list inspections submitted in January list inspections from January 2026 filter inspections by month January',
+        'sql':    """\
+-- MONTH FILTER — use EXTRACT for dynamic month+year, NEVER TO_CHAR in WHERE, NEVER hardcode year
+-- For "January this year": EXTRACT(MONTH FROM ir.submitted_on) = 1 AND EXTRACT(YEAR ...) = EXTRACT(YEAR FROM CURRENT_DATE)
+-- For "January 2026" specifically: EXTRACT(MONTH ...) = 1 AND EXTRACT(YEAR ...) = 2026
+-- completed inspections = status IN ('CLOSED','SUBMITTED') — NOT status != 'DRAFT'
+SELECT ir.inspection_id,
+       fac.name AS facility_name,
+       it.name  AS inspection_type_name,
+       ir.submitted_on,
+       ir.status
+FROM inspection_report ir
+JOIN facility fac ON ir.facility_id = fac.id
+JOIN inspection_type it ON ir.inspection_type_id = it.id
+WHERE ir.active = true
+  AND ir.status IN ('CLOSED','SUBMITTED')
+  AND EXTRACT(MONTH FROM ir.submitted_on) = 1
+  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
+ORDER BY ir.submitted_on DESC
+LIMIT 100;
+""",
+        'domain': 'inspection',
+        'intent': 'filter',
+        'limit':  100,
     },
     {
         'nl':     'which month had the most high risk observations this year',
@@ -1144,12 +1215,15 @@ ORDER BY aa.score DESC LIMIT 10;
         'limit':  10,
     },
     {
-        'nl':     'show corrective actions linked to a specific observation CAs for observation',
-        'sql':    """-- CORRECT: filter by ica.observation_id = aa.submission_id::uuid (direct FK — 398 CAs have this)
--- NOT: WHERE ica.inspection_id = ... (returns ALL CAs for the whole inspection)
+        'nl':     'show corrective actions linked to a specific observation CAs for observation corrective actions for this observation corrective actions for first observation corrective actions raised from this finding',
+        'sql':    """-- OBSERVATION → CA PATH: use ica.observation_id = aa.submission_id::uuid
+-- This is the DIRECT link — NOT ica.inspection_id = ir.id (that returns ALL CAs in the inspection)
+-- CORRECT: filter by ica.observation_id = aa.submission_id::uuid (direct FK — 398 CAs have this)
+-- NOT: JOIN inspection_report ir ON ica.inspection_id = ir.id (returns ALL CAs for the whole inspection)
 SELECT ica.corrective_action_id,
        ica.cause,
        ica.corrective_action,
+       ica.correction,
        ica.responsible,
        ica.status,
        ica.capex,
@@ -1158,6 +1232,7 @@ FROM inspection_corrective_action ica
 JOIN ai_answers aa ON ica.observation_id = aa.submission_id::uuid
 WHERE ica.observation_id IS NOT NULL
   AND ica.active = true
+  AND aa.answer_text ILIKE '%observation_text%'
 ORDER BY ica.corrective_action_id;
 """,
         'domain': 'corrective_action',
@@ -2122,9 +2197,42 @@ WHERE ir.status != 'DRAFT'
         'limit':  None,
     },
     {
+        # CAPEX Lost by grouping (region, facility, country, entity).
+        # Formula: SUM(ica.capex) - SUM(po.po_amount) — NOT po minus pr (that is profit).
+        # NEVER: SUM(po.total_po) - SUM(pr.total_pr) — that computes income minus cost (P&L).
+        # FIXED: Now properly uses the CTE for aggregation to avoid row multiplication.
+        'nl':     'capex lost by region capex lost by facility capex lost by country capex lost breakdown',
+        'sql':    """\
+-- CAPEX Lost = SUM(ica.capex) - SUM(po.po_amount) — arithmetic gap
+-- NEVER: SUM(po) - SUM(pr) — that is profit/loss, not capex lost
+-- Pre-aggregate po_details to avoid row multiplication
+WITH po_by_ica AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po
+    FROM po_details WHERE active = true GROUP BY 1
+)
+SELECT 
+    reg.name AS region_name,
+    COUNT(DISTINCT ica.id) AS ca_count,
+    COALESCE(SUM(ica.capex), 0) AS capex_generated,
+    COALESCE(SUM(p.total_po), 0) AS capex_converted,
+    COALESCE(SUM(ica.capex), 0) - COALESCE(SUM(p.total_po), 0) AS capex_lost
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+JOIN region reg ON fac.region_id = reg.id
+LEFT JOIN po_by_ica p ON p.ica_id = ica.id
+WHERE ica.active = true AND ir.active = true AND fac.active = true AND reg.active = true
+  AND ica.capex > 0
+GROUP BY reg.id, reg.name
+ORDER BY capex_lost DESC;
+""",
+        'domain': 'financial',
+        'intent': 'ranked_list',
+        'limit':  None,
+    },
+    {
         'nl':     'capex generated converted lost by fm manager facility manager',
         'sql':    """\
--- FM Manager = ir.inspectee_user_id (NOT inspector_user_id, NOT creator_name)
 -- CAPEX Generated = SUM(ica.capex)    — amount quoted on ICA
 -- CAPEX Converted = SUM(po.po_amount) — actual PO raised via po_details
 -- CAPEX Lost      = Generated - Converted (arithmetic gap, NOT capex_status='REJECTED')
@@ -2276,6 +2384,35 @@ LIMIT 20;
         'domain': 'financial',
         'intent': 'ranked_list',
         'limit':  20,
+    },
+    {
+        # CAPEX Lost filtered by month — always use date_trunc for month arithmetic.
+        # NEVER: EXTRACT(MONTH FROM col) - 1  (fails in January, returns month 0)
+        # ALWAYS: date_trunc('month', col) = date_trunc('month', CURRENT_DATE - INTERVAL '1 month')
+        'nl':     'capex lost last month capex lost this month capex lost by month filter capex by month',
+        'sql':    """\
+-- CAPEX Lost = SUM(ica.capex) - SUM(po.po_amount) — arithmetic gap, NOT capex_status
+-- Month filter: ALWAYS use date_trunc arithmetic — NEVER EXTRACT(MONTH)-1 (fails in January)
+-- Last month: date_trunc('month', CURRENT_DATE - INTERVAL '1 month')
+-- This month: date_trunc('month', CURRENT_DATE)
+WITH po_by_ica AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po
+    FROM po_details WHERE active = true GROUP BY 1
+)
+SELECT
+    COALESCE(SUM(ica.capex), 0)          AS capex_generated,
+    COALESCE(SUM(p.total_po), 0)         AS capex_converted,
+    COALESCE(SUM(ica.capex), 0)
+        - COALESCE(SUM(p.total_po), 0)   AS capex_lost
+FROM inspection_corrective_action ica
+LEFT JOIN po_by_ica p ON p.ica_id = ica.id
+WHERE ica.active = true
+  AND ica.capex > 0
+  AND date_trunc('month', ica.created_on) = date_trunc('month', CURRENT_DATE - INTERVAL '1 month');
+""",
+        'domain': 'financial',
+        'intent': 'single_value',
+        'limit':  None,
     },
     {
         'nl':     'what is the total capex generated converted and lost',

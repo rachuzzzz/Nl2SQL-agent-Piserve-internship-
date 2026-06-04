@@ -97,8 +97,8 @@ _RAW: list[dict] = [
             # The single biggest silent corruption: "completed" → status='CLOSED' only
             r"status\s*=\s*'CLOSED'\s*(?:AND|ORDER|GROUP|LIMIT|;|$)",
         ],
-        "correct_sql": "status IN ('CLOSED', 'SUBMITTED', 'UNDER_REVIEW', 'RETURN_FOR_MODIFICATION')",
-        "message": "completed inspections include SUBMITTED, CLOSED, UNDER_REVIEW, RETURN_FOR_MODIFICATION — not only CLOSED",
+        "correct_sql": "status IN ('CLOSED', 'SUBMITTED')",
+        "message": "completed inspections = status IN ('CLOSED', 'SUBMITTED') — UNDER_REVIEW and RETURN_FOR_MODIFICATION are NOT completed",
         "severity": "SOFT_WARN",
     },
     {

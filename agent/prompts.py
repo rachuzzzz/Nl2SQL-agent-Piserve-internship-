@@ -136,6 +136,44 @@ KNOWN ANSWER VALUES — route directly to generate_sql, do NOT search for questi
   "facilities that never had X" / "facilities without X" → generate_sql
     Requires facility-level NOT IN subquery — cannot be answered with search tools
 
+NON-EXISTENT TABLES — respond with final_answer immediately, do NOT call generate_sql:
+  If the user mentions any of these tables, they do not exist in the database.
+  Explain the correct table to use and offer to query it instead:
+  - fb_submissions / fb_submission  → use inspection_report (form submissions)
+  - fb_answers / fb_answer          → use ai_answers (form question answers)
+  - fb_responses / fb_response      → use ai_answers
+  - fb_form_answers                 → use ai_answers
+  - fb_users                        → use users table
+  - ai_question (singular)          → use ai_questions (plural)
+  - ai_answer (singular)            → use ai_answers (plural)
+  Do NOT call generate_sql to "explore" these — they simply do not exist.
+
+P&L FINANCIAL MODEL — always route these to generate_sql, NEVER answer with final_answer:
+  This database DOES track profit and loss. The model is:
+  - INCOME  = SUM(po_details.po_amount)   — client paid Khidmah via Purchase Orders
+  - COST    = SUM(pr_details.pr_amount)   — Khidmah paid out via Payment Requests
+  - PROFIT  = INCOME - COST
+  Ground truth totals: Income=684,243.49 | Cost=365,034.16 | Net Profit=319,209.33
+  Route ALL of these to generate_sql immediately:
+  "net profit", "total income", "total cost", "P&L", "profit and loss",
+  "how much did we earn", "revenue", "what is our profit", "income vs cost"
+
+OBSERVATION → CORRECTIVE ACTION — two distinct paths, NEVER confuse them:
+  PATH 1 — CAs for a SPECIFIC observation (user clicked an observation, asks about its CAs):
+    JOIN ai_answers aa ON ica.observation_id = aa.submission_id::uuid
+    WHERE aa.answer_text ILIKE '%the observation text%'
+    Use this when: "corrective actions for this observation", "CAs raised from this finding",
+    "how many CAs for the first observation", "corrective actions linked to this observation"
+
+  PATH 2 — ALL CAs in an inspection:
+    JOIN inspection_report ir ON ica.inspection_id = ir.id
+    WHERE ir.inspection_id = '2026/01/ST074/INS002'
+    Use this when: "all corrective actions for inspection X", "CAs in this inspection"
+
+  KEY RULE: if the user came from an observation list and is asking about CAs,
+  ALWAYS use PATH 1 (observation_id). PATH 2 returns all CAs for the whole
+  inspection which is NOT what the user wants when they're drilling into one observation.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AVAILABLE TOOLS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

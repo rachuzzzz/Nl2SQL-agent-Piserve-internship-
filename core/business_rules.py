@@ -124,6 +124,52 @@ REGISTRY: list[dict] = [
         "sql_pattern": r"\bfb_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}\b",
         "message":     "BLOCKED: Dynamic fb_<uuid> table. Use ai_answers instead.",
     },
+    {
+        "id":          "block_table_impact",
+        "type":        BLOCK,
+        "description": "There is no 'impact' table — impact is stored in ai_answers where aq.label = 'Impact'.",
+        "sql_pattern": r"\bjoin\s+impact\b|\bfrom\s+impact\b",
+        "message":     (
+            "HALLUCINATION: table 'impact' does not exist. "
+            "Impact data is in ai_answers: JOIN ai_questions aq ON aa.element_id = aq.element_id "
+            "WHERE aq.label = 'Impact'. The score is aa.score (1-27), "
+            "categories are in aa.answer_text (comma-separated)."
+        ),
+    },
+    {
+        "id":          "block_ica_ir_varchar_uuid_join",
+        "type":        BLOCK,
+        "description": "ir.inspection_id = ica.inspection_id is a varchar=UUID type mismatch.",
+        "sql_pattern": r"\bir\.inspection_id\s*=\s*ica\.inspection_id\b|\bica\.inspection_id\s*=\s*ir\.inspection_id\b",
+        "message":     (
+            "WRONG JOIN: ir.inspection_id (VARCHAR) ≠ ica.inspection_id (UUID). "
+            "CORRECT: JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id "
+            "(ica.inspection_id is a UUID FK → inspection_report.id UUID PK)"
+        ),
+    },
+    {
+        "id":          "block_ca_for_observation_wrong_path",
+        "type":        BLOCK,
+        "description": (
+            "When fetching CAs for a specific observation text (ILIKE), must use "
+            "observation_id → submission_id path, not inspection join."
+        ),
+        # Fires when: ai_answers ILIKE filter present + ICA joined via inspection_report
+        # but observation_id → submission_id join is absent
+        "sql_pattern": (
+            r"(?=.*\bai_answers\b)"                          # ai_answers present
+            r"(?=.*\bilike\b)"                               # ILIKE filter present
+            r"(?=.*\binspection_corrective_action\b)"        # ICA present
+            r"(?=.*\bica\.inspection_id\s*=\s*ir\.id\b)"     # wrong path: via inspection
+            r"(?!.*\bica\.observation_id\b)"                 # correct path absent
+        ),
+        "message":     (
+            "WRONG PATH: When filtering CAs by observation text (ILIKE), join via "
+            "ica.observation_id = aa.submission_id::uuid — NOT via ica.inspection_id = ir.id. "
+            "The inspection join returns ALL CAs in the inspection; the observation_id join "
+            "returns only CAs directly linked to that specific observation."
+        ),
+    },
 
     # ── CAPEX Lost definition — block capex_status=REJECTED as loss proxy ──────
     {
@@ -150,9 +196,17 @@ REGISTRY: list[dict] = [
         "id":          "block_capex_left_join_multiplication",
         "type":        BLOCK,
         "description": "Direct LEFT JOIN po_details inflates SUM(ica.capex) when one ICA has multiple POs",
-        # Two separate checks — both must be present (order doesn't matter)
-        # Checked via question_pattern match + manual check in validate_sql
-        "sql_pattern": r"(?=.*SUM\s*\(\s*ica\.capex)(?=.*LEFT\s+JOIN\s+po_details)",
+        # Must match: SUM(ica.capex) AND LEFT JOIN po_details in the main query
+        # but NOT when po_details only appears inside a CTE (WITH ... AS (...po_details...))
+        # Detection: LEFT JOIN po_details must appear AFTER the main SELECT (outside CTE)
+        # We detect this by requiring LEFT JOIN po_details to NOT be preceded by a closing paren
+        # that belongs to a CTE definition.
+        # Simpler reliable check: LEFT JOIN po_details appears AND no po_by_ica CTE alias follows it
+        "sql_pattern": (
+            r"(?=.*\bSUM\s*\(\s*ica\.capex)"        # SUM(ica.capex) present
+            r"(?=.*\bLEFT\s+JOIN\s+po_details\b)"   # direct LEFT JOIN po_details
+            r"(?!.*\bpo_by_ica\b)"                  # CTE alias po_by_ica NOT present
+        ),
         "message":     (
             "WRONG: Direct LEFT JOIN po_details inflates SUM(ica.capex) — one ICA can have multiple POs. "
             "Use scalar subqueries instead: "
@@ -245,12 +299,30 @@ REGISTRY: list[dict] = [
         "id":          "block_col_ir_id_in_select",
         "type":        BLOCK,
         "description": "ir.id is a UUID PK — never select for display. Use ir.inspection_id (varchar).",
-        "sql_pattern": r"\bselect\b.*?\bir\.id\b.*?\bfrom\b",
+        # Tightened to avoid false positive on JOIN conditions like ica.inspection_id = ir.id.
+        # Only matches ir.id when it appears as a standalone SELECT expression:
+        # SELECT ir.id,  or  SELECT ..., ir.id,  or  SELECT ..., ir.id AS ...
+        # Does NOT match ir.id inside JOIN ON clauses or WHERE conditions.
+        "sql_pattern": r"\bselect\b\s+(?:[^,]+,\s*)*ir\.id(?:\s+as\s+\w+)?(?:\s*,|\s+from\b)",
         "table_guard": "inspection_report",
         "message":     "WRONG COLUMN: ir.id is the UUID primary key — outputs UUID garbage. Use ir.inspection_id (varchar like '2026/04/ST001/INS001') for display. Note: ir.id in JOIN conditions is correct.",
     },
 
-    # ── Hallucinated columns on inspection_corrective_action ─────────────────
+    # ── close_on misuse in date filters ──────────────────────────────────────
+    {
+        "id":          "block_close_on_date_filter",
+        "type":        BLOCK,
+        "description": "close_on is NULL on most ICA rows — filtering by EXTRACT/date_trunc on close_on returns near-empty results.",
+        "sql_pattern": r"EXTRACT\s*\([^)]*FROM\s+\w*\.?close_on\b|date_trunc\s*\([^)]*,\s*\w*\.?close_on\b",
+        "table_guard": "inspection_corrective_action",
+        "message":     (
+            "WRONG: close_on is NULL on most inspection_corrective_action rows (only set in special workflows). "
+            "NEVER use EXTRACT or date_trunc on close_on for date filtering. "
+            "For 'closed this month' use: WHERE status IN ('CLOSED','CLOSE_WITH_DEFERRED') "
+            "AND date_trunc('month', target_close_out_date) = date_trunc('month', CURRENT_DATE). "
+            "Or use created_on for when the ICA was raised."
+        ),
+    },
     {
         "id":          "block_col_ica_risk_level_bare",
         "type":        BLOCK,
@@ -538,6 +610,43 @@ REGISTRY: list[dict] = [
             "ORDER BY capex_converted DESC LIMIT 5;\n"
             "NEVER: ORDER BY ica.capex — that ranks by GENERATED not CONVERTED\n"
             "NEVER: ica.expenditure filter — that is a category flag, not conversion\n"
+        ),
+    },
+    {
+        "id":             "inject_top_capex_generators",
+        "type":           INJECT,
+        "priority":       96,
+        "description":    "Top N capex generators — ranked by SUM(ica.capex), includes po join for context.",
+        "required_tables": ["po_details"],
+        "forbidden_patterns": [r"ORDER BY.*capex_converted", r"ica\.expenditure"],
+        "question_pattern": (
+            # Must explicitly mention fm manager / facility manager context
+            r"\b(top|best|highest|leading|most).{0,25}capex.{0,20}generat\w*.{0,20}(fm|facility.{0,5}manager|inspectee)\b"
+            r"|\b(top|best|highest|leading|most).{0,25}(fm|facility.{0,5}manager).{0,25}capex.{0,20}generat\w*\b"
+            r"|\bcapex.{0,20}generat\w*.{0,20}(top|best|rank|leaderboard).{0,20}(fm|facility|manager)\b"
+            r"|\b(fm|facility).{0,10}manager.{0,30}generat.{0,20}(most|highest|top).{0,20}capex\b"
+            r"|\bwhich.{0,10}(fm|facility).{0,10}manager.{0,30}(most|highest).{0,20}capex\b"
+        ),
+        "hint": (
+            "\nUSE THIS EXACT SQL FOR TOP CAPEX GENERATORS (ranked by generated, NOT converted):\n"
+            "WITH po_by_ica AS (\n"
+            "    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po\n"
+            "    FROM po_details WHERE active = true GROUP BY 1\n"
+            ")\n"
+            "SELECT\n"
+            "    u.first_name || ' ' || u.last_name  AS fm_manager,\n"
+            "    COUNT(DISTINCT ica.id)              AS ca_count,\n"
+            "    COALESCE(SUM(ica.capex), 0)         AS capex_generated,\n"
+            "    COALESCE(SUM(p.total_po), 0)        AS capex_converted,\n"
+            "    ROUND(COALESCE(SUM(p.total_po), 0) * 100.0 / NULLIF(SUM(ica.capex), 0), 1) AS conversion_pct\n"
+            "FROM inspection_corrective_action ica\n"
+            "JOIN inspection_report ir ON ica.inspection_id = ir.id\n"
+            "JOIN users u ON ir.inspectee_user_id = u.id\n"
+            "LEFT JOIN po_by_ica p ON p.ica_id = ica.id\n"
+            "WHERE ir.active = true AND ica.active = true AND u.active = true AND ica.capex > 0\n"
+            "GROUP BY u.id, u.first_name, u.last_name\n"
+            "ORDER BY capex_generated DESC LIMIT 10;\n"
+            "NEVER: ORDER BY capex_converted — that ranks converters not generators\n"
         ),
     },
     {

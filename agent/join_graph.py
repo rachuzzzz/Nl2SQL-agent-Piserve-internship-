@@ -46,7 +46,7 @@ JOIN_GRAPH: dict[str, dict[str, tuple]] = {
         "inspection_sub_type":   ("ist",  "ist.id = ir.inspection_sub_type_id"),
         "project":               ("proj", "proj.id = ir.project_id"),
         "client":                ("cl",   "cl.id = ir.client_id"),
-        "country":               ("c",    "c.id = ir.country_id"),
+        # NOTE: ir.country_id does not exist — reach country via facility → region → country
         "inspection_cycle":      ("ic",   "ic.id = ir.cycle_id"),
         "inspection_schedule":   ("isched","isched.id = ir.schedule_id"),
         # Two user roles — different aliases to allow both in same query
@@ -116,7 +116,7 @@ JOIN_GRAPH: dict[str, dict[str, tuple]] = {
         "organisation":      ("org", "org.id = fac.organization_id"),   # American spelling on FK
         "country":           ("c",   "c.id = fac.country_id"),
         "region":            ("reg", "reg.id = fac.region_id"),
-        "client":            ("cl",  "cl.id = fac.client_id"),
+        # NOTE: fac.client_id does not exist — client is on inspection_report directly
     },
     "organisation": {
         "facility":          ("fac", "fac.organization_id = org.id"),   # American spelling on FK
@@ -124,7 +124,7 @@ JOIN_GRAPH: dict[str, dict[str, tuple]] = {
     "country": {
         "facility":          ("fac", "fac.country_id = c.id"),
         "region":            ("reg", "reg.country_id = c.id"),
-        "inspection_report": ("ir",  "ir.country_id = c.id"),
+        # NOTE: ir.country_id does not exist — removed from join graph
     },
     "region": {
         "facility":          ("fac", "fac.region_id = reg.id"),
@@ -138,7 +138,7 @@ JOIN_GRAPH: dict[str, dict[str, tuple]] = {
     },
     "client": {
         "inspection_report": ("ir",  "ir.client_id = cl.id"),
-        "facility":          ("fac", "fac.client_id = cl.id"),
+        # NOTE: fac.client_id does not exist — removed from join graph
     },
     "inspection_type":     {"inspection_report": ("ir",  "ir.inspection_type_id = it.id")},
     "frequency_definition":{"inspector_portfolio_details": ("ipd","ipd.frequency_definition_id = fd.id")},

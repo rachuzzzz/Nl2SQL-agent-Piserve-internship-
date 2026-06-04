@@ -24,6 +24,58 @@ _SEMANTIC_FALLBACK_MIN_SCORE = 0.50
 
 
 # ---------------------------------------------------------------------------
+# schema_hint sanitiser
+# ---------------------------------------------------------------------------
+
+# Regex that matches a SQL SELECT statement — used to strip full SQL blocks
+# that Qwen puts in schema_hint on retries (deepseek ignores them anyway).
+_SQL_BLOCK_RE = re.compile(
+    r'(?:^|\n)\s*(?:```sql\s*)?'       # optional fence or newline
+    r'SELECT\b.*?'                       # SELECT keyword
+    r'(?:;|```|(?=\n\s*(?:--|\Z)))',    # end at ; or fence or next comment
+    re.IGNORECASE | re.DOTALL,
+)
+
+def _strip_sql_from_hint(hint: str) -> str:
+    """
+    Remove full SQL SELECT blocks from schema_hint, keeping comment lines.
+
+    deepseek treats its seed examples as higher authority than schema_hint SQL,
+    so a full SQL in schema_hint wastes ~200 tokens and confuses generation.
+    Comment lines (-- ...) are preserved because they carry genuine constraint hints.
+
+    EXCEPTION: hints containing specific filter values (IN-lists with IDs, dates,
+    facility names) are preserved because these carry data deepseek cannot guess.
+    Specifically: if the hint SQL contains WHERE ... IN ('...', '...') with literal
+    string values, we keep it — those values are context deepseek needs.
+    """
+    if not hint or "SELECT" not in hint.upper():
+        return hint
+
+    # Preserve hints that carry specific filter values (IN-lists, = 'literal' filters)
+    # These are context-specific and deepseek cannot guess the values from seeds.
+    _has_value_filter = re.search(
+        r"""\bIN\s*\(\s*'[^']+'\s*(?:,\s*'[^']+'\s*)+\)""",
+        hint, re.IGNORECASE,
+    )
+    if _has_value_filter:
+        return hint  # keep as-is — the specific values are needed
+
+    cleaned = _SQL_BLOCK_RE.sub("", hint)
+    cleaned = re.sub(
+        r'\n\s*(?:FROM|JOIN|LEFT\s+JOIN|INNER\s+JOIN|WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING)\b[^\n]*',
+        '',
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+    return cleaned
+
+
+
+
+
+# ---------------------------------------------------------------------------
 # Tool: list_forms
 # Lists distinct forms known to the system via ai_question (the flat table).
 # Falls back to fb_forms if ai_question has no form_name column.
@@ -447,6 +499,16 @@ def generate_sql(
         if auto_schema and not schema_hint.startswith("Use"):
             schema_hint = f"{auto_schema}\n{schema_hint}" if schema_hint else auto_schema
 
+        # ── Strip full SQL blocks from schema_hint ────────────────────────
+        # When Qwen retries generate_sql, it often puts a full corrected SQL
+        # in schema_hint. deepseek ignores it and generates from seed examples
+        # anyway — so it just wastes tokens and adds noise. Strip SELECT blocks,
+        # keeping only comment lines (-- ...) which are genuinely useful hints.
+        #
+        # We detect SQL blocks by looking for SELECT ... FROM patterns and
+        # remove them, preserving any leading comment lines.
+        schema_hint = _strip_sql_from_hint(schema_hint)
+
         if not sql_prompt_template:
             from agent.prompts import SQL_GENERATION_PROMPT
             sql_prompt_template = SQL_GENERATION_PROMPT
@@ -556,8 +618,58 @@ def generate_sql(
 
         sql = validator.clean_sql(raw_sql)
 
+        # ── AST repair — deterministic fixes before validation ────────────
+        # Repairs hallucinated aa.active/aq.active and injects missing
+        # soft-delete filters. Zero retry cost — mutations logged only.
+        sql, _repairs = validator.ast_repair(sql)
+        if _repairs and _debug_logger:
+            for _r in _repairs:
+                _debug_logger.info(f"  [ast_repair] {_r}")
+        # deepseek sometimes hits token limit mid-generation, producing a valid
+        # SQL fragment that is silently incomplete (e.g. "SELECT col1, col2,;").
+        # Detect by checking the last non-whitespace token before the final ';'.
+        # If it's a comma or a keyword that implies more clauses follow, reject.
+        import re as _re_trunc
+        _sql_stripped = sql.rstrip().rstrip(';').rstrip()
+        if _sql_stripped and _sql_stripped[-1] == ',':
+            return {
+                "success": True,
+                "result": {
+                    "sql": sql,
+                    "validation": {
+                        "passed": False,
+                        "errors": ["TRUNCATED_SQL: SQL ends mid-clause (trailing comma) — deepseek hit token limit. Retry with a simpler query."],
+                        "warnings": [],
+                        "_vresult": None,
+                    },
+                },
+                "error": None,
+            }
+        # ── end truncation detection ──────────────────────────────────────────
+
         # validate() returns ValidationResult — hard fails block, soft warns are advisory only.
         vresult = validator.validate(sql)
+
+        # ── Business rules BLOCK/WARN validation ─────────────────────────────
+        # Runs the 44 BLOCK rules from business_rules.py (hallucinated tables,
+        # hallucinated columns, wrong join patterns, capex_status misuse, etc.)
+        # These run AFTER validator.validate() so both sets of errors are merged.
+        try:
+            from core.business_rules import get_engine as _get_br_engine
+            _br_engine = _get_br_engine()
+            _br_passed, _br_msgs = _br_engine.validate_sql(sql)
+            if not _br_passed:
+                # Merge BLOCK errors into vresult as hard fails
+                from core.validator import ValidationIssue
+                for _msg in _br_msgs:
+                    vresult.issues.append(
+                        ValidationIssue("HARD_FAIL", "BUSINESS_RULE", _msg)
+                    )
+                vresult.passed = False
+        except Exception as _br_exc:
+            if _debug_logger:
+                _debug_logger.debug(f"  [business_rules] skipped: {_br_exc}")
+        # ── end business rules ────────────────────────────────────────────────
 
         # validate_semantic() returns SOFT_WARN issues only.
         # These are logged for observability but NEVER injected into the retry prompt.

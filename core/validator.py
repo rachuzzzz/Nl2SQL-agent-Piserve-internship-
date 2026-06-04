@@ -31,7 +31,7 @@ except ImportError:
     _HAS_SQLGLOT = False
 
 try:
-    from core.buisness_glossary import check_glossary as _check_glossary
+    from core.business_glossary import check_glossary as _check_glossary
     _HAS_GLOSSARY = True
 except ImportError:
     _HAS_GLOSSARY = False
@@ -194,10 +194,21 @@ class SQLValidator:
             "question_type":  "use entity_type instead",
             "page_name":      "column does not exist on ai_questions",
             "required":       "column does not exist on ai_questions",
+            "active":         "ai_questions has no active column — no soft-delete on this table",
         },
         "ai_answers": {
-            "answer_value": "use answer_text (text) or answer_numeric (numeric)",
-            "form_name":    "use module_name (ai_answers has no form_name column)",
+            "answer_value":  "use answer_text (text) or answer_numeric (numeric)",
+            "form_name":     "use module_name (ai_answers has no form_name column)",
+            "label":         "ai_answers has no label column — JOIN ai_questions aq ON aa.element_id = aq.element_id, then filter aq.label = '...'",
+            "active":        "ai_answers has no active column — filter via inspection_report: ir.active = true AND ir.status != 'DRAFT'",
+        },
+        "inspection_schedule": {
+            # deepseek training bias: uses scheduled_date (past participle) instead of schedule_date
+            "scheduled_date": "column is 'schedule_date' not 'scheduled_date' on inspection_schedule",
+            # inspection_schedule has no active column
+            "active":         "inspection_schedule has no active column — no soft-delete on this table",
+            # inspection_id does not exist — use inspection_report_id
+            "inspection_id":  "inspection_schedule has no inspection_id — use inspection_report_id FK",
         },
     }
 
@@ -228,7 +239,7 @@ class SQLValidator:
         # capex_status DOES exist (unsuppressed) — do not flag it
         "adequacy_status":    "does not exist — adequacy workflow not active",
         "risk_level":         "does not exist as a column — risk_level_id is a UUID FK; JOIN risk_level rl ON ica.risk_level_id = rl.id → rl.name",
-        "impact":             "does not exist as a column — impact_id is a UUID FK; JOIN impact i ON ica.impact_id = i.id → i.name",
+        "impact":             "does not exist as a column on ica — impact data is in ai_answers: JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aq.label = 'Impact'",
         # Other ghost columns seen in traces
         "corrective_action_description": "does not exist — use ica.corrective_action (the text field)",
     }
@@ -255,6 +266,17 @@ class SQLValidator:
         # inspection_schedule.inspection_id — does not exist
         (r'\bisched\.inspection_id\b|\binspection_schedule\.inspection_id\b',
          'inspection_schedule has no inspection_id — use inspection_report_id FK'),
+        # ── observation → ai_answers cast direction ───────────────────────────
+        # CORRECT cast: ica.observation_id = aa.submission_id::uuid
+        #   (ica.observation_id is uuid, aa.submission_id is varchar — cast the varchar)
+        # WRONG casts caught below:
+        #   aa.submission_id = ica.observation_id::uuid  (reversed)
+        #   ica.observation_id::text = aa.submission_id  (wrong side cast)
+        (r'\baa\.submission_id\s*=\s*ica\.observation_id(?:::\w+)?\b',
+         'Wrong cast direction. Correct: ica.observation_id = aa.submission_id::uuid '
+         '(cast the varchar submission_id to uuid, not the uuid observation_id)'),
+        (r'\bica\.observation_id\s*::\s*text\s*=\s*aa\.submission_id\b',
+         'Wrong cast direction. Correct: ica.observation_id = aa.submission_id::uuid'),
     ]
 
     # UUID FK columns — SOFT_WARN if selected without their lookup JOIN
@@ -346,10 +368,26 @@ class SQLValidator:
         for table, col_hints in self.HALLUCINATED_AI_COLUMNS.items():
             if not re.search(rf"\b{re.escape(table)}\b", sql_lower):
                 continue
+            # Collect the aliases used for this table in FROM/JOIN clauses
+            # e.g. "FROM ai_answers aa" → alias "aa"
+            # e.g. "JOIN ai_answers ans" → alias "ans"
+            # We only flag qualified refs where the alias maps to THIS table.
+            table_aliases: set[str] = set()
+            for m in re.finditer(
+                rf'\b{re.escape(table)}\s+(\w+)\b', sql_lower
+            ):
+                table_aliases.add(m.group(1))
+            # Also include the bare table name itself as a possible qualifier
+            table_aliases.add(table)
+
             for col, hint in col_hints.items():
-                # Only match qualified references (alias.col or table.col)
-                # to avoid flagging valid AS aliases like "SELECT ... AS form_name"
-                if re.search(rf"\b\w+\.{re.escape(col)}\b", sql_lower):
+                # Only match qualified references (alias.col) where alias ∈ table_aliases
+                found = False
+                for alias in table_aliases:
+                    if re.search(rf'\b{re.escape(alias)}\.{re.escape(col)}\b', sql_lower):
+                        found = True
+                        break
+                if found:
                     issues.append(ValidationIssue(
                         "HARD_FAIL", "WRONG_COLUMN",
                         f"Column '{col}' does not exist on {table} — {hint}",
@@ -410,12 +448,15 @@ class SQLValidator:
         # ── 5c. Impossible JOIN conditions (from join graph) ─────────────
         for _pattern, _correct in self.IMPOSSIBLE_JOIN_PATTERNS:
             if re.search(_pattern, sql_lower):
+                # Distinguish cast-direction errors with a dedicated code
+                # so the retry message is specific, not generic IMPOSSIBLE_JOIN.
+                _code = "WRONG_CAST_DIR" if "cast" in _correct.lower() or "submission_id" in _pattern else "IMPOSSIBLE_JOIN"
                 issues.append(ValidationIssue(
-                    "HARD_FAIL", "IMPOSSIBLE_JOIN",
-                    f"Impossible join detected — {_correct}",
+                    "HARD_FAIL", _code,
+                    f"{'Wrong cast direction' if _code == 'WRONG_CAST_DIR' else 'Impossible join'} — {_correct}",
                     detail=f"Pattern matched: {_pattern}",
                 ))
-                ValidatorStats.record("IMPOSSIBLE_JOIN", is_retry_trigger=True)
+                ValidatorStats.record(_code, is_retry_trigger=True)
 
         # ── 6. ir.id in SELECT clause (UUID PK exposed for display) ───────
         # IMPORTANT: ir.id is CORRECT and required as a JOIN key, e.g.:
@@ -479,6 +520,26 @@ class SQLValidator:
             ))
             ValidatorStats.record("HARDCODED_YEAR", is_retry_trigger=False)
 
+        # ── 9b. Stale hardcoded date literal — HARD_FAIL ─────────────────
+        # deepseek hallucinates DATE '2023-01-01' or '2022-...' from training data
+        # when generating date range filters. These are always wrong — the data is
+        # from 2025/2026. Only fire for years clearly in the past (≤ current year - 2)
+        # to avoid blocking intentional historical queries like "inspections in 2024".
+        _stale_date_re = re.compile(
+            r"""(?:date\s+['"]|['"])(20(?:2[0-4]|1\d))-\d{2}-\d{2}['"]""",
+            re.IGNORECASE,
+        )
+        for m in _stale_date_re.finditer(sql_lower):
+            stale_year = m.group(0)
+            issues.append(ValidationIssue(
+                "HARD_FAIL", "STALE_DATE_LITERAL",
+                f"Hardcoded stale date literal detected — use EXTRACT(MONTH/YEAR FROM CURRENT_DATE) "
+                f"or pass the year from context instead of a fixed past date",
+                detail=f"Matched: {stale_year}",
+            ))
+            ValidatorStats.record("STALE_DATE_LITERAL", is_retry_trigger=True)
+            break  # one report is enough
+
         # ── 10. close_on arithmetic — SOFT_WARN (not a hard fail) ─────────
         # close_on is NULL for most records but arithmetic IS valid for the
         # subset where it is populated. Block only with a soft advisory.
@@ -491,7 +552,45 @@ class SQLValidator:
             ))
             ValidatorStats.record("UNRELIABLE_COLUMN", is_retry_trigger=False)
 
-        # ── 11. Missing LIMIT — SOFT_WARN ─────────────────────────────────
+        # ── 10b. TO_CHAR used as a WHERE filter — HARD_FAIL ───────────────
+        # TO_CHAR(col, 'Month YYYY') = 'January 2026' silently returns 0 rows
+        # because PostgreSQL pads month names: 'January   2026' ≠ 'January 2026'.
+        # This pattern is ONLY valid for GROUP BY labels / SELECT display.
+        if re.search(r'\bto_char\b', sql_lower):
+            # Detect: to_char(...'Month YYYY'...) = '...' anywhere in the SQL
+            # Use a flat scan (not [^)]+) to handle nested calls like date_trunc('month',...)
+            tochar_month_eq = re.search(
+                r"\bto_char\b[^;]*'month\s+yyyy'[^;]*=\s*'",
+                sql_lower, re.IGNORECASE | re.DOTALL,
+            )
+            if tochar_month_eq:
+                # Confirm a WHERE keyword precedes this pattern (not just SELECT/GROUP BY)
+                before = sql_lower[:tochar_month_eq.start()]
+                in_where = bool(re.search(r'\bwhere\b', before))
+                if in_where:
+                    issues.append(ValidationIssue(
+                        "HARD_FAIL", "TOCHAR_WHERE_FILTER",
+                        "TO_CHAR(..., 'Month YYYY') = '...' in WHERE always returns 0 rows — "
+                        "use submitted_on >= 'YYYY-MM-01' AND < next month instead",
+                        detail="PostgreSQL pads month names with spaces: 'January   2026' != 'January 2026'",
+                    ))
+                    ValidatorStats.record("TOCHAR_WHERE_FILTER", is_retry_trigger=True)
+
+        # ── 10c. Truncated inspection_id — HARD_FAIL ──────────────────────
+        # inspection_id is always 'YYYY/MM/STXXX/INSXXX' (full VARCHAR).
+        # deepseek sometimes drops the 'YYYY/MM/' prefix, producing 'STXXX/INSXXX'.
+        # Detect: inspection_id = 'STXXX/INSXXX' (missing year/month prefix).
+        _trunc_id = re.search(
+            r"""inspection_id\s*=\s*['"](?!\d{4}/)(st\d+/ins\d+)['"]""",
+            sql_lower, re.IGNORECASE,
+        )
+        if _trunc_id:
+            issues.append(ValidationIssue(
+                "HARD_FAIL", "TRUNCATED_INSPECTION_ID",
+                f"Truncated inspection_id '{_trunc_id.group(1)}' — full format is 'YYYY/MM/STXXX/INSXXX'",
+                detail="Use the full inspection_id string as provided by the user",
+            ))
+            ValidatorStats.record("TRUNCATED_INSPECTION_ID", is_retry_trigger=True)
         has_agg = bool(self._AGG_RE.search(sql))
         if not has_agg and not self._LIMIT_RE.search(sql):
             issues.append(ValidationIssue(
@@ -546,6 +645,30 @@ class SQLValidator:
 
         issues: list[ValidationIssue] = []
         q_lower = question.lower()
+
+        # ── Completed status filter ───────────────────────────────────────
+        # "completed inspections" must filter status IN ('CLOSED','SUBMITTED').
+        # status != 'DRAFT' alone is insufficient — it includes IN_PROGRESS etc.
+        # NOTE: SOFT_WARN only — deepseek cannot fix this via retry because it
+        # copies the seed example. Fix is in the seed SQL and CORE_CONTEXT.
+        _COMPLETED_Q = re.compile(
+            r"\b(completed|finished|done|finalized)\s+(inspection|inspections?)\b"
+            r"|\binspections?\s+(were\s+)?(completed|finished|done|finalized)\b"
+            r"|\bhow\s+many\s+inspections?.{0,20}(completed|finished|done)\b",
+            re.IGNORECASE,
+        )
+        if _COMPLETED_Q.search(question):
+            has_submitted = "'SUBMITTED'" in sql.upper() or "\"SUBMITTED\"" in sql
+            has_closed = "'CLOSED'" in sql.upper() or "\"CLOSED\"" in sql
+            if not (has_submitted or has_closed):
+                issues.append(ValidationIssue(
+                    "SOFT_WARN", "MISSING_COMPLETED_STATUS",
+                    "Query asks about 'completed' inspections but SQL has neither 'CLOSED' nor 'SUBMITTED'",
+                    detail="completed_inspection = status IN ('CLOSED','SUBMITTED')",
+                    retryable=False,
+                ))
+                ValidatorStats.record("MISSING_COMPLETED_STATUS", is_retry_trigger=False)
+                return ValidationResult(passed=True, issues=issues)  # warn but don't block
 
         # Detect single-row comparison intent
         is_single_row_intent = bool(self._SINGLE_ROW_PATTERNS.search(q_lower))
@@ -825,6 +948,247 @@ class SQLValidator:
             r'^fb_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}$',
             table_name,
         ))
+
+    # ------------------------------------------------------------------ #
+    # AST repair — deterministic post-generation fixes via sqlglot
+    # ------------------------------------------------------------------ #
+
+    # Tables that have an `active` boolean soft-delete column.
+    _SOFT_DELETE_TABLES: frozenset = frozenset({
+        "inspection_report", "inspection_corrective_action", "facility",
+        "users", "inspection_type", "inspection_sub_type",
+        "inspector_portfolio", "inspector_portfolio_details",
+        "frequency_definition", "po_details", "pr_details", "risk_level",
+        "client", "project", "country", "region", "entity", "organisation",
+    })
+
+    # Tables that NEVER have an active column — never inject for these.
+    _NO_ACTIVE_TABLES: frozenset = frozenset({
+        "ai_answers", "ai_questions", "role", "user_roles",
+        "inspection_schedule",
+    })
+
+    def ast_repair(self, sql: str) -> tuple:
+        """
+        Deterministic AST-level repairs using sqlglot. Every mutation is
+        logged in the returned mutations list. Falls back to original SQL
+        on parse failure — never corrupts.
+
+        Repairs:
+          1. Remove aa.active / aq.active  (columns don't exist)
+          2. Inject {alias}.active = true  for soft-delete tables missing it
+        """
+        if not _HAS_SQLGLOT:
+            return sql, []
+
+        mutations: list = []
+
+        try:
+            tree = sqlglot.parse_one(sql, dialect="postgres")
+        except Exception:
+            return sql, []
+
+        # ── 1. Drop hallucinated active columns on no-active tables ─────────
+        # ALL tables in _NO_ACTIVE_TABLES have no soft-delete column.
+        # Covers ai_answers, ai_questions, role, user_roles, inspection_schedule.
+        # deepseek writes `aa.active`, `sched.active` etc from training bias.
+        _no_active_aliases: set = set()
+        for node in tree.find_all(exp.Table):
+            if node.name and node.name.lower() in self._NO_ACTIVE_TABLES:
+                _no_active_aliases.add((node.alias or node.name).lower())
+
+        if _no_active_aliases:
+            def _drop_ai_active(node):
+                if (isinstance(node, exp.EQ)
+                        and isinstance(node.left, exp.Column)
+                        and node.left.name.lower() == "active"
+                        and node.left.table
+                        and node.left.table.lower() in _no_active_aliases):
+                    mutations.append(
+                        f"Removed {node.left.table}.active "
+                        f"(table has no active column)"
+                    )
+                    return exp.true()
+                return node
+
+            tree = tree.transform(_drop_ai_active)
+            # Clean up AND(TRUE, x) → x and AND(x, TRUE) → x
+            def _simplify_and(node):
+                if isinstance(node, exp.And):
+                    if isinstance(node.left, exp.Boolean) and node.left.this:
+                        return node.right
+                    if isinstance(node.right, exp.Boolean) and node.right.this:
+                        return node.left
+                return node
+            tree = tree.transform(_simplify_and)
+
+        # ── 2. Inject active = true for soft-delete tables ────────────────
+        def _direct_tables(sel: exp.Select) -> dict:
+            """alias → table_name for tables directly in this SELECT's FROM/JOIN."""
+            result = {}
+            def _add(t):
+                if isinstance(t, exp.Table) and t.name:
+                    result[(t.alias or t.name).lower()] = t.name.lower()
+            # sqlglot v20+ uses 'from_' key; older versions use 'from'
+            from_clause = sel.args.get("from_") or sel.args.get("from")
+            if from_clause:
+                _add(from_clause.this)
+            for j in (sel.args.get("joins") or []):
+                _add(j.this)
+            return result
+
+        def _active_aliases(where) -> set:
+            """Aliases already filtered by active = true/TRUE/1 (qualified or bare)."""
+            found = set()
+            if where is None:
+                return found
+            for eq in where.find_all(exp.EQ):
+                if (isinstance(eq.left, exp.Column)
+                        and eq.left.name.lower() == "active"):
+                    right = eq.right
+                    is_true = (
+                        (isinstance(right, exp.Boolean) and right.this is True)
+                        or (isinstance(right, exp.Literal)
+                            and str(right.this).lower() in ("1", "true"))
+                    )
+                    if is_true:
+                        if eq.left.table:
+                            found.add(eq.left.table.lower())
+                        else:
+                            # Bare `active = true` without alias covers all tables
+                            # in this scope — mark with sentinel so we skip injection
+                            found.add("__bare__")
+            return found
+
+        def _inject_active(sel: exp.Select) -> exp.Select:
+            direct = _direct_tables(sel)
+            existing = _active_aliases(sel.args.get("where"))
+            # If bare `active = true` present, skip injection — it already filters
+            if "__bare__" in existing:
+                return sel
+            for alias, tname in sorted(direct.items()):
+                if (tname in self._SOFT_DELETE_TABLES
+                        and alias not in existing):
+                    cond = exp.EQ(
+                        this=exp.Column(
+                            this=exp.Identifier(this="active"),
+                            table=exp.Identifier(this=alias),
+                        ),
+                        expression=exp.true(),
+                    )
+                    sel = sel.where(cond)
+                    mutations.append(f"Injected {alias}.active = true ({tname})")
+            return sel
+
+        # ── 4. Strip date_trunc wrapping bare string literals in comparisons ─
+        # deepseek generates: ir.submitted_on >= date_trunc('month', '2026-03-01')
+        # PostgreSQL can't infer the type of the bare string inside date_trunc
+        # → raises "function date_trunc(unknown, unknown) is ambiguous".
+        # Fix: replace with CAST('YYYY-MM-DD' AS DATE) which is unambiguous.
+        # sqlglot parses date_trunc('month', 'literal') as TimestampTrunc.
+        def _fix_date_trunc_literal(node):
+            if not isinstance(node, exp.TimestampTrunc):
+                return node
+            date_arg = node.args.get("this")
+            if isinstance(date_arg, exp.Literal) and date_arg.is_string:
+                mutations.append(
+                    f"Replaced date_trunc('month', '{date_arg.this}') "
+                    f"→ CAST('{date_arg.this}' AS DATE)"
+                )
+                return exp.Cast(
+                    this=exp.Literal.string(date_arg.this),
+                    to=exp.DataType(this=exp.DataType.Type.DATE),
+                )
+            return node
+
+        tree = tree.transform(_fix_date_trunc_literal)
+
+        tree = tree.transform(
+            lambda n: _inject_active(n) if isinstance(n, exp.Select) else n
+        )
+
+        # ── 5. Fix sched.scheduled_date → sched.schedule_date ────────────
+        # deepseek training bias: uses 'scheduled_date' (past participle) but
+        # the actual column on inspection_schedule is 'schedule_date'.
+        _sched_aliases: set = set()
+        for node in tree.find_all(exp.Table):
+            if node.name and node.name.lower() == "inspection_schedule":
+                _sched_aliases.add((node.alias or node.name).lower())
+
+        if _sched_aliases:
+            def _fix_scheduled_date(node):
+                if (isinstance(node, exp.Column)
+                        and node.name.lower() == "scheduled_date"
+                        and node.table
+                        and node.table.lower() in _sched_aliases):
+                    mutations.append(
+                        f"Renamed {node.table}.scheduled_date → {node.table}.schedule_date"
+                    )
+                    return exp.Column(
+                        this=exp.Identifier(this="schedule_date"),
+                        table=exp.Identifier(this=node.table),
+                    )
+                return node
+            tree = tree.transform(_fix_scheduled_date)
+        # deepseek hallucinates a standalone 'impact' table every time it generates
+        # CA detail queries. ast_repair removes both the JOIN and any SELECT columns
+        # referencing the impact alias, so the BLOCK rule never fires.
+        _impact_aliases: set = set()
+        for node in tree.find_all(exp.Table):
+            if node.name and node.name.lower() == "impact":
+                _impact_aliases.add((node.alias or node.name).lower())
+
+        if _impact_aliases:
+            # Remove impact columns from SELECT expressions
+            def _drop_impact_cols(node):
+                if isinstance(node, exp.Select):
+                    new_exprs = []
+                    for expr in node.expressions:
+                        col = expr.this if isinstance(expr, exp.Alias) else expr
+                        if (isinstance(col, exp.Column)
+                                and col.table
+                                and col.table.lower() in _impact_aliases):
+                            mutations.append(
+                                f"Removed {col.table}.{col.name} "
+                                f"(table 'impact' does not exist — use ai_answers WHERE aq.label='Impact')"
+                            )
+                            continue
+                        new_exprs.append(expr)
+                    if len(new_exprs) < len(node.expressions):
+                        node = node.copy()
+                        node.set("expressions", new_exprs)
+                return node
+
+            tree = tree.transform(_drop_impact_cols)
+
+            # Remove the JOIN to impact from every Select node's joins list
+            # (transform can't delete JOIN nodes — must mutate the joins list directly)
+            for sel in tree.find_all(exp.Select):
+                joins = sel.args.get("joins")
+                if not joins:
+                    continue
+                new_joins = []
+                for j in joins:
+                    tbl = j.this
+                    if (isinstance(tbl, exp.Table)
+                            and tbl.name
+                            and tbl.name.lower() == "impact"):
+                        mutations.append("Removed JOIN impact (table does not exist)")
+                    else:
+                        new_joins.append(j)
+                if len(new_joins) < len(joins):
+                    sel.set("joins", new_joins)
+
+        if not mutations:
+            return sql, []
+
+        try:
+            repaired = tree.sql(dialect="postgres", pretty=False)
+            if repaired and not repaired.rstrip().endswith(";"):
+                repaired = repaired.rstrip() + ";"
+            return repaired, mutations
+        except Exception:
+            return sql, []
 
 
 # ---------------------------------------------------------------------------
