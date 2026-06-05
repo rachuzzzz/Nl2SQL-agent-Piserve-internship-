@@ -460,12 +460,40 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_interval_30_days_for_month",
         "type":        BLOCK,
-        "description": "INTERVAL '30 days' is not 'this month' — it's a rolling window.",
+        "description": "INTERVAL '30 days' used as proxy for 'this month' — wrong semantics.",
+        # Only fire when question asks about 'this month' or 'current month'
+        # but SQL uses INTERVAL '30 days' as the filter (rolling window ≠ calendar month).
+        # NEVER fire when user explicitly says 'last 30 days', 'past 30 days', 'in 30 days' etc.
         "sql_pattern": r"INTERVAL\s*'30\s*days?'",
+        "question_pattern": r"\b(this\s+month|current\s+month|in\s+(?:the\s+)?month)\b",
         "message":     (
             "BLOCKED: INTERVAL '30 days' is a rolling 30-day window, NOT 'this month'. "
             "For 'this month' use: date_trunc('month', col) = date_trunc('month', NOW()). "
-            "Only use INTERVAL '30 days' if the question literally says 'last 30 days' or 'past 30 days'."
+            "Only use INTERVAL '30 days' when the question says 'last 30 days' or 'past 30 days'."
+        ),
+    },
+    {
+        "id":          "block_inspector_not_in_pattern",
+        "type":        BLOCK,
+        "description": "NOT IN (SELECT inspector_user_id) misses new inspectors with zero inspections.",
+        # Fires when: query asks about inactive/missing inspectors using NOT IN subquery
+        # on inspection_report — this silently excludes brand-new inspectors.
+        "sql_pattern": (
+            r"\bNOT\s+IN\s*\(\s*SELECT\b.*?\binspector_user_id\b.*?\bFROM\s+inspection_report\b"
+        ),
+        "question_pattern": (
+            r"\b(inspector|inspectors?)\b.{0,50}"
+            r"\b(haven.t|not|no|never|inactive|zero|0)\b.{0,30}"
+            r"\b(inspection|submitted|conducted|done|performed|activity)\b"
+        ),
+        "message": (
+            "WRONG PATTERN: NOT IN (SELECT inspector_user_id FROM inspection_report) "
+            "misses new inspectors who have ZERO inspections — they have no rows in "
+            "inspection_report so they don't appear in either the subquery or the result. "
+            "CORRECT: start from users JOIN user_roles JOIN role, "
+            "LEFT JOIN inspection_report ON ir.inspector_user_id = u.id, "
+            "HAVING MAX(ir.submitted_on) < CURRENT_DATE - INTERVAL '...' "
+            "OR MAX(ir.submitted_on) IS NULL"
         ),
     },
     {
@@ -1374,14 +1402,20 @@ class RulesEngine:
 
     # ── SQL validation ────────────────────────────────────────────────────────
 
-    def validate_sql(self, sql: str) -> tuple[bool, list[str]]:
+    def validate_sql(self, sql: str, question: str = "") -> tuple[bool, list[str]]:
         """
         Apply BLOCK and WARN rules to the given SQL.
         Returns (passed, [error/warning strings]).
         Real errors (BLOCK) cause passed=False.
+
+        question — optional user question text. When provided, BLOCK rules with a
+                   question_pattern will only fire if that pattern matches the question.
+                   Allows context-sensitive rules (e.g. INTERVAL '30 days' is only wrong
+                   when user asked about 'this month', not when they said 'last 30 days').
         """
         errors: list[str] = []
         sql_lower = sql.lower()
+        q_lower = question.lower() if question else ""
 
         for rule in self._block_rules:
             pattern_re: re.Pattern = rule["_sql_re"]
@@ -1389,6 +1423,13 @@ class RulesEngine:
             guard = rule.get("table_guard")
             if guard and guard.lower() not in sql_lower:
                 continue
+            # Optional question_pattern: rule only fires if question matches.
+            # If question is empty/unknown, skip question_pattern rules entirely —
+            # we have no context to evaluate them, so don't block.
+            q_pat = rule.get("_q_re")
+            if q_pat:
+                if not q_lower or not q_pat.search(q_lower):
+                    continue
             if pattern_re.search(sql):
                 errors.append(rule["message"])
 

@@ -46,7 +46,7 @@ JOIN_GRAPH: dict[str, dict[str, tuple]] = {
         "inspection_sub_type":   ("ist",  "ist.id = ir.inspection_sub_type_id"),
         "project":               ("proj", "proj.id = ir.project_id"),
         "client":                ("cl",   "cl.id = ir.client_id"),
-        # NOTE: ir.country_id does not exist — reach country via facility → region → country
+        "country":               ("c",    "c.id = ir.country_id"),
         "inspection_cycle":      ("ic",   "ic.id = ir.cycle_id"),
         "inspection_schedule":   ("isched","isched.id = ir.schedule_id"),
         # Two user roles — different aliases to allow both in same query
@@ -116,7 +116,7 @@ JOIN_GRAPH: dict[str, dict[str, tuple]] = {
         "organisation":      ("org", "org.id = fac.organization_id"),   # American spelling on FK
         "country":           ("c",   "c.id = fac.country_id"),
         "region":            ("reg", "reg.id = fac.region_id"),
-        # NOTE: fac.client_id does not exist — client is on inspection_report directly
+        "client":            ("cl",  "cl.id = fac.client_id"),
     },
     "organisation": {
         "facility":          ("fac", "fac.organization_id = org.id"),   # American spelling on FK
@@ -124,7 +124,7 @@ JOIN_GRAPH: dict[str, dict[str, tuple]] = {
     "country": {
         "facility":          ("fac", "fac.country_id = c.id"),
         "region":            ("reg", "reg.country_id = c.id"),
-        # NOTE: ir.country_id does not exist — removed from join graph
+        "inspection_report": ("ir",  "ir.country_id = c.id"),
     },
     "region": {
         "facility":          ("fac", "fac.region_id = reg.id"),
@@ -138,13 +138,44 @@ JOIN_GRAPH: dict[str, dict[str, tuple]] = {
     },
     "client": {
         "inspection_report": ("ir",  "ir.client_id = cl.id"),
-        # NOTE: fac.client_id does not exist — removed from join graph
+        "facility":          ("fac", "fac.client_id = cl.id"),
     },
     "inspection_type":     {"inspection_report": ("ir",  "ir.inspection_type_id = it.id")},
     "frequency_definition":{"inspector_portfolio_details": ("ipd","ipd.frequency_definition_id = fd.id")},
     "risk_level":          {"inspection_corrective_action": ("ica","ica.risk_level_id = rl.id")},
     "users_inspector":     {"inspection_report": ("ir",  "ir.inspector_user_id = u.id")},
     "users_inspectee":     {"inspection_report": ("ir",  "ir.inspectee_user_id = uinsp.id")},
+
+    # ── Communication Groups ────────────────────────────────────────────────
+    # inspection_communication_group: the group entity (id, name, active)
+    # Junction tables link groups to facilities, organisations, countries, projects
+    # inspection_group_emails: email recipients for a group
+    #
+    # Join paths:
+    #   facility → icg_facilities → icg (which group is a facility in?)
+    #   organisation → icg_organisations → icg (which group is an org in?)
+    #   icg → icg_emails (what emails does a group have?)
+    #   organisation → organisation_countries → country (which countries is an org in?)
+    "inspection_communication_group": {
+        "inspection_communication_group_facilities":    ("icgf",  "icgf.group_id = icg.id"),
+        "inspection_communication_group_organisations": ("icgo",  "icgo.group_id = icg.id"),
+        "inspection_group_emails":                      ("ige",   "ige.group_id = icg.id"),
+    },
+    "inspection_communication_group_facilities": {
+        "inspection_communication_group": ("icg",  "icg.id = icgf.group_id"),
+        "facility":                        ("fac",  "fac.id = icgf.facility_id"),
+    },
+    "inspection_communication_group_organisations": {
+        "inspection_communication_group": ("icg",  "icg.id = icgo.group_id"),
+        "organisation":                    ("org",  "org.id = icgo.organisation_id"),
+    },
+    "inspection_group_emails": {
+        "inspection_communication_group": ("icg",  "icg.id = ige.group_id"),
+    },
+    "organisation_countries": {
+        "organisation": ("org", "org.id = oc.organisation_id"),
+        "country":      ("c",   "c.id = oc.country_id"),
+    },
 }
 
 
@@ -177,6 +208,12 @@ CANONICAL_ALIAS: dict[str, str] = {
     "project":                      "proj",
     "client":                       "cl",
     "entity":                       "ent",
+    # Communication groups
+    "inspection_communication_group":               "icg",
+    "inspection_communication_group_facilities":    "icgf",
+    "inspection_communication_group_organisations": "icgo",
+    "inspection_group_emails":                      "ige",
+    "organisation_countries":                       "oc",
 }
 
 

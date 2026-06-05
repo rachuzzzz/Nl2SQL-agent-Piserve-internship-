@@ -1541,17 +1541,28 @@ GROUP BY ica.responsible ORDER BY ica.responsible;
         'limit':  None,
     },
     {
-        'nl':     "which inspectors haven't submitted any inspections in the last 30 days",
+        'nl':     "which inspectors haven't submitted any inspections in the last 30 days inspectors with no recent activity inactive inspectors new inspectors who haven't inspected yet inspectors never submitted",
         'sql':    """\
-SELECT u.first_name || ' ' || u.last_name AS inspector_name
+-- CORRECT: start from users JOIN role, LEFT JOIN inspection_report
+-- This includes new inspectors who have NEVER submitted (last_inspection_date IS NULL)
+-- WRONG pattern: NOT IN (SELECT inspector_user_id FROM inspection_report WHERE ...)
+--   → silently excludes brand-new inspectors with zero rows in inspection_report
+SELECT u.first_name || ' ' || u.last_name AS inspector_name,
+       MAX(ir.submitted_on)               AS last_inspection_date
 FROM users u
-WHERE u.id NOT IN (
-    SELECT DISTINCT ir.inspector_user_id FROM inspection_report ir
-    WHERE ir.submitted_on >= CURRENT_DATE - INTERVAL '30 days'
+JOIN user_roles ur ON ur.user_id = u.id
+JOIN role r        ON r.id = ur.role_id
+LEFT JOIN inspection_report ir
+       ON ir.inspector_user_id = u.id
       AND ir.status != 'DRAFT'
-      AND ir.inspector_user_id IS NOT NULL
-)
-ORDER BY u.first_name, u.last_name;
+      AND ir.active = true
+WHERE r.name ILIKE '%inspector%'
+  AND u.active = true
+GROUP BY u.id, u.first_name, u.last_name
+HAVING MAX(ir.submitted_on) < CURRENT_DATE - INTERVAL '30 days'
+    OR MAX(ir.submitted_on) IS NULL
+ORDER BY last_inspection_date ASC NULLS FIRST
+LIMIT 100;
 """,
         'domain': 'inspection',
         'intent': 'filter',
@@ -1678,6 +1689,99 @@ ORDER BY assignment_count DESC LIMIT 1;
         'domain': 'schedule',
         'intent': 'single_value',
         'limit':  1,
+    },
+    {
+        'nl':     'which communication group does a facility belong to show communication group for facility',
+        'sql':    """\
+SELECT icg.name AS communication_group, fac.name AS facility_name
+FROM inspection_communication_group icg
+JOIN inspection_communication_group_facilities icgf ON icgf.group_id = icg.id
+JOIN facility fac ON fac.id = icgf.facility_id
+WHERE icg.active = true AND fac.active = true
+ORDER BY icg.name, fac.name;
+""",
+        'domain': 'organisation',
+        'intent': 'list',
+        'limit':  None,
+    },
+    {
+        'nl':     'show all facilities in a communication group list facilities for communication group',
+        'sql':    """\
+SELECT fac.name AS facility_name, icg.name AS communication_group
+FROM inspection_communication_group icg
+JOIN inspection_communication_group_facilities icgf ON icgf.group_id = icg.id
+JOIN facility fac ON fac.id = icgf.facility_id
+WHERE icg.active = true AND fac.active = true
+  AND icg.name ILIKE '%group_name%'
+ORDER BY fac.name;
+""",
+        'domain': 'organisation',
+        'intent': 'list',
+        'limit':  None,
+    },
+    {
+        'nl':     'show emails for a communication group who gets notified for a group',
+        'sql':    """\
+SELECT icg.name AS communication_group, ige.email
+FROM inspection_communication_group icg
+JOIN inspection_group_emails ige ON ige.group_id = icg.id
+WHERE icg.active = true
+  AND icg.name ILIKE '%group_name%'
+ORDER BY ige.email;
+""",
+        'domain': 'organisation',
+        'intent': 'list',
+        'limit':  None,
+    },
+    {
+        'nl':     'which organisations are in a communication group show organisations for communication group',
+        'sql':    """\
+SELECT icg.name AS communication_group, org.name AS organisation_name
+FROM inspection_communication_group icg
+JOIN inspection_communication_group_organisations icgo ON icgo.group_id = icg.id
+JOIN organisation org ON org.id = icgo.organisation_id
+WHERE icg.active = true AND org.active = true
+ORDER BY icg.name, org.name;
+""",
+        'domain': 'organisation',
+        'intent': 'list',
+        'limit':  None,
+    },
+    {
+        'nl':     'which countries does an organisation operate in organisation countries',
+        'sql':    """\
+SELECT org.name AS organisation_name, c.name AS country_name
+FROM organisation org
+JOIN organisation_countries oc ON oc.organisation_id = org.id
+JOIN country c ON c.id = oc.country_id
+WHERE org.active = true AND c.active = true
+ORDER BY org.name, c.name;
+""",
+        'domain': 'organisation',
+        'intent': 'list',
+        'limit':  None,
+    },
+    {
+        'nl':     'list all communication groups show all groups',
+        'sql':    """\
+SELECT icg.name AS communication_group,
+       COUNT(DISTINCT icgf.facility_id)    AS facility_count,
+       COUNT(DISTINCT icgo.organisation_id) AS organisation_count,
+       COUNT(DISTINCT ige.email)           AS email_count
+FROM inspection_communication_group icg
+LEFT JOIN inspection_communication_group_facilities icgf
+       ON icgf.group_id = icg.id
+LEFT JOIN inspection_communication_group_organisations icgo
+       ON icgo.group_id = icg.id
+LEFT JOIN inspection_group_emails ige
+       ON ige.group_id = icg.id
+WHERE icg.active = true
+GROUP BY icg.id, icg.name
+ORDER BY icg.name;
+""",
+        'domain': 'organisation',
+        'intent': 'list',
+        'limit':  None,
     },
     {
         'nl':     'which facilities have high risk observations but no corrective actions raised',
@@ -2200,7 +2304,6 @@ WHERE ir.status != 'DRAFT'
         # CAPEX Lost by grouping (region, facility, country, entity).
         # Formula: SUM(ica.capex) - SUM(po.po_amount) — NOT po minus pr (that is profit).
         # NEVER: SUM(po.total_po) - SUM(pr.total_pr) — that computes income minus cost (P&L).
-        # FIXED: Now properly uses the CTE for aggregation to avoid row multiplication.
         'nl':     'capex lost by region capex lost by facility capex lost by country capex lost breakdown',
         'sql':    """\
 -- CAPEX Lost = SUM(ica.capex) - SUM(po.po_amount) — arithmetic gap
@@ -2210,12 +2313,13 @@ WITH po_by_ica AS (
     SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po
     FROM po_details WHERE active = true GROUP BY 1
 )
-SELECT 
-    reg.name AS region_name,
-    COUNT(DISTINCT ica.id) AS ca_count,
-    COALESCE(SUM(ica.capex), 0) AS capex_generated,
-    COALESCE(SUM(p.total_po), 0) AS capex_converted,
-    COALESCE(SUM(ica.capex), 0) - COALESCE(SUM(p.total_po), 0) AS capex_lost
+SELECT
+    reg.name                                        AS region_name,
+    COUNT(DISTINCT ica.id)                          AS ca_count,
+    COALESCE(SUM(ica.capex), 0)                     AS capex_generated,
+    COALESCE(SUM(p.total_po), 0)                    AS capex_converted,
+    COALESCE(SUM(ica.capex), 0)
+        - COALESCE(SUM(p.total_po), 0)              AS capex_lost
 FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
 JOIN facility fac ON ir.facility_id = fac.id

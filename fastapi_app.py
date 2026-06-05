@@ -83,7 +83,7 @@ app = FastAPI(title="InspectAI NL2SQL API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4200", "http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -413,6 +413,38 @@ async def chat(req: ChatRequest):
                         sess_data["last_sql"]   = sql
                         sess_data["last_total"] = _count_total(sql, orch)
 
+            elif step.tool == "get_answers":
+                # get_answers returns same shape as execute_sql — extract rows for frontend
+                info.success = (step.result or {}).get("success", True)
+                inner = (step.result or {}).get("result") or {}
+                rows = inner.get("rows", [])
+                info.result_preview = str(rows[:3])[:200] if rows else "No rows"
+                if rows and isinstance(rows[0], dict):
+                    sess_data["last_raw_rows"] = rows
+                    sess_data["last_cols"] = inner.get("columns", list(rows[0].keys()))
+                    _result_rows = [{k: str(v) for k, v in row.items()} for row in rows]
+                    _result_cols = inner.get("columns", list(rows[0].keys()))
+                    _row_count = inner.get("row_count", len(rows))
+
+            elif step.tool == "get_answer_stats":
+                # get_answer_stats returns value_breakdown — convert to table rows for frontend
+                info.success = (step.result or {}).get("success", True)
+                inner = (step.result or {}).get("result") or {}
+                breakdown = inner.get("value_breakdown", [])
+                info.result_preview = str(breakdown[:3])[:200] if breakdown else "No data"
+                if breakdown:
+                    # Normalise to [{answer: ..., count: ...}] table shape
+                    rows = [{"answer": b.get("value", ""), "count": str(b.get("count", 0))} for b in breakdown]
+                    # Prepend aggregate stats row if available
+                    avg = inner.get("average_value")
+                    if avg is not None:
+                        rows.insert(0, {"answer": "— average score —", "count": str(round(avg, 2))})
+                    sess_data["last_raw_rows"] = rows
+                    _result_rows = rows
+                    _result_cols = list(rows[0].keys()) if rows else []
+                    _result_cols = ["answer", "count"]
+                    _row_count = len(breakdown)
+
             elif step.tool == "[parse_error]":
                 info.success = False
 
@@ -593,4 +625,4 @@ async def ready():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

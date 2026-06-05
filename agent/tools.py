@@ -24,58 +24,6 @@ _SEMANTIC_FALLBACK_MIN_SCORE = 0.50
 
 
 # ---------------------------------------------------------------------------
-# schema_hint sanitiser
-# ---------------------------------------------------------------------------
-
-# Regex that matches a SQL SELECT statement — used to strip full SQL blocks
-# that Qwen puts in schema_hint on retries (deepseek ignores them anyway).
-_SQL_BLOCK_RE = re.compile(
-    r'(?:^|\n)\s*(?:```sql\s*)?'       # optional fence or newline
-    r'SELECT\b.*?'                       # SELECT keyword
-    r'(?:;|```|(?=\n\s*(?:--|\Z)))',    # end at ; or fence or next comment
-    re.IGNORECASE | re.DOTALL,
-)
-
-def _strip_sql_from_hint(hint: str) -> str:
-    """
-    Remove full SQL SELECT blocks from schema_hint, keeping comment lines.
-
-    deepseek treats its seed examples as higher authority than schema_hint SQL,
-    so a full SQL in schema_hint wastes ~200 tokens and confuses generation.
-    Comment lines (-- ...) are preserved because they carry genuine constraint hints.
-
-    EXCEPTION: hints containing specific filter values (IN-lists with IDs, dates,
-    facility names) are preserved because these carry data deepseek cannot guess.
-    Specifically: if the hint SQL contains WHERE ... IN ('...', '...') with literal
-    string values, we keep it — those values are context deepseek needs.
-    """
-    if not hint or "SELECT" not in hint.upper():
-        return hint
-
-    # Preserve hints that carry specific filter values (IN-lists, = 'literal' filters)
-    # These are context-specific and deepseek cannot guess the values from seeds.
-    _has_value_filter = re.search(
-        r"""\bIN\s*\(\s*'[^']+'\s*(?:,\s*'[^']+'\s*)+\)""",
-        hint, re.IGNORECASE,
-    )
-    if _has_value_filter:
-        return hint  # keep as-is — the specific values are needed
-
-    cleaned = _SQL_BLOCK_RE.sub("", hint)
-    cleaned = re.sub(
-        r'\n\s*(?:FROM|JOIN|LEFT\s+JOIN|INNER\s+JOIN|WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING)\b[^\n]*',
-        '',
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-    return cleaned
-
-
-
-
-
-# ---------------------------------------------------------------------------
 # Tool: list_forms
 # Lists distinct forms known to the system via ai_question (the flat table).
 # Falls back to fb_forms if ai_question has no form_name column.
@@ -247,8 +195,20 @@ def get_answers(
             filters.append("aq.label ILIKE :q_label")
             params["q_label"] = f"%{question_label}%"
         if inspection_id:
-            filters.append("aa.inspection_id = :insp_id")
+            # aa.inspection_id may store the UUID, not the human-readable varchar.
+            # Safest path: join via inspection_report to match ir.inspection_id (varchar).
+            # This handles both cases — if aa.inspection_id IS the varchar it works too.
+            filters.append("""aa.inspection_report_id = (
+                SELECT ir.id FROM inspection_report ir
+                WHERE ir.inspection_id = :insp_id
+                LIMIT 1
+            )""")
             params["insp_id"] = inspection_id
+            # When fetching by inspection_id with no explicit module filter,
+            # default to 'Inspection Form' — ai_answers contains rows from
+            # multiple modules for the same inspection.
+            if not module_name and not form_name:
+                filters.append("aa.module_name = 'Inspection Form'")
         if answer_value:
             filters.append(
                 "(aa.answer_text ILIKE :ans_val OR aa.answer_numeric::text ILIKE :ans_val)"
@@ -259,8 +219,9 @@ def get_answers(
 
         # answer_text for categorical, answer_numeric for scores/numbers.
         # COALESCE so we always get one displayable value.
+        # aa.inspection_id is a UUID — join to inspection_report to get readable varchar id.
         sql = sql_text(f"""
-            SELECT aa.inspection_id,
+            SELECT ir.inspection_id,
                    aa.module_name,
                    aq.label                                          AS question_label,
                    COALESCE(aa.answer_text, aa.answer_numeric::text) AS answer_value,
@@ -268,6 +229,7 @@ def get_answers(
                    aa.submitted_on
             FROM ai_answers aa
             LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id
+            LEFT JOIN inspection_report ir ON aa.inspection_report_id = ir.id
             WHERE {where}
             ORDER BY aa.submitted_on DESC
             LIMIT :limit
@@ -319,11 +281,16 @@ def get_answer_stats(
     form_name: Optional[str] = None,
     module_name: Optional[str] = None,
     question_label: Optional[str] = None,
+    breakdown_limit: Optional[int] = None,
 ) -> dict[str, Any]:
     """
     Aggregate statistics over ai_answer.answer_value.
     Returns numeric stats (avg/min/max) + categorical value breakdown.
     Use for "most common answer", "average score", "distribution" questions.
+
+    breakdown_limit — if set, truncates value_breakdown to the top N entries.
+                      Pass 1 when user asks for "most common", "most chosen",
+                      "top" or "highest" single value.
     """
     try:
         filters = ["1=1"]
@@ -437,6 +404,8 @@ def get_answer_stats(
                 "scored_count": scored_count,   # how many answers have a score
                 "value_breakdown": [
                     {"value": r[0], "count": r[1]} for r in cat_rows
+                ][:breakdown_limit] if breakdown_limit else [
+                    {"value": r[0], "count": r[1]} for r in cat_rows
                 ],
             },
             "error": None,
@@ -498,16 +467,6 @@ def generate_sql(
 
         if auto_schema and not schema_hint.startswith("Use"):
             schema_hint = f"{auto_schema}\n{schema_hint}" if schema_hint else auto_schema
-
-        # ── Strip full SQL blocks from schema_hint ────────────────────────
-        # When Qwen retries generate_sql, it often puts a full corrected SQL
-        # in schema_hint. deepseek ignores it and generates from seed examples
-        # anyway — so it just wastes tokens and adds noise. Strip SELECT blocks,
-        # keeping only comment lines (-- ...) which are genuinely useful hints.
-        #
-        # We detect SQL blocks by looking for SELECT ... FROM patterns and
-        # remove them, preserving any leading comment lines.
-        schema_hint = _strip_sql_from_hint(schema_hint)
 
         if not sql_prompt_template:
             from agent.prompts import SQL_GENERATION_PROMPT
@@ -618,58 +577,8 @@ def generate_sql(
 
         sql = validator.clean_sql(raw_sql)
 
-        # ── AST repair — deterministic fixes before validation ────────────
-        # Repairs hallucinated aa.active/aq.active and injects missing
-        # soft-delete filters. Zero retry cost — mutations logged only.
-        sql, _repairs = validator.ast_repair(sql)
-        if _repairs and _debug_logger:
-            for _r in _repairs:
-                _debug_logger.info(f"  [ast_repair] {_r}")
-        # deepseek sometimes hits token limit mid-generation, producing a valid
-        # SQL fragment that is silently incomplete (e.g. "SELECT col1, col2,;").
-        # Detect by checking the last non-whitespace token before the final ';'.
-        # If it's a comma or a keyword that implies more clauses follow, reject.
-        import re as _re_trunc
-        _sql_stripped = sql.rstrip().rstrip(';').rstrip()
-        if _sql_stripped and _sql_stripped[-1] == ',':
-            return {
-                "success": True,
-                "result": {
-                    "sql": sql,
-                    "validation": {
-                        "passed": False,
-                        "errors": ["TRUNCATED_SQL: SQL ends mid-clause (trailing comma) — deepseek hit token limit. Retry with a simpler query."],
-                        "warnings": [],
-                        "_vresult": None,
-                    },
-                },
-                "error": None,
-            }
-        # ── end truncation detection ──────────────────────────────────────────
-
         # validate() returns ValidationResult — hard fails block, soft warns are advisory only.
         vresult = validator.validate(sql)
-
-        # ── Business rules BLOCK/WARN validation ─────────────────────────────
-        # Runs the 44 BLOCK rules from business_rules.py (hallucinated tables,
-        # hallucinated columns, wrong join patterns, capex_status misuse, etc.)
-        # These run AFTER validator.validate() so both sets of errors are merged.
-        try:
-            from core.business_rules import get_engine as _get_br_engine
-            _br_engine = _get_br_engine()
-            _br_passed, _br_msgs = _br_engine.validate_sql(sql)
-            if not _br_passed:
-                # Merge BLOCK errors into vresult as hard fails
-                from core.validator import ValidationIssue
-                for _msg in _br_msgs:
-                    vresult.issues.append(
-                        ValidationIssue("HARD_FAIL", "BUSINESS_RULE", _msg)
-                    )
-                vresult.passed = False
-        except Exception as _br_exc:
-            if _debug_logger:
-                _debug_logger.debug(f"  [business_rules] skipped: {_br_exc}")
-        # ── end business rules ────────────────────────────────────────────────
 
         # validate_semantic() returns SOFT_WARN issues only.
         # These are logged for observability but NEVER injected into the retry prompt.
@@ -884,11 +793,19 @@ class ToolRegistry:
                     return v
                 # Accept both 'label' and 'question_label' — LLM uses both names
                 q_label = args.get("question_label") or args.get("label")
+                # Parse limit — 1 = top only, None = full distribution
+                _blimit = args.get("limit")
+                if _blimit is not None:
+                    try:
+                        _blimit = int(_blimit)
+                    except (TypeError, ValueError):
+                        _blimit = None
                 return get_answer_stats(
                     self._db_engine,
                     form_name=_clean(args.get("form_name")),
                     module_name=_clean(args.get("module_name")),
                     question_label=_clean(q_label),
+                    breakdown_limit=_blimit,
                 )
 
             if name == "generate_sql":

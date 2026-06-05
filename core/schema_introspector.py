@@ -138,6 +138,34 @@ TABLE COLUMNS (lookup tables):
 
   SOFT DELETE — include WHERE active = true for: country, region, organisation, project, client, entity
 
+COMMUNICATION GROUPS:
+  inspection_communication_group: id (uuid), name (varchar), active (bool)
+    — A named group of recipients for inspection notifications
+
+  Junction tables (many-to-many):
+    inspection_communication_group_facilities    — group_id (→icg.id), facility_id (→facility.id)
+    inspection_communication_group_organisations — group_id (→icg.id), organisation_id (→organisation.id)
+    inspection_group_emails                      — group_id (→icg.id), email (varchar)
+
+  organisation_countries: organisation_id (→organisation.id), country_id (→country.id)
+    — which countries an organisation operates in
+
+  TYPICAL QUERIES:
+  "which communication group does facility X belong to?"
+    → JOIN icgf ON icgf.facility_id = fac.id → JOIN icg ON icg.id = icgf.group_id
+
+  "show all facilities in communication group Y"
+    → JOIN icgf ON icgf.group_id = icg.id → JOIN facility ON facility.id = icgf.facility_id
+
+  "what emails does communication group X have?"
+    → JOIN ige ON ige.group_id = icg.id → SELECT ige.email
+
+  "which organisations are in communication group X?"
+    → JOIN icgo ON icgo.group_id = icg.id → JOIN organisation ON organisation.id = icgo.organisation_id
+
+  "which countries does organisation X operate in?"
+    → JOIN oc ON oc.organisation_id = org.id → JOIN country ON country.id = oc.country_id
+
 USER ROLES:
   users.id → user_roles.user_id → user_roles.role_id → role.id → role.name
   user_roles(user_id, role_id) — one user can have MULTIPLE roles

@@ -126,7 +126,15 @@ ROUTING — FORM ANSWER QUERIES:
   "show answers for form X"               → get_answers(form_name="X")
   "answers for inspection INS-001"         → get_answers(inspection_id="INS-001")
   "most common / average answer for Q"    → get_answer_stats(label="Q")
+  "most chosen impact / top impact"       → get_answer_stats(label="Impact", limit=1)
+  "most common risk level"                → get_answer_stats(label="Risk Level", limit=1)
+  "distribution of X answers"            → get_answer_stats(label="X")  [no limit — full breakdown]
   "answers at facility F (complex join)"  → generate_sql with ai_answers + inspection_report JOIN
+
+  get_answer_stats limit parameter:
+    limit=1   → return only the single top/most-common value (use for "most", "top", "highest")
+    limit=N   → return top N values
+    omit      → return full distribution (use for "breakdown", "distribution", "all values")
 
 KNOWN ANSWER VALUES — route directly to generate_sql, do NOT search for question labels first:
   "count deviations at X" / "how many deviations"       → generate_sql
@@ -190,8 +198,13 @@ AVAILABLE TOOLS
   4. get_answers       — { "form_name": null, "module_name": null, "label": null,
                            "inspection_id": null, "answer_text": null, "limit": 50 }
                          Returns matching answer rows from ai_answers.
-  5. get_answer_stats  — { "form_name": null, "module_name": null, "label": null }
+                         When inspection_id is given with no module_name, defaults to
+                         module_name='Inspection Form'. Pass module_name explicitly to
+                         see other modules (e.g. 'Corrective Action Form').
+  5. get_answer_stats  — { "form_name": null, "module_name": null, "label": null, "limit": null }
                          Returns avg/min/max + value distribution for numeric/categorical answers.
+                         limit=1 → top value only ("most common", "most chosen", "highest")
+                         limit=N → top N values; omit for full distribution
 
   SQL PATH (inspection_* tables + complex cross-table queries):
   6. generate_sql      — { "question": "...", "schema_hint": "..." }

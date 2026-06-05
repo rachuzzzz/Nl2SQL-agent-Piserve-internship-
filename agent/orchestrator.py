@@ -208,6 +208,26 @@ _CONSTRAINT_NOTE_MAP = {
         "--   status != 'DRAFT' alone is NOT sufficient — it includes IN_PROGRESS, UNDER_REVIEW etc.\n"
         "--   Always add: AND ir.status IN ('CLOSED','SUBMITTED')"
     ),
+    # Fired when business_rules.py BLOCK rules trigger (error code is "BUSINESS_RULE").
+    # The most common cause is block_capex_left_join_multiplication or
+    # block_cte_reference_without_definition.  The note gives deepseek the two
+    # safe alternatives so it does NOT repeat the same broken pattern.
+    "BUSINESS_RULE": (
+        "-- CAPEX ROW-MULTIPLICATION FIX: never LEFT JOIN po_details directly when SUM(ica.capex) is present.\n"
+        "-- Safe option A — scalar subqueries (no GROUP BY needed):\n"
+        "--   SELECT\n"
+        "--     (SELECT COALESCE(SUM(capex),0) FROM inspection_corrective_action\n"
+        "--      WHERE active=true AND capex>0) AS capex_generated,\n"
+        "--     (SELECT COALESCE(SUM(po_amount),0) FROM po_details WHERE active=true) AS capex_converted\n"
+        "-- Safe option B — CTE pre-aggregation (required when grouping by region/facility/etc):\n"
+        "--   WITH po_by_ica AS (\n"
+        "--       SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po\n"
+        "--       FROM po_details WHERE active=true GROUP BY 1\n"
+        "--   )\n"
+        "--   SELECT ... LEFT JOIN po_by_ica p ON p.ica_id = ica.id ...\n"
+        "-- NEVER omit the WITH clause when referencing po_by_ica in a JOIN.\n"
+        "-- NEVER: LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id  (direct join inflates SUM)"
+    ),
 }
 
 def _build_constraint_notes(retry_reason: str) -> str:
