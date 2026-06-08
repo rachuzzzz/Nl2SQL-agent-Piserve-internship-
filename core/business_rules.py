@@ -56,6 +56,15 @@ REGISTRY: list[dict] = [
     # BLOCK — hard errors that cause SQL rejection
     # ══════════════════════════════════════════════════════════════════════════
 
+    # ── Organisation join always returns empty (FK unpopulated) ─────────────
+    {
+        "id":          "block_organisation_join",
+        "type":        BLOCK,
+        "description": "facility.organization_id is unpopulated (all NULL) — joining to organisation always returns zero rows.",
+        "sql_pattern": r"\bJOIN\s+organisation\b",
+        "message":     "UNSUPPORTED: facility.organization_id is not populated in the current dataset. All facilities belong to a single organisation (Khidmah). Grouping by organisation is not meaningful — use facility, region, country, project, or entity instead.",
+    },
+
     # ── DML / DDL ────────────────────────────────────────────────────────────
     {
         "id":          "block_dml",
@@ -114,6 +123,109 @@ REGISTRY: list[dict] = [
         "description": "Dynamic fb_{uuid} answer tables — all answer data is in ai_answers.",
         "sql_pattern": r"\bfb_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}\b",
         "message":     "BLOCKED: Dynamic fb_<uuid> table. Use ai_answers instead.",
+    },
+    {
+        "id":          "block_table_impact",
+        "type":        BLOCK,
+        "description": "There is no 'impact' table — impact is stored in ai_answers where aq.label = 'Impact'.",
+        "sql_pattern": r"\bjoin\s+impact\b|\bfrom\s+impact\b",
+        "message":     (
+            "HALLUCINATION: table 'impact' does not exist. "
+            "Impact data is in ai_answers: JOIN ai_questions aq ON aa.element_id = aq.element_id "
+            "WHERE aq.label = 'Impact'. The score is aa.score (1-27), "
+            "categories are in aa.answer_text (comma-separated)."
+        ),
+    },
+    {
+        "id":          "block_ica_ir_varchar_uuid_join",
+        "type":        BLOCK,
+        "description": "ir.inspection_id = ica.inspection_id is a varchar=UUID type mismatch.",
+        "sql_pattern": r"\bir\.inspection_id\s*=\s*ica\.inspection_id\b|\bica\.inspection_id\s*=\s*ir\.inspection_id\b",
+        "message":     (
+            "WRONG JOIN: ir.inspection_id (VARCHAR) ≠ ica.inspection_id (UUID). "
+            "CORRECT: JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id "
+            "(ica.inspection_id is a UUID FK → inspection_report.id UUID PK)"
+        ),
+    },
+    {
+        "id":          "block_ca_for_observation_wrong_path",
+        "type":        BLOCK,
+        "description": (
+            "When fetching CAs for a specific observation text (ILIKE), must use "
+            "observation_id → submission_id path, not inspection join."
+        ),
+        # Fires when: ai_answers ILIKE filter present + ICA joined via inspection_report
+        # but observation_id → submission_id join is absent
+        "sql_pattern": (
+            r"(?=.*\bai_answers\b)"                          # ai_answers present
+            r"(?=.*\bilike\b)"                               # ILIKE filter present
+            r"(?=.*\binspection_corrective_action\b)"        # ICA present
+            r"(?=.*\bica\.inspection_id\s*=\s*ir\.id\b)"     # wrong path: via inspection
+            r"(?!.*\bica\.observation_id\b)"                 # correct path absent
+        ),
+        "message":     (
+            "WRONG PATH: When filtering CAs by observation text (ILIKE), join via "
+            "ica.observation_id = aa.submission_id::uuid — NOT via ica.inspection_id = ir.id. "
+            "The inspection join returns ALL CAs in the inspection; the observation_id join "
+            "returns only CAs directly linked to that specific observation."
+        ),
+    },
+
+    # ── CAPEX Lost definition — block capex_status=REJECTED as loss proxy ──────
+    {
+        "id":          "block_capex_status_rejected_as_loss",
+        "type":        BLOCK,
+        "description": "capex_status REJECTED/DEFERRED is NOT how CAPEX Lost is calculated.",
+        "sql_pattern": r"capex_status.*(?:=\s*'REJECTED'|IN\s*\([^)]*'REJECTED'[^)]*\)|IN\s*\([^)]*'DEFERRED'[^)]*\))",
+        "message":     (
+            "WRONG: capex_status='REJECTED' or 'DEFERRED' does not mean CAPEX Lost. "
+            "CAPEX Lost = SUM(ica.capex) - COALESCE(SUM(po.po_amount), 0) "
+            "via LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id. "
+            "For loss detail: join ai_answers via ica.completion_submission_id and "
+            "filter HAVING MAX(CASE WHEN label='Is CAPEX Lost' THEN answer_text END) = 'true'."
+        ),
+    },
+    {
+        "id":          "block_po_wrong_join_col",
+        "type":        BLOCK,
+        "description": "po_details has no corrective_action_id column — join via mitigative_action_uuid",
+        "sql_pattern": r"po\.corrective_action_id",
+        "message":     "WRONG JOIN: po_details has no corrective_action_id. Use: po.mitigative_action_uuid = ica.id",
+    },
+    {
+        "id":          "block_capex_left_join_multiplication",
+        "type":        BLOCK,
+        "description": "Direct LEFT JOIN po_details inflates SUM(ica.capex) when one ICA has multiple POs",
+        # Must match: SUM(ica.capex) AND LEFT JOIN po_details in the main query
+        # but NOT when po_details only appears inside a CTE (WITH ... AS (...po_details...))
+        # Detection: LEFT JOIN po_details must appear AFTER the main SELECT (outside CTE)
+        # We detect this by requiring LEFT JOIN po_details to NOT be preceded by a closing paren
+        # that belongs to a CTE definition.
+        # Simpler reliable check: LEFT JOIN po_details appears AND no po_by_ica CTE alias follows it
+        "sql_pattern": (
+            r"(?=.*\bSUM\s*\(\s*ica\.capex)"        # SUM(ica.capex) present
+            r"(?=.*\bLEFT\s+JOIN\s+po_details\b)"   # direct LEFT JOIN po_details
+            r"(?!.*\bpo_by_ica\b)"                  # CTE alias po_by_ica NOT present
+        ),
+        "message":     (
+            "WRONG: Direct LEFT JOIN po_details inflates SUM(ica.capex) — one ICA can have multiple POs. "
+            "Use scalar subqueries instead: "
+            "SELECT (SELECT SUM(capex) FROM inspection_corrective_action) AS capex_generated, "
+            "(SELECT SUM(po_amount) FROM po_details) AS capex_converted. "
+            "OR use CTE: WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total FROM po_details GROUP BY 1) "
+            "LEFT JOIN po_by_ica p ON p.ica_id = ica.id"
+        ),
+    },
+    {
+        "id":          "block_expenditure_as_conversion",
+        "type":        BLOCK,
+        "description": "expenditure column is a category flag, NOT a conversion indicator",
+        "sql_pattern": r"expenditure.*IN.*CAPEX.*converted|converted.*expenditure.*IN.*CAPEX|CASE.*expenditure.*CAPEX.*capex",
+        "message":     (
+            "WRONG: ica.expenditure is a category enum (CAPEX/OPEX/NO_EXPENDITURE), NOT a conversion indicator. "
+            "CAPEX Converted = SUM(po.po_amount) via LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id. "
+            "NEVER use expenditure to calculate converted amounts."
+        ),
     },
 
     # ── Hallucinated columns on ai_questions ──────────────────────────────────
@@ -187,12 +299,30 @@ REGISTRY: list[dict] = [
         "id":          "block_col_ir_id_in_select",
         "type":        BLOCK,
         "description": "ir.id is a UUID PK — never select for display. Use ir.inspection_id (varchar).",
-        "sql_pattern": r"\bselect\b.*?\bir\.id\b.*?\bfrom\b",
+        # Tightened to avoid false positive on JOIN conditions like ica.inspection_id = ir.id.
+        # Only matches ir.id when it appears as a standalone SELECT expression:
+        # SELECT ir.id,  or  SELECT ..., ir.id,  or  SELECT ..., ir.id AS ...
+        # Does NOT match ir.id inside JOIN ON clauses or WHERE conditions.
+        "sql_pattern": r"\bselect\b\s+(?:[^,]+,\s*)*ir\.id(?:\s+as\s+\w+)?(?:\s*,|\s+from\b)",
         "table_guard": "inspection_report",
         "message":     "WRONG COLUMN: ir.id is the UUID primary key — outputs UUID garbage. Use ir.inspection_id (varchar like '2026/04/ST001/INS001') for display. Note: ir.id in JOIN conditions is correct.",
     },
 
-    # ── Hallucinated columns on inspection_corrective_action ─────────────────
+    # ── close_on misuse in date filters ──────────────────────────────────────
+    {
+        "id":          "block_close_on_date_filter",
+        "type":        BLOCK,
+        "description": "close_on is NULL on most ICA rows — filtering by EXTRACT/date_trunc on close_on returns near-empty results.",
+        "sql_pattern": r"EXTRACT\s*\([^)]*FROM\s+\w*\.?close_on\b|date_trunc\s*\([^)]*,\s*\w*\.?close_on\b",
+        "table_guard": "inspection_corrective_action",
+        "message":     (
+            "WRONG: close_on is NULL on most inspection_corrective_action rows (only set in special workflows). "
+            "NEVER use EXTRACT or date_trunc on close_on for date filtering. "
+            "For 'closed this month' use: WHERE status IN ('CLOSED','CLOSE_WITH_DEFERRED') "
+            "AND date_trunc('month', target_close_out_date) = date_trunc('month', CURRENT_DATE). "
+            "Or use created_on for when the ICA was raised."
+        ),
+    },
     {
         "id":          "block_col_ica_risk_level_bare",
         "type":        BLOCK,
@@ -216,13 +346,9 @@ REGISTRY: list[dict] = [
         "table_guard": "inspection_corrective_action",
         "message":     "WRONG COLUMN: times_deferred does not exist on inspection_corrective_action. Use COUNT(*) AS times_deferred in GROUP BY aggregation instead.",
     },
-    {
-        "id":          "block_col_ica_capex_status",
-        "type":        BLOCK,
-        "description": "capex_status does not exist on inspection_corrective_action.",
-        "sql_pattern": r"\b(ica|ics?|ca|inspection_corrective_action)\.capex_status\b",
-        "message":     "WRONG COLUMN: capex_status does not exist on inspection_corrective_action. For risk filtering: JOIN risk_level rl ON ica.risk_level_id = rl.id WHERE rl.name = 'High'",
-    },
+    # block_col_ica_capex_status removed — capex_status IS a valid column on
+    # inspection_corrective_action (NULL=awaiting, ACCEPTED, REJECTED, DEFERRED).
+    # It is a workflow flag only — NOT a financial metric.
     {
         "id":          "block_col_ica_adequacy_status",
         "type":        BLOCK,
@@ -334,12 +460,40 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_interval_30_days_for_month",
         "type":        BLOCK,
-        "description": "INTERVAL '30 days' is not 'this month' — it's a rolling window.",
+        "description": "INTERVAL '30 days' used as proxy for 'this month' — wrong semantics.",
+        # Only fire when question asks about 'this month' or 'current month'
+        # but SQL uses INTERVAL '30 days' as the filter (rolling window ≠ calendar month).
+        # NEVER fire when user explicitly says 'last 30 days', 'past 30 days', 'in 30 days' etc.
         "sql_pattern": r"INTERVAL\s*'30\s*days?'",
+        "question_pattern": r"\b(this\s+month|current\s+month|in\s+(?:the\s+)?month)\b",
         "message":     (
             "BLOCKED: INTERVAL '30 days' is a rolling 30-day window, NOT 'this month'. "
             "For 'this month' use: date_trunc('month', col) = date_trunc('month', NOW()). "
-            "Only use INTERVAL '30 days' if the question literally says 'last 30 days' or 'past 30 days'."
+            "Only use INTERVAL '30 days' when the question says 'last 30 days' or 'past 30 days'."
+        ),
+    },
+    {
+        "id":          "block_inspector_not_in_pattern",
+        "type":        BLOCK,
+        "description": "NOT IN (SELECT inspector_user_id) misses new inspectors with zero inspections.",
+        # Fires when: query asks about inactive/missing inspectors using NOT IN subquery
+        # on inspection_report — this silently excludes brand-new inspectors.
+        "sql_pattern": (
+            r"\bNOT\s+IN\s*\(\s*SELECT\b.*?\binspector_user_id\b.*?\bFROM\s+inspection_report\b"
+        ),
+        "question_pattern": (
+            r"\b(inspector|inspectors?)\b.{0,50}"
+            r"\b(haven.t|not|no|never|inactive|zero|0)\b.{0,30}"
+            r"\b(inspection|submitted|conducted|done|performed|activity)\b"
+        ),
+        "message": (
+            "WRONG PATTERN: NOT IN (SELECT inspector_user_id FROM inspection_report) "
+            "misses new inspectors who have ZERO inspections — they have no rows in "
+            "inspection_report so they don't appear in either the subquery or the result. "
+            "CORRECT: start from users JOIN user_roles JOIN role, "
+            "LEFT JOIN inspection_report ON ir.inspector_user_id = u.id, "
+            "HAVING MAX(ir.submitted_on) < CURRENT_DATE - INTERVAL '...' "
+            "OR MAX(ir.submitted_on) IS NULL"
         ),
     },
     {
@@ -360,6 +514,19 @@ REGISTRY: list[dict] = [
     },
 
     # ── Hardcoded year ────────────────────────────────────────────────────────
+    {
+        "id":          "block_responsible_groupby_fm",
+        "type":        BLOCK,
+        "description": "GROUP BY ica.responsible returns CLIENT/INTERNAL/SUB_CONTRACTOR — not FM managers",
+        "sql_pattern": r"GROUP\s+BY\s+(?:[\w.]+\s*,\s*)*ica\.responsible",
+        "message":     (
+            "WRONG: GROUP BY ica.responsible gives CLIENT/INTERNAL_OPERATIONS/SUB_CONTRACTOR — "
+            "these are who carries out the fix, NOT FM managers or users. "
+            "For FM manager grouping: GROUP BY u.id, u.first_name, u.last_name "
+            "with JOIN users u ON ir.inspectee_user_id = u.id. "
+            "ica.responsible is an enum column, not a person."
+        ),
+    },
     {
         "id":          "block_hardcoded_year",
         "type":        BLOCK,
@@ -425,11 +592,196 @@ REGISTRY: list[dict] = [
         "message":     "[autocorrect] Replaced reserved alias 'is' with 'isch'",
     },
 
+    {
+        "id":          "autocorrect_impact_ilike",
+        "type":        AUTOCORRECT,
+        "description": "aq.label ILIKE '%impact%' matches wrong labels — use exact match",
+        "sql_pattern": r"aq\.label\s+ILIKE\s+'%[Ii]mpact%'",
+        "replacement": "aq.label = 'Impact'",
+        "message":     "[autocorrect] Replaced ILIKE Impact with exact aq.label = 'Impact'",
+    },
+
     # ══════════════════════════════════════════════════════════════════════════
     # INJECT — append hint to schema_hint when question matches
     # Higher priority fires first; hints are concatenated in priority order.
     # ══════════════════════════════════════════════════════════════════════════
 
+    {
+        "id":             "inject_top_capex_converters",
+        "type":           INJECT,
+        "priority":       97,
+        "description":    "Top N capex converters — inject exact CTE SQL, bypass embedding.",
+        "required_tables": ["po_details"],
+        "forbidden_patterns": [r"ORDER BY ica\.capex", r"capex_status\s*=\s*'ACCEPTED'", r"ica\.expenditure"],
+        "question_pattern": (
+            r"\b(top|best|highest|leading).{0,20}(capex.{0,15}converter|convert.{0,15}capex)s?\b"
+            r"|\b(capex.{0,15}converter|convert.{0,15}capex)s?.{0,20}(top|best|rank|leaderboard)\b"
+        ),
+        "hint": (
+            "\nUSE THIS EXACT SQL FOR TOP CAPEX CONVERTERS (do not deviate):\n"
+            "WITH po_by_ica AS (\n"
+            "    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po\n"
+            "    FROM po_details WHERE active = true GROUP BY 1\n"
+            ")\n"
+            "SELECT\n"
+            "    u.first_name || ' ' || u.last_name  AS fm_manager,\n"
+            "    COUNT(DISTINCT ica.id)              AS ca_count,\n"
+            "    COALESCE(SUM(ica.capex), 0)         AS capex_generated,\n"
+            "    COALESCE(SUM(p.total_po), 0)        AS capex_converted,\n"
+            "    ROUND(COALESCE(SUM(p.total_po), 0) * 100.0 / NULLIF(SUM(ica.capex), 0), 1) AS conversion_pct\n"
+            "FROM inspection_corrective_action ica\n"
+            "JOIN inspection_report ir ON ica.inspection_id = ir.id\n"
+            "JOIN users u ON ir.inspectee_user_id = u.id\n"
+            "LEFT JOIN po_by_ica p ON p.ica_id = ica.id\n"
+            "WHERE ir.active = true AND ica.active = true AND u.active = true AND ica.capex > 0\n"
+            "GROUP BY u.id, u.first_name, u.last_name\n"
+            "ORDER BY capex_converted DESC LIMIT 5;\n"
+            "NEVER: ORDER BY ica.capex — that ranks by GENERATED not CONVERTED\n"
+            "NEVER: ica.expenditure filter — that is a category flag, not conversion\n"
+        ),
+    },
+    {
+        "id":             "inject_top_capex_generators",
+        "type":           INJECT,
+        "priority":       96,
+        "description":    "Top N capex generators — ranked by SUM(ica.capex), includes po join for context.",
+        "required_tables": ["po_details"],
+        "forbidden_patterns": [r"ORDER BY.*capex_converted", r"ica\.expenditure"],
+        "question_pattern": (
+            # Must explicitly mention fm manager / facility manager context
+            r"\b(top|best|highest|leading|most).{0,25}capex.{0,20}generat\w*.{0,20}(fm|facility.{0,5}manager|inspectee)\b"
+            r"|\b(top|best|highest|leading|most).{0,25}(fm|facility.{0,5}manager).{0,25}capex.{0,20}generat\w*\b"
+            r"|\bcapex.{0,20}generat\w*.{0,20}(top|best|rank|leaderboard).{0,20}(fm|facility|manager)\b"
+            r"|\b(fm|facility).{0,10}manager.{0,30}generat.{0,20}(most|highest|top).{0,20}capex\b"
+            r"|\bwhich.{0,10}(fm|facility).{0,10}manager.{0,30}(most|highest).{0,20}capex\b"
+        ),
+        "hint": (
+            "\nUSE THIS EXACT SQL FOR TOP CAPEX GENERATORS (ranked by generated, NOT converted):\n"
+            "WITH po_by_ica AS (\n"
+            "    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po\n"
+            "    FROM po_details WHERE active = true GROUP BY 1\n"
+            ")\n"
+            "SELECT\n"
+            "    u.first_name || ' ' || u.last_name  AS fm_manager,\n"
+            "    COUNT(DISTINCT ica.id)              AS ca_count,\n"
+            "    COALESCE(SUM(ica.capex), 0)         AS capex_generated,\n"
+            "    COALESCE(SUM(p.total_po), 0)        AS capex_converted,\n"
+            "    ROUND(COALESCE(SUM(p.total_po), 0) * 100.0 / NULLIF(SUM(ica.capex), 0), 1) AS conversion_pct\n"
+            "FROM inspection_corrective_action ica\n"
+            "JOIN inspection_report ir ON ica.inspection_id = ir.id\n"
+            "JOIN users u ON ir.inspectee_user_id = u.id\n"
+            "LEFT JOIN po_by_ica p ON p.ica_id = ica.id\n"
+            "WHERE ir.active = true AND ica.active = true AND u.active = true AND ica.capex > 0\n"
+            "GROUP BY u.id, u.first_name, u.last_name\n"
+            "ORDER BY capex_generated DESC LIMIT 10;\n"
+            "NEVER: ORDER BY capex_converted — that ranks converters not generators\n"
+        ),
+    },
+    {
+        "id":             "inject_top_fm_performers",
+        "type":           INJECT,
+        "priority":       96,
+        "description":    "Top performing FM managers — inject CTE SQL ranking by conversion rate.",
+        "required_tables": ["po_details"],
+        "forbidden_patterns": [r"AVG\(ir\.inspection_score\)", r"ORDER BY avg_score", r"GROUP BY ica\.responsible"],
+        "question_pattern": (
+            r"\b(top|best|highest).{0,20}(perform|fm.{0,10}manager|facility.{0,10}manager).{0,30}"
+            r"(manager|fm|perform|rank|leaderboard)\b"
+            r"|\b(who.{0,20}(best|top).{0,20}(fm|facility).{0,10}manager"
+            r"|best.{0,20}fm.{0,10}manager)\b"
+        ),
+        "hint": (
+            "\nUSE THIS EXACT SQL FOR TOP FM MANAGERS — rank by conversion_pct, filter by FM role, NOT avg_score:\n"
+            "NEVER: AVG(ir.inspection_score) — that is inspector quality, not FM performance\n"
+            "WITH po_by_ica AS (\n"
+            "    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po\n"
+            "    FROM po_details WHERE active = true GROUP BY 1\n"
+            "),\n"
+            "pr_by_ica AS (\n"
+            "    SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_pr\n"
+            "    FROM pr_details WHERE active = true GROUP BY 1\n"
+            ")\n"
+            "SELECT\n"
+            "    u.first_name || ' ' || u.last_name          AS fm_manager,\n"
+            "    COALESCE(SUM(ica.capex), 0)                  AS capex_generated,\n"
+            "    COALESCE(SUM(p.total_po), 0)                 AS capex_converted,\n"
+            "    ROUND(COALESCE(SUM(p.total_po), 0) * 100.0 / NULLIF(SUM(ica.capex), 0), 1) AS conversion_pct,\n"
+            "    COALESCE(SUM(pr.total_tr), 0)                AS opex_incurred\n"
+            "FROM inspection_report ir\n"
+            "JOIN users u ON ir.inspectee_user_id = u.id\n"
+            "LEFT JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id AND ica.active = true AND ica.capex > 0\n"
+            "LEFT JOIN po_by_ica p  ON p.ica_id  = ica.id\n"
+            "LEFT JOIN pr_by_ica pr ON pr.ica_id = ica.id\n"
+            "WHERE ir.active = true AND u.active = true\n"
+            "  AND EXISTS (\n"
+            "      SELECT 1 FROM user_roles ur JOIN role r ON ur.role_id = r.id\n"
+            "      WHERE ur.user_id = u.id\n"
+            "        AND r.name IN ('FM Manager','FM Engineer','AD FM',\n"
+            "                       'Asst FM Manager','FM Admin','FM Supervisor')\n"
+            "  )\n"
+            "GROUP BY u.id, u.first_name, u.last_name\n"
+            "HAVING SUM(ica.capex) > 0\n"
+            "ORDER BY conversion_pct DESC NULLS LAST, opex_incurred ASC\n"
+            "LIMIT 5;\n"
+        ),
+    },
+    {
+        "id":             "inject_avg_ca_close_time",
+        "type":           INJECT,
+        "priority":       85,
+        "description":    "Average time to close corrective action — use target_close_out_date not close_on.",
+        "question_pattern": (
+            r"\b(average|avg|mean).{0,20}(time|days?|hours?|duration).{0,20}"
+            r"(close|clos|resolv|complet).{0,20}(corrective|action|ca|ica)\b"
+            r"|\b(how.{0,10}long|time.{0,10}taken?).{0,30}(close|clos|resolv)\b"
+        ),
+        "hint": (
+            "\nAVERAGE TIME TO CLOSE CORRECTIVE ACTION:\n"
+            "NEVER use close_on — it is NULL on most rows (only set in special workflows).\n"
+            "USE target_close_out_date - created_on for the planned close window:\n"
+            "SELECT\n"
+            "    AVG(EXTRACT(EPOCH FROM (ica.target_close_out_date - ica.created_on)) / 86400) AS avg_days,\n"
+            "    COUNT(*) AS total_closed\n"
+            "FROM inspection_corrective_action ica\n"
+            "WHERE ica.status IN (\'CLOSED\', \'CLOSE_WITH_DEFERRED\')\n"
+            "  AND ica.active = true\n"
+            "  AND ica.target_close_out_date IS NOT NULL\n"
+            "  AND ica.created_on IS NOT NULL;\n"
+            "NEVER: EXTRACT(EPOCH FROM (close_on - created_on)) — close_on IS NULL on most rows\n"
+        ),
+    },
+    {
+        "id":             "inject_qa_recent_form",
+        "type":           INJECT,
+        "priority":       92,
+        "description":    "Q&A from most recent form — provide complete 2-table SQL direct.",
+        "suppresses":     [],
+        "question_pattern": (
+            r"\b(list|show|get|fetch|display|what).{0,20}"
+            r"(question|answer|qa|form.{0,10}answer|answer.{0,10}form).{0,40}"
+            r"(most.{0,10}recent(?:ly)?|latest|last)\b"
+            r"|\b(most.{0,10}recent(?:ly)?|latest|last).{0,30}"
+            r"(question|answer|qa|form.{0,10}answer)\b"
+            # 'questions and answers for the most recently' — noun comes before recency qualifier
+            r"|\b(question|answer)s?.{0,50}(most.{0,10}recent(?:ly)?|latest|last)\b"
+        ),
+        "hint": (
+            "\nQ&A FROM MOST RECENT FORM — use this EXACT SQL. ONE query, NOT two separate queries:\n"
+            "SELECT aq.label AS question, aa.answer_text AS answer, aa.module_name AS form_section\n"
+            "FROM ai_answers aa\n"
+            "JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
+            "WHERE aa.inspection_report_id = (\n"
+            "    SELECT aa2.inspection_report_id FROM ai_answers aa2\n"
+            "    ORDER BY aa2.submitted_on DESC LIMIT 1\n"
+            ")\n"
+            "\n"
+            "ORDER BY aa.module_name, aq.label\n"
+            "LIMIT 200;\n"
+            "CRITICAL: This is a SINGLE SQL query — do NOT first lookup the inspection_id and then\n"
+            "do a second query. The subquery handles the inspection lookup internally.\n"
+            "NEVER: SELECT ir.inspection_id first, then ask for Q&A — use the complete SQL above.\n"
+        ),
+    },
     {
         "id":             "inject_pct_with_ca",
         "type":           INJECT,
@@ -477,59 +829,146 @@ REGISTRY: list[dict] = [
     },
     {
         "id":             "inject_financial_routing",
+        "required_tables": ["po_details"],
+        "forbidden_patterns": [r"SUM\\(ica\\.opex\\)", r"capex_status\\s*=\\s*'ACCEPTED'"],
+
         "type":           INJECT,
         "priority":       88,
-        "description":    "CAPEX/OPEX financial queries — route to po_details/pr_details.",
+        "description":    "CAPEX/OPEX financial queries — route to po_details/pr_details/ai_answers.",
         "question_pattern": (
             r"\b(po[_\s]detail|pr[_\s]detail|purchase\s+order|purchase\s+requisition|"
-            r"capex\s+(generat|convert|lost|loss|incurr)|"
-            r"opex\s+(incurr|facilit|spend)|"
-            r"(generat|convert|lost|incurr).{0,20}(capex|opex)|"
+            r"purchase\s+order\s+amount|po\s+amount|total\s+po|"
+            r"capex.{0,30}(generat|convert|lost|loss|incurr)|"
+            r"opex.{0,30}(incurr|facilit|spend|higher|exceed)|"
+            r"(generat|convert|lost|incurr).{0,30}(capex|opex)|"
+            r"how\s+much.{0,40}(convert|capex|opex|po|purchase)|"
+            r"opex.{0,30}(higher|more|greater|exceed).{0,30}capex|"
+            r"conversion\s+rate|capex\s+conversion|"
+            r"(convert|capex).{0,20}(inspectee|fm|manager|facility)|"
+            # plural 'converters' / 'generators' explicitly
+            r"(capex|opex)\s+(converter|generator)s?|"
+            r"(converter|generator)s?\s+(capex|opex)|"
+            r"top.{0,15}(capex|opex).{0,15}(converter|generator)s?|"
+            # facility cost / expenditure queries
+            r"(facility|site).{0,30}(costs?|spend|expenditure|expensive)|"
+            r"(cost|spend|expenditure).{0,30}(facility|site)|"
+            r"most\s+expensive\s+(facility|site)|"
             r"rival.{0,20}(quote|bid|amount)|financial\s+summary)\b"
         ),
         "hint": (
             "\nFINANCIAL DATA ROUTING:\n"
-            "  CAPEX Generated  = SUM(ica.capex)          — original quoted amount on ICA\n"
-            "  CAPEX Converted  = SUM(po.po_amount)        — actual PO raised by client\n"
-            "  CAPEX Lost       = SUM(ica.capex) WHERE capex_status='REJECTED'\n"
-            "  OPEX Incurred    = SUM(pr.pr_amount)        — actual internal PR spend\n"
+            "  CAPEX Generated  = SUM(ica.capex)       — inspectee's original estimate on ICA\n"
+            "  CAPEX Converted  = SUM(po.po_amount)    — actual PO raised (via po_details)\n"
+            "  CAPEX Lost       = CAPEX Generated - CAPEX Converted\n"
+            "                     i.e. SUM(ica.capex) - COALESCE(SUM(po.po_amount), 0)\n"
+            "  DO NOT use capex_status for loss calculation — use the arithmetic difference\n"
+            "\n  CAPEX Loss Detail (from form answers — module: 'Inspection Mitigative Action Completion'):\n"
+            "    'Is CAPEX Lost'                        — aa.answer_text = 'true' (boolean flag)\n"
+            "    'Amount Difference for CPAEX Loss'     — aa.answer_numeric (NOTE: typo CPAEX not CAPEX)\n"
+            "    'CAPEX Lost To(Company/Entity/Subcontractor)' — aa.answer_text (who did it cheaper)\n"
+            "    'Justification for CAPEX Loss'         — aa.answer_text (reason)\n"
+            "    JOIN via: ica.completion_submission_id = aa.inspection_report_id\n"
+            "\n  OPEX Incurred    = SUM(pr.pr_amount)    — actual PR spend (via pr_details)\n"
+            "    'PR Amount' / 'PR Date' / 'PR Number' also in form: 'Inspection Mitigative Action PR Entry'\n"
+            "    JOIN via: ica.pr_submission_id = aa.inspection_report_id\n"
             "\npo_details: id, po_amount, po_date, po_number, mitigative_action_uuid\n"
-            "  JOIN: LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id\n"
-            "  One ICA can have MULTIPLE POs — always SUM(po.po_amount), never assume 1:1\n"
+            "  One ICA can have MULTIPLE POs — NEVER direct LEFT JOIN, use CTE pre-aggregation:\n"
+            "  WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po_amount FROM po_details GROUP BY 1)\n"
+            "  LEFT JOIN po_by_ica p ON p.ica_id = ica.id\n"
             "\npr_details: id, pr_amount, pr_date, pr_number, mitigative_action_uuid\n"
             "  JOIN: LEFT JOIN pr_details pr ON pr.mitigative_action_uuid = ica.id\n"
             "  One ICA can have MULTIPLE PRs — always SUM(pr.pr_amount)\n"
-            "\nInspector CAPEX = inspector_user_id (who raised the CA)\n"
-            "FM Manager CAPEX = inspectee_user_id (facility manager receiving inspection)\n"
+            "\nCAPEX is ALWAYS tied to the FM Manager (inspectee_user_id)\n"
+"  Inspectors only raise observations — they have NO role in CAPEX/OPEX\n"
+"  FM Manager (inspectee_user_id) raises the ICA and assigns the CAPEX value\n"
+"  Client raises PO to cover it (CAPEX Converted) or org raises PR (OPEX Incurred)\n"
+            "\nDATE RULE: NEVER hardcode years (2026, 2025). Use CURRENT_DATE or DATE_TRUNC('year', CURRENT_DATE).\n"
         ),
     },
     {
         "id":             "inject_fm_manager_routing",
+        "forbidden_patterns": [r"GROUP\\s+BY\\s+ica\\.responsible", r"AVG\\(ir\\.inspection_score\\)"],
+
         "type":           INJECT,
         "priority":       85,
         "description":    "FM Manager / inspectee queries — route to inspectee_user_id not inspector_user_id.",
         "question_pattern": (
             r"\b(fm\s+manager|facility\s+manager|inspectee|fm\s+engineer|"
             r"fm\s+auditee|fm\s+leaderboard|capex\s+leaderboard|"
-            r"top.{0,20}(fm|manager|capex|opex).{0,20}(generator|converter|performer|leaderboard)|"
-            r"capex.{0,20}(generator|converter|generat|convert)|"
-            r"(generator|converter).{0,20}capex)\b"
+            # 'top N capex converters/generators' — plural handled by 's?' suffix
+            r"top.{0,25}(fm|manager|capex|opex).{0,25}(generator|converter|performer|leaderboard)s?|"
+            # standalone 'capex converters/generators'
+            r"capex\s+(generator|converter|generat|convert)s?|"
+            r"(generator|converter)s?.{0,20}capex|"
+            # 'who are the top capex converters' type phrasing
+            r"(best|highest|top|leading|rank).{0,30}(capex|opex).{0,30}(converter|generator)s?|"
+            r"(converter|generator)s?.{0,30}(capex|opex))\b"
         ),
         "hint": (
-            "\nFM MANAGER ROUTING:\n"
-            "  FM Manager = inspectee_user_id on inspection_report (NOT inspector_user_id)\n"
-            "  Inspector   = inspector_user_id on inspection_report\n"
-            "  JOIN: JOIN users u ON ir.inspectee_user_id = u.id → u.first_name || ' ' || u.last_name AS fm_manager\n"
-            "\nCAPEX LEADERBOARD DEFINITIONS:\n"
-            "  CAPEX Generator = FM managers ranked by total capex raised (SUM where capex > 0)\n"
-            "  CAPEX Converter = FM managers ranked by capex that reached ACCEPTED status\n"
-            "\nCAPEX STATUS (inspection_corrective_action.capex_status):\n"
-            "  NULL        = awaiting approval (not yet actioned)\n"
-            "  'ACCEPTED'  = approved / converted\n"
-            "  'REJECTED'  = rejected\n"
-            "  'DEFERRED'  = deferred\n"
-            "  CAPEX Awaiting Approval = capex > 0 AND capex_status IS NULL\n"
-            "\nEXPENDITURE column values: NO_EXPENDITURE, CAPEX, OPEX, CAPEX_AND_OPEX\n"
+            "\nFM MANAGER ROUTING — CRITICAL RULES:\n"
+            "RULE 1: ica.responsible is a STRING ENUM (CLIENT/INTERNAL_OPERATIONS/SUB_CONTRACTOR)\n"
+            "  It is NOT a person. NEVER GROUP BY ica.responsible for FM manager queries.\n"
+            "  NEVER SELECT ica.responsible AS fm_manager — this gives 3 rows, not people.\n"
+            "RULE 2: NEVER rank FM managers by avg_inspection_score — that is inspector quality.\n"
+            "  FM performance = CAPEX conversion rate + low OPEX (pr_details), not inspection scores.\n"
+            "RULE 3: FM Manager = inspectee_user_id (NOT inspector_user_id)\n"
+            "  CORRECT JOIN: JOIN users u ON ir.inspectee_user_id = u.id\n"
+            "  CORRECT GROUP: GROUP BY u.id, u.first_name, u.last_name\n"
+            "\nFM MANAGER PERFORMANCE — correct ranking:\n"
+            "  GOOD: High conversion = SUM(po.po_amount) / NULLIF(SUM(ica.capex),0) * 100\n"
+            "  BAD:  High OPEX = SUM(pr.pr_amount) from pr_details (Khidmah pays internally)\n"
+            "  NEVER SUM(ica.opex) — use pr_details for actual OPEX paid\n"
+            "  Best FM manager = highest conversion_pct DESC, opex_incurred ASC\n"
+            "\nCAPEX LEADERBOARD:\n"
+            "  CAPEX Generated = SUM(ica.capex)\n"
+            "  CAPEX Converted = SUM(po.po_amount) via po_details — NOT capex_status='ACCEPTED'\n"
+            "  CAPEX Lost      = SUM(ica.capex) - COALESCE(SUM(po.po_amount), 0)\n"
+            "  OPEX Incurred   = SUM(pr.pr_amount) via pr_details\n"
+            "  capex_status IS a valid column but is a workflow flag — NOT a financial metric\n"
+            "\nPRE-AGGREGATE to avoid row multiplication:\n"
+            "  WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total FROM po_details WHERE active=true GROUP BY 1)\n"
+            "  WITH pr_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total FROM pr_details WHERE active=true GROUP BY 1)\n"
+        ),
+    },
+    {
+        "id":             "inject_risk_observation_routing",
+        "required_tables": ["risk_level"],
+        "forbidden_patterns": [r"ai_answers.*label.*Risk Level", r"aa\.answer_text.*ILIKE.*High"],
+
+        "type":           INJECT,
+        "priority":       87,
+        "description":    "ICA corrective action risk queries — route to risk_level table via UUID FK. Does NOT apply to form observation queries which correctly use ai_answers.",
+        "suppresses":     [],
+        "question_pattern": (
+            # Only fires for CORRECTIVE ACTION risk queries.
+            # Form observation queries ("high risk observations") use ai_answers correctly.
+            r"\b(high.{0,10}risk|critical.{0,10}risk).{0,30}"
+            r"(corrective.{0,10}action|\bca\b|\bica\b)|"
+            r"\b(corrective.{0,10}action|\bca\b|\bica\b).{0,30}"
+            r"(high.{0,10}risk|critical.{0,10}risk)|"
+            r"\b(risk.{0,10}breakdown|breakdown.{0,10}risk|"
+            r"risk.{0,10}distribut|risk.{0,10}count|count.{0,10}risk|"
+            r"risk.{0,10}by.{0,20}facilit|by.{0,10}risk.{0,10}level)\b"
+        ),
+        "hint": (
+            "\nICA RISK ROUTING — corrective action risk levels use inspection_corrective_action:\n"
+            "  For risk level COUNTS / BREAKDOWNS on corrective actions:\n"
+            "  ALWAYS use the risk_level table via inspection_corrective_action:\n"
+            "  NOTE: form 'high risk observations' uses ai_answers correctly — this rule\n"
+            "  only applies to ICA/corrective-action risk queries.\n"
+            "  ALWAYS use the risk_level table via inspection_corrective_action:\n"
+            "  JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
+            "  WHERE rl.name = \'High\'   -- or \'Medium\' / \'Low\'\n"
+            "\nCorrect pattern for high-risk observations this month:\n"
+            "SELECT COUNT(*) AS high_risk_count\n"
+            "FROM inspection_corrective_action ica\n"
+            "JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
+            "JOIN inspection_report ir ON ica.inspection_id = ir.id\n"
+            "WHERE rl.name = \'High\'\n"
+            "  AND ir.active = true AND ica.active = true\n"
+            "  AND date_trunc(\'month\', ir.submitted_on) = date_trunc(\'month\', CURRENT_DATE);\n"
+            "\nNEVER: ai_answers WHERE label=\'Observation\' AND answer_text ILIKE \'%High%\'\n"
+            "NEVER: ai_questions WHERE label=\'Risk Level\'\n"
         ),
     },
     {
@@ -665,29 +1104,52 @@ REGISTRY: list[dict] = [
         "type":           INJECT,
         "priority":       90,
         "description":    "Most recent inspection form Q&A — use aa subquery not ir subquery.",
+        # Suppresses inject_most_recent_inspection when both patterns match, preventing
+        # contradictory hints (one says 'use ir.submitted_on', the other says 'use aa subquery').
+        "suppresses":     ["inject_most_recent_inspection"],
         "question_pattern": (
-            r"\b(list|show|get|fetch|display).{0,30}"
-            r"(question|answer|form).{0,30}"
-            r"(most\s+recent|latest|last)\b"
-            r"|\b(most\s+recent|latest|last).{0,30}"
-            r"(question|answer|form)\b"
+            # verb + answer/question/form + recency qualifier
+            r"\b(list|show|get|fetch|display|what|give).{0,30}"
+            r"(question|answer(?:s|ed)?|form).{0,30}"
+            r"(most\s+recent(?:ly)?|latest|last)"
+            # recency qualifier + answer/question/form (any order for the noun)
+            r"|\b(most\s+recent(?:ly)?|latest|last).{0,30}"
+            r"(question|answer(?:s|ed)?|form)"
+            # answer/question/form + recency qualifier (handles "answers for the latest")
+            r"|\b(answer(?:s|ed)?|question|form).{0,30}"
+            r"(most\s+recent(?:ly)?|latest|last)\b"
         ),
         "hint": (
-            "\nCRITICAL: The most recent inspection_report row may NOT have ai_answers yet.\n"
-            "Use the aa subquery to find the most recent inspection WITH Inspection Form answers:\n"
-            "SELECT aq.label AS question, aa.answer_text AS answer\n"
+            "\nMOST RECENT FORM — always anchor on ai_answers.submitted_on, not ir.submitted_on.\n"
+            "ai_answers is a complete flattened snapshot so every inspection has rows,\n"
+            "but the submission timestamps in ai_answers may differ from ir.submitted_on.\n"
+            "Use the aa subquery to guarantee you get the inspection with the latest FORM submission:\n"
+            "\n-- Pattern A: user wants Q&A from the most recent form\n"
+            "SELECT aq.label AS question, aa.answer_text AS answer, aa.module_name\n"
             "FROM ai_answers aa\n"
             "JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
             "WHERE aa.inspection_report_id = (\n"
-            "    SELECT aa2.inspection_report_id\n"
-            "    FROM ai_answers aa2\n"
-            "    WHERE aa2.module_name = 'Inspection Form'\n"
+            "    SELECT aa2.inspection_report_id FROM ai_answers aa2\n"
             "    ORDER BY aa2.submitted_on DESC LIMIT 1\n"
             ")\n"
-            "  AND aa.module_name = 'Inspection Form'\n"
-            "ORDER BY aq.label LIMIT 100;\n"
-            "NEVER: (SELECT id FROM inspection_report WHERE status != 'DRAFT' "
-            "ORDER BY submitted_on DESC LIMIT 1) — that row may have no form answers.\n"
+            "ORDER BY aa.module_name, aq.label LIMIT 200;\n"
+            "\n-- Pattern B: user wants inspection metadata for the most recently answered inspection\n"
+            "SELECT ir.inspection_id, fac.name AS facility_name,\n"
+            "       it.name AS inspection_type_name,\n"
+            "       u.first_name || ' ' || u.last_name AS inspector_name,\n"
+            "       ir.submitted_on, ir.status, ir.inspection_score\n"
+            "FROM inspection_report ir\n"
+            "JOIN facility fac ON ir.facility_id = fac.id\n"
+            "JOIN inspection_type it ON ir.inspection_type_id = it.id\n"
+            "JOIN users u ON ir.inspector_user_id = u.id\n"
+            "WHERE ir.id = (\n"
+            "    SELECT aa2.inspection_report_id FROM ai_answers aa2\n"
+            "    ORDER BY aa2.submitted_on DESC LIMIT 1\n"
+            ");\n"
+            "\nNEVER: ORDER BY ir.submitted_on DESC LIMIT 1 — use aa subquery instead.\n"
+            "NEVER: WHERE aa2.module_name = 'Inspection Form' in the inner subquery — "
+            "if the actual module_name differs the subquery returns NULL and the whole query returns empty.\n"
+            "Only filter by module_name in the OUTER WHERE using ILIKE if the user names a specific form.\n"
         ),
     },
     # Fault 1 — "completed" semantic mapping
@@ -764,6 +1226,36 @@ REGISTRY: list[dict] = [
             "FROM inspection_corrective_action ica\n"
             "JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
             "WHERE rl.name = 'High';\n"
+        ),
+    },
+    # EDG-02 — "how many questions" routing disambiguation
+    {
+        "id":             "inject_count_questions_in_form",
+        "type":           INJECT,
+        "priority":       95,
+        "description":    "Count questions in a form — route to COUNT(ai_questions), NOT list_forms.",
+        "question_pattern": (
+            r"\b(how\s+many|count|number\s+of).{0,25}"
+            r"(question|field|item|section).{0,25}"
+            r"(form|inspection|module)\b"
+            r"|\b(form|inspection|module).{0,25}"
+            r"(how\s+many|count|number\s+of).{0,25}"
+            r"(question|field|item)\b"
+        ),
+        "hint": (
+            "\nCOUNT QUESTIONS — use generate_sql with COUNT(*) on ai_questions, NOT list_forms.\n"
+            "list_forms returns a summary table; it cannot answer 'how many questions' naturally.\n"
+            "\nIf user names a specific form:\n"
+            "SELECT COUNT(*) AS question_count\n"
+            "FROM ai_questions\n"
+            "WHERE module_name ILIKE '%<form_name>%';\n"
+            "\nIf user did not name a form, list all forms and their counts:\n"
+            "SELECT module_name, COUNT(*) AS question_count\n"
+            "FROM ai_questions\n"
+            "WHERE module_name IS NOT NULL AND module_name != ''\n"
+            "GROUP BY module_name\n"
+            "ORDER BY question_count DESC;\n"
+            "NEVER call list_forms then generate_sql separately — one generate_sql call is enough.\n"
         ),
     },
     # Join registry — schedule/cycle/frequency tables
@@ -914,14 +1406,20 @@ class RulesEngine:
 
     # ── SQL validation ────────────────────────────────────────────────────────
 
-    def validate_sql(self, sql: str) -> tuple[bool, list[str]]:
+    def validate_sql(self, sql: str, question: str = "") -> tuple[bool, list[str]]:
         """
         Apply BLOCK and WARN rules to the given SQL.
         Returns (passed, [error/warning strings]).
         Real errors (BLOCK) cause passed=False.
+
+        question — optional user question text. When provided, BLOCK rules with a
+                   question_pattern will only fire if that pattern matches the question.
+                   Allows context-sensitive rules (e.g. INTERVAL '30 days' is only wrong
+                   when user asked about 'this month', not when they said 'last 30 days').
         """
         errors: list[str] = []
         sql_lower = sql.lower()
+        q_lower = question.lower() if question else ""
 
         for rule in self._block_rules:
             pattern_re: re.Pattern = rule["_sql_re"]
@@ -929,6 +1427,13 @@ class RulesEngine:
             guard = rule.get("table_guard")
             if guard and guard.lower() not in sql_lower:
                 continue
+            # Optional question_pattern: rule only fires if question matches.
+            # If question is empty/unknown, skip question_pattern rules entirely —
+            # we have no context to evaluate them, so don't block.
+            q_pat = rule.get("_q_re")
+            if q_pat:
+                if not q_lower or not q_pat.search(q_lower):
+                    continue
             if pattern_re.search(sql):
                 errors.append(rule["message"])
 
@@ -966,11 +1471,21 @@ class RulesEngine:
         """
         Return combined schema_hint for all INJECT rules matching the question.
         Rules fire in priority order (highest first) and hints are concatenated.
+
+        If a matching rule declares ``"suppresses": ["rule_id", ...]``, those
+        lower-priority rules are silenced even if their own pattern matches.
+        This prevents contradictory hints from being concatenated.
         """
+        suppressed: set[str] = set()
         parts: list[str] = []
         for rule in self._inject_rules:
+            rid = rule["id"]
+            if rid in suppressed:
+                continue
             if rule["_q_re"].search(question):
                 parts.append(rule["hint"])
+                for sid in rule.get("suppresses", []):
+                    suppressed.add(sid)
         return "".join(parts)
 
     def matching_inject_ids(self, question: str) -> list[str]:
@@ -987,6 +1502,22 @@ class RulesEngine:
             if r["id"] == rule_id:
                 return r
         return None
+
+    def required_tables_for(self, rule_ids: list) -> list:
+        """Return all required_tables for a set of fired INJECT rule IDs."""
+        tables = []
+        for rule in REGISTRY:
+            if rule.get("id") in rule_ids and rule.get("type") == INJECT:
+                tables.extend(rule.get("required_tables", []))
+        return list(set(tables))
+
+    def forbidden_patterns_for(self, rule_ids: list) -> list:
+        """Return all forbidden_patterns for a set of fired INJECT rule IDs."""
+        patterns = []
+        for rule in REGISTRY:
+            if rule.get("id") in rule_ids and rule.get("type") == INJECT:
+                patterns.extend(rule.get("forbidden_patterns", []))
+        return patterns
 
     def summary(self) -> str:
         counts = {BLOCK: 0, WARN: 0, AUTOCORRECT: 0, INJECT: 0}

@@ -107,10 +107,13 @@ class ConversationTurn:
     inspection_ids: list = field(default_factory=list)   # e.g. ["2026/04/ST085/INS003"]
     facility_names: list = field(default_factory=list)   # e.g. ["Golf Gardens"]
     inspector_names: list = field(default_factory=list)  # e.g. ["neenu extinsp1"]
+    cycle_ids: list = field(default_factory=list)        # UUIDs from cycle_id column
     single_row_values: dict = field(default_factory=dict) # col→val when result is 1 row
-    # Typed entity IDs for deterministic WHERE injection (scoped memory)
-    cycle_ids: list = field(default_factory=list)       # inspection_cycle UUIDs
-    fm_manager_ids: list = field(default_factory=list)  # inspectee user UUIDs
+    # Active focal entity — what the user is currently drilling into
+    # type: "inspection"|"facility"|"inspector"|"cycle"|"corrective_action"|None
+    active_subject_type: str = ""
+    active_subject_value: str = ""   # exact value (UUID or name)
+    active_subject_label: str = ""   # human-readable label for context message
 
 
 
@@ -150,6 +153,100 @@ def _has_uuid_leak(rows: list, columns: list) -> list[str]:
     return sorted(leaking)
 
 
+# ---------------------------------------------------------------------------
+# Retry constraint notes builder
+# ---------------------------------------------------------------------------
+
+# Maps validator error codes → focused constraint notes for the retry prompt.
+# These notes survive deepseek's seed-example bias because they are placed in
+# Qwen's message (not in schema_hint which deepseek may override with seeds).
+# Rule: give the exact fix as a constraint, never a full replacement SQL.
+_CONSTRAINT_NOTE_MAP = {
+    "WRONG_CAST_DIR": (
+        "-- CAST RULE: JOIN ON ica.observation_id = aa.submission_id::uuid\n"
+        "--   ica.observation_id is uuid; aa.submission_id is varchar → cast the varchar side\n"
+        "--   NEVER: aa.submission_id = ica.observation_id::uuid  (reversed)\n"
+        "--   NEVER: ica.observation_id::text = aa.submission_id  (wrong side cast)"
+    ),
+    "IMPOSSIBLE_JOIN": (
+        "-- Check the join path carefully. Use get_schema to verify FK columns."
+    ),
+    "WRONG_COLUMN": (
+        "-- ai_answers has NO 'label' column. To filter by question label:\n"
+        "--   JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
+        "--   WHERE aq.label = 'Observation'  (or whichever label)\n"
+        "-- ai_answers also has NO 'form_name' column — it has 'module_name'."
+    ),
+    "WRONG_JOIN": (
+        "-- 'responsible' and 'pending_with' are VARCHAR enums, not UUID FKs.\n"
+        "--   Do NOT join to users table on these columns."
+    ),
+    "UUID_IN_SELECT": (
+        "-- ir.id is the UUID primary key — never SELECT it for display.\n"
+        "--   Use ir.inspection_id (VARCHAR) for human-readable inspection IDs."
+    ),
+    "TOCHAR_WHERE_FILTER": (
+        "-- TO_CHAR(col, 'Month YYYY') = 'January 2026' ALWAYS RETURNS 0 ROWS in WHERE.\n"
+        "--   PostgreSQL pads month names with spaces: 'January   2026' != 'January 2026'.\n"
+        "--   CORRECT: EXTRACT(MONTH FROM ir.submitted_on) = 1 AND EXTRACT(YEAR ...) = 2026\n"
+        "--   TO_CHAR is only valid for SELECT/GROUP BY display labels, never WHERE."
+    ),
+    "STALE_DATE_LITERAL": (
+        "-- NEVER hardcode a past year in date literals like DATE '2023-01-01'.\n"
+        "--   The data is from 2025/2026. Use EXTRACT with CURRENT_DATE:\n"
+        "--     EXTRACT(MONTH FROM ir.submitted_on) = 1\n"
+        "--     AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)\n"
+        "--   Only use a specific year if the user explicitly asked for it."
+    ),
+    "TRUNCATED_INSPECTION_ID": (
+        "-- inspection_id is always the FULL string 'YYYY/MM/STXXX/INSXXX'.\n"
+        "--   NEVER truncate to 'STXXX/INSXXX' — always use the complete value the user provided.\n"
+        "--   Example: WHERE ir.inspection_id = '2026/01/ST074/INS002'"
+    ),
+    "MISSING_COMPLETED_STATUS": (
+        "-- 'completed' inspections require: WHERE ir.status IN ('CLOSED','SUBMITTED')\n"
+        "--   status != 'DRAFT' alone is NOT sufficient — it includes IN_PROGRESS, UNDER_REVIEW etc.\n"
+        "--   Always add: AND ir.status IN ('CLOSED','SUBMITTED')"
+    ),
+    # Fired when business_rules.py BLOCK rules trigger (error code is "BUSINESS_RULE").
+    # The most common cause is block_capex_left_join_multiplication or
+    # block_cte_reference_without_definition.  The note gives deepseek the two
+    # safe alternatives so it does NOT repeat the same broken pattern.
+    "BUSINESS_RULE": (
+        "-- CAPEX ROW-MULTIPLICATION FIX: never LEFT JOIN po_details directly when SUM(ica.capex) is present.\n"
+        "-- Safe option A — scalar subqueries (no GROUP BY needed):\n"
+        "--   SELECT\n"
+        "--     (SELECT COALESCE(SUM(capex),0) FROM inspection_corrective_action\n"
+        "--      WHERE active=true AND capex>0) AS capex_generated,\n"
+        "--     (SELECT COALESCE(SUM(po_amount),0) FROM po_details WHERE active=true) AS capex_converted\n"
+        "-- Safe option B — CTE pre-aggregation (required when grouping by region/facility/etc):\n"
+        "--   WITH po_by_ica AS (\n"
+        "--       SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po\n"
+        "--       FROM po_details WHERE active=true GROUP BY 1\n"
+        "--   )\n"
+        "--   SELECT ... LEFT JOIN po_by_ica p ON p.ica_id = ica.id ...\n"
+        "-- NEVER omit the WITH clause when referencing po_by_ica in a JOIN.\n"
+        "-- NEVER: LEFT JOIN po_details po ON po.mitigative_action_uuid = ica.id  (direct join inflates SUM)"
+    ),
+}
+
+def _build_constraint_notes(retry_reason: str) -> str:
+    """
+    Given a retry_reason string (from ValidationResult.retry_message()),
+    return focused constraint notes for the codes present.
+
+    Returns empty string if no matching codes found — avoids adding noise
+    for codes with no known constraint fix.
+    """
+    notes = []
+    for code, note in _CONSTRAINT_NOTE_MAP.items():
+        if code in retry_reason:
+            notes.append(note)
+    if notes:
+        return "Constraints to follow in your rewrite:\n" + "\n".join(notes) + "\n"
+    return ""
+
+
 class ConversationSession:
     MAX_TURNS = 5
 
@@ -169,13 +266,12 @@ class ConversationSession:
         if not self.turns:
             return ""
 
-        # Detect if the current question is a fresh subject vs a follow-up.
-        # Only emit the entity CONTEXT line when the question has clear follow-up signals.
         _FOLLOWUP_RE = re.compile(
             r"\b(it|that|this|she|he|they|them|her|his|their|"
             r"that\s+inspection|that\s+site|that\s+facility|that\s+form|"
             r"the\s+same|the\s+above|from\s+there|more|rest|remaining|"
-            r"continue|next|previous|last\s+one)\b",
+            r"continue|next|previous|last\s+one|back\s+to|go\s+back|"
+            r"that\s+inspector|that\s+cycle|that\s+person)\b",
             re.IGNORECASE,
         )
         _FRESH_SUBJECT_RE = re.compile(
@@ -201,53 +297,110 @@ class ConversationSession:
                 lines.append(f"  Total rows: {t.total_count}")
             if t.columns:
                 lines.append(f"  Columns: {t.columns}")
-            # Surface extracted entities so the LLM can use them as exact filters
             if t.inspection_ids:
                 lines.append(f"  ★ inspection_id(s) from this result: {t.inspection_ids[:5]}")
+            if t.cycle_ids:
+                lines.append(f"  ★ cycle_id(s) from this result: {t.cycle_ids[:3]}")
             if t.facility_names:
                 lines.append(f"  ★ facility(s) from this result: {t.facility_names[:5]}")
             if t.inspector_names:
                 lines.append(f"  ★ inspector(s) from this result: {t.inspector_names[:5]}")
             if t.single_row_values:
                 lines.append(f"  ★ single-row result: {t.single_row_values}")
+            # Show active subject for each turn
+            if t.active_subject_type and t.active_subject_value:
+                lines.append(
+                    f"  ◆ ACTIVE SUBJECT: {t.active_subject_type} = "
+                    f"'{t.active_subject_label or t.active_subject_value}' "
+                    f"(exact value: {t.active_subject_value})"
+                )
         lines.append("")
 
-        # Only synthesise entity context for follow-up questions.
-        # For fresh subject queries ("list all Q&A from most recent form") never
-        # inject a facility/inspection filter — that's context pollution.
-        if not is_clearly_fresh:
+        # ── Resolve active subject across all turns ──────────────────────────
+        # Walk backwards through turns to find the most recent active subject.
+        # "go back to that inspector" can re-anchor to an earlier turn's subject.
+        active_type = ""
+        active_value = ""
+        active_label = ""
+
+        # "go back" or "back to" signals: re-anchor to the earliest matching subject
+        _BACK_RE = re.compile(r"\b(go\s+back|back\s+to|return\s+to)\b", re.IGNORECASE)
+        if _BACK_RE.search(current_question):
+            # Look for the first (oldest) active subject in history
+            for t in self.turns:
+                if t.active_subject_type and t.active_subject_value:
+                    active_type = t.active_subject_type
+                    active_value = t.active_subject_value
+                    active_label = t.active_subject_label
+                    break
+        else:
+            # Normal: use the most recent active subject
+            for t in reversed(self.turns):
+                if t.active_subject_type and t.active_subject_value:
+                    active_type = t.active_subject_type
+                    active_value = t.active_subject_value
+                    active_label = t.active_subject_label
+                    break
+
+        # ── Emit the scoped context block ────────────────────────────────────
+        if not is_clearly_fresh and active_type and active_value:
+            if active_type == "cycle":
+                lines.append(
+                    f"ACTIVE CONTEXT — The conversation is scoped to cycle "
+                    f"'{active_value}'."
+                    f" All follow-up questions about inspections, corrective actions,"
+                    f" facilities, or inspectors should include WHERE ir.cycle_id = '{active_value}'."
+                    f" When user says 'they', 'that cycle', 'those facilities', 'those inspectors'"
+                    f" — this is the scope."
+                )
+            elif active_type == "inspector":
+                lines.append(
+                    f"ACTIVE CONTEXT — The conversation is about inspector '{active_label}'."
+                    f" When user says 'they', 'that inspector', 'their inspections'"
+                    f" — filter by inspector name ILIKE '%{active_label.split()[0]}%'"
+                    f" on the users table joined via ir.inspector_user_id."
+                    f" Do NOT broaden to all inspectors."
+                )
+            elif active_type == "inspection":
+                lines.append(
+                    f"ACTIVE CONTEXT — The conversation is about inspection '{active_value}'."
+                    f" When the user says 'it', 'that inspection', 'that site'"
+                    f" — use WHERE ir.inspection_id = '{active_value}'"
+                    f" (or aa.inspection_id = '{active_value}' for form answers)."
+                )
+            elif active_type == "facility":
+                lines.append(
+                    f"ACTIVE CONTEXT — The conversation is about facility '{active_label}'."
+                    f" When user says 'that facility', 'that site'"
+                    f" — filter by fac.name ILIKE '%{active_label}%'."
+                )
+            elif active_type == "corrective_action":
+                lines.append(
+                    f"ACTIVE CONTEXT — The conversation is about corrective action '{active_value}'."
+                )
+        elif not is_clearly_fresh:
+            # Fallback: legacy single-entity context
             last = self.turns[-1]
             if last.inspection_ids and len(last.inspection_ids) == 1:
                 lines.append(
                     f"CONTEXT — The conversation is about inspection '{last.inspection_ids[0]}'."
-                    f" When the user says 'that inspection', 'it', 'that site', 'she filled',"
-                    f" 'he filled', 'they filled', 'that form' — use"
-                    f" WHERE aa.inspection_id = '{last.inspection_ids[0]}'"
-                    f" (or ir.inspection_id = '{last.inspection_ids[0]}') as an exact filter."
-                    f" Do NOT filter by facility name or inspector name — use the inspection_id."
+                    f" When the user says 'that inspection', 'it', 'that site' — use"
+                    f" WHERE ir.inspection_id = '{last.inspection_ids[0]}'"
+                    f" as an exact filter."
                 )
             elif last.inspection_ids:
-                ids_str = ", ".join(f"'{i}'" for i in last.inspection_ids[:5])
+                ids_str = ", ".join(f"\'{i}\'" for i in last.inspection_ids[:5])
                 lines.append(
                     f"CONTEXT — The conversation involves inspections: {ids_str}."
-                    f" When the user references 'those inspections' or 'that data',"
-                    f" filter by inspection_id IN ({ids_str})."
+                    f" Filter by inspection_id IN ({ids_str}) when user references 'those'."
                 )
             elif last.facility_names and len(last.facility_names) == 1:
                 lines.append(
                     f"CONTEXT — The conversation is about facility '{last.facility_names[0]}'."
-                    f" If the user asks about 'that facility' or 'that site',"
-                    f" filter by fac.name ILIKE '%{last.facility_names[0]}%'."
+                    f" Filter by fac.name ILIKE '%{last.facility_names[0]}%'."
                 )
             elif last.single_row_values:
                 lines.append(f"CONTEXT — Last query returned a single result: {last.single_row_values}")
-            # Emit cycle_ids explicitly — never let Qwen truncate them
-            _cids = getattr(last, "cycle_ids", [])
-            if _cids:
-                for _cid in _cids:
-                    lines.append(
-                        f"CYCLE_ID (use this EXACT UUID, never truncate): {_cid}"
-                    )
 
         lines.append("")
         lines.append(
@@ -280,10 +433,8 @@ class AgentResult:
 _INSPECTION_REPORT_RE = re.compile(
     r'\b(inspection.?score|gp.?score|inspection.?hour|total.?hour|'
     r'inspection.?report|inspection.?status|inspector|inspectee|'
-    r'inspection.?type|inspection.?sub.?type|facility|facilities|'
-    r'inspections?\s+by\s+type|inspections?\s+per\s+cycle|'
-    r'inspections?|inspection|duration|submitted|score|'
-    r'completed.{0,20}inspect|inspect.{0,20}completed)\b',
+    r'inspection.?type|inspection.?sub.?type|facility|'
+    r'inspections?\s+by\s+type|inspections?\s+per\s+cycle)\b',
     re.IGNORECASE,
 )
 _CORRECTIVE_ACTION_RE = re.compile(
@@ -298,47 +449,10 @@ _SCHEDULE_CYCLE_RE = re.compile(
     r'due.?date|schedule.?date|portfolio|inspector.?portfolio)\b',
     re.IGNORECASE,
 )
-
-# Inspector count query — deepseek reliably generates hardcoded years for this pattern.
-# Auto-inject the exact working SQL template as schema_hint.
-_INSPECTOR_COUNT_RE = re.compile(
-    r'\b(which|who|top|most|count|how\s+many|list).{0,30}'
-    r'(inspector|inspectors?).{0,30}'
-    r'(most|conducted|done|most\s+inspections?|count|number|year)\b',
-    re.IGNORECASE,
-)
-
-# Corrective action + facility/grouping queries — deepseek always generates
-# ON ir.inspection_id = ica.inspection_id (varchar=UUID type mismatch).
-# Correct join is ON ica.inspection_id = ir.id (UUID=UUID).
-_ICA_JOIN_RE = re.compile(
-    r'\b(corrective.?action|capex|opex).{0,50}'
-    r'(facility|client|inspector|type|count|by|group|breakdown)\b'
-    r'|\b(facility|client|inspector|type|breakdown).{0,50}'
-    r'(corrective.?action|capex|opex)\b',
-    re.IGNORECASE,
-)
-
-# Most-recent inspection query — llama3.1 sometimes routes through ai_answers
-# looking for "Inspection Facility" label, omitting ir.inspection_id from SELECT.
-# Inject direct inspection_report pattern so deepseek ignores the ai_answers hint.
-_MOST_RECENT_INSPECTION_RE = re.compile(
-    r'\b(most\s+recent|latest|last)\s+(inspection|site|facility|form)\b'
-    r'|\b(which|what)\s+(facility|site).{0,30}(most\s+recent|latest|last)\b',
-    re.IGNORECASE,
-)
-
-
-def _detect_inspection_tables(question: str) -> list:
-    tables = []
-    q = question.lower()
-    if _INSPECTION_REPORT_RE.search(q):
-        tables.extend(["inspection_report", "inspection_type", "inspection_sub_type"])
-    if _CORRECTIVE_ACTION_RE.search(q):
-        tables.append("inspection_corrective_action")
-    if _SCHEDULE_CYCLE_RE.search(q):
-        tables.extend(["inspection_schedule", "inspection_cycle", "inspector_portfolio"])
-    return tables
+# NOTE: _INSPECTOR_COUNT_RE, _ICA_JOIN_RE, _MOST_RECENT_INSPECTION_RE removed —
+# these duplicated INJECT rules already handled by business_rules.py:
+#   inject_inspector_count, inject_ica_join, inject_most_recent_inspection.
+# business_rules.hint_for_question() fires all three via the registry at line ~697.
 
 
 class AgentOrchestrator:
@@ -381,33 +495,25 @@ class AgentOrchestrator:
             examples=SEED_EXAMPLES,
         )
 
-        # Validate join graph against live DB
-        try:
-            from agent.join_graph import validate_join_graph
-            _jg_errors = validate_join_graph(self.db_engine)
-            if _jg_errors:
-                print(f"  ⚠ JOIN_GRAPH validation errors ({len(_jg_errors)}):")
-                for _e in _jg_errors:
-                    print(f"    {_e}")
-            else:
-                print(f"  ✓ Join graph validated")
-        except Exception as _jg_init_err:
-            print(f"  ⚠ Join graph validation skipped: {_jg_init_err}")
-
         print(f"  Configuring reasoning LLM: {chat_model}...")
         self.reasoning_llm = Ollama(model=chat_model, base_url=ollama_url,
             temperature=0.2, request_timeout=120.0,
-            additional_kwargs={"num_predict": 768, "num_ctx": 16384})
+            additional_kwargs={
+                "num_predict": 1024,
+                "num_ctx": 16384,
+                "think": False,   # Disable Qwen3 internal chain-of-thought — saves 8-15s per call
+            })
         print(f"  ✓ Reasoning LLM ({chat_model})")
 
         print(f"  Configuring SQL LLM: {sql_model}...")
         self.sql_llm = Ollama(model=sql_model, base_url=ollama_url,
             temperature=0.0, request_timeout=120.0,
             additional_kwargs={
-                "num_predict": 350,
+                "num_predict": 1024,
                 "num_ctx": 16384,
                 "top_p": 0.9,
                 # Stop tokens prevent deepseek adding explanation text after SQL
+                # ";" must be first — stops generation immediately after the query ends
                 "stop": [";", "[/SQL]", "This query", "Note:", "-- Note", "/*"],
             })
         print(f"  ✓ SQL LLM ({sql_model})")
@@ -424,6 +530,23 @@ class AgentOrchestrator:
             sql_prompt=self._sql_prompt,
             debug_logger=self._debug,
         )
+
+        # ── Join graph startup validation ─────────────────────────────────
+        # Validates every FK edge in JOIN_GRAPH against the live DB schema.
+        # Catches schema drift (renamed columns, dropped tables) immediately
+        # at startup rather than silently failing at query time.
+        # Errors are logged as warnings — they don't prevent startup.
+        try:
+            from agent.join_graph import validate_join_graph
+            jg_errors = validate_join_graph(self.db_engine)
+            if jg_errors:
+                print(f"  ⚠ JOIN_GRAPH validation ({len(jg_errors)} issues):")
+                for e in jg_errors:
+                    print(f"    - {e}")
+            else:
+                print(f"  ✓ JOIN_GRAPH validated ({len(jg_errors)} errors)")
+        except Exception as _jg_exc:
+            print(f"  ⚠ JOIN_GRAPH validation skipped: {_jg_exc}")
 
     # ------------------------------------------------------------------ #
     # Terminal tools — synthesize and return immediately on success
@@ -446,16 +569,9 @@ class AgentOrchestrator:
         if session and session.turns:
             system_content += "\n\n" + session.build_context_block(question)
 
-        # ── Schema-first: inject compressed column context before Qwen plans ──
-        # Qwen plans against real verified columns, not memory.
-        # This eliminates hallucinated columns like total_inspection_hours.
-        _relevant_tables = _detect_inspection_tables(question)
-        _schema_prefix = self._build_planner_schema_context(question, _relevant_tables)
-        _user_content = (_schema_prefix + "\n\n" + question) if _schema_prefix else question
-
         messages = [
             ChatMessage(role=MessageRole.SYSTEM, content=system_content),
-            ChatMessage(role=MessageRole.USER, content=_user_content),
+            ChatMessage(role=MessageRole.USER, content=question),
         ]
         steps = []
         gen_sql_failures = 0
@@ -568,12 +684,7 @@ class AgentOrchestrator:
 
             thought, tool, args = tc.get("thought", ""), tc["tool"], tc["args"]
 
-            # Auto-inject targeted hints for generate_sql calls.
-            # NOTE: _detect_inspection_tables DDL injection intentionally removed —
-            # for_schema_hint() returns live DB columns (created_by, modified_by, active,
-            # subform_id etc.) that conflict with the simplified schema in the SQL prompt,
-            # causing deepseek to SELECT wrong columns. The SQL prompt's own schema
-            # definitions are sufficient.
+            # Auto-inject targeted hints for generate_sql calls via business_rules registry.
             if tool == "generate_sql":
                 # ── Business rules inject hints ───────────────────────────────
                 # Apply INJECT rules from business_rules.py registry.
@@ -587,129 +698,6 @@ class AgentOrchestrator:
                     args["_inject_rule_ids"] = _inject_ids
                 except Exception:
                     args["_inject_rule_ids"] = []
-
-                # ── Join graph injection ────────────────────────────────────
-                # Only override when Qwen's hint contains a KNOWN IMPOSSIBLE JOIN
-                # or when the question is specifically about a cycle's frequency.
-                # Do NOT strip valid hints for general portfolio/schedule queries.
-                try:
-                    from agent.join_graph import render_join_path, find_join_path
-                    _q_lower_jg = question.lower()
-                    _hint_lower = (args.get("schema_hint", "") or "").lower()
-
-                    # Detect if Qwen emitted an impossible join
-                    _has_bad_join = bool(re.search(
-                        r'ipd\.cycle_id|ic\.inspection_cycle_id',
-                        _hint_lower
-                    ))
-
-                    # Detect cycle-specific frequency question (not general portfolio frequency)
-                    _is_cycle_freq_q = bool(
-                        re.search(r'\b(cycle|most\s+recent\w*\s+completed|completed\s+cycle)\b', _q_lower_jg)
-                        and re.search(r'\b(frequency|how\s+often)\b', _q_lower_jg)
-                    )
-
-                    # Only inject/strip for cycle→frequency path
-                    if _has_bad_join or _is_cycle_freq_q:
-                        _path = find_join_path("inspection_cycle", "frequency_definition")
-                        if _path:
-                            _hint = args.get("schema_hint", "")
-                            # Strip only the bad join conditions, not all joins
-                            _hint = re.sub(
-                                r'(?i)(LEFT\s+)?JOIN\s+inspector_portfolio_details\s+\w+\s+ON\s+[^\n]+\n?',
-                                "", _hint
-                            )
-                            _hint = re.sub(r'\bipd\.cycle_id\b', "", _hint, flags=re.IGNORECASE)
-                            args["schema_hint"] = (
-                                _hint +
-                                "\nGRAPH-RESOLVED PATH (use exactly, NEVER ipd.cycle_id):\n"
-                                + render_join_path(_path) + "\n"
-                            )
-
-                    # ICA → facility: only inject, never strip existing hints
-                    if re.search(r'\b(corrective.?action|capex|opex)\b', _q_lower_jg):
-                        if re.search(r'\b(facility|facilities|site|by\s+facility)\b', _q_lower_jg):
-                            _path = find_join_path("inspection_corrective_action", "facility")
-                            if _path:
-                                args["schema_hint"] = (
-                                    args.get("schema_hint", "") +
-                                    "\nJOIN PATH (ica→ir→facility):\n"
-                                    + render_join_path(_path) + "\n"
-                                )
-
-                    # Scoped memory: inject known cycle_id as hard WHERE
-                    _lt = session.last_turn if session else None
-                    _s_cycles = getattr(_lt, "cycle_ids", []) if _lt else []
-                    if _s_cycles and re.search(
-                        r'\b(frequency|cycle|schedule|its?|that|this)\b', _q_lower_jg
-                    ):
-                        _cid = _s_cycles[0]
-                        _existing_hint = args.get("schema_hint", "") or ""
-                        # Strip truncated UUIDs (e.g. '012095ba-...' with ellipsis)
-                        # Qwen copies truncated UUIDs from conversation display
-                        _existing_hint = re.sub(
-                            r"'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{0,4}\.\.\.'?",
-                            f"'{_cid}'", _existing_hint, flags=re.IGNORECASE
-                        )
-                        args["schema_hint"] = (
-                            _existing_hint +
-                            f"\nHARD FILTER — EXACT UUID (do not truncate):"
-                            f" WHERE ic.id = '{_cid}'\n"
-                        )
-                except Exception as _jg_err:
-                    pass  # join graph optional — never break query execution
-
-                # Auto-inject exact SQL template for inspector count queries —
-                # deepseek reliably generates hardcoded years for this pattern.
-                if _INSPECTOR_COUNT_RE.search(question):
-                    inspector_hint = (
-                        "\nUSE THIS EXACT PATTERN for inspector count queries:\n"
-                        "SELECT u.first_name || ' ' || u.last_name AS inspector_name,\n"
-                        "       COUNT(*) AS num_inspections\n"
-                        "FROM inspection_report ir\n"
-                        "JOIN users u ON ir.inspector_user_id = u.id\n"
-                        "WHERE ir.status != 'DRAFT'\n"
-                        "  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)\n"
-                        "GROUP BY u.first_name, u.last_name\n"
-                        "ORDER BY num_inspections DESC LIMIT 1;\n"
-                        "CRITICAL: NEVER write '= 2023' or '= 2026' — always use EXTRACT(YEAR FROM CURRENT_DATE)."
-                    )
-                    args["schema_hint"] = (args.get("schema_hint", "") + inspector_hint)
-
-                # Auto-inject correct ICA→IR join — deepseek always generates
-                # ON ir.inspection_id = ica.inspection_id (varchar=UUID mismatch).
-                # The correct join is ON ica.inspection_id = ir.id (UUID=UUID).
-                if _ICA_JOIN_RE.search(question):
-                    ica_hint = (
-                        "\nCRITICAL JOIN — inspection_corrective_action to inspection_report:\n"
-                        "  ica.inspection_id → UUID FK to inspection_report.id (UUID PK)\n"
-                        "  ir.inspection_id  → VARCHAR human-readable ('2026/04/ST001/INS001') — DIFFERENT\n"
-                        "  ALWAYS: JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id\n"
-                        "  NEVER:  ON ir.inspection_id = ica.inspection_id  ← varchar=UUID type mismatch\n"
-                        "Example:\n"
-                        "SELECT fac.name AS facility_name, COUNT(ica.id) AS open_count\n"
-                        "FROM inspection_report ir\n"
-                        "JOIN facility fac ON ir.facility_id = fac.id\n"
-                        "JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id\n"
-                        "WHERE ica.status = 'OPEN'\n"
-                        "GROUP BY fac.name ORDER BY open_count DESC;"
-                    )
-                    args["schema_hint"] = (args.get("schema_hint", "") + ica_hint)
-
-                # Auto-inject most-recent inspection template — llama3.1 sometimes
-                # routes through ai_answers (looking for "Inspection Facility" label),
-                # omitting ir.inspection_id from SELECT.  Force the direct pattern.
-                if _MOST_RECENT_INSPECTION_RE.search(question):
-                    recent_hint = (
-                        "\nDIRECT QUERY — do NOT route through ai_answers for this:\n"
-                        "SELECT ir.inspection_id, fac.name AS facility_name, ir.submitted_on, ir.status\n"
-                        "FROM inspection_report ir\n"
-                        "JOIN facility fac ON ir.facility_id = fac.id\n"
-                        "WHERE ir.status != 'DRAFT'\n"
-                        "ORDER BY ir.submitted_on DESC LIMIT 1;\n"
-                        "CRITICAL: always SELECT ir.inspection_id — needed for multi-turn follow-up."
-                    )
-                    args["schema_hint"] = (args.get("schema_hint", "") + recent_hint)
 
                 # Preserve explicit LIMIT from user question
                 limit_match = re.search(
@@ -725,48 +713,16 @@ class AgentOrchestrator:
                             args.get("schema_hint", "") +
                             f"\nIMPORTANT: user asked for exactly {n} results — use LIMIT {n}."
                         )
+                # Inject active cycle UUID for seed substitution
+                if session and session.turns:
+                    for _t in reversed(session.turns):
+                        if _t.active_subject_type == "cycle" and _t.active_subject_value:
+                            args["_active_cycle_uuid"] = _t.active_subject_value
+                            break
                 tc["args"] = args
 
             if tool == "final_answer":
                 ans = args.get("answer", "")
-
-                # ── Hallucination guard ───────────────────────────────────────
-                # Reject final_answer if Qwen skipped execution for a data query.
-                # Detects when Qwen invents a numeric/factual answer without
-                # any prior successful execute_sql or get_answers step.
-                _DATA_Q_RE = re.compile(
-                    r'\b(how many|how much|average|total|count|percentage|'
-                    r'which|show|list|what is the|what are|who|when|'
-                    r'highest|lowest|most|least|best|worst|top|rank)\b',
-                    re.IGNORECASE,
-                )
-                _has_execution = any(
-                    s.tool in ("execute_sql", "get_answers", "get_answer_stats",
-                               "list_forms", "search_questions")
-                    and s.result.get("success")
-                    for s in steps
-                )
-                _looks_like_data_query = bool(_DATA_Q_RE.search(question))
-                _is_nonsense_decline = bool(re.search(
-                    r"couldn't find|can't help|don't have|no data|"
-                    r"rephrase|not related|nonsense",
-                    ans, re.IGNORECASE
-                ))
-
-                if (_looks_like_data_query
-                        and not _has_execution
-                        and not _is_nonsense_decline):
-                    # Qwen called final_answer without any DB execution — reject.
-                    # This fires on any iteration, not just iter 1.
-                    messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
-                    messages.append(ChatMessage(role=MessageRole.USER, content=
-                        "You called final_answer without executing any query. "
-                        "You MUST call generate_sql first (execute_sql runs automatically). "
-                        "Never invent numbers or results from memory. "
-                        f"Re-attempt the question: {question}"))
-                    continue
-                # ── End hallucination guard ───────────────────────────────────
-
                 s = AgentStep(iteration, thought, "final_answer", args,
                               {"answer": ans}, int((time.time()-t0)*1000))
                 steps.append(s); _emit(s)
@@ -799,9 +755,14 @@ class AgentOrchestrator:
                     if not er.get("success"):
                         messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
                         hint = self._schema_hint_for_error(er.get("error", ""))
+                        err_msg = er.get("error", "")
+                        # Extract just the key constraint from the error — don't echo
+                        # the full failed SQL back as schema_hint because deepseek ignores it
+                        # and Qwen then enters a loop re-passing the same broken SQL.
                         messages.append(ChatMessage(role=MessageRole.USER, content=
-                            f"SQL failed: {er.get('error','')}\nSQL: {sql}\n{hint}"
-                            f"Fix the query or use get_schema to check column names."))
+                            f"SQL execution failed: {err_msg}\n{hint}"
+                            f"Rewrite the query. Do NOT pass the failed SQL as schema_hint again. "
+                            f"Use get_schema if you need to verify column names."))
                         continue
 
                     exec_data = er.get("result", {})
@@ -813,14 +774,11 @@ class AgentOrchestrator:
                         rows_preview = json.dumps(exec_data.get("rows", [])[:10], default=str)
                         messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
                         messages.append(ChatMessage(role=MessageRole.USER, content=
-                            f"SQL executed. Rows returned: {exec_data.get('row_count',0)}\n"
-                            f"Columns: {exec_data.get('columns',[])}\n"
-                            f"Data: {rows_preview}\n\n"
+                            f"SQL: {sql}\nResult: {exec_data.get('row_count',0)} rows, "
+                            f"columns={exec_data.get('columns',[])}\n"
+                            f"Sample: {rows_preview}\n\n"
                             f"Original question: \"{question}\"\n"
-                            f"RULE: Your final_answer MUST use ONLY the data above.\n"
-                            f"Do NOT invent values not in the rows above.\n"
-                            f"If these rows answer the question, call final_answer now.\n"
-                            f"If you need more data (e.g. a second query), call the next tool."))
+                            f"If this answers it, call final_answer. Otherwise call the next tool."))
                         continue
 
                     ans = self._synthesize(question, "execute_sql", er)
@@ -860,9 +818,16 @@ class AgentOrchestrator:
                                 ans = self._synthesize(question, "execute_sql", er)
                                 return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
+                    # Build a focused, actionable retry note.
+                    # IMPORTANT: never put a full corrected SQL in the retry message —
+                    # deepseek ignores schema_hint SQL and generates its own anyway,
+                    # causing Llama to loop re-passing the same broken SQL in schema_hint.
+                    # Instead give constraint notes that survive deepseek's seed-example bias.
+                    _constraint_notes = _build_constraint_notes(retry_reason)
                     messages.append(ChatMessage(role=MessageRole.USER, content=
                         f"generate_sql failed ({gen_sql_failures}x). Fix required: {retry_reason}\n"
-                        f"Correct the SQL or use get_schema to verify column names."))
+                        f"{_constraint_notes}"
+                        f"Rewrite the SQL from scratch. Do NOT put corrected SQL in schema_hint."))
                     continue
 
             # Path B: terminal tools → synthesize and return
@@ -926,33 +891,7 @@ class AgentOrchestrator:
     # Finish helper
     # ------------------------------------------------------------------ #
 
-    def _build_planner_schema_context(self, question: str, relevant_tables: list) -> str:
-        """Compressed schema context for Qwen — real columns only, ~300-500 tokens."""
-        if not relevant_tables:
-            return ""
-        from core.schema_introspector import USEFUL_COLUMNS
-        lines = ["[VERIFIED SCHEMA — only these columns exist:]",]
-        shown = set()
-        for tname in relevant_tables:
-            if tname not in USEFUL_COLUMNS or tname in shown:
-                continue
-            shown.add(tname)
-            cols = USEFUL_COLUMNS[tname]
-            ev = self.db_schema.enum_values.get(f"{tname}.status")
-            status_note = f" | status: {', '.join(repr(v) for v in ev)}" if ev else ""
-            lines.append(f"  {tname}: {', '.join(cols)}{status_note}")
-        _q = question.lower()
-        if any(w in _q for w in ('inspector', 'manager', 'fm ', 'user', 'who', 'inspectee')):
-            lines.append("  users: id, first_name, last_name, email")
-            lines.append("  inspector_user_id → JOIN users u ON ir.inspector_user_id = u.id")
-            lines.append("  inspectee_user_id → FM Manager: JOIN users u ON ir.inspectee_user_id = u.id")
-        if any(w in _q for w in ('facility', 'facilities', 'site')):
-            lines.append("  facility: id, name, client_id")
-        lines.append("[Use get_schema tool if you need a column not listed above]")
-        return "\n".join(lines)
-
     def _finish(self, question, answer, steps, iteration, emit_fn=None,
-
                 stats=None, session=None, query_start=None):
         s = AgentStep(iteration, "[auto] synthesized", "final_answer",
                       {"answer": answer}, {"answer": answer}, 0)
@@ -986,9 +925,12 @@ class AgentOrchestrator:
                     break
 
         # Extract key entities from result rows for follow-up context
-        insp_ids, fac_names, insp_names = [], [], []
-        cycle_ids, fm_manager_ids = [], []
+        insp_ids, fac_names, insp_names, cycle_ids = [], [], [], []
         single_row_vals = {}
+        _UUID_PAT = re.compile(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+            re.IGNORECASE
+        )
 
         for row in last_rows[:20]:
             if not isinstance(row, dict):
@@ -1005,11 +947,10 @@ class AgentOrchestrator:
                 v = row.get(col)
                 if v and str(v) not in insp_names:
                     insp_names.append(str(v))
-            # Extract typed entity UUIDs for scoped memory
-            for col in ("inspection_cycle_id", "cycle_id"):
+            for col in ("cycle_id", "inspection_cycle_id"):
                 v = row.get(col)
-                if v and re.match(r'^[0-9a-f-]{36}$', str(v), re.I):
-                    if str(v) not in cycle_ids: cycle_ids.append(str(v))
+                if v and str(v) not in cycle_ids and _UUID_PAT.match(str(v).strip()):
+                    cycle_ids.append(str(v).strip())
 
         # If only 1 row, store all values for maximum context
         if len(last_rows) == 1 and last_rows[0]:
@@ -1017,6 +958,42 @@ class AgentOrchestrator:
                 k: str(v) for k, v in last_rows[0].items()
                 if v is not None and str(v).strip()
             }
+            # Also pull cycle_id from single-row result
+            for col in ("cycle_id", "inspection_cycle_id"):
+                v = last_rows[0].get(col)
+                if v and str(v) not in cycle_ids and _UUID_PAT.match(str(v).strip()):
+                    cycle_ids.append(str(v).strip())
+
+        # ── Determine active subject for this turn ───────────────────────────
+        # Priority: cycle > single inspector > single inspection > single facility
+        active_subject_type = ""
+        active_subject_value = ""
+        active_subject_label = ""
+
+        if len(cycle_ids) == 1:
+            active_subject_type = "cycle"
+            active_subject_value = cycle_ids[0]
+            active_subject_label = cycle_ids[0]
+        elif len(insp_names) == 1:
+            active_subject_type = "inspector"
+            active_subject_value = insp_names[0]
+            active_subject_label = insp_names[0]
+        elif len(insp_ids) == 1:
+            active_subject_type = "inspection"
+            active_subject_value = insp_ids[0]
+            active_subject_label = insp_ids[0]
+        elif len(fac_names) == 1:
+            active_subject_type = "facility"
+            active_subject_value = fac_names[0]
+            active_subject_label = fac_names[0]
+        # If previous turn had a cycle scope and this result has no conflicting subject,
+        # inherit the cycle scope so it persists across multi-turn drilldowns
+        elif session and session.turns:
+            prev_turn = session.turns[-1]
+            if prev_turn.active_subject_type == "cycle" and prev_turn.active_subject_value:
+                active_subject_type = "cycle"
+                active_subject_value = prev_turn.active_subject_value
+                active_subject_label = prev_turn.active_subject_label
 
         if session is not None:
             # MT-03 fix: if we have a facility name but no inspection_id (e.g. MT-01
@@ -1052,8 +1029,11 @@ class AgentOrchestrator:
                 inspection_ids=insp_ids[:5],
                 facility_names=fac_names[:5],
                 inspector_names=insp_names[:5],
-                single_row_values=single_row_vals,
                 cycle_ids=cycle_ids[:3],
+                single_row_values=single_row_vals,
+                active_subject_type=active_subject_type,
+                active_subject_value=active_subject_value,
+                active_subject_label=active_subject_label,
             ))
 
         return AgentResult(question, answer, steps, iteration, True, stats or QueryStats())

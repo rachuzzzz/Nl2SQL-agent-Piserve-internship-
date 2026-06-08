@@ -1,0 +1,872 @@
+"""
+Chart Advisor
+=============
+Analyses SQL result shape and recommends the best Apache ECharts option object.
+
+Public API:
+  advise(columns, rows)                → dict   — primary recommendation + alternatives
+  force_config(columns, rows, type)    → dict | None
+  get_alternatives(columns, rows, n)   → list[dict]  — top N ranked alternatives
+
+Return format of advise():
+  {
+    "chart_type":     str,        # primary recommended type
+    "reason":         str,        # human-readable justification
+    "confidence":     str,        # "high" | "medium" | "low"
+    "config":         dict,       # ECharts option for primary
+    "labels_column":  str | None,
+    "values_columns": list[str],
+    "alternatives": [             # up to 3 ranked alternatives, ready to render
+      {
+        "chart_type": str,
+        "label":      str,        # display label e.g. "Bar Chart"
+        "config":     dict,
+      },
+      ...
+    ]
+  }
+"""
+
+from __future__ import annotations
+import json
+import os
+import re
+from typing import Any
+
+
+# ── Palette ───────────────────────────────────────────────────────────────────
+# Professional dark-background palette — sufficient contrast, not garish
+_PALETTE = [
+    "#6366f1",   # indigo    (primary)
+    "#10b981",   # emerald
+    "#f59e0b",   # amber
+    "#ef4444",   # red
+    "#3b82f6",   # blue
+    "#a855f7",   # purple
+    "#14b8a6",   # teal
+    "#f97316",   # orange
+    "#ec4899",   # pink
+    "#84cc16",   # lime
+]
+
+# Semantic colours
+_C_POSITIVE = "#10b981"   # green  — income, good
+_C_NEGATIVE = "#ef4444"   # red    — cost, bad
+_C_NEUTRAL  = "#6366f1"   # indigo — neutral
+
+# Theme tokens (applied to axis/grid/label text)
+_GRID    = "rgba(255,255,255,0.05)"
+_TICK    = "#6b7280"
+_LABEL   = "#9ca3af"
+_AXLINE  = "#374151"
+
+# ── Valid types ───────────────────────────────────────────────────────────────
+_VALID_TYPES = {
+    "bar", "horizontal_bar", "stacked_bar",
+    "line", "area",
+    "pie", "doughnut",
+    "scatter",
+    "radar",
+    "heatmap",
+    "waterfall",
+    "gauge",
+}
+
+_TYPE_LABELS = {
+    "bar":           "Bar Chart",
+    "horizontal_bar":"Horizontal Bar",
+    "stacked_bar":   "Stacked Bar",
+    "line":          "Line Chart",
+    "area":          "Area Chart",
+    "pie":           "Pie Chart",
+    "doughnut":      "Doughnut Chart",
+    "scatter":       "Scatter Plot",
+    "radar":         "Radar Chart",
+    "heatmap":       "Heatmap",
+    "waterfall":     "Waterfall Chart",
+    "gauge":         "Gauge",
+}
+
+# Alternatives map — what makes sense as a second/third option for each type
+_ALT_MAP: dict[str, list[str]] = {
+    "bar":           ["horizontal_bar", "line"],
+    "horizontal_bar":["bar", "stacked_bar"],
+    "stacked_bar":   ["bar", "area"],
+    "line":          ["area", "bar"],
+    "area":          ["line", "stacked_bar"],
+    "pie":           ["doughnut", "bar"],
+    "doughnut":      ["pie", "bar"],
+    "scatter":       ["bar", "line"],
+    "radar":         ["bar", "line"],
+    "heatmap":       ["bar", "scatter"],
+    "waterfall":     ["bar", "line"],
+    "gauge":         ["bar"],
+}
+
+
+# ── Column classifier ─────────────────────────────────────────────────────────
+_DATE_RE   = re.compile(r'(date|month|year|week|\btime\b|period|quarter|\bday\b|created|modified|submitted|reported)', re.I)
+_PCT_RE    = re.compile(r'(pct|percent|rate|ratio|share|proportion|conversion)', re.I)
+_SCORE_RE  = re.compile(r'(score|rating|grade|index)', re.I)
+_INCOME_RE = re.compile(r'(income|revenue|po_amount|converted|earned)', re.I)
+_COST_RE   = re.compile(r'(cost|opex|pr_amount|expenditure|spent|loss)', re.I)
+_PROFIT_RE = re.compile(r'(profit|net|margin|gain)', re.I)
+_CAPEX_RE  = re.compile(r'(capex|opex|budget|amount)', re.I)
+
+def _is_date_col(col, vals):
+    if _DATE_RE.search(col): return True
+    return any(re.match(r'\d{4}[-/]\d{2}', str(v)) for v in vals[:5] if v)
+
+def _coerce(v) -> float | None:
+    if isinstance(v, (int, float)): return float(v)
+    try: return float(str(v).replace(',','').strip())
+    except: return None
+
+def _is_numeric(vals):
+    nz = [v for v in vals if v is not None]
+    return bool(nz) and all(_coerce(v) is not None for v in nz[:10])
+
+def _cardinality(vals):
+    return len(set(str(v) for v in vals if v is not None))
+
+def _classify(columns, rows):
+    out = {"date": [], "numeric": [], "category": []}
+    for col in columns:
+        vals = [r.get(col) for r in rows]
+        if _is_date_col(col, vals): out["date"].append(col)
+        elif _is_numeric(vals):     out["numeric"].append(col)
+        else:                       out["category"].append(col)
+    return out
+
+def _lbl(col): return col.replace("_", " ").title()
+
+
+# ── ECharts building blocks ────────────────────────────────────────────────────
+# Every builder targets a dark-panel background.
+# All axis/label colours use theme tokens so they're legible on both
+# dark cards and light themes (frontend can override via ECharts theme).
+
+def _cat_axis(data, rotate=0):
+    ax = {
+        "type": "category", "data": data,
+        "axisLabel": {"color": _LABEL, "fontSize": 11, "hideOverlap": True},
+        "axisLine":  {"lineStyle": {"color": _AXLINE}},
+        "axisTick":  {"show": False},
+    }
+    if rotate: ax["axisLabel"]["rotate"] = rotate
+    return ax
+
+def _val_axis(name=""):
+    ax = {
+        "type": "value",
+        "axisLabel":  {"color": _LABEL, "fontSize": 11},
+        "axisLine":   {"show": False},
+        "splitLine":  {"lineStyle": {"color": _GRID, "type": "dashed"}},
+    }
+    if name:
+        ax["name"] = name
+        ax["nameTextStyle"] = {"color": _LABEL, "fontSize": 10, "padding": [0,0,4,0]}
+    return ax
+
+def _grid(left="4%", right="4%", top="48px", bottom="52px"):
+    return {"left":left,"right":right,"top":top,"bottom":bottom,"containLabel":True}
+
+def _tt_axis():
+    return {
+        "trigger": "axis",
+        "axisPointer": {"type": "shadow", "shadowStyle": {"color": "rgba(255,255,255,0.03)"}},
+        "backgroundColor": "rgba(17,24,39,0.92)",
+        "borderColor": "rgba(255,255,255,0.08)",
+        "borderWidth": 1,
+        "textStyle": {"color": "#e5e7eb", "fontSize": 12},
+        "extraCssText": "border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.4);",
+    }
+
+def _tt_item():
+    return {
+        "trigger": "item",
+        "backgroundColor": "rgba(17,24,39,0.92)",
+        "borderColor": "rgba(255,255,255,0.08)",
+        "borderWidth": 1,
+        "textStyle": {"color": "#e5e7eb", "fontSize": 12},
+        "extraCssText": "border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.4);",
+        "formatter": "{b}<br/>{d}%  ({c})",
+    }
+
+def _legend(names, show=True):
+    if not show or not names: return {"show": False}
+    return {
+        "show": True, "data": names,
+        "top": "6px", "left": "center",
+        "orient": "horizontal",
+        "itemGap": 18, "itemWidth": 10, "itemHeight": 10,
+        "icon": "circle",
+        "textStyle": {"color": _LABEL, "fontSize": 11},
+        "pageTextStyle": {"color": _LABEL},
+    }
+
+def _base(extra=None):
+    out = {
+        "_lib": "echarts",
+        "color": _PALETTE,
+        "animation": True,
+        "animationDuration": 600,
+        "animationEasing": "cubicOut",
+    }
+    if extra: out.update(extra)
+    return out
+
+
+# ── Chart builders ────────────────────────────────────────────────────────────
+
+def _bar(labels, num_cols, rows, horizontal=False):
+    """Grouped bar — vertical or horizontal."""
+    series = []
+    for i, col in enumerate(num_cols):
+        vals = [_coerce(r.get(col)) for r in rows]
+        s = {
+            "name": _lbl(col), "type": "bar",
+            "data": vals,
+            "barMaxWidth": 48,
+            "barCategoryGap": "35%",
+            "emphasis": {"focus": "series"},
+            "itemStyle": {"borderRadius": [3,3,0,0] if not horizontal else [0,3,3,0]},
+        }
+        series.append(s)
+
+    rotate = 35 if (not horizontal and len(labels) > 10) else 0
+    show_legend = len(num_cols) > 1
+
+    if horizontal:
+        return _base({
+            "tooltip": _tt_axis(),
+            "legend":  _legend([_lbl(c) for c in num_cols], show=show_legend),
+            "grid":    _grid(left="26%", right="6%", top="16px" if not show_legend else "40px", bottom="16px"),
+            "xAxis":   _val_axis(),
+            "yAxis":   {**_cat_axis(labels), "axisLabel": {"color":_LABEL,"fontSize":11,"width":160,"overflow":"truncate"}},
+            "series":  series,
+        })
+    return _base({
+        "tooltip": _tt_axis(),
+        "legend":  _legend([_lbl(c) for c in num_cols], show=show_legend),
+        "grid":    _grid(bottom="60px" if rotate else "52px"),
+        "xAxis":   _cat_axis(labels, rotate=rotate),
+        "yAxis":   _val_axis(),
+        "series":  series,
+    })
+
+
+def _stacked_bar(labels, num_cols, rows):
+    """Stacked bar with rounded top of the stack."""
+    series = []
+    for i, col in enumerate(num_cols):
+        s = {
+            "name": _lbl(col), "type": "bar",
+            "stack": "total",
+            "data": [_coerce(r.get(col)) for r in rows],
+            "emphasis": {"focus": "series"},
+        }
+        # Only round the top of the last (topmost) series
+        if i == len(num_cols) - 1:
+            s["itemStyle"] = {"borderRadius": [3,3,0,0]}
+        series.append(s)
+
+    rotate = 35 if len(labels) > 10 else 0
+    return _base({
+        "tooltip": _tt_axis(),
+        "legend":  _legend([_lbl(c) for c in num_cols]),
+        "grid":    _grid(bottom="60px" if rotate else "52px"),
+        "xAxis":   _cat_axis(labels, rotate=rotate),
+        "yAxis":   _val_axis(),
+        "series":  series,
+    })
+
+
+def _line(labels, num_cols, rows, area=False):
+    """Smooth line or area chart."""
+    series = []
+    for i, col in enumerate(num_cols):
+        color = _PALETTE[i % len(_PALETTE)]
+        s = {
+            "name": _lbl(col), "type": "line",
+            "smooth": True,
+            "data": [_coerce(r.get(col)) for r in rows],
+            "symbolSize": 5,
+            "symbol": "circle",
+            "emphasis": {"focus": "series"},
+            "lineStyle": {"width": 2.5},
+        }
+        if area:
+            s["areaStyle"] = {
+                "opacity": 0.12,
+                "color": {
+                    "type": "linear", "x": 0, "y": 0, "x2": 0, "y2": 1,
+                    "colorStops": [
+                        {"offset": 0, "color": color},
+                        {"offset": 1, "color": "rgba(0,0,0,0)"},
+                    ],
+                },
+            }
+        series.append(s)
+
+    return _base({
+        "tooltip": {**_tt_axis(), "axisPointer": {"type": "cross", "label": {"backgroundColor": "#374151"}}},
+        "legend":  _legend([_lbl(c) for c in num_cols], show=len(num_cols) > 1),
+        "grid":    _grid(),
+        "xAxis":   _cat_axis(labels),
+        "yAxis":   _val_axis(),
+        "series":  series,
+    })
+
+
+def _pie(labels, values, doughnut=False):
+    """Pie or doughnut chart."""
+    data = [
+        {"name": str(lbl), "value": _coerce(val)}
+        for lbl, val in zip(labels, values)
+        if _coerce(val) is not None
+    ]
+    radius = ["42%", "70%"] if doughnut else "68%"
+
+    extra_series = {}
+    if doughnut:
+        extra_series["label"] = {
+            "show": True,
+            "formatter": "{b}\n{d}%",
+            "color": _LABEL, "fontSize": 11,
+        }
+        extra_series["labelLine"] = {"length": 12, "length2": 8}
+        # Centre label showing total
+        total = sum(d["value"] for d in data if d["value"])
+        extra_series["center"] = ["40%", "50%"]
+    else:
+        extra_series["label"] = {
+            "show": True,
+            "formatter": "{b}: {d}%",
+            "color": _LABEL, "fontSize": 11,
+        }
+
+    return _base({
+        "tooltip": _tt_item(),
+        "legend": {
+            "orient": "vertical", "right": "2%", "top": "middle",
+            "itemGap": 10, "itemWidth": 10, "itemHeight": 10, "icon": "circle",
+            "textStyle": {"color": _LABEL, "fontSize": 11},
+        },
+        "series": [{
+            "type": "pie", "radius": radius,
+            "data": data,
+            "emphasis": {
+                "itemStyle": {"shadowBlur": 12, "shadowColor": "rgba(0,0,0,0.35)"},
+                "label": {"fontSize": 13},
+            },
+            "itemStyle": {"borderRadius": 4, "borderWidth": 2, "borderColor": "rgba(0,0,0,0.15)"},
+            **extra_series,
+        }],
+    })
+
+
+def _scatter(x_col, y_col, rows, label_col=None):
+    """Scatter plot."""
+    data = []
+    for r in rows:
+        x = _coerce(r.get(x_col))
+        y = _coerce(r.get(y_col))
+        if x is None or y is None: continue
+        if label_col:
+            data.append({"value": [x, y], "name": str(r.get(label_col, ""))})
+        else:
+            data.append([x, y])
+
+    tt_fmt = f"{_lbl(x_col)}: {{c[0]}}<br/>{_lbl(y_col)}: {{c[1]}}" + ("<br/>{b}" if label_col else "")
+    return _base({
+        "tooltip": {**_tt_item(), "formatter": tt_fmt},
+        "grid": _grid(),
+        "xAxis": {**_val_axis(_lbl(x_col))},
+        "yAxis": {**_val_axis(_lbl(y_col))},
+        "series": [{
+            "type": "scatter", "data": data,
+            "symbolSize": 10,
+            "emphasis": {"focus": "self", "itemStyle": {"shadowBlur": 8, "shadowColor": "rgba(0,0,0,0.4)"}},
+        }],
+    })
+
+
+def _radar(labels_col, metric_cols, rows):
+    """Radar chart."""
+    maxes = {}
+    for col in metric_cols:
+        vals = [_coerce(r.get(col)) for r in rows if _coerce(r.get(col)) is not None]
+        maxes[col] = max(vals) * 1.15 if vals else 1
+
+    indicators = [{"name": _lbl(c), "max": maxes[c]} for c in metric_cols]
+    series_data = [
+        {
+            "value": [_coerce(row.get(c)) or 0 for c in metric_cols],
+            "name": str(row.get(labels_col, f"Row {i+1}")),
+        }
+        for i, row in enumerate(rows[:8])
+    ]
+
+    return _base({
+        "tooltip": {**_tt_item(), "formatter": None},
+        "legend": _legend([str(r.get(labels_col, f"Row {i+1}")) for i, r in enumerate(rows[:8])],
+                          show=len(rows) > 1),
+        "radar": {
+            "indicator": indicators,
+            "shape": "polygon",
+            "axisName": {"color": _LABEL, "fontSize": 11},
+            "splitLine": {"lineStyle": {"color": _GRID}},
+            "splitArea": {"show": True, "areaStyle": {"color": ["rgba(255,255,255,0.01)", "rgba(255,255,255,0.03)"]}},
+            "axisLine":  {"lineStyle": {"color": _AXLINE}},
+            "center": ["50%", "54%"], "radius": "68%",
+        },
+        "series": [{
+            "type": "radar", "data": series_data,
+            "emphasis": {"focus": "series"},
+            "symbol": "circle", "symbolSize": 4,
+            "lineStyle": {"width": 2},
+            "areaStyle": {"opacity": 0.1},
+        }],
+    })
+
+
+def _heatmap(row_col, col_col, val_col, rows):
+    """Heatmap grid."""
+    y_cats = list(dict.fromkeys(str(r.get(row_col,"")) for r in rows))
+    x_cats = list(dict.fromkeys(str(r.get(col_col,"")) for r in rows))
+
+    data = []
+    for r in rows:
+        xi = x_cats.index(str(r.get(col_col,""))) if str(r.get(col_col,"")) in x_cats else -1
+        yi = y_cats.index(str(r.get(row_col,""))) if str(r.get(row_col,"")) in y_cats else -1
+        v  = _coerce(r.get(val_col))
+        if xi >= 0 and yi >= 0 and v is not None:
+            data.append([xi, yi, v])
+
+    all_vals = [d[2] for d in data]
+    vmin = min(all_vals) if all_vals else 0
+    vmax = max(all_vals) if all_vals else 1
+    rotate = 35 if len(x_cats) > 7 else 0
+
+    return _base({
+        "tooltip": {
+            **_tt_item(),
+            "formatter": "{b0}: {c[2]}",
+        },
+        "grid": _grid(left="20%", bottom="80px", right="70px"),
+        "xAxis": {
+            **_cat_axis(x_cats, rotate=rotate),
+            "splitArea": {"show": True, "areaStyle": {"color": ["rgba(255,255,255,0.01)","rgba(255,255,255,0.03)"]}},
+        },
+        "yAxis": {
+            **_cat_axis(y_cats),
+            "splitArea": {"show": True, "areaStyle": {"color": ["rgba(255,255,255,0.01)","rgba(255,255,255,0.03)"]}},
+        },
+        "visualMap": {
+            "min": vmin, "max": vmax,
+            "calculable": True,
+            "orient": "horizontal", "left": "center", "bottom": "8px",
+            "textStyle": {"color": _LABEL},
+            "inRange": {"color": ["#1e2a42", "#6366f1", "#10b981"]},
+        },
+        "series": [{
+            "type": "heatmap", "data": data,
+            "label": {"show": len(data) <= 60, "fontSize": 10, "color": "#e5e7eb"},
+            "emphasis": {"itemStyle": {"shadowBlur": 10, "shadowColor": "rgba(0,0,0,0.5)"}},
+        }],
+    })
+
+
+def _waterfall(labels, values, col_name):
+    """Waterfall chart."""
+    running = 0.0
+    bases, bars, colors = [], [], []
+    for v in values:
+        if v >= 0:
+            bases.append(running)
+            bars.append(v)
+            colors.append(_C_POSITIVE)
+        else:
+            bases.append(running + v)
+            bars.append(abs(v))
+            colors.append(_C_NEGATIVE)
+        running += v
+
+    base_s = {
+        "type": "bar", "stack": "wf",
+        "itemStyle": {"borderColor":"transparent","color":"transparent"},
+        "emphasis": {"itemStyle": {"borderColor":"transparent","color":"transparent"}},
+        "data": bases, "silent": True,
+    }
+    bar_s = {
+        "type": "bar", "stack": "wf",
+        "name": _lbl(col_name),
+        "data": [{"value": b, "itemStyle": {"color": c, "borderRadius": [3,3,0,0] if c==_C_POSITIVE else [0,0,3,3]}} for b,c in zip(bars,colors)],
+        "barMaxWidth": 56,
+        "label": {
+            "show": True, "position": "top",
+            "formatter": "{c}", "fontSize": 10, "color": _LABEL,
+        },
+        "emphasis": {"focus": "self"},
+    }
+    rotate = 30 if len(labels) > 8 else 0
+    return _base({
+        "tooltip": _tt_axis(),
+        "grid": _grid(bottom="70px" if rotate else "52px"),
+        "xAxis": _cat_axis(labels, rotate=rotate),
+        "yAxis": _val_axis(),
+        "series": [base_s, bar_s],
+    })
+
+
+def _gauge(value, label, max_val=100.0):
+    """
+    Gauge — opt-in only (user explicitly requested it).
+    NOT auto-routed from the rules engine.
+    """
+    return _base({
+        "series": [{
+            "type": "gauge",
+            "center": ["50%", "58%"], "radius": "82%",
+            "startAngle": 205, "endAngle": -25,
+            "min": 0, "max": max_val, "splitNumber": 5,
+            "axisLine": {
+                "lineStyle": {
+                    "width": 18,
+                    "color": [[0.4,"#ef4444"],[0.7,"#f59e0b"],[1.0,"#10b981"]],
+                }
+            },
+            "pointer": {
+                "length": "58%", "width": 6,
+                "itemStyle": {"color": "auto"},
+            },
+            "axisTick": {"distance": -24, "length": 6, "lineStyle": {"color":"#fff","width":1}},
+            "splitLine": {"distance": -30, "length": 14, "lineStyle": {"color":"#fff","width":2}},
+            "axisLabel": {"color": "inherit", "distance": 38, "fontSize": 11},
+            "detail": {
+                "valueAnimation": True,
+                "formatter": f"{{value}}\n{label}",
+                "color": "inherit", "fontSize": 20, "fontWeight": 500,
+                "offsetCenter": [0, "30%"],
+            },
+            "data": [{"value": round(value, 1), "name": label}],
+        }],
+    })
+
+
+def _kpi_bar(num_cols, rows):
+    """Single-row multi-KPI horizontal bar, one colour per bar."""
+    data = [
+        {"value": _coerce(rows[0].get(col)), "name": _lbl(col),
+         "itemStyle": {"color": _PALETTE[i % len(_PALETTE)], "borderRadius": [0,3,3,0]}}
+        for i, col in enumerate(num_cols)
+    ]
+    return _base({
+        "tooltip": _tt_axis(),
+        "grid": _grid(left="24%", right="8%", top="12px", bottom="12px"),
+        "xAxis": _val_axis(),
+        "yAxis": {
+            **_cat_axis([_lbl(c) for c in num_cols]),
+            "axisLabel": {"color":_LABEL,"fontSize":11,"width":170,"overflow":"truncate"},
+        },
+        "series": [{
+            "type": "bar", "data": data, "barMaxWidth": 48,
+            "label": {"show": True, "position": "right", "color": _LABEL, "fontSize": 11},
+        }],
+    })
+
+
+# ── Rule engine ────────────────────────────────────────────────────────────────
+
+def _rules_advise(columns, rows):
+    if not rows or not columns:
+        return _no_chart("No data")
+
+    t = _classify(columns, rows)
+    dates, nums, cats = t["date"], t["numeric"], t["category"]
+    n = len(rows)
+
+    has_income = any(_INCOME_RE.search(c) for c in nums)
+    has_cost   = any(_COST_RE.search(c)   for c in nums)
+    has_profit = any(_PROFIT_RE.search(c) for c in nums)
+    has_capex  = any(_CAPEX_RE.search(c)  for c in nums)
+
+    # ── 1. Single-row KPI ─────────────────────────────────────────────────────
+    if n == 1:
+        # P&L single row → waterfall across metric names
+        if len(nums) >= 2 and (has_income or has_cost or has_profit):
+            metric_labels = [_lbl(c) for c in nums]
+            metric_vals   = [_coerce(rows[0].get(c)) or 0 for c in nums]
+            return _result("waterfall", "P&L breakdown — waterfall", "high",
+                           None, nums, _waterfall(metric_labels, metric_vals, nums[0]))
+        # Multi-metric → KPI bar
+        if len(nums) >= 2:
+            return _result("bar", f"Single-row summary — {len(nums)} KPIs", "high",
+                           None, nums, _kpi_bar(nums, rows))
+
+    # ── 2. Waterfall — mixed positive/negative ─────────────────────────────────
+    if len(nums) == 1 and cats and n <= 20:
+        vals = [_coerce(r.get(nums[0])) for r in rows if _coerce(r.get(nums[0])) is not None]
+        if any(v < 0 for v in vals):
+            lc = cats[0]
+            return _result("waterfall", "Mixed positive/negative values — waterfall", "high",
+                           lc, nums, _waterfall([str(r.get(lc)) for r in rows],
+                                                [_coerce(r.get(nums[0])) or 0 for r in rows], nums[0]))
+
+    # ── 3. Stacked bar — capex/financial multi-metric ─────────────────────────
+    if cats and 2 <= len(nums) <= 5 and (has_capex or (has_income and has_cost)):
+        lc = cats[0]
+        return _result("stacked_bar", f"Compositional breakdown per '{lc}' — stacked bar", "high",
+                       lc, nums, _stacked_bar([str(r.get(lc)) for r in rows], nums, rows))
+
+    # P&L multi-row → waterfall
+    if (has_income or has_cost or has_profit) and len(nums) >= 2 and cats and n <= 15:
+        lc = cats[0]
+        metric_labels = [_lbl(c) for c in nums[:3]]
+        metric_vals   = [_coerce(rows[0].get(c)) or 0 for c in nums[:3]]
+        return _result("waterfall", "P&L decomposition — waterfall", "high",
+                       lc, nums[:3], _waterfall(metric_labels, metric_vals, nums[0]))
+
+    # ── 4. Time-series ─────────────────────────────────────────────────────────
+    if dates:
+        lc = dates[0]
+        labels = [str(r.get(lc)) for r in rows]
+        if len(nums) == 1:
+            use_area = any(kw in nums[0].lower() for kw in ("total","cumul","volume","amount","sum"))
+            ct = "area" if use_area else "line"
+            return _result(ct, f"Time-series on '{lc}'", "high",
+                           lc, nums, _line(labels, nums, rows, area=use_area))
+        if len(nums) >= 2:
+            parts = has_income and has_cost
+            if parts and len(nums) <= 4:
+                return _result("area", "Multi-metric time-series — stacked area", "high",
+                               lc, nums[:4], _line(labels, nums[:4], rows, area=True))
+            return _result("line", f"Multi-series time-series on '{lc}'", "high",
+                           lc, nums, _line(labels, nums[:6], rows))
+
+    # ── 5. Radar — multi-metric profile across few entities ───────────────────
+    if cats and len(nums) >= 2 and n <= 12:
+        lc = cats[0]
+        ranges = []
+        for nc in nums[:6]:
+            vals = [_coerce(r.get(nc)) for r in rows if _coerce(r.get(nc)) is not None]
+            if vals: ranges.append(max(vals) - min(vals))
+        similar_scale = not ranges or (max(ranges) / max(min(ranges), 0.001)) < 1000
+        if similar_scale and n <= 8:
+            return _result("radar", f"Multi-metric profile per '{lc}' — radar", "medium",
+                           lc, nums[:6], _radar(lc, nums[:6], rows))
+
+    # ── 6. Heatmap — two categorical dimensions ────────────────────────────────
+    if len(cats) == 2 and len(nums) == 1 and n >= 4:
+        rc, cc, nc = cats[0], cats[1], nums[0]
+        if _cardinality([r.get(rc) for r in rows]) >= 2 and _cardinality([r.get(cc) for r in rows]) >= 2:
+            return _result("heatmap", f"Grid of '{rc}' × '{cc}' — heatmap", "high",
+                           rc, nums, _heatmap(rc, cc, nc, rows))
+
+    # ── 7. Low-cardinality single metric → doughnut ────────────────────────────
+    if cats and len(nums) == 1 and 3 <= n <= 8:
+        lc, vc = cats[0], nums[0]
+        return _result("doughnut", f"Part-of-whole across {n} categories", "high",
+                       lc, nums, _pie([str(r.get(lc)) for r in rows], [r.get(vc) for r in rows], doughnut=True))
+
+    # ── 8. Single numeric — bar or horizontal bar ─────────────────────────────
+    if cats and len(nums) == 1:
+        lc, nc = cats[0], nums[0]
+        horiz = n > 10 or any(len(str(r.get(lc,""))) > 18 for r in rows[:5])
+        ct = "horizontal_bar" if horiz else "bar"
+        return _result(ct, f"{'Horizontal bar' if horiz else 'Bar'} — '{lc}' vs '{nc}'", "high",
+                       lc, nums, _bar([str(r.get(lc)) for r in rows], nums, rows, horizontal=horiz))
+
+    # ── 9. Multiple numerics → grouped bar ────────────────────────────────────
+    if cats and 2 <= len(nums) <= 6:
+        lc = cats[0]
+        return _result("bar", f"Grouped bar — {len(nums)} metrics per '{lc}'", "high",
+                       lc, nums, _bar([str(r.get(lc)) for r in rows], nums[:6], rows))
+
+    # ── 10. Two numerics no category → scatter ─────────────────────────────────
+    if len(nums) >= 2 and not cats and not dates:
+        label_col = next((c for c in columns if c not in nums), None)
+        return _result("scatter", "Correlation — scatter plot", "medium",
+                       None, nums[:2], _scatter(nums[0], nums[1], rows, label_col=label_col))
+
+    # ── 11. Fallback ───────────────────────────────────────────────────────────
+    if nums:
+        lc = cats[0] if cats else (dates[0] if dates else columns[0])
+        horiz = n > 10
+        return _result("horizontal_bar" if horiz else "bar", "Bar chart", "low",
+                       lc, nums[:4], _bar([str(r.get(lc)) for r in rows], nums[:4], rows, horizontal=horiz))
+
+    return _no_chart("No numeric columns found")
+
+
+def _result(chart_type, reason, confidence, lc, vcs, config):
+    return {"chart_type": chart_type, "reason": reason, "confidence": confidence,
+            "labels_column": lc, "values_columns": vcs, "config": config}
+
+def _no_chart(reason):
+    return {"chart_type": None, "reason": reason, "confidence": "low",
+            "labels_column": None, "values_columns": [], "config": None}
+
+
+# ── Alternative generator ─────────────────────────────────────────────────────
+
+def _build_config(chart_type, lc, num_cols, labels, rows):
+    """Build ECharts config for a given type. Returns None if not applicable."""
+    if chart_type == "bar":
+        return _bar(labels, num_cols, rows, horizontal=False)
+    if chart_type == "horizontal_bar":
+        return _bar(labels, num_cols, rows, horizontal=True)
+    if chart_type == "stacked_bar":
+        return _stacked_bar(labels, num_cols, rows)
+    if chart_type == "line":
+        return _line(labels, num_cols, rows)
+    if chart_type == "area":
+        return _line(labels, num_cols, rows, area=True)
+    if chart_type in ("pie", "doughnut"):
+        vc = num_cols[0] if num_cols else None
+        if not vc: return None
+        return _pie(labels, [r.get(vc) for r in rows], doughnut=(chart_type=="doughnut"))
+    if chart_type == "scatter" and len(num_cols) >= 2:
+        return _scatter(num_cols[0], num_cols[1], rows)
+    if chart_type == "radar" and len(num_cols) >= 3:
+        return _radar(lc, num_cols[:6], rows)
+    if chart_type == "heatmap":
+        t = _classify(list({lc} | set(num_cols)) if lc else num_cols, rows)
+        if len(t["category"]) >= 2 and t["numeric"]:
+            return _heatmap(t["category"][0], t["category"][1], t["numeric"][0], rows)
+    if chart_type == "waterfall" and num_cols:
+        vals = [_coerce(r.get(num_cols[0])) or 0 for r in rows]
+        return _waterfall(labels, vals, num_cols[0])
+    if chart_type == "gauge" and num_cols and rows:
+        v = _coerce(rows[0].get(num_cols[0])) or 0
+        return _gauge(v, _lbl(num_cols[0]))
+    return None
+
+
+def get_alternatives(columns, rows, n=3):
+    """
+    Return up to n alternative chart configs for a dataset.
+    Used by the frontend to show "Also try" options.
+    """
+    primary = _rules_advise(columns, rows)
+    if not primary["chart_type"]:
+        return []
+
+    t = _classify(columns, rows)
+    dates, nums, cats = t["date"], t["numeric"], t["category"]
+    lc     = primary["labels_column"] or (cats[0] if cats else (dates[0] if dates else columns[0]))
+    labels = [str(r.get(lc)) for r in rows] if lc else []
+    nc     = primary["values_columns"] or nums
+
+    alts = []
+    for alt_type in _ALT_MAP.get(primary["chart_type"], [])[:n]:
+        cfg = _build_config(alt_type, lc, nc, labels, rows)
+        if cfg:
+            alts.append({
+                "chart_type": alt_type,
+                "label": _TYPE_LABELS.get(alt_type, alt_type.title()),
+                "config": cfg,
+            })
+    return alts
+
+
+# ── LLM advisor ───────────────────────────────────────────────────────────────
+
+_llm_client = None
+
+def _get_llm():
+    global _llm_client
+    if _llm_client is None:
+        from llama_index.llms.ollama import Ollama
+        url   = os.getenv("OLLAMA_URL", "http://localhost:11434")
+        model = os.getenv("OLLAMA_CHAT_MODEL", "qwen2.5:14b-instruct-q4_K_M")
+        _llm_client = Ollama(model=model, base_url=url, request_timeout=15.0)
+    return _llm_client
+
+def _llm_advise(columns, rows):
+    try:
+        sample = rows[:5]
+        prompt = f"""You are a data visualization expert. Given this dataset, choose the BEST chart type.
+
+Columns: {json.dumps(columns)}
+Sample rows (first 5 of {len(rows)}): {json.dumps(sample, default=str)}
+
+Available chart types: bar, horizontal_bar, stacked_bar, line, area, pie, doughnut, scatter, radar, heatmap, waterfall, gauge
+
+Rules:
+- line/area: time-series. area for cumulative/volume metrics.
+- bar: comparisons with 1-2 metrics. horizontal_bar when >10 rows or long labels.
+- stacked_bar: multiple metrics composing a total (capex+opex, pass+fail).
+- pie/doughnut: part-of-whole, ≤8 categories. Prefer doughnut.
+- scatter: correlation between exactly two numerics.
+- radar: compare 3+ metrics across ≤8 entities.
+- heatmap: two categorical dimensions × one numeric.
+- waterfall: sequential P&L, or mixed positive/negative values.
+- gauge: ONLY when user explicitly asks for a gauge. Never auto-select.
+- Default to bar or horizontal_bar when unsure.
+
+Respond ONLY with JSON: {{"chart_type":"line","reason":"monthly trend","confidence":"high"}}"""
+
+        raw = str(_get_llm().complete(prompt)).strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
+        m = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
+        if not m: raise ValueError("No JSON")
+
+        parsed = json.loads(m.group(0))
+        ct     = parsed.get("chart_type","").lower().strip()
+        reason = parsed.get("reason","LLM recommendation")
+        conf   = parsed.get("confidence","medium")
+
+        if ct == "gauge": ct = "bar"   # never auto-gauge
+        if ct not in _VALID_TYPES: raise ValueError(f"Invalid: {ct}")
+        if conf not in ("high","medium","low"): conf = "medium"
+
+        rule = _rules_advise(columns, rows)
+        t    = _classify(columns, rows)
+        lc   = t["category"][0] if t["category"] else (t["date"][0] if t["date"] else columns[0])
+        nc   = t["numeric"] or [columns[-1]]
+        lbls = [str(r.get(lc)) for r in rows]
+
+        cfg = _build_config(ct, lc, nc, lbls, rows)
+        if cfg is None: cfg = rule.get("config")
+
+        return {"chart_type":ct,"reason":reason,"confidence":conf,
+                "labels_column":lc,"values_columns":nc,"config":cfg}
+    except Exception:
+        return _rules_advise(columns, rows)
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+# Public alias for column classification — used by /api/columns endpoint
+classify_columns = _classify
+
+
+def advise(columns, rows):
+    """
+    Primary entry point. Returns recommendation + alternatives.
+
+    Response includes:
+      chart_type, reason, confidence, config,
+      labels_column, values_columns,
+      alternatives: list of {chart_type, label, config}
+    """
+    use_llm = os.getenv("USE_LLM_CHART_ADVISOR","false").lower() in ("1","true","yes")
+    result  = _llm_advise(columns, rows) if use_llm else _rules_advise(columns, rows)
+
+    # Always attach alternatives (built from rules regardless of llm/rules mode)
+    result["alternatives"] = get_alternatives(columns, rows, n=3)
+    return result
+
+
+def force_config(columns, rows, chart_type):
+    """Force a specific chart type regardless of recommendation."""
+    if not rows or not columns or chart_type not in _VALID_TYPES:
+        return None
+    t  = _classify(columns, rows)
+    lc = t["category"][0] if t["category"] else (t["date"][0] if t["date"] else columns[0])
+    labels   = [str(r.get(lc)) for r in rows]
+    num_cols = t["numeric"] or [columns[-1]]
+    return _build_config(chart_type, lc, num_cols, labels, rows) or _bar(labels, num_cols, rows)

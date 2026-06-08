@@ -53,6 +53,10 @@ BUSINESS_RULES = [
     "Use ILIKE for text matching, never LIKE.",
     "corrective_action_id is a human-readable ID like '2026/01/ST064/INS001_MA001', not a UUID.",
     "inspection_corrective_action.inspection_id is the PRIMARY FK to inspection_report.id.",
+    "inspection_corrective_action.observation_id → ai_answers.submission_id (cast to uuid: ica.observation_id = aa.submission_id::uuid) (DIRECT FK). "
+    "When user asks CAs for a specific observation, filter: WHERE ica.observation_id = aa.submission_id::uuid. "
+    "Do NOT filter by inspection_id alone — that returns ALL CAs for the inspection. "
+    "398 CAs have a non-NULL observation_id.",
     "Use LEFT JOIN (not INNER JOIN) for optional lookups like inspection_sub_type, "
     "entity, and inspection_report_remark.",
     "VOCABULARY — corrective action status: "
@@ -68,6 +72,12 @@ BUSINESS_RULES = [
     "'id' is the UUID primary key — NEVER select this for display (outputs UUID garbage). "
     "'inspection_id' is the human-readable varchar like '2026/04/ST001/INS001' — ALWAYS use "
     "ir.inspection_id (not ir.id) when showing the inspection identifier to the user.",
+    "USER ROLES — users have multiple roles via user_roles(user_id, role_id) → role(id, name). "
+    "To filter by role use EXISTS not JOIN (JOIN fans out rows): "
+    "WHERE EXISTS (SELECT 1 FROM user_roles ur JOIN role r ON ur.role_id = r.id "
+    "WHERE ur.user_id = u.id AND r.name = 'FM Manager'). "
+    "FM Manager role names: fm_manager, fm_engineer, ad_fm, asst_fm_manager, fm_admin, fm_supervisor. "
+    "Inspector role names: internal_inspector, internal_auditor, external_inspector, external_auditor.",
 ]
 
 TABLE_RELATIONSHIPS = """\
@@ -77,6 +87,11 @@ WHERE CONCEPTS LIVE:
   - Facility names → facility.name (JOIN via facility_id)
   - Project names → project.name (JOIN via project_id)
   - Client names → client.name (JOIN via client_id)
+  - Country names → country.name (JOIN via country_id)
+  - Entity names       → entity.name        (JOIN via inspection_report.entity_id — DIRECT)
+  - Organisation names → organisation.name (JOIN via facility.organization_id)
+  - Country names      → country.name      (JOIN via ir.country_id OR facility.country_id)
+  - Region names       → region.name       (JOIN via facility.region_id → region)
   - Scores, status, dates → inspection_report
   - Causes, costs, overdue → inspection_corrective_action
   - Form question labels → ai_questions.label  (NOT question_label)
@@ -85,16 +100,87 @@ WHERE CONCEPTS LIVE:
   - Form scores → ai_answers.score
 
 HOW TABLES CONNECT (inspection_report is the hub):
-  inspection_report.inspection_type_id → inspection_type.id
-  inspection_report.facility_id → facility.id
-  inspection_report.project_id → project.id
-  inspection_report.client_id → client.id
-  inspection_report.inspector_user_id → users.id
-  inspection_report.cycle_id → inspection_cycle.id
-  inspection_report.schedule_id → inspection_schedule.id
+  inspection_report.inspection_type_id  → inspection_type.id
+  inspection_report.facility_id         → facility.id
+  inspection_report.project_id          → project.id
+  inspection_report.client_id           → client.id
+  inspection_report.country_id          → country.id
+  inspection_report.entity_id   → entity.id    (DIRECT)
+  inspection_report.country_id  → country.id   (DIRECT)
+  inspection_report → facility (facility_id) → organisation (organization_id)
+  inspection_report → facility (facility_id) → region (region_id) → country (country_id)
+  NOTE: inspection_report has NO direct organisation_id or region_id — join via facility
+  facility.organization_id → organisation.id   ← American spelling on FK; British on table name
+  facility.region_id       → region.id
+  region.country_id        → country.id        ← region belongs to a country
+  inspection_report.inspector_user_id   → users.id
+  inspection_report.inspectee_user_id   → users.id  (FM Manager — facility manager being inspected)
+  inspection_report.cycle_id            → inspection_cycle.id
+  inspection_report.schedule_id         → inspection_schedule.id
   inspection_corrective_action.inspection_id → inspection_report.id
-  ai_answers.inspection_report_id → inspection_report.id
-  ai_answers.element_id → ai_questions.element_id
+  ai_answers.inspection_report_id       → inspection_report.id
+  ai_answers.element_id                 → ai_questions.element_id
+
+  facility.client_id       → client.id
+  facility.country_id      → country.id
+  facility.organization_id → organisation.id   ← American spelling on FK column
+
+  project.organisation_id  → organisation.id
+
+TABLE COLUMNS (lookup tables):
+  country:      id (uuid), active (bool), name (varchar)
+  organisation: id (uuid), active (bool), name (varchar), logo (varchar)
+  entity:       id (uuid), active (bool), name (varchar), logo (varchar)
+               — standalone business/contract entity, inspection_report.entity_id → entity.id
+  region:       id (uuid), active (bool), name (varchar), country_id (uuid→country.id)
+  project:      id (uuid), active (bool), name (varchar), organisation_id (uuid→organisation.id)
+  client:       id (uuid), active (bool), name (varchar)
+
+  SOFT DELETE — include WHERE active = true for: country, region, organisation, project, client, entity
+
+COMMUNICATION GROUPS:
+  inspection_communication_group: id (uuid), name (varchar), active (bool)
+    — A named group of recipients for inspection notifications
+
+  Junction tables (many-to-many):
+    inspection_communication_group_facilities    — group_id (→icg.id), facility_id (→facility.id)
+    inspection_communication_group_organisations — group_id (→icg.id), organisation_id (→organisation.id)
+    inspection_group_emails                      — group_id (→icg.id), email (varchar)
+
+  organisation_countries: organisation_id (→organisation.id), country_id (→country.id)
+    — which countries an organisation operates in
+
+  TYPICAL QUERIES:
+  "which communication group does facility X belong to?"
+    → JOIN icgf ON icgf.facility_id = fac.id → JOIN icg ON icg.id = icgf.group_id
+
+  "show all facilities in communication group Y"
+    → JOIN icgf ON icgf.group_id = icg.id → JOIN facility ON facility.id = icgf.facility_id
+
+  "what emails does communication group X have?"
+    → JOIN ige ON ige.group_id = icg.id → SELECT ige.email
+
+  "which organisations are in communication group X?"
+    → JOIN icgo ON icgo.group_id = icg.id → JOIN organisation ON organisation.id = icgo.organisation_id
+
+  "which countries does organisation X operate in?"
+    → JOIN oc ON oc.organisation_id = org.id → JOIN country ON country.id = oc.country_id
+
+USER ROLES:
+  users.id → user_roles.user_id → user_roles.role_id → role.id → role.name
+  user_roles(user_id, role_id) — one user can have MULTIPLE roles
+  role.name values relevant to inspections:
+    FM-side (inspectee):  FM Manager, FM Engineer, AD FM, Asst FM Manager,
+                          FM Admin, FM Supervisor, hse_officer
+    Inspector-side:       internal_inspector, internal_auditor, external_inspector,
+                          external_auditor, hse_officer
+  CRITICAL — use EXISTS subquery (not JOIN) to avoid row fan-out:
+    WHERE EXISTS (
+        SELECT 1 FROM user_roles ur JOIN role r ON ur.role_id = r.id
+        WHERE ur.user_id = ir.inspectee_user_id
+          AND r.name IN ('FM Manager','FM Engineer','AD FM',
+                         'Asst FM Manager','FM Admin','FM Supervisor')
+    )
 
 CRITICAL ai_* JOIN PATTERN:
   FROM ai_answers aa
@@ -181,6 +267,8 @@ INSPECTION_TABLES = [
     "inspection_report_remark",
     "accompanying_inspectors",
     "additional_inspectees",
+    "po_details",    # CAPEX Converted — JOIN via po.mitigative_action_uuid = ica.id
+    "pr_details",    # OPEX Incurred   — JOIN via pr.mitigative_action_uuid = ica.id
 ]
 
 AI_TABLES = [
@@ -213,11 +301,19 @@ USEFUL_COLUMNS = {
         # expenditure: STRING ENUM — NO_EXPENDITURE | CAPEX | OPEX | CAPEX_AND_OPEX
         #   (NOT a numeric amount — it is a category flag)
         # capex and opex are the NUMERIC amounts (decimal)
-        # ica.capex = CAPEX Generated (quoted amount)
-        # po_details.po_amount = CAPEX Converted (actual PO raised by client)
+        # ica.capex = CAPEX Generated (quoted amount by inspectee)
+        # po_details.po_amount = CAPEX Converted (actual PO raised)
         # pr_details.pr_amount = OPEX Incurred (actual PR raised internally)
+        # CAPEX Lost = SUM(ica.capex) - COALESCE(SUM(po.po_amount),0) — arithmetic diff
+        # DO NOT use capex_status='REJECTED' for loss — use arithmetic difference
         # Join: po_details ON po.mitigative_action_uuid = ica.id
         # Join: pr_details ON pr.mitigative_action_uuid = ica.id
+        # close_on is NULL for ALL rows — use modified_on as closure date proxy
+        # CAPEX loss form answers (module: Inspection Mitigative Action Completion):
+        #   'Is CAPEX Lost' — answer_text = 'true'
+        #   'Amount Difference for CPAEX Loss' — answer_numeric (NOTE: typo CPAEX)
+        #   'CAPEX Lost To(Company/Entity/Subcontractor)' — answer_text
+        #   JOIN via: ica.completion_submission_id = ai_answers.inspection_report_id
     ],
     "inspection_schedule": [
         "id", "status", "due_date", "scheduled_date",

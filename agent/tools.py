@@ -195,8 +195,20 @@ def get_answers(
             filters.append("aq.label ILIKE :q_label")
             params["q_label"] = f"%{question_label}%"
         if inspection_id:
-            filters.append("aa.inspection_id = :insp_id")
+            # aa.inspection_id may store the UUID, not the human-readable varchar.
+            # Safest path: join via inspection_report to match ir.inspection_id (varchar).
+            # This handles both cases — if aa.inspection_id IS the varchar it works too.
+            filters.append("""aa.inspection_report_id = (
+                SELECT ir.id FROM inspection_report ir
+                WHERE ir.inspection_id = :insp_id
+                LIMIT 1
+            )""")
             params["insp_id"] = inspection_id
+            # When fetching by inspection_id with no explicit module filter,
+            # default to 'Inspection Form' — ai_answers contains rows from
+            # multiple modules for the same inspection.
+            if not module_name and not form_name:
+                filters.append("aa.module_name = 'Inspection Form'")
         if answer_value:
             filters.append(
                 "(aa.answer_text ILIKE :ans_val OR aa.answer_numeric::text ILIKE :ans_val)"
@@ -207,8 +219,9 @@ def get_answers(
 
         # answer_text for categorical, answer_numeric for scores/numbers.
         # COALESCE so we always get one displayable value.
+        # aa.inspection_id is a UUID — join to inspection_report to get readable varchar id.
         sql = sql_text(f"""
-            SELECT aa.inspection_id,
+            SELECT ir.inspection_id,
                    aa.module_name,
                    aq.label                                          AS question_label,
                    COALESCE(aa.answer_text, aa.answer_numeric::text) AS answer_value,
@@ -216,6 +229,7 @@ def get_answers(
                    aa.submitted_on
             FROM ai_answers aa
             LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id
+            LEFT JOIN inspection_report ir ON aa.inspection_report_id = ir.id
             WHERE {where}
             ORDER BY aa.submitted_on DESC
             LIMIT :limit
@@ -267,11 +281,16 @@ def get_answer_stats(
     form_name: Optional[str] = None,
     module_name: Optional[str] = None,
     question_label: Optional[str] = None,
+    breakdown_limit: Optional[int] = None,
 ) -> dict[str, Any]:
     """
     Aggregate statistics over ai_answer.answer_value.
     Returns numeric stats (avg/min/max) + categorical value breakdown.
     Use for "most common answer", "average score", "distribution" questions.
+
+    breakdown_limit — if set, truncates value_breakdown to the top N entries.
+                      Pass 1 when user asks for "most common", "most chosen",
+                      "top" or "highest" single value.
     """
     try:
         filters = ["1=1"]
@@ -385,6 +404,8 @@ def get_answer_stats(
                 "scored_count": scored_count,   # how many answers have a score
                 "value_breakdown": [
                     {"value": r[0], "count": r[1]} for r in cat_rows
+                ][:breakdown_limit] if breakdown_limit else [
+                    {"value": r[0], "count": r[1]} for r in cat_rows
                 ],
             },
             "error": None,
@@ -431,6 +452,7 @@ def generate_sql(
     _inject_rule_ids: list | None = None,
     _seed_index=None,
     _db_schema=None,
+    _active_cycle_uuid: str = "",
 ) -> dict[str, Any]:
     try:
         # Schema block — use the slim version to keep context under ~600 tokens.
@@ -463,35 +485,14 @@ def generate_sql(
             )
         if _seed_index is not None:
             try:
-                # Domain-selective top_k: prevent cross-domain seed pollution.
-                # Simple aggregates (avg, count, total) don't need cycle/frequency seeds.
-                # Raised vs closed / comparison queries need exactly their FILTER example.
-                _q = question.lower()
-                _is_comparison = bool(re.search(
-                    r'\b(vs\.?|versus|raised.{0,20}closed|faster.{0,20}slower'
-                    r'|this.{0,10}(month|quarter).{0,10}last'
-                    r'|last.{0,10}(month|quarter).{0,10}this)\b', _q))
-                _is_cycle_freq = bool(re.search(
-                    r'\b(cycle|frequency|portfolio|schedule)\b', _q))
-                _is_simple = bool(re.search(
-                    r'^(what is the (average|total)|how many|count of'
-                    r'|show (all|me the)|which (inspector|facility|inspection))',
-                    _q)) and not _is_comparison and not _is_cycle_freq
-
-                if _is_simple:
-                    _top_k = 2   # simple aggregates: 2 examples max
-                elif _is_comparison:
-                    _top_k = 2   # comparison: only FILTER aggregate examples
-                elif _is_cycle_freq:
-                    _top_k = 3   # cycle/frequency: join path examples
-                else:
-                    _top_k = 4   # complex/cross-domain: full retrieval
-
-                retrieved = _seed_index.format_for_prompt(question, top_k=_top_k)
+                retrieved = _seed_index.format_for_prompt(question, top_k=4)
             except Exception:
                 retrieved = ""
         else:
             retrieved = ""
+        # Substitute <CYCLE_UUID> placeholder with actual active cycle UUID if available
+        if _active_cycle_uuid and retrieved:
+            retrieved = retrieved.replace("<CYCLE_UUID>", _active_cycle_uuid)
         dynamic_examples = _core_ctx + ("\n" + retrieved if retrieved else "")
 
         prompt = sql_prompt_template.replace(
@@ -517,6 +518,64 @@ def generate_sql(
             _debug_logger.debug(
                 f"\n{'='*70}\n>>> DEEPSEEK RAW OUTPUT\n{'='*70}\n{raw_sql}\n"
             )
+
+        # ── Table guard: if inject rules required specific tables and they're
+        # missing from the generated SQL, force one retry with the requirement
+        # prepended directly to the question (not just in schema_hint).
+        # This turns INJECT rules from suggestions into contracts. ───────────
+        if _inject_rule_ids:
+            try:
+                from core.business_rules import get_engine as _get_rules_engine
+                _guard_engine = _get_rules_engine()   # singleton — no re-init cost
+                required = _guard_engine.required_tables_for(_inject_rule_ids)
+                forbidden = _guard_engine.forbidden_patterns_for(_inject_rule_ids)
+                missing_req = [t for t in required if t.lower() not in raw_sql.lower()]
+                violated_forbidden = []
+                for fpat in forbidden:
+                    try:
+                        if re.search(fpat, raw_sql, re.IGNORECASE):
+                            violated_forbidden.append(fpat)
+                    except re.error:
+                        pass
+
+                if missing_req or violated_forbidden:
+                    guard_msg_parts = []
+                    if missing_req:
+                        guard_msg_parts.append(f"MUST USE TABLES: {', '.join(missing_req)}")
+                    if violated_forbidden:
+                        guard_msg_parts.append(f"DO NOT USE: {', '.join(violated_forbidden)}")
+                    guard_prefix = " | ".join(guard_msg_parts)
+                    forced_question = f"[{guard_prefix}] {question}"
+                    # Replace both the question AND collapse the schema_hint to
+                    # just the guard message — avoids token overflow on retry
+                    # when the original schema_hint is long (e.g. FM CTE hints).
+                    forced_prompt = prompt.replace(
+                        f"[QUESTION]{question}[/QUESTION]",
+                        f"[QUESTION]{forced_question}[/QUESTION]",
+                    )
+                    # Also slim the schema_hint section to the guard message only
+                    # so deepseek focuses on the constraint, not the original hint
+                    forced_prompt = re.sub(
+                        r'(### Schema Hint \(follow this guidance\)\n).*?(\n### Examples)',
+                        r'\1-- ' + guard_prefix + r'\2',
+                        forced_prompt,
+                        flags=re.DOTALL,
+                    )
+                    # Always log table-guard fires — doubles deepseek latency, important to track
+                    import logging as _logging
+                    _logging.getLogger("inspectai").warning(
+                        f"[table-guard] retry fired — missing={missing_req} forbidden={violated_forbidden}"
+                    )
+                    if _debug_logger:
+                        _debug_logger.debug(
+                            f"  [table-guard] firing retry — missing={missing_req} forbidden_hit={violated_forbidden}"
+                        )
+                    response2 = sql_llm.complete(forced_prompt)
+                    raw_sql = str(response2).strip()
+            except Exception as _guard_exc:
+                if _debug_logger:
+                    _debug_logger.debug(f"  [table-guard] skipped: {_guard_exc}")
+        # ── end table guard ──────────────────────────────────────────────────
 
         sql = validator.clean_sql(raw_sql)
 
@@ -639,6 +698,7 @@ def get_schema(db_engine: Engine, table_name: Optional[str] = None) -> dict[str,
         return {"success": False, "result": None, "error": str(exc)}
 
 
+
 # ---------------------------------------------------------------------------
 # ToolRegistry
 # ---------------------------------------------------------------------------
@@ -735,11 +795,19 @@ class ToolRegistry:
                     return v
                 # Accept both 'label' and 'question_label' — LLM uses both names
                 q_label = args.get("question_label") or args.get("label")
+                # Parse limit — 1 = top only, None = full distribution
+                _blimit = args.get("limit")
+                if _blimit is not None:
+                    try:
+                        _blimit = int(_blimit)
+                    except (TypeError, ValueError):
+                        _blimit = None
                 return get_answer_stats(
                     self._db_engine,
                     form_name=_clean(args.get("form_name")),
                     module_name=_clean(args.get("module_name")),
                     question_label=_clean(q_label),
+                    breakdown_limit=_blimit,
                 )
 
             if name == "generate_sql":
@@ -753,6 +821,7 @@ class ToolRegistry:
                     _inject_rule_ids=args.get("_inject_rule_ids", []),
                     _seed_index=self._seed_index,
                     _db_schema=self._db_schema,
+                    _active_cycle_uuid=str(args.get("_active_cycle_uuid", "")),
                 )
 
             if name == "execute_sql":
