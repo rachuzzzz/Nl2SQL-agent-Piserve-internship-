@@ -56,9 +56,8 @@ ROUTING — INSPECTION QUERIES:
   "by project" / "by country" / "by org"   → generate_sql — JOIN lookup table via inspection_report FK
 
 LOOKUP TABLES (all have active column — filter WHERE active = true):
-  country:       id, name  — inspection_report.country_id / facility.country_id
-  entity:        id, name  — inspection_report.entity_id (DIRECT) — standalone business entity
   country:       id, name  — inspection_report.country_id (DIRECT) or facility.country_id
+  entity:        id, name  — inspection_report.entity_id (DIRECT) — standalone business entity
   region:        id, name, country_id  — facility.region_id → region.id → country
   organisation:  id, name  — NO direct FK on inspection_report
                              Join path: inspection_report → facility → organisation
@@ -279,9 +278,15 @@ Turn 1: {"thought": "Total score = SUM of ai_answers.score per inspection. NOT i
 User: "what did inspectors write in the observation field for Al Ghadeer?"
 Turn 1: {"thought": "Need ai_answers filtered by question label='Observation' AND facility='Al Ghadeer'. Must join: ai_answers → ai_questions (label) → inspection_report → facility. Exclude 'Observation Type' and 'Unique Identifier' — only the free-text Observation field.", "tool": "generate_sql", "args": {"question": "observation text at Al Ghadeer facility", "schema_hint": "SELECT aa.answer_text AS observation, ir.inspection_id, ir.submitted_on FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Observation' AND fac.name ILIKE '%Al Ghadeer%' AND aa.answer_text IS NOT NULL AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
 
+─── Inspection schedule: overdue inspections ───
+User: "show all overdue inspections"
+Turn 1: {"thought": "Overdue inspections are in inspection_schedule WHERE status = 'OVERDUE'. inspection_schedule has NO inspection_id column — get facility, inspector, inspectee from FKs on inspection_schedule itself. Join inspection_report via schedule_id = ir.id to get inspection details. Do NOT select inspection_id from inspection_schedule.", "tool": "generate_sql", "args": {"question": "overdue inspections with facility inspector and due date", "schema_hint": "SELECT fac.name AS facility_name, proj.name AS project_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, u_ins.first_name || ' ' || u_ins.last_name AS inspectee_name, isched.due_date, (CURRENT_DATE - isched.due_date::date) AS days_overdue, isched.schedule_date FROM inspection_schedule isched JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN project proj ON isched.project_id = proj.id JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN users u_ins ON isched.inspectee_id = u_ins.id WHERE isched.status = 'OVERDUE' AND isched.active = true AND fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
+─── Inspection schedule: schedule status counts ───
+User: "how many inspections are overdue vs pending vs completed"
+Turn 1: {"thought": "Count by status from inspection_schedule.", "tool": "generate_sql", "args": {"question": "inspection schedule status counts", "schema_hint": "SELECT status, COUNT(*) AS count FROM inspection_schedule WHERE active = true GROUP BY status ORDER BY count DESC;"}}
 ─── Form answers: filter by answer value ───
 User: "show all high risk observations"
-Turn 1: {"thought": "User wants answers where Risk Level = High. Use ILIKE '%High%' on answer_text. Also filter where label='Observation' to get the observation text.", "tool": "generate_sql", "args": {"question": "observations where risk level is high", "schema_hint": "SELECT aa.inspection_id, aq.label, aa.answer_text, ir.submitted_on FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id WHERE aa.inspection_report_id IN (SELECT aa2.inspection_report_id FROM ai_answers aa2 JOIN ai_questions aq2 ON aa2.element_id = aq2.element_id WHERE aq2.label = 'Risk Level' AND aa2.answer_text ILIKE '%High%') AND aq.label = 'Observation' AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
+Turn 1: {"thought": "User wants observation TEXT for inspections where Risk Level answer = High. Must use TWO arms: subquery gets inspection_report_ids where Risk Level=High, outer query gets Observation answer_text for those inspections. NEVER return risk level rows themselves — return the observation text.", "tool": "generate_sql", "args": {"question": "observation text for inspections where risk level is high", "schema_hint": "SELECT obs.answer_text AS observation, ir.inspection_id, ir.submitted_on FROM ai_answers obs JOIN ai_questions obs_q ON obs.element_id = obs_q.element_id JOIN inspection_report ir ON obs.inspection_report_id = ir.id WHERE obs_q.label = 'Observation' AND obs.inspection_report_id IN (SELECT aa2.inspection_report_id FROM ai_answers aa2 JOIN ai_questions aq2 ON aa2.element_id = aq2.element_id WHERE aq2.label = 'Risk Level' AND aa2.answer_text = 'High') AND ir.status != 'DRAFT' AND ir.active = true ORDER BY ir.submitted_on DESC LIMIT 100;"}}
 
 ─── Form answers: by inspection ───
 User: "all answers in inspection INS-2024-001"
@@ -289,7 +294,7 @@ Turn 1: {"thought": "Filter by inspection_id.", "tool": "get_answers", "args": {
 
 ─── Form answers: most recently filled form ───
 User: "show all questions and answers in the most recently filled form"
-Turn 1: {"thought": "Need most recent inspection that has Inspection Form answers — using aa subquery, NOT inspection_report subquery (newest ir row may have no answers yet). CRITICAL: module_name filter goes on OUTER query only — NEVER inside the subquery or it returns NULL.", "tool": "generate_sql", "args": {"question": "questions and answers from most recent inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT aa2.inspection_report_id FROM ai_answers aa2 ORDER BY aa2.submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' ORDER BY aq.label LIMIT 100;"}}
+Turn 1: {"thought": "Need most recent inspection that has Inspection Form answers — using aa subquery, NOT inspection_report subquery (newest ir row may have no answers yet). CRITICAL: module_name filter goes on OUTER query only — NEVER inside the subquery or it returns NULL.", "tool": "generate_sql", "args": {"question": "questions and answers from most recent inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT aa2.inspection_report_id FROM ai_answers aa2                    ORDER BY aa2.submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' ORDER BY aq.label LIMIT 100;"}}
 
 ─── Scores for a named inspector's last inspection ───
 User: "show questions and scores for the last inspection by George"
@@ -509,7 +514,7 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
     Region:     ... → facility → region
     Entity:     JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN entity ent ON ir.entity_id = ent.id
     Project:    JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN project proj ON ir.project_id = proj.id
-    Country:    JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN country c ON ir.country_id = c.id
+    Country:    JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id JOIN country c ON fac.country_id = c.id
 
 ### INSPECTION_REPORT — TWO USER FK COLUMNS (different people, NEVER mix):
   inspector_user_id  → person who CONDUCTED the inspection (Inspector)
@@ -533,7 +538,7 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
     WHERE ica.observation_id = aa.submission_id::uuid   ← filter by the specific answer row, NOT by inspection_id
 
   "corrective actions for this inspection" / "all CAs for this inspection":
-    WHERE ica.inspection_id = ir.inspection_id  ← all CAs for the whole inspection
+    WHERE ica.inspection_id = ir.id  ← all CAs for the whole inspection (ica.inspection_id is UUID FK to ir.id)
 
   NEVER confuse: one observation ≠ all observations in an inspection.
 
@@ -620,7 +625,7 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
   CRITICAL — most recent inspection subquery (use aa.submitted_on, NOT ir.submitted_on):
     CORRECT:   WHERE aa.inspection_report_id = (
                    SELECT aa2.inspection_report_id FROM ai_answers aa2
-ORDER BY aa2.submitted_on DESC LIMIT 1)
+                   ORDER BY aa2.submitted_on DESC LIMIT 1)
     WRONG:     WHERE ir.id = (SELECT id FROM inspection_report ORDER BY ir.submitted_on DESC LIMIT 1)
                (ir.submitted_on and aa.submitted_on differ — use aa.submitted_on for most-recently-answered)
 

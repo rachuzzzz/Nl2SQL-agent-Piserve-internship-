@@ -117,39 +117,20 @@ class SemanticQuestionIndex:
               AND (aq.module_name IS NULL OR aq.module_name NOT IN ({excluded_placeholders}))
         """
 
-        # Form names for semantic form lookup
-        forms_sql = """
-            SELECT f.name   AS form_name,
-                   f.name   AS label_text,
-                   'FORM'   AS entity_type,
-                   f.id::text AS element_id
-            FROM fb_forms f
-            WHERE f.name IS NOT NULL AND f.name != ''
-        """
-
-        # Module names
-        modules_sql = """
-            SELECT ''       AS form_name,
-                   m.name   AS label_text,
-                   'MODULE' AS entity_type,
-                   m.id::text AS element_id
-            FROM fb_modules m
-            WHERE m.name IS NOT NULL AND m.name != ''
-        """
+        # fb_forms and fb_modules intentionally excluded:
+        # FORM and MODULE entity types are never retrieved at query time —
+        # the LLM only uses semantic_search to find QUESTION matches.
+        # Including them added startup latency, RAM overhead, and
+        # diluted cosine similarity scores with irrelevant vectors.
 
         rows_all = []
-        for label, query in [
-            ("ai_questions labels", questions_sql),
-            ("form names",          forms_sql),
-            ("module names",        modules_sql),
-        ]:
-            try:
-                with db_engine.connect() as conn:
-                    rows = conn.execute(sql_text(query)).fetchall()
-                rows_all.extend(rows)
-                print(f"    ✓ {len(rows)} {label}")
-            except Exception as e:
-                print(f"  ⚠ Could not pull {label}: {e}")
+        try:
+            with db_engine.connect() as conn:
+                rows = conn.execute(sql_text(questions_sql)).fetchall()
+            rows_all.extend(rows)
+            print(f"    ✓ {len(rows)} ai_questions labels")
+        except Exception as e:
+            print(f"  ⚠ Could not pull ai_questions labels: {e}")
 
         if not rows_all:
             print("  ⚠ No labels found — semantic search unavailable")
@@ -180,13 +161,10 @@ class SemanticQuestionIndex:
             })
 
             # Contextual enrichment: embed "[label] [form_name]" instead of bare label.
-            # This gives the embedding model enough signal to separate:
-            #   "Risk Level [Inspection Form]" vs "Risk Level [Statutory FLS Audit]"
-            # Forms/modules are embedded as-is (no enrichment needed).
-            if entity_type == "QUESTION" and form_name:
-                enriched = f"{label_text} [{form_name}]"
-            else:
-                enriched = label_text
+            # Gives the embedding model enough signal to separate same-label questions
+            # across different forms: "Risk Level [Inspection Form]" vs
+            # "Risk Level [Mitigative Action Entry]".
+            enriched = f"{label_text} [{form_name}]" if form_name else label_text
             texts.append(enriched)
 
         self.embeddings = np.array([

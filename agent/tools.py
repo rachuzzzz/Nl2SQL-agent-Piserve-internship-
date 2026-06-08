@@ -529,15 +529,13 @@ def generate_sql(
                 _guard_engine = _get_rules_engine()   # singleton — no re-init cost
                 required = _guard_engine.required_tables_for(_inject_rule_ids)
                 forbidden = _guard_engine.forbidden_patterns_for(_inject_rule_ids)
-                import re as _re
-
                 missing_req = [t for t in required if t.lower() not in raw_sql.lower()]
                 violated_forbidden = []
                 for fpat in forbidden:
                     try:
-                        if _re.search(fpat, raw_sql, _re.IGNORECASE):
+                        if re.search(fpat, raw_sql, re.IGNORECASE):
                             violated_forbidden.append(fpat)
-                    except _re.error:
+                    except re.error:
                         pass
 
                 if missing_req or violated_forbidden:
@@ -557,12 +555,16 @@ def generate_sql(
                     )
                     # Also slim the schema_hint section to the guard message only
                     # so deepseek focuses on the constraint, not the original hint
-                    import re as _re2
-                    forced_prompt = _re2.sub(
+                    forced_prompt = re.sub(
                         r'(### Schema Hint \(follow this guidance\)\n).*?(\n### Examples)',
                         r'\1-- ' + guard_prefix + r'\2',
                         forced_prompt,
-                        flags=_re2.DOTALL,
+                        flags=re.DOTALL,
+                    )
+                    # Always log table-guard fires — doubles deepseek latency, important to track
+                    import logging as _logging
+                    _logging.getLogger("inspectai").warning(
+                        f"[table-guard] retry fired — missing={missing_req} forbidden={violated_forbidden}"
                     )
                     if _debug_logger:
                         _debug_logger.debug(

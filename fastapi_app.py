@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from chart_advisor import advise, force_config
+from chart_advisor import advise, force_config, get_alternatives, classify_columns
 
 # ── Chart follow-up fast-path ──────────────────────────────────────────────────
 # Detects pure chart requests that need no new SQL — handled before the LLM.
@@ -98,6 +98,12 @@ class PageRequest(BaseModel):
     page:       int           # 0-based page index
     page_size:  int = 50
     sql:        str | None = None  # if provided, use this SQL instead of last_sql
+
+class ChartRequest(BaseModel):
+    session_id: str
+    chart_type: str | None = None   # None → auto-advise; string → force that type
+    x_col:      str | None = None   # override label column (column picker)
+    y_cols:     list[str] | None = None  # override value columns (column picker)
 
 class StepInfo(BaseModel):
     tool: str
@@ -608,6 +614,119 @@ async def get_session_info(session_id: str):
 async def clear_session(session_id: str):
     _sessions.pop(session_id, None)
     return {"status": "cleared", "session_id": session_id}
+
+
+@app.post("/api/chart")
+async def get_chart(req: ChartRequest):
+    """
+    Slash-command chart endpoint — /chart [type?]
+    Generates or regenerates a chart from the session's last result.
+    Zero LLM calls. Zero SQL calls. Pure chart advisor.
+
+    - chart_type=None      → auto-advise best type
+    - chart_type="bar"     → force that specific type
+    - x_col / y_cols       → column picker overrides (user selected columns)
+    """
+    sess_data = _sessions.get(req.session_id)
+    if not sess_data or not sess_data.get("last_raw_rows"):
+        raise HTTPException(
+            status_code=404,
+            detail="No data in session. Run a query first, then use /chart."
+        )
+
+    cols = sess_data["last_cols"]
+    rows = sess_data["last_raw_rows"]
+
+    # Column picker overrides — user explicitly selected which cols to chart
+    if req.x_col or req.y_cols:
+        active_cols = []
+        if req.x_col and req.x_col in cols:
+            active_cols.append(req.x_col)
+        if req.y_cols:
+            active_cols.extend(c for c in req.y_cols if c in cols)
+        # Rebuild rows with only the selected columns
+        if active_cols:
+            cols = active_cols
+            rows = [{k: r[k] for k in active_cols if k in r} for r in rows]
+
+    if req.chart_type:
+        cfg = force_config(cols, rows, req.chart_type)
+        if cfg is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Cannot build '{req.chart_type}' chart for this data shape."
+            )
+            alts = get_alternatives(cols, rows, n=3)
+        return ChartConfig(
+            chart_type=req.chart_type,
+            reason=f"Requested by user via /chart {req.chart_type}",
+            confidence="high",
+            config=cfg,
+            conflict=False,
+            requested_type=None,
+            requested_config=None,
+            alternatives=alts,
+        )
+    else:
+        rec = advise(cols, rows)
+        if not rec.get("chart_type"):
+            raise HTTPException(
+                status_code=422,
+                detail="Cannot determine a chart for this data. Try /chart bar or select specific columns."
+            )
+        return ChartConfig(
+            chart_type=rec["chart_type"],
+            reason=rec["reason"],
+            confidence=rec["confidence"],
+            config=rec["config"],
+            conflict=False,
+            requested_type=None,
+            requested_config=None,
+            alternatives=rec.get("alternatives", []),
+        )
+
+
+@app.get("/api/sql/{session_id}")
+async def get_last_sql(session_id: str):
+    """
+    Slash-command /sql endpoint.
+    Returns the last generated SQL for this session.
+    """
+    sess_data = _sessions.get(session_id)
+    if not sess_data or not sess_data.get("last_sql"):
+        raise HTTPException(
+            status_code=404,
+            detail="No SQL in session. Ask a data question first."
+        )
+    return {
+        "sql": sess_data["last_sql"],
+        "session_id": session_id,
+    }
+
+
+@app.get("/api/columns/{session_id}")
+async def get_last_columns(session_id: str):
+    """
+    Returns available columns and their types from the last result.
+    Used by the column picker when user wants to customise a chart.
+    """
+    sess_data = _sessions.get(session_id)
+    if not sess_data or not sess_data.get("last_cols"):
+        raise HTTPException(status_code=404, detail="No result in session.")
+
+    cols = sess_data["last_cols"]
+    rows = sess_data.get("last_raw_rows", [])
+
+    # Classify each column so the frontend can show sensible picker options
+    t = classify_columns(cols, rows)
+
+    return {
+        "columns":    cols,
+        "categories": t.get("category", []),
+        "numerics":   t.get("numeric", []),
+        "dates":      t.get("date", []),
+        "session_id": session_id,
+    }
 
 
 @app.get("/api/health")

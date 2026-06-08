@@ -513,7 +513,8 @@ class AgentOrchestrator:
                 "num_ctx": 16384,
                 "top_p": 0.9,
                 # Stop tokens prevent deepseek adding explanation text after SQL
-                "stop": ["[/SQL]", "This query", "Note:", "-- Note", "/*"],
+                # ";" must be first — stops generation immediately after the query ends
+                "stop": [";", "[/SQL]", "This query", "Note:", "-- Note", "/*"],
             })
         print(f"  ✓ SQL LLM ({sql_model})")
 

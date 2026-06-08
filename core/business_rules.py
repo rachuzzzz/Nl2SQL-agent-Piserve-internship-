@@ -937,21 +937,25 @@ REGISTRY: list[dict] = [
 
         "type":           INJECT,
         "priority":       87,
-        "description":    "High-risk observations/deviations — route to risk_level table not ai_answers.",
+        "description":    "ICA corrective action risk queries — route to risk_level table via UUID FK. Does NOT apply to form observation queries which correctly use ai_answers.",
         "suppresses":     [],
         "question_pattern": (
-            r"\b(high.{0,10}risk|critical.{0,10}risk|risk.{0,10}level).{0,30}"
-            r"(observation|deviation|finding|action|corrective)|"
-            r"\b(observation|deviation|finding).{0,30}"
-            r"(high.{0,10}risk|critical.{0,10}risk|risk.{0,10}level)|"
-            r"\b(risk.{0,10}breakdown|breakdown.{0,10}risk|breakdown.{0,40}risk|"
+            # Only fires for CORRECTIVE ACTION risk queries.
+            # Form observation queries ("high risk observations") use ai_answers correctly.
+            r"\b(high.{0,10}risk|critical.{0,10}risk).{0,30}"
+            r"(corrective.{0,10}action|\bca\b|\bica\b)|"
+            r"\b(corrective.{0,10}action|\bca\b|\bica\b).{0,30}"
+            r"(high.{0,10}risk|critical.{0,10}risk)|"
+            r"\b(risk.{0,10}breakdown|breakdown.{0,10}risk|"
             r"risk.{0,10}distribut|risk.{0,10}count|count.{0,10}risk|"
             r"risk.{0,10}by.{0,20}facilit|by.{0,10}risk.{0,10}level)\b"
         ),
         "hint": (
-            "\nRISK ROUTING — high-risk observations/deviations are stored in inspection_corrective_action:\n"
-            "  NEVER use ai_answers / ai_questions for risk level counts — the risk level label\n"
-            "  in form answers returns 0 results (answer_text does not match risk level names).\n"
+            "\nICA RISK ROUTING — corrective action risk levels use inspection_corrective_action:\n"
+            "  For risk level COUNTS / BREAKDOWNS on corrective actions:\n"
+            "  ALWAYS use the risk_level table via inspection_corrective_action:\n"
+            "  NOTE: form 'high risk observations' uses ai_answers correctly — this rule\n"
+            "  only applies to ICA/corrective-action risk queries.\n"
             "  ALWAYS use the risk_level table via inspection_corrective_action:\n"
             "  JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
             "  WHERE rl.name = \'High\'   -- or \'Medium\' / \'Low\'\n"
