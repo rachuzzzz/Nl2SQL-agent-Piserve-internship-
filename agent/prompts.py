@@ -180,6 +180,14 @@ OBSERVATION → CORRECTIVE ACTION — two distinct paths, NEVER confuse them:
   KEY RULE: if the user came from an observation list and is asking about CAs,
   ALWAYS use PATH 1 (observation_id). PATH 2 returns all CAs for the whole
   inspection which is NOT what the user wants when they're drilling into one observation.
+  REVERSE PATH — observation for a CA (user asks "what was the observation for this CA"):
+    SELECT aa.answer_text AS observation FROM inspection_corrective_action ica
+    JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
+    JOIN ai_questions aq ON aa.element_id = aq.element_id
+    WHERE ica.corrective_action_id = '<CA_ID>'
+    AND aq.label = 'Observation'   ← MUST filter to get free-text, not Risk Level/Type dropdown
+    NEVER use get_answers(inspection_id=...) for this — it returns the whole form.
+    NEVER cast aa.submission_id::uuid — cast ica.observation_id::varchar instead.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AVAILABLE TOOLS
@@ -225,6 +233,22 @@ When the conversation history shows "★ inspection_id(s) from this result" or
   4. "that inspection", "that site", "she/he filled", "that form", "for that"
      → all mean: filter by the inspection_id from context, not by name.
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NAME DISAMBIGUATION RULE — ALWAYS CHECK BEFORE FETCHING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When user asks for data about a PERSON by first name only (e.g. "George", "Ahmed", "Sara"):
+  STEP 1 — ALWAYS run generate_sql to COUNT DISTINCT matching users first:
+    SELECT u.first_name || ' ' || u.last_name AS name, COUNT(ir.id) AS count
+    FROM users u JOIN inspection_report ir ON ir.inspector_user_id = u.id
+    WHERE u.first_name ILIKE '%<name>%' AND u.active = true
+    GROUP BY u.id, u.first_name, u.last_name ORDER BY count DESC;
+  STEP 2a — If result has EXACTLY 1 row → proceed with full query immediately.
+  STEP 2b — If result has 2+ rows → call final_answer listing the options:
+    "I found N inspectors named X: • Name1 (Y inspections) • Name2 (Z inspections)
+     Which one did you mean?"
+    Then STOP and wait for user to reply with the full name.
+  STEP 3 — After user confirms full name → run full query with exact name filter.
+  NEVER skip step 1 for first-name-only queries. NEVER dump all results when multiple matches exist.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 IMPORTANT DISTINCTIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -278,9 +302,33 @@ Turn 1: {"thought": "Total score = SUM of ai_answers.score per inspection. NOT i
 User: "what did inspectors write in the observation field for Al Ghadeer?"
 Turn 1: {"thought": "Need ai_answers filtered by question label='Observation' AND facility='Al Ghadeer'. Must join: ai_answers → ai_questions (label) → inspection_report → facility. Exclude 'Observation Type' and 'Unique Identifier' — only the free-text Observation field.", "tool": "generate_sql", "args": {"question": "observation text at Al Ghadeer facility", "schema_hint": "SELECT aa.answer_text AS observation, ir.inspection_id, ir.submitted_on FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Observation' AND fac.name ILIKE '%Al Ghadeer%' AND aa.answer_text IS NOT NULL AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
 
+─── Observation for a specific corrective action ───
+User: "show the observation for the first corrective action"
+Turn 1: {"thought": "User wants the free-text observation the inspector wrote for this CA. ica.observation_id (UUID) links to ai_answers.submission_id (varchar) — a group of answers for that observation. Must filter aq.label = 'Observation' to get the free-text field only, not Observation Type/Risk Level/Impact. Cast: aa.submission_id = ica.observation_id::varchar. NEVER use get_answers(inspection_id=...) — returns whole form.", "tool": "generate_sql", "args": {"question": "observation text linked to corrective action", "schema_hint": "SELECT aa.answer_text AS observation, ir.inspection_id, fac.name AS facility_name FROM inspection_corrective_action ica JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.corrective_action_id = '<CA_ID>' AND aq.label = 'Observation' AND ica.active = true AND aa.answer_text IS NOT NULL LIMIT 1;"}}
+─── High risk corrective actions for a specific month ───
+User: "show high risk corrective actions from February 2026"
+Turn 1: {"thought": "Need high risk CAs from Feb 2026. Risk level is on ica.risk_level_id — JOIN risk_level table. Date filter on ir.submitted_on using EXTRACT. NEVER join ai_answers to get risk level — ica.risk_level_id is a direct UUID FK to risk_level table.", "tool": "generate_sql", "args": {"question": "high risk corrective actions from February 2026", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, rl.name AS risk_level, ica.target_close_out_date, fac.name AS facility_name FROM inspection_corrective_action ica JOIN risk_level rl ON ica.risk_level_id = rl.id JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE rl.name = 'High' AND EXTRACT(MONTH FROM ir.submitted_on) = 2 AND EXTRACT(YEAR FROM ir.submitted_on) = 2026 AND ica.active = true AND ir.active = true AND ir.status != 'DRAFT' ORDER BY ica.target_close_out_date ASC LIMIT 100;"}}
+─── Corrective actions for a specific inspection ───
+User: "show corrective actions for inspection 2026/04/ST158/INS005"
+Turn 1: {"thought": "Need corrective actions for a specific inspection. ica.inspection_id is UUID FK to inspection_report.id — must join and filter by ir.inspection_id (varchar). NEVER use ica.due_date (use target_close_out_date), NEVER use ica.actual_date (use close_on), NEVER use ica.mitigative_action_uuid (that is on po_details/pr_details pointing TO ica.id).", "tool": "generate_sql", "args": {"question": "corrective actions for inspection 2026/04/ST158/INS005", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, ica.target_close_out_date, ica.close_on, ica.capex, ica.opex, ica.progress_stage FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id WHERE ir.inspection_id = '2026/04/ST158/INS005' AND ica.active = true AND ir.active = true ORDER BY ica.created_on ASC LIMIT 100;"}}
+─── Name disambiguation: multiple matches ───
+User: "show inspections by George"
+Turn 1: {"thought": "Before fetching all inspections, check if multiple users named George exist as inspectors. Run a COUNT DISTINCT first to detect ambiguity.", "tool": "generate_sql", "args": {"question": "distinct inspectors named George with inspection count", "schema_hint": "SELECT u.first_name || ' ' || u.last_name AS inspector_name, COUNT(ir.id) AS inspection_count FROM users u JOIN inspection_report ir ON ir.inspector_user_id = u.id WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%George%') AND u.active = true AND ir.status != 'DRAFT' GROUP BY u.id, u.first_name, u.last_name ORDER BY inspection_count DESC;"}}
+Turn 2: {"thought": "Result shows 3 distinct inspectors named George. Cannot proceed without knowing which one the user means. Surface the options and ask.", "tool": "final_answer", "args": {"answer": "I found 3 inspectors named George:
+- George Auditor — 47 inspections
+- George Thomas — 12 inspections
+- George Al Mansouri — 3 inspections
+
+Which one would you like to see?"}}
+─── Name disambiguation: user confirms ───
+User: "George Auditor"
+Turn 1: {"thought": "User has confirmed they want George Auditor. Now run the full query filtered to exact full name match.", "tool": "generate_sql", "args": {"question": "inspections by George Auditor", "schema_hint": "SELECT ir.inspection_id, ir.inspection_score, ir.status, ir.submitted_on, fac.name AS facility_name FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id JOIN facility fac ON ir.facility_id = fac.id WHERE u.first_name || ' ' || u.last_name ILIKE '%George Auditor%' AND ir.status != 'DRAFT' AND u.active = true AND fac.active = true ORDER BY ir.submitted_on DESC LIMIT 100;"}}
+─── Facilities scheduled for a specific frequency ───
+User: "which facilities are scheduled for daily inspections"
+Turn 1: {"thought": "Daily inspections come from frequency_definition → inspector_portfolio_details → facility. Do NOT use inspection_schedule for this — frequency is set on the portfolio, not the schedule. Filter frequency_definition.name = 'Daily'.", "tool": "generate_sql", "args": {"question": "facilities scheduled for daily inspections", "schema_hint": "SELECT DISTINCT fac.name AS facility_name, fd.name AS frequency FROM frequency_definition fd JOIN inspector_portfolio_details ipd ON ipd.frequency_definition_id = fd.id JOIN facility fac ON fac.id = ipd.facility_id WHERE fd.name = 'Daily' AND fd.active = true AND ipd.active = true AND fac.active = true ORDER BY fac.name;"}}
 ─── Inspection schedule: overdue inspections ───
 User: "show all overdue inspections"
-Turn 1: {"thought": "Overdue inspections are in inspection_schedule WHERE status = 'OVERDUE'. inspection_schedule has NO inspection_id column — get facility, inspector, inspectee from FKs on inspection_schedule itself. Join inspection_report via schedule_id = ir.id to get inspection details. Do NOT select inspection_id from inspection_schedule.", "tool": "generate_sql", "args": {"question": "overdue inspections with facility inspector and due date", "schema_hint": "SELECT fac.name AS facility_name, proj.name AS project_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, u_ins.first_name || ' ' || u_ins.last_name AS inspectee_name, isched.due_date, (CURRENT_DATE - isched.due_date::date) AS days_overdue, isched.schedule_date FROM inspection_schedule isched JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN project proj ON isched.project_id = proj.id JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN users u_ins ON isched.inspectee_id = u_ins.id WHERE isched.status = 'OVERDUE' AND isched.active = true AND fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
+Turn 1: {"thought": "Overdue inspections are in inspection_schedule WHERE status = 'OVERDUE'. inspection_schedule has NO inspection_id column — get facility, inspector, inspectee from FKs on inspection_schedule itself. Join inspection_report via schedule_id = ir.id to get inspection details. Do NOT select inspection_id from inspection_schedule.", "tool": "generate_sql", "args": {"question": "overdue inspections with facility inspector and due date", "schema_hint": "SELECT fac.name AS facility_name, proj.name AS project_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, u_ins.first_name || ' ' || u_ins.last_name AS inspectee_name, isched.due_date, (CURRENT_DATE - isched.due_date::date) AS days_overdue, isched.schedule_date FROM inspection_schedule isched JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN project proj ON isched.project_id = proj.id JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN users u_ins ON isched.inspectee_id = u_ins.id WHERE isched.status = 'OVERDUE' AND fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
 ─── Inspection schedule: schedule status counts ───
 User: "how many inspections are overdue vs pending vs completed"
 Turn 1: {"thought": "Count by status from inspection_schedule.", "tool": "generate_sql", "args": {"question": "inspection schedule status counts", "schema_hint": "SELECT status, COUNT(*) AS count FROM inspection_schedule WHERE active = true GROUP BY status ORDER BY count DESC;"}}
@@ -335,6 +383,16 @@ User: "who inspected it"
 
 Turn 1: {"thought": "Context is about Facility X facility. Query the most recent inspection there to find inspector.", "tool": "generate_sql", "args": {"question": "inspector of most recent inspection at Facility X", "schema_hint": "SELECT u.first_name || ' ' || u.last_name AS inspector_name FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id JOIN facility fac ON ir.facility_id = fac.id WHERE fac.name ILIKE '%Facility X%' AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 1;"}}
 
+─── Capex lost from rejected corrective actions ───
+User: "show capex lost from rejected corrective actions"
+Turn 1: {"thought": "User wants CAs where capex_status = 'REJECTED' — these are quotes that were rejected by the client. capex_status is a valid column on inspection_corrective_action with values ACCEPTED/REJECTED/DEFERRED. This is different from total capex lost (arithmetic gap) — this is specifically rejected quotes.", "tool": "generate_sql", "args": {"question": "capex from rejected corrective actions", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.capex, ica.capex_status, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.capex_status = 'REJECTED' AND ica.active = true AND ir.active = true ORDER BY ica.capex DESC LIMIT 100;"}}
+─── Total capex generated converted and lost ───
+User: "what is the total capex generated converted and lost"
+ROUTING RULE: Use scalar subqueries NOT a JOIN between ica and po_details.
+NEVER: LEFT JOIN po_details p ON ica.mitigative_action_uuid = p.mitigative_action_uuid (wrong direction)
+NEVER: LEFT JOIN po_details p ON p.mitigative_action_uuid = ica.mitigative_action_uuid (causes row fan-out)
+ALWAYS: Use scalar subqueries — one SELECT per metric, no JOIN needed for totals.
+Turn 1: {"thought": "Total capex summary — use scalar subqueries, no JOIN. mitigative_action_uuid on po_details points TO ica.id so a direct JOIN causes fan-out. Scalar subqueries give ONE clean row.", "tool": "generate_sql", "args": {"question": "total capex generated converted and lost", "schema_hint": "SELECT (SELECT COALESCE(SUM(capex),0) FROM inspection_corrective_action WHERE active=true AND capex>0) AS capex_generated, (SELECT COALESCE(SUM(po_amount),0) FROM po_details WHERE active=true) AS capex_converted, COALESCE((SELECT SUM(capex) FROM inspection_corrective_action WHERE active=true AND capex>0),0) - COALESCE((SELECT SUM(po_amount) FROM po_details WHERE active=true),0) AS capex_lost, (SELECT COALESCE(SUM(pr_amount),0) FROM pr_details WHERE active=true) AS opex_incurred;"}}
 ─── FM manager CAPEX conversion rate ───
 User: "which FM manager has the highest capex conversion rate?"
 ROUTING RULE: CAPEX conversion rate = SUM(po_details.po_amount) / SUM(ica.capex).
@@ -427,7 +485,7 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
   facility.organization_id          → organisation.id  ← American spelling on column, British on table
   facility.region_id                → region.id
   facility.country_id               → country.id
-  facility.client_id                → client.id
+  # facility.client_id does NOT exist — reach client via inspection_report.client_id
   region.country_id                 → country.id       (region belongs to country)
   project.organisation_id           → organisation.id
 - ENUM values are ALWAYS uppercase: status = 'OPEN', status = 'CLOSED', status = 'OVERDUE',
@@ -440,6 +498,11 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
 - CALENDAR YEAR filter: EXTRACT(YEAR FROM col) = EXTRACT(YEAR FROM CURRENT_DATE)
   or: col >= date_trunc('year', CURRENT_DATE)
   NEVER: col > CURRENT_DATE - INTERVAL '1 year' — that is a rolling 365-day window, not a calendar year.
+- SPECIFIC MONTH filter (known month like Feb 2026):
+  CORRECT:  EXTRACT(MONTH FROM col) = 2 AND EXTRACT(YEAR FROM col) = 2026
+  CORRECT:  col >= '2026-02-01' AND col < '2026-03-01'
+  NEVER:    date_trunc('month', col) = date_trunc('month', '2026-02-01') — missing ::date cast causes error
+  IF cast needed: date_trunc('month', '2026-02-01'::date) is valid but prefer EXTRACT pattern
 - EXACT QUESTION LABELS (use = not ILIKE for known labels):
   'Observation'      — free-text field written by inspector. NOT a type/category.
   'Observation Type' — dropdown: 'Deviation' | 'Good Practice'  ← use THIS to count deviations or GP
@@ -531,11 +594,16 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
            WHERE ... ur.user_id = ir.inspectee_user_id  ← two different people!
 
 ### OBSERVATION → CORRECTIVE ACTION LINK:
-  inspection_corrective_action.observation_id → ai_answers.submission_id (cast to uuid: ica.observation_id = aa.submission_id::uuid)  (DIRECT FK)
-  398 CAs have a non-NULL observation_id — directly linked to the form answer that triggered them.
+  inspection_corrective_action.observation_id (UUID) → ai_answers.submission_id (varchar)
+  JOIN: aa.submission_id = ica.observation_id::varchar  ← cast UUID to varchar, NOT the other way
+  submission_id groups ALL answers for one observation (Risk Level, Observation Type, free-text etc.)
+  To get the free-text observation: MUST filter WHERE aq.label = 'Observation'
+  398 CAs have a non-NULL observation_id — directly linked to the observation group that triggered them.
 
-  "corrective actions for this observation" / "CAs linked to that observation":
-    WHERE ica.observation_id = aa.submission_id::uuid   ← filter by the specific answer row, NOT by inspection_id
+  "observation text for this CA" / "what was the observation":
+    JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
+    JOIN ai_questions aq ON aa.element_id = aq.element_id
+    WHERE aq.label = 'Observation'   ← ALWAYS add this to get free-text, not Risk Level/Type
 
   "corrective actions for this inspection" / "all CAs for this inspection":
     WHERE ica.inspection_id = ir.id  ← all CAs for the whole inspection (ica.inspection_id is UUID FK to ir.id)

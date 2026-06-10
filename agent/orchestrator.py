@@ -500,7 +500,7 @@ class AgentOrchestrator:
             temperature=0.2, request_timeout=120.0,
             additional_kwargs={
                 "num_predict": 1024,
-                "num_ctx": 16384,
+                "num_ctx": 20000,
                 "think": False,   # Disable Qwen3 internal chain-of-thought — saves 8-15s per call
             })
         print(f"  ✓ Reasoning LLM ({chat_model})")

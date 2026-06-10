@@ -829,7 +829,7 @@ REGISTRY: list[dict] = [
     },
     {
         "id":             "inject_financial_routing",
-        "required_tables": ["po_details"],
+        "required_tables": [],
         "forbidden_patterns": [r"SUM\\(ica\\.opex\\)", r"capex_status\\s*=\\s*'ACCEPTED'"],
 
         "type":           INJECT,

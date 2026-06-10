@@ -431,6 +431,25 @@ async def chat(req: ChatRequest):
                     _result_rows = [{k: str(v) for k, v in row.items()} for row in rows]
                     _result_cols = inner.get("columns", list(rows[0].keys()))
                     _row_count = inner.get("row_count", len(rows))
+                    # Build plain SQL from get_answers args so pagination works correctly
+                    # Without this, pagination falls back to last_sql (wrong query)
+                    _ga_args = step.args or {}
+                    _ga_filters = ["1=1"]
+                    if _ga_args.get("form_name"):
+                        _ga_filters.append(f"aq.module_name ILIKE '%{_ga_args['form_name']}%'")
+                    if _ga_args.get("module_name"):
+                        _ga_filters.append(f"aa.module_name ILIKE '%{_ga_args['module_name']}%'")
+                    if _ga_args.get("label"):
+                        _ga_filters.append(f"aq.label ILIKE '%{_ga_args['label']}%'")
+                    if _ga_args.get("inspection_id"):
+                        _ga_filters.append(f"aa.inspection_report_id = (SELECT ir.id FROM inspection_report ir WHERE ir.inspection_id = '{_ga_args['inspection_id']}' LIMIT 1)")
+                        if not _ga_args.get("module_name") and not _ga_args.get("form_name"):
+                            _ga_filters.append("aa.module_name = 'Inspection Form'")
+                    if _ga_args.get("answer_text"):
+                        _ga_filters.append(f"aa.answer_text ILIKE '%{_ga_args['answer_text']}%'")
+                    _ga_where = " AND ".join(_ga_filters)
+                    sql = f"""SELECT ir.inspection_id, aa.module_name, aq.label AS question_label, COALESCE(aa.answer_text, aa.answer_numeric::text) AS answer_value, aa.score, aa.submitted_on FROM ai_answers aa LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id LEFT JOIN inspection_report ir ON aa.inspection_report_id = ir.id WHERE {_ga_where} ORDER BY aa.submitted_on DESC"""
+                    sess_data["last_sql"] = sql
 
             elif step.tool == "get_answer_stats":
                 # get_answer_stats returns value_breakdown — convert to table rows for frontend

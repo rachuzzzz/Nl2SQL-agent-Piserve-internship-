@@ -277,13 +277,10 @@ _RAW: list[dict] = [
         "id": "capex_lost",
         "terms": ["capex lost", "lost capex", "capex loss"],
         "required_pattern": r"po_details|po\.po_amount|po_by_ica",
-        "forbidden_patterns": [
-            r"capex_status\s*(?:=|IN)\s*['\(]*REJECTED",
-            r"capex_status\s*(?:=|IN)\s*['\(]*DEFERRED",
-        ],
-        "correct_sql": "SUM(ica.capex) - (SELECT SUM(po_amount) FROM po_details) AS capex_lost",
-        "message": "CAPEX Lost = SUM(ica.capex) - SUM(po.po_amount) — NOT WHERE capex_status='REJECTED'",
-        "severity": "HARD_FAIL",
+        "forbidden_patterns": [],
+        "correct_sql": "SUM(ica.capex) WHERE ica.active=true AND ica.capex>0 MINUS SUM(po_details.po_amount) WHERE po_details.active=true — arithmetic gap",
+        "message": "CAPEX Lost = SUM(ica.capex) - SUM(po.po_amount) — arithmetic gap. capex_status=REJECTED is a valid filter for rejected CA queries.",
+        "severity": "SOFT_WARN",
     },
     {
         "id": "capex_generated",

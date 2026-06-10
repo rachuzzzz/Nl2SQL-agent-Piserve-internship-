@@ -239,6 +239,14 @@ class SQLValidator:
         # capex_status DOES exist (unsuppressed) — do not flag it
         "adequacy_status":    "does not exist — adequacy workflow not active",
         "risk_level":         "does not exist as a column — risk_level_id is a UUID FK; JOIN risk_level rl ON ica.risk_level_id = rl.id → rl.name",
+        # ICA columns that do not exist — common hallucinations
+        "due_date":           "does not exist on inspection_corrective_action — use target_close_out_date",
+        "actual_date":        "does not exist on inspection_corrective_action — use close_on",
+        # mitigative_action_uuid is on po_details/pr_details — only block if qualified as ica.mitigative_action_uuid
+        # "po.mitigative_action_uuid = ica.id" is CORRECT and must NOT be blocked
+        "ica.mitigative_action_uuid": "does not exist on inspection_corrective_action — use po_details.mitigative_action_uuid = ica.id",
+        "completion_date":    "does not exist on inspection_corrective_action — use close_on or completed_on",
+        "resolution_date":    "does not exist on inspection_corrective_action — use close_on",
         "impact":             "does not exist as a column on ica — impact data is in ai_answers: JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aq.label = 'Impact'",
         # Other ghost columns seen in traces
         "corrective_action_description": "does not exist — use ica.corrective_action (the text field)",
@@ -267,16 +275,13 @@ class SQLValidator:
         (r'\bisched\.inspection_id\b|\binspection_schedule\.inspection_id\b',
          'inspection_schedule has no inspection_id — use inspection_report_id FK'),
         # ── observation → ai_answers cast direction ───────────────────────────
-        # CORRECT cast: ica.observation_id = aa.submission_id::uuid
-        #   (ica.observation_id is uuid, aa.submission_id is varchar — cast the varchar)
-        # WRONG casts caught below:
-        #   aa.submission_id = ica.observation_id::uuid  (reversed)
-        #   ica.observation_id::text = aa.submission_id  (wrong side cast)
-        (r'\baa\.submission_id\s*=\s*ica\.observation_id(?:::\w+)?\b',
-         'Wrong cast direction. Correct: ica.observation_id = aa.submission_id::uuid '
-         '(cast the varchar submission_id to uuid, not the uuid observation_id)'),
+        # CORRECT cast: aa.submission_id = ica.observation_id::varchar
+        #   (ica.observation_id is uuid, aa.submission_id is varchar — cast uuid to varchar)
+        #   Verified in pgAdmin: aa.submission_id = ica.observation_id::varchar works correctly
+        # WRONG cast caught below:
+        #   ica.observation_id::text = aa.submission_id  (wrong side assignment)
         (r'\bica\.observation_id\s*::\s*text\s*=\s*aa\.submission_id\b',
-         'Wrong cast direction. Correct: ica.observation_id = aa.submission_id::uuid'),
+         'Wrong cast — use: aa.submission_id = ica.observation_id::varchar'),
     ]
 
     # UUID FK columns — SOFT_WARN if selected without their lookup JOIN
