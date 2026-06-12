@@ -70,7 +70,7 @@ def _detect_truncation(raw: str) -> str | None:
         return f"TRUNCATED — {open_b} unclosed brace(s)"
     if open_q:
         return "TRUNCATED — odd number of quotes (mid-string cut)"
-    if not stripped.endswith(("}","}")):
+    if not stripped.endswith(("}", "]")):
         return f"SUSPICIOUS — ends with: {repr(stripped[-30:])}"
     return None
 
@@ -161,13 +161,23 @@ def _has_uuid_leak(rows: list, columns: list) -> list[str]:
 # These notes survive deepseek's seed-example bias because they are placed in
 # Qwen's message (not in schema_hint which deepseek may override with seeds).
 # Rule: give the exact fix as a constraint, never a full replacement SQL.
+#
+# STATUS + CAST notes are generated from core.semantics_registry — the single
+# source of truth. Never hardcode status groupings or cast directions here.
+try:
+    from core.semantics_registry import constraint_note_status, constraint_note_cast
+    _NOTE_STATUS = constraint_note_status()
+    _NOTE_CAST = constraint_note_cast()
+except ImportError:
+    # Fallback literals — keep in sync with core/semantics_registry.py
+    _NOTE_STATUS = (
+        "-- completed = status = 'CLOSED' | conducted = status IN "
+        "('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION') | always exclude DRAFT"
+    )
+    _NOTE_CAST = "-- JOIN ON aa.submission_id = ica.observation_id::varchar"
+
 _CONSTRAINT_NOTE_MAP = {
-    "WRONG_CAST_DIR": (
-        "-- CAST RULE: JOIN ON ica.observation_id = aa.submission_id::uuid\n"
-        "--   ica.observation_id is uuid; aa.submission_id is varchar → cast the varchar side\n"
-        "--   NEVER: aa.submission_id = ica.observation_id::uuid  (reversed)\n"
-        "--   NEVER: ica.observation_id::text = aa.submission_id  (wrong side cast)"
-    ),
+    "WRONG_CAST_DIR": _NOTE_CAST,
     "IMPOSSIBLE_JOIN": (
         "-- Check the join path carefully. Use get_schema to verify FK columns."
     ),
@@ -177,9 +187,28 @@ _CONSTRAINT_NOTE_MAP = {
         "--   WHERE aq.label = 'Observation'  (or whichever label)\n"
         "-- ai_answers also has NO 'form_name' column — it has 'module_name'."
     ),
+    "CYCLE_FREQUENCY_MISSING_SUBQUERY": (
+        "-- 'list all cycles' / 'cycle types' = frequency_definition directly, NO inspection_cycle join:\n"
+        "--   SELECT name AS frequency_name, repeat_count, repeat_interval, repeat_unit\n"
+        "--   FROM frequency_definition WHERE active = true ORDER BY name;\n"
+        "-- The ic->ip->ipd->fd join chain with status='COMPLETED' is ONLY for\n"
+        "--   'the MOST RECENT completed cycle' and REQUIRES:\n"
+        "--   WHERE ic.id = (SELECT id FROM inspection_cycle WHERE status='COMPLETED'\n"
+        "--                   ORDER BY end_date DESC LIMIT 1)"
+    ),
+    "UNDEFINED_ALIAS": (
+        "-- A table alias was referenced in WHERE/SELECT but never introduced via FROM/JOIN.\n"
+        "--   EITHER add the missing JOIN for that alias (if you need its columns),\n"
+        "--   OR remove every reference to that alias if the table isn't actually needed.\n"
+        "--   Re-check every alias used (ica, ir, fac, u, ...) has a matching\n"
+        "--   'FROM <table> <alias>' or 'JOIN <table> <alias>' in the query."
+    ),
     "WRONG_JOIN": (
         "-- 'responsible' and 'pending_with' are VARCHAR enums, not UUID FKs.\n"
-        "--   Do NOT join to users table on these columns."
+        "--   Do NOT join to users table on these columns.\n"
+        "-- 'responsible party' = ica.responsible directly (CLIENT | INTERNAL_OPERATIONS | SUB_CONTRACTOR)\n"
+        "--   SELECT ica.responsible AS responsible_party — NO JOIN to users needed or possible.\n"
+        "--   If a previous attempt added LEFT JOIN users ON ica.responsible = '...', REMOVE that join entirely."
     ),
     "UUID_IN_SELECT": (
         "-- ir.id is the UUID primary key — never SELECT it for display.\n"
@@ -203,11 +232,7 @@ _CONSTRAINT_NOTE_MAP = {
         "--   NEVER truncate to 'STXXX/INSXXX' — always use the complete value the user provided.\n"
         "--   Example: WHERE ir.inspection_id = '2026/01/ST074/INS002'"
     ),
-    "MISSING_COMPLETED_STATUS": (
-        "-- 'completed' inspections require: WHERE ir.status IN ('CLOSED','SUBMITTED')\n"
-        "--   status != 'DRAFT' alone is NOT sufficient — it includes IN_PROGRESS, UNDER_REVIEW etc.\n"
-        "--   Always add: AND ir.status IN ('CLOSED','SUBMITTED')"
-    ),
+    "MISSING_COMPLETED_STATUS": _NOTE_STATUS,
     # Fired when business_rules.py BLOCK rules trigger (error code is "BUSINESS_RULE").
     # The most common cause is block_capex_left_join_multiplication or
     # block_cte_reference_without_definition.  The note gives deepseek the two
@@ -390,10 +415,35 @@ class ConversationSession:
                 )
             elif last.inspection_ids:
                 ids_str = ", ".join(f"\'{i}\'" for i in last.inspection_ids[:5])
-                lines.append(
-                    f"CONTEXT — The conversation involves inspections: {ids_str}."
-                    f" Filter by inspection_id IN ({ids_str}) when user references 'those'."
-                )
+                if last.total_count > len(last.inspection_ids):
+                    # The captured IDs are only a SAMPLE of a larger result set
+                    # (e.g. 5 captured out of 195 total). An IN-list of these 5
+                    # can NEVER represent "all"/"those"/"these" — it would silently
+                    # answer over 5 rows instead of all {total_count}.
+                    # Give Llama the previous SQL so it can re-apply the SAME
+                    # base filters as a fresh aggregate, NOT an IN-list.
+                    prev_sql_snippet = " ".join(last.sql.split())[:500] if last.sql else "(not available)"
+                    lines.append(
+                        f"CONTEXT — The previous result had {last.total_count} total rows; "
+                        f"only {len(last.inspection_ids)} sample IDs were captured ({ids_str})."
+                        f" These {len(last.inspection_ids)} IDs are NOT the full set.\n"
+                        f"  If the user asks 'how many of these/those/them are X' (an aggregate"
+                        f" over the FULL {last.total_count}-row result), do NOT filter by"
+                        f" inspection_id IN (...) — that covers only"
+                        f" {len(last.inspection_ids)} of {last.total_count} rows.\n"
+                        f"  INSTEAD: reuse the SAME FROM/JOIN/WHERE filters as the previous"
+                        f" query below, add the new condition (e.g. status = 'CLOSED'), and"
+                        f" return a fresh COUNT(*) — a complete recount, not a sample filter.\n"
+                        f"  Previous SQL: {prev_sql_snippet}"
+                    )
+                else:
+                    # The captured IDs ARE the complete result set (small result,
+                    # e.g. "inspections by George" → 3 rows) — IN-list is valid here.
+                    lines.append(
+                        f"CONTEXT — The conversation involves inspections: {ids_str}"
+                        f" (this is the COMPLETE result set, {last.total_count or len(last.inspection_ids)} total)."
+                        f" Filter by inspection_id IN ({ids_str}) when user references 'those'."
+                    )
             elif last.facility_names and len(last.facility_names) == 1:
                 lines.append(
                     f"CONTEXT — The conversation is about facility '{last.facility_names[0]}'."
@@ -500,7 +550,7 @@ class AgentOrchestrator:
             temperature=0.2, request_timeout=120.0,
             additional_kwargs={
                 "num_predict": 1024,
-                "num_ctx": 20000,
+                "num_ctx": 23000,
                 "think": False,   # Disable Qwen3 internal chain-of-thought — saves 8-15s per call
             })
         print(f"  ✓ Reasoning LLM ({chat_model})")
@@ -510,7 +560,7 @@ class AgentOrchestrator:
             temperature=0.0, request_timeout=120.0,
             additional_kwargs={
                 "num_predict": 1024,
-                "num_ctx": 16384,
+                "num_ctx": 20000,
                 "top_p": 0.9,
                 # Stop tokens prevent deepseek adding explanation text after SQL
                 # ";" must be first — stops generation immediately after the query ends

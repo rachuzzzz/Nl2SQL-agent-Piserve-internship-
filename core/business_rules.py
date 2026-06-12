@@ -40,6 +40,52 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+# ── Semantics registry (single source of truth for status/cast rules) ─────────
+try:
+    from core.semantics_registry import (
+        inject_hint_status as _inject_hint_status,
+        inject_hint_financial as _inject_hint_financial,
+        draft_exclusion_filter as _draft_exclusion_filter,
+    )
+    _STATUS_HINT = _inject_hint_status()
+    _FINANCIAL_HINT = _inject_hint_financial()
+    _DRAFT_EXCLUSION = _draft_exclusion_filter()
+except ImportError:
+    # Fallback — keep in sync with core/semantics_registry.py
+    _DRAFT_EXCLUSION = "status != 'DRAFT'"
+    _STATUS_HINT = (
+        "\nSTATUS GROUPINGS — always show as TWO categories, never raw status values:\n"
+        "  conducted = status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')\n"
+        "  completed = status = 'CLOSED'\n"
+        "  NEVER: status IN ('CLOSED','SUBMITTED') — mixes conducted and completed\n"
+        "  NEVER: status != 'DRAFT' alone for conducted — CLOSED is not conducted\n"
+        "  NEVER expose raw status names (SUBMITTED/UNDER_REVIEW/etc) in results\n"
+        "  UNLESS user explicitly asks to drill into a specific status\n\n"
+        "DEFAULT PATTERN for total/how many inspections:\n"
+        "SELECT\n"
+        "    CASE WHEN ir.status = 'CLOSED' THEN 'completed' ELSE 'conducted' END AS category,\n"
+        "    COUNT(*) AS inspection_count\n"
+        "FROM inspection_report ir\n"
+        "WHERE ir.active = true AND ir.status != 'DRAFT'\n"
+        "GROUP BY category ORDER BY category DESC;\n\n"
+        "If user asks ONLY for completed: WHERE ir.status = 'CLOSED'\n"
+        "If user asks ONLY for conducted: WHERE ir.status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')\n"
+    )
+    _FINANCIAL_HINT = (
+        "\nFINANCIAL DATA ROUTING:\n"
+        "  CAPEX Generated  = SUM(ica.capex)       — inspectee's original estimate on ICA\n"
+        "  CAPEX Converted  = SUM(po.po_amount)    — actual PO raised (via po_details)\n"
+        "  CAPEX Lost       = SUM(ica.capex) - COALESCE(SUM(po.po_amount), 0)\n"
+        "  DO NOT use capex_status for loss calculation — use the arithmetic difference\n"
+        "  OPEX Incurred    = SUM(pr.pr_amount)    — actual PR spend (via pr_details)\n"
+        "po_details JOIN: po.mitigative_action_uuid = ica.id — one ICA can have MULTIPLE POs,\n"
+        "  NEVER direct LEFT JOIN with SUM(ica.capex); use CTE pre-aggregation.\n"
+        "pr_details JOIN: pr.mitigative_action_uuid = ica.id — always SUM(pr.pr_amount).\n"
+        "CAPEX is tied to the FM Manager (inspectee_user_id); inspectors have no role in CAPEX/OPEX.\n"
+        "DATE RULE: NEVER hardcode years. Use CURRENT_DATE or DATE_TRUNC('year', CURRENT_DATE).\n"
+    )
+
+
 # ── Rule type constants ────────────────────────────────────────────────────────
 
 BLOCK       = "BLOCK"
@@ -72,6 +118,127 @@ REGISTRY: list[dict] = [
         "description": "Only SELECT is allowed — no data modification.",
         "sql_pattern": r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE)\b",
         "message":     "BLOCKED: DML/DDL detected. Only SELECT is allowed.",
+    },
+
+    # ── frequency_definition has NO description column ───────────────────────
+    {
+        "id":          "block_frequency_definition_description",
+        "type":        BLOCK,
+        "description": "frequency_definition has no 'description' column — hallucinated.",
+        # frequency_definition columns: id, name, repeat_count, repeat_interval, repeat_unit, active
+        "sql_pattern": r"\b(fd|frequency_definition)\.description\b",
+        "message": (
+            "WRONG COLUMN: frequency_definition has no 'description' column. "
+            "Its columns are: id, name, repeat_count, repeat_interval, repeat_unit, active. "
+            "Use fd.name (e.g. 'Quarterly Twice') — repeat_count/repeat_interval/repeat_unit "
+            "describe the cadence (e.g. repeat_count=2, repeat_interval=3, repeat_unit='MONTH')."
+        ),
+    },
+
+    # ── inspection_cycle has NO name column ───────────────────────────────────
+    {
+        "id":          "block_inspection_cycle_name",
+        "type":        BLOCK,
+        "description": "inspection_cycle has no 'name' column — hallucinated.",
+        # Confirmed 2026-06-12 (Llama self-correction after real DB error):
+        # inspection_cycle columns: id, status, start_date, end_date, due_date,
+        # send_notification_to_inspectors, created_on, modified_on — NO name.
+        # "cycles" with human-readable names = frequency_definition.name instead
+        # (see block_frequency_definition_description / "list all cycles" seed).
+        "sql_pattern": r"\b(ic|inspection_cycle)\.name\b",
+        "message": (
+            "WRONG COLUMN: inspection_cycle has no 'name' column. Its columns are: "
+            "id, status, start_date, end_date, due_date, send_notification_to_inspectors, "
+            "created_on, modified_on. For a display label, use ic.id / ic.status, or "
+            "join to frequency_definition for a human-readable cadence name "
+            "(fd.name via ip/ipd, see cycle-frequency seeds)."
+        ),
+    },
+
+    # ── cycle-frequency join chain missing its defining subquery ─────────────
+    {
+        "id":          "block_cycle_frequency_missing_subquery",
+        "type":        BLOCK,
+        "description": "ic→ip→ipd→fd frequency join with status='COMPLETED' requires the most-recent-cycle subquery.",
+        # This exact join chain (ic -> ip -> ipd -> fd) combined with
+        # ic.status = 'COMPLETED' is ONLY valid as part of the "most recently
+        # completed cycle" pattern, which REQUIRES:
+        #   WHERE ic.id = (SELECT id FROM inspection_cycle WHERE status='COMPLETED'
+        #                   ORDER BY end_date DESC LIMIT 1)
+        # Without that subquery, "ic.status = 'COMPLETED'" matches MANY cycles,
+        # turning "frequency of the MOST RECENT cycle" into "frequencies used
+        # by ALL completed cycles" — a silently different, usually-DISTINCT-ed
+        # answer. Observed twice in a row (2026-06-11) on "list all cycles".
+        "sql_pattern": (
+            r"(?=.*\binspection_cycle\s+\w+)"
+            r"(?=.*\binspector_portfolio\b)"
+            r"(?=.*\bfrequency_definition\b)"
+            r"(?=.*status\s*=\s*'COMPLETED')"
+            # Exempt: subquery form (most-recent-cycle pattern) ...
+            r"(?!.*\(\s*select\s+id\s+from\s+inspection_cycle)"
+            # ... or direct UUID/parameter filter (specific-cycle pattern):
+            # ic.id = '<uuid-or-placeholder>' — any quoted literal, not a subquery
+            r"(?!.*\bic\.id\s*=\s*'[^']*')"
+        ),
+        "message": (
+            "WRONG SHAPE: the ic→ip→ipd→fd join with status='COMPLETED' is ONLY "
+            "for 'the MOST RECENTLY COMPLETED cycle's frequency' — and REQUIRES "
+            "the defining subquery:\n"
+            "  WHERE ic.id = (SELECT id FROM inspection_cycle WHERE status = 'COMPLETED' "
+            "ORDER BY end_date DESC LIMIT 1)\n"
+            "Without it, this returns frequencies for ALL completed cycles — a different question.\n"
+            "If the user asked 'list all cycles' / 'what cycles are available' / "
+            "'cycle types', do NOT join inspection_cycle at all — use:\n"
+            "  SELECT name AS frequency_name, repeat_count, repeat_interval, repeat_unit "
+            "FROM frequency_definition WHERE active = true ORDER BY name;"
+        ),
+    },
+
+    # ── mitigative_action_uuid must join to ica.id — nothing else ────────────
+    {
+        "id":          "block_mitigative_uuid_wrong_target",
+        "type":        BLOCK,
+        "description": "po/pr_details.mitigative_action_uuid joins to ica.id only.",
+        # Catches the WRONG form: mitigative_action_uuid = ir.id / ir.<col> / fac.id etc.
+        # Silent-zero failure mode: the join matches nothing, LEFT JOIN +
+        # COALESCE(...,0) then paints every row with zeros (observed 2026-06-11).
+        "sql_pattern": (
+            r"mitigative_action_uuid\s*=\s*(?!ica\.id\b)(ir|fac|aa|aq|isched|u|cl|proj|reg|ent)\."
+            r"|\b(ir|fac|aa|aq|isched|u|cl|proj|reg|ent)\.\w+\s*=\s*\w*\.?mitigative_action_uuid"
+        ),
+        "message": (
+            "WRONG JOIN TARGET: mitigative_action_uuid points to inspection_corrective_action.id "
+            "(the CA), NEVER inspection_report.id or any other table. "
+            "Correct path: po_details/pr_details → ica → inspection_report → facility:\n"
+            "  JOIN inspection_corrective_action ica ON pd.mitigative_action_uuid = ica.id\n"
+            "  JOIN inspection_report ir ON ica.inspection_id = ir.id\n"
+            "Joining it to ir.id matches ZERO rows and silently produces all-zero results."
+        ),
+    },
+
+    # ── DRAFT records must never be counted ──────────────────────────────────
+    {
+        "id":          "block_draft_not_excluded",
+        "type":        BLOCK,
+        "description": "inspection_report queries must always exclude DRAFT records.",
+        # Fires when inspection_report is queried but no status filter operator is present.
+        # status != 'DRAFT', status = 'CLOSED', status IN (...) all satisfy this.
+        # SCOPE LIMIT (eval regression FLT-03): queries joining ai_answers are exempt —
+        # observation/form-answer queries are answer-driven and repeatedly hard-blocking
+        # them caused 8-retry death spirals. ai_answers rows only exist for submitted
+        # inspections, so DRAFT leakage risk there is minimal.
+        "sql_pattern": (
+            r"(?=.*\bFROM\s+inspection_report\b)"              # inspection_report is the PRIMARY table
+            r"(?!.*\bai_answers\b)"                            # exempt form-answer queries
+            r"(?!.*\bstatus\s*(?:!=|=|IN\s*\(|NOT\s+IN))"     # no status comparison operator anywhere
+        ),
+        "message": (
+            "MISSING FILTER: inspection_report queries must always exclude DRAFT records. "
+            "DRAFT inspections are incomplete and must NEVER be counted or listed. "
+            "Add: AND ir.status != 'DRAFT'  (or a stricter filter like = 'CLOSED' or = 'SUBMITTED'). "
+            "A stricter status filter already excludes DRAFT implicitly — "
+            "only add != 'DRAFT' when listing all non-draft statuses."
+        ),
     },
 
     # ── Hallucinated tables ───────────────────────────────────────────────────
@@ -165,7 +332,7 @@ REGISTRY: list[dict] = [
         ),
         "message":     (
             "WRONG PATH: When filtering CAs by observation text (ILIKE), join via "
-            "ica.observation_id = aa.submission_id::uuid — NOT via ica.inspection_id = ir.id. "
+            "aa.submission_id = ica.observation_id::varchar — NOT via ica.inspection_id = ir.id. "
             "The inspection join returns ALL CAs in the inspection; the observation_id join "
             "returns only CAs directly linked to that specific observation."
         ),
@@ -176,7 +343,17 @@ REGISTRY: list[dict] = [
         "id":          "block_capex_status_rejected_as_loss",
         "type":        BLOCK,
         "description": "capex_status REJECTED/DEFERRED is NOT how CAPEX Lost is calculated.",
-        "sql_pattern": r"capex_status.*(?:=\s*'REJECTED'|IN\s*\([^)]*'REJECTED'[^)]*\)|IN\s*\([^)]*'DEFERRED'[^)]*\))",
+        # Narrowed (2026-06-12): only fire when capex_status REJECTED/DEFERRED is
+        # used to PRODUCE a capex_lost/capex_converted output column (a SUM/CASE
+        # computing loss from capex_status), NOT when it's a plain WHERE filter
+        # for listing/displaying rows (e.g. "capex lost from rejected corrective
+        # actions" — legitimately filters WHERE ica.capex_status = 'REJECTED'
+        # to list those rows; capex_status is user-entered/declarative and
+        # POs can legitimately exist on REJECTED rows).
+        "sql_pattern": (
+            r"(?:capex_lost|capex_converted)\s*=.*capex_status.*(?:'REJECTED'|'DEFERRED')"
+            r"|capex_status.*(?:'REJECTED'|'DEFERRED').*(?:AS\s+capex_lost|AS\s+capex_converted)"
+        ),
         "message":     (
             "WRONG: capex_status='REJECTED' or 'DEFERRED' does not mean CAPEX Lost. "
             "CAPEX Lost = SUM(ica.capex) - COALESCE(SUM(po.po_amount), 0) "
@@ -504,13 +681,26 @@ REGISTRY: list[dict] = [
         "message":     "HALLUCINATION: responsible and pending_with are plain string ENUMs, NOT UUID FKs. Never JOIN them to users. Use: WHERE ica.responsible = 'CLIENT' (uppercase).",
     },
 
-    # ── close_on arithmetic ───────────────────────────────────────────────────
+    # ── close_on usage — DEAD COLUMN, confirmed all-NULL ─────────────────────
     {
         "id":          "block_close_on_arithmetic",
         "type":        BLOCK,
-        "description": "close_on is NULL on most rows — arithmetic on it is unreliable.",
-        "sql_pattern": r"\bclose_on\s*[-+]\s*\w|\bextract\s*\(.*?\bclose_on\b",
-        "message":     "BLOCKED: Arithmetic on close_on is unreliable — NULL on most rows. Use status-based counting: COUNT(*) FILTER (WHERE status IN ('CLOSED','CLOSE_WITH_DEFERRED')).",
+        "description": "close_on is a DEAD COLUMN (all values NULL, confirmed) — any comparison/arithmetic is meaningless.",
+        # Catches arithmetic (+/-), EXTRACT/date_trunc, AND comparisons (>, <, >=, <=, =)
+        "sql_pattern": (
+            r"\bclose_on\s*[-+<>]=?\s*\w"
+            r"|\bextract\s*\(.*?\bclose_on\b"
+            r"|\bdate_trunc\s*\([^)]*,\s*\w*\.?close_on\b"
+        ),
+        "message": (
+            "BLOCKED: close_on is a DEAD COLUMN — all values are NULL, confirmed. "
+            "Any comparison or arithmetic on it always evaluates to NULL/false. "
+            "Use completed_on for closure timing instead:\n"
+            "  'overdue' (still open, past due)     → status NOT IN ('CLOSED','CLOSE_WITH_DEFERRED') "
+            "AND target_close_out_date < CURRENT_DATE\n"
+            "  'closed late' / 'not closed on time' → status = 'CLOSED' AND completed_on > target_close_out_date\n"
+            "These two are MUTUALLY EXCLUSIVE — never OR them into one count."
+        ),
     },
 
     # ── Hardcoded year ────────────────────────────────────────────────────────
@@ -518,6 +708,12 @@ REGISTRY: list[dict] = [
         "id":          "block_responsible_groupby_fm",
         "type":        BLOCK,
         "description": "GROUP BY ica.responsible returns CLIENT/INTERNAL/SUB_CONTRACTOR — not FM managers",
+        # Guarded (2026-06-12): only fire when the QUESTION is actually about
+        # FM managers / performers — "breakdown by responsible party" is a
+        # legitimate generic GROUP BY ica.responsible question and should pass.
+        # This rule exists to catch the case where the user means PEOPLE
+        # (FM managers) but the model groups by the enum instead.
+        "question_pattern": r"\b(fm|facility)\s*manager|capex\s*(generator|converter)s?|top\s*perform",
         "sql_pattern": r"GROUP\s+BY\s+(?:[\w.]+\s*,\s*)*ica\.responsible",
         "message":     (
             "WRONG: GROUP BY ica.responsible gives CLIENT/INTERNAL_OPERATIONS/SUB_CONTRACTOR — "
@@ -568,6 +764,28 @@ REGISTRY: list[dict] = [
         "message":     "[autocorrect] Fixed reversed ICA→IR join",
     },
     {
+        "id":          "autocorrect_strip_responsible_users_join",
+        "type":        AUTOCORRECT,
+        "description": "Strip invalid LEFT JOIN users on ica.responsible enum comparison.",
+        # Matches: LEFT JOIN users <alias> ON ica.responsible = '<ENUM>' AND <anything up to u.id>
+        "sql_pattern": (
+            r"\s*LEFT\s+JOIN\s+users\s+\w+\s+ON\s+ica\.responsible\s*=\s*'[A-Z_]+'"
+            r"\s+AND\s+[\w.]+\s*=\s*\w+\.id"
+        ),
+        "replacement": "",
+        "message":     "[autocorrect] Removed invalid users join on ica.responsible enum",
+    },
+    {
+        "id":          "autocorrect_responsible_party_select",
+        "type":        AUTOCORRECT,
+        "description": "Replace u.first_name||' '||u.last_name AS responsible_party with ica.responsible.",
+        "sql_pattern": (
+            r"\w+\.first_name\s*\|\|\s*'\s+'\s*\|\|\s*\w+\.last_name\s+AS\s+responsible_party"
+        ),
+        "replacement": "ica.responsible AS responsible_party",
+        "message":     "[autocorrect] responsible_party now selects ica.responsible enum, not a user name",
+    },
+    {
         "id":          "autocorrect_ica_ir_join_cast",
         "type":        AUTOCORRECT,
         "description": "Fix CAST(ir.inspection_id AS ...) = ica.inspection_id type mismatch.",
@@ -613,6 +831,10 @@ REGISTRY: list[dict] = [
         "description":    "Top N capex converters — inject exact CTE SQL, bypass embedding.",
         "required_tables": ["po_details"],
         "forbidden_patterns": [r"ORDER BY ica\.capex", r"capex_status\s*=\s*'ACCEPTED'", r"ica\.expenditure"],
+        # Suppress the broader generic FM-manager routing hint — its routing
+        # advice can conflict with this rule's "USE THIS EXACT SQL" template
+        # when both fire on an ambiguous "top capex converter for FM manager" question.
+        "suppresses":     ["inject_fm_manager_routing"],
         "question_pattern": (
             r"\b(top|best|highest|leading).{0,20}(capex.{0,15}converter|convert.{0,15}capex)s?\b"
             r"|\b(capex.{0,15}converter|convert.{0,15}capex)s?.{0,20}(top|best|rank|leaderboard)\b"
@@ -647,6 +869,7 @@ REGISTRY: list[dict] = [
         "description":    "Top N capex generators — ranked by SUM(ica.capex), includes po join for context.",
         "required_tables": ["po_details"],
         "forbidden_patterns": [r"ORDER BY.*capex_converted", r"ica\.expenditure"],
+        "suppresses":     ["inject_fm_manager_routing"],
         "question_pattern": (
             # Must explicitly mention fm manager / facility manager context
             r"\b(top|best|highest|leading|most).{0,25}capex.{0,20}generat\w*.{0,20}(fm|facility.{0,5}manager|inspectee)\b"
@@ -684,6 +907,7 @@ REGISTRY: list[dict] = [
         "description":    "Top performing FM managers — inject CTE SQL ranking by conversion rate.",
         "required_tables": ["po_details"],
         "forbidden_patterns": [r"AVG\(ir\.inspection_score\)", r"ORDER BY avg_score", r"GROUP BY ica\.responsible"],
+        "suppresses":     ["inject_fm_manager_routing"],
         "question_pattern": (
             r"\b(top|best|highest).{0,20}(perform|fm.{0,10}manager|facility.{0,10}manager).{0,30}"
             r"(manager|fm|perform|rank|leaderboard)\b"
@@ -801,7 +1025,55 @@ REGISTRY: list[dict] = [
             ") AS pct_with_corrective_action\n"
             "FROM inspection_report ir\n"
             "LEFT JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id\n"
-            "WHERE ir.status != 'DRAFT';\n"
+            f"WHERE ir.{_DRAFT_EXCLUSION};\n"
+        ),
+    },
+    {
+        "id":             "inject_inspector_performance",
+        "type":           INJECT,
+        "priority":       93,
+        "description":    "Inspector performance summary — assigned/conducted/observations — inject CTE pattern.",
+        "question_pattern": (
+            r"\b(inspector).{0,50}(performance|summary|breakdown|stats?|report|overview)\b"
+            r"|\b(performance|summary|breakdown|stats?).{0,50}(inspector)\b"
+            r"|\b(assigned|conducted).{0,30}(inspection|inspector)\b"
+            r"|\b(inspector).{0,30}(assigned|conducted|observations?|high.?risk)\b"
+        ),
+        "hint": (
+            "\nINSPECTOR PERFORMANCE SUMMARY — CRITICAL DEFINITIONS:\n"
+            "  assigned   = COUNT(ir.id)                               — ALL reports for inspector\n"
+            "  conducted  = COUNT FILTER (WHERE ir.status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION'))\n"
+            "               NEVER status != 'DRAFT' — that includes CLOSED\n"
+            "               NEVER status = 'SUBMITTED' alone — misses UNDER_REVIEW and RETURN_FOR_MOD\n"
+            "  total_observations = SUM(COUNT DISTINCT aa.submission_id per inspection)\n"
+            "               NEVER COUNT(*) on ai_answers — overcounts (many rows per observation)\n"
+            "  high_risk_observations = COUNT DISTINCT submission_id WHERE Risk Level = High\n"
+            "  NEVER join ai_answers twice in main query — causes cross-join fan-out\n"
+            "  NEVER join inspection_schedule — irrelevant to performance counts\n"
+            "  Pre-aggregate observations in a CTE:\n"
+            "WITH obs AS (\n"
+            "    SELECT aa.inspection_report_id,\n"
+            "           COUNT(DISTINCT aa.submission_id)   AS total_obs,\n"
+            "           COUNT(DISTINCT CASE\n"
+            "               WHEN aq.label = 'Risk Level' AND aa.answer_text ILIKE '%High%'\n"
+            "               THEN aa.submission_id END)     AS high_risk_obs\n"
+            "    FROM ai_answers aa\n"
+            "    JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
+            "    WHERE aa.module_name = 'Inspection Form'\n"
+            "    GROUP BY aa.inspection_report_id\n"
+            ")\n"
+            "SELECT u.first_name || ' ' || u.last_name          AS inspector_name,\n"
+            "       COUNT(ir.id)                                AS assigned,\n"
+            "       COUNT(ir.id) FILTER (WHERE ir.status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')) AS conducted,\n"
+            "       COUNT(ir.id) FILTER (WHERE ir.status = 'CLOSED') AS completed,\n"
+            "       COALESCE(SUM(obs.total_obs), 0)             AS total_observations,\n"
+            "       COALESCE(SUM(obs.high_risk_obs), 0)         AS high_risk_observations\n"
+            "FROM users u\n"
+            "JOIN inspection_report ir ON ir.inspector_user_id = u.id AND ir.active = true\n"
+            "LEFT JOIN obs ON obs.inspection_report_id = ir.id\n"
+            "WHERE u.active = true\n"
+            "GROUP BY u.id, u.first_name, u.last_name\n"
+            "ORDER BY conducted DESC NULLS LAST LIMIT 100;\n"
         ),
     },
     {
@@ -816,15 +1088,21 @@ REGISTRY: list[dict] = [
         ),
         "hint": (
             "\nUSE THIS EXACT PATTERN for inspector count queries:\n"
+            "-- conducted = IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION') — in-flight\n"
+            "-- completed = CLOSED only\n"
+            "-- assigned  = all reports linked to inspector (any non-draft status)\n"
             "SELECT u.first_name || ' ' || u.last_name AS inspector_name,\n"
-            "       COUNT(*) AS num_inspections\n"
+            "       COUNT(*) AS assigned,\n"
+            "       COUNT(*) FILTER (WHERE ir.status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')) AS conducted,\n"
+            "       COUNT(*) FILTER (WHERE ir.status = 'CLOSED') AS completed\n"
             "FROM inspection_report ir\n"
             "JOIN users u ON ir.inspector_user_id = u.id\n"
-            "WHERE ir.status != 'DRAFT'\n"
+            "WHERE ir.active = true AND ir.status != 'DRAFT'\n"
             "  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)\n"
-            "GROUP BY u.first_name, u.last_name\n"
-            "ORDER BY num_inspections DESC LIMIT 1;\n"
+            "GROUP BY u.id, u.first_name, u.last_name\n"
+            "ORDER BY conducted DESC LIMIT 1;\n"
             "CRITICAL: NEVER write '= 2023' or '= 2026' — always use EXTRACT(YEAR FROM CURRENT_DATE).\n"
+            "CRITICAL: conducted = IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION'). NEVER status = 'SUBMITTED' only.\n"
         ),
     },
     {
@@ -855,35 +1133,7 @@ REGISTRY: list[dict] = [
             r"most\s+expensive\s+(facility|site)|"
             r"rival.{0,20}(quote|bid|amount)|financial\s+summary)\b"
         ),
-        "hint": (
-            "\nFINANCIAL DATA ROUTING:\n"
-            "  CAPEX Generated  = SUM(ica.capex)       — inspectee's original estimate on ICA\n"
-            "  CAPEX Converted  = SUM(po.po_amount)    — actual PO raised (via po_details)\n"
-            "  CAPEX Lost       = CAPEX Generated - CAPEX Converted\n"
-            "                     i.e. SUM(ica.capex) - COALESCE(SUM(po.po_amount), 0)\n"
-            "  DO NOT use capex_status for loss calculation — use the arithmetic difference\n"
-            "\n  CAPEX Loss Detail (from form answers — module: 'Inspection Mitigative Action Completion'):\n"
-            "    'Is CAPEX Lost'                        — aa.answer_text = 'true' (boolean flag)\n"
-            "    'Amount Difference for CPAEX Loss'     — aa.answer_numeric (NOTE: typo CPAEX not CAPEX)\n"
-            "    'CAPEX Lost To(Company/Entity/Subcontractor)' — aa.answer_text (who did it cheaper)\n"
-            "    'Justification for CAPEX Loss'         — aa.answer_text (reason)\n"
-            "    JOIN via: ica.completion_submission_id = aa.inspection_report_id\n"
-            "\n  OPEX Incurred    = SUM(pr.pr_amount)    — actual PR spend (via pr_details)\n"
-            "    'PR Amount' / 'PR Date' / 'PR Number' also in form: 'Inspection Mitigative Action PR Entry'\n"
-            "    JOIN via: ica.pr_submission_id = aa.inspection_report_id\n"
-            "\npo_details: id, po_amount, po_date, po_number, mitigative_action_uuid\n"
-            "  One ICA can have MULTIPLE POs — NEVER direct LEFT JOIN, use CTE pre-aggregation:\n"
-            "  WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po_amount FROM po_details GROUP BY 1)\n"
-            "  LEFT JOIN po_by_ica p ON p.ica_id = ica.id\n"
-            "\npr_details: id, pr_amount, pr_date, pr_number, mitigative_action_uuid\n"
-            "  JOIN: LEFT JOIN pr_details pr ON pr.mitigative_action_uuid = ica.id\n"
-            "  One ICA can have MULTIPLE PRs — always SUM(pr.pr_amount)\n"
-            "\nCAPEX is ALWAYS tied to the FM Manager (inspectee_user_id)\n"
-"  Inspectors only raise observations — they have NO role in CAPEX/OPEX\n"
-"  FM Manager (inspectee_user_id) raises the ICA and assigns the CAPEX value\n"
-"  Client raises PO to cover it (CAPEX Converted) or org raises PR (OPEX Incurred)\n"
-            "\nDATE RULE: NEVER hardcode years (2026, 2025). Use CURRENT_DATE or DATE_TRUNC('year', CURRENT_DATE).\n"
-        ),
+        "hint": _FINANCIAL_HINT,
     },
     {
         "id":             "inject_fm_manager_routing",
@@ -1152,25 +1402,124 @@ REGISTRY: list[dict] = [
             "Only filter by module_name in the OUTER WHERE using ILIKE if the user names a specific form.\n"
         ),
     },
-    # Fault 1 — "completed" semantic mapping
+    # Fault 1 — "completed/conducted/total" semantic mapping
+    # hint comes from core.semantics_registry — edit there, not here
+    # SCOPE LIMIT (eval regression FREQ-05): excludes schedule-context questions —
+    # "completed vs overdue in the SCHEDULE" is an inspection_schedule question with
+    # different status enums (COMPLETED/OVERDUE/PENDING), handled by the rule below.
+    # SCOPE LIMIT 2 (2026-06-12): also excludes overdue/pending/cancelled vocabulary
+    # even when "schedule" isn't said literally — "how many inspections are overdue
+    # vs pending vs completed" is schedule-status vocabulary (inspection_schedule's
+    # own enum), not inspection_report's conducted/completed split.
+    # inject_schedule_status (priority 76, below) still requires the literal word
+    # "schedule" by design — it is NOT broadened here. If NEITHER rule fires for
+    # such a question, the model falls back to the relevant worked example in
+    # prompts.py — considered acceptable.
     {
         "id":             "inject_completed_inspections",
         "type":           INJECT,
         "priority":       75,
-        "description":    "Completed inspections — canonical mapping to CLOSED and SUBMITTED.",
+        "description":    "Total/completed/conducted inspections — canonical two-row category summary.",
         "question_pattern": (
-            r"\b(completed|finished|done|finalized)\s+(inspection|inspections?)\b"
-            r"|\binspections?\s+(completed|finished|done)\b"
-            r"|\bhow\s+many\s+inspections?.{0,20}(completed|finished)\b"
+            r"(?i)^(?!.*\bschedule)(?!.*\b(overdue|pending|cancelled)\b)"
+            r"(?:.*(?:\b(completed|conducted|total|how\s+many|count)\s*(inspections?|inspection\s+report)\b"
+            r"|\binspections?\s*(completed|conducted|total|count|in\s+\w+)\b))"
+        ),
+        "hint": _STATUS_HINT,
+    },
+    # "responsible party" phrasing — proactively prevent the users-join instinct
+    {
+        "id":             "inject_responsible_party_enum",
+        "type":           INJECT,
+        "priority":       79,
+        "description":    "'responsible party' = ica.responsible enum, never a users join.",
+        "question_pattern": (
+            r"(?i)\bresponsible\s*(party|parties)?\b"
         ),
         "hint": (
-            "\nSEMANTIC MAPPING: 'completed inspection' = status IN ('CLOSED', 'SUBMITTED').\n"
-            "  SUBMITTED = inspector filed and submitted — counts as completed.\n"
-            "  CLOSED = fully reviewed and approved — counts as completed.\n"
-            "  UNDER_REVIEW = still being reviewed — NOT completed.\n"
-            "  RETURN_FOR_MODIFICATION = sent back — NOT completed.\n"
-            "  DRAFT = not yet submitted — NOT completed.\n"
-            "USE: WHERE ir.status IN ('CLOSED', 'SUBMITTED')\n"
+            "\n'responsible' / 'responsible party' = ica.responsible directly.\n"
+            "  It is a VARCHAR ENUM: CLIENT | INTERNAL_OPERATIONS | SUB_CONTRACTOR — a category, not a person.\n"
+            "  SELECT ica.responsible AS responsible_party — NO JOIN to users table.\n"
+            "  NEVER: LEFT JOIN users u ON ica.responsible = '...' AND ...u.id — this is not a valid join,\n"
+            "  ica.responsible has no FK relationship to users at all.\n"
+        ),
+    },
+    # CA approval-workflow questions — route to implementation_status, never capex_status
+    {
+        "id":             "inject_ca_approval_workflow",
+        "type":           INJECT,
+        "priority":       78,
+        "description":    "CA approval/progress questions — implementation_status & progress_stage routing.",
+        "question_pattern": (
+            r"(?i)\b(awaiting|pending)\s*(for\s+)?(approval|review)\b"
+            r"|\bapproval\b.{0,30}\b(corrective|action|CA)s?\b"
+            r"|\b(approved|sent\s+back|returned)\b.{0,30}\b(corrective|action|CA)s?\b"
+            r"|\b(at\s+risk|behind\s+schedule|on\s+track|not\s+started)\b.{0,30}\b(corrective|action|CA)s?\b"
+            r"|\b(corrective|action|CA)s?\b.{0,40}\b(at\s+risk|behind|on\s+track|approved?|pending|sent\s+back|returned)\b"
+        ),
+        "hint": (
+            "\nCA WORKFLOW ROUTING — four independent ica columns, do not confuse:\n"
+            "  'awaiting/pending approval/review' → implementation_status = 'PENDING_FOR_REVIEW'\n"
+            "      (EXACT string — NOT 'PENDING'. NEVER capex_status — that is the financial track)\n"
+            "  'approved'                         → implementation_status = 'APPROVE' (NOT 'APPROVED')\n"
+            "  'sent back / returned' (CAs)       → ica.implementation_status = 'RETURN_FOR_MODIFICATION'\n"
+            "  'returned' (INSPECTIONS)           → ir.status = 'RETURN_FOR_MODIFICATION' — different table!\n"
+            "  'at risk / behind / on track'      → progress_stage (schedule health)\n"
+            "      'at risk' = progress_stage='AT_RISK' — NOT risk_level='High' (severity)\n"
+            "  'not started'                      → progress_stage = 'NOT_STARTED' OR progress_stage IS NULL\n"
+            "  status='CLOSED' ⟺ implementation_status='APPROVE' — closure IS the approval\n"
+        ),
+    },
+    # "Needs attention" dashboard questions — scalar subqueries, never UNION
+    {
+        "id":             "inject_needs_attention_dashboard",
+        "type":           INJECT,
+        "priority":       77,
+        "description":    "Ambiguous dashboard questions — scalar subquery summary, never UNION ALL.",
+        "question_pattern": (
+            r"(?i)\b(needs?\s+attention|critical\s+issues?|urgent\s+items?"
+            r"|what\s+should\s+i\s+(look|focus)|action\s+items?)\b"
+        ),
+        "hint": (
+            "\nDASHBOARD QUESTION — return ONE ROW of scalar subqueries.\n"
+            "NEVER UNION ALL heterogeneous tables (CA rows + schedule rows) — "
+            "'N/A' placeholders clash with date/enum column types and fail at runtime.\n\n"
+            "USE THIS PATTERN:\n"
+            "SELECT\n"
+            "    (SELECT COUNT(*) FROM inspection_corrective_action\n"
+            "     WHERE status = 'OVERDUE' AND active = true)  AS overdue_corrective_actions,\n"
+            "    (SELECT COUNT(*) FROM inspection_corrective_action\n"
+            "     WHERE status = 'OPEN' AND active = true)     AS open_corrective_actions,\n"
+            "    (SELECT COUNT(*) FROM inspection_schedule\n"
+            "     WHERE status = 'OVERDUE')                    AS overdue_scheduled_inspections,\n"
+            "    (SELECT COUNT(*) FROM inspection_corrective_action ica\n"
+            "     JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
+            "     WHERE rl.name = 'High' AND ica.status IN ('OPEN','OVERDUE')\n"
+            "       AND ica.active = true)                     AS high_risk_open_cas;\n"
+        ),
+    },
+    # Schedule-status questions — inspection_schedule has its OWN status enum
+    {
+        "id":             "inject_schedule_status",
+        "type":           INJECT,
+        "priority":       76,
+        "description":    "Schedule status questions — inspection_schedule enum, not inspection_report.",
+        "question_pattern": (
+            r"(?i)\b(completed|overdue|pending|cancelled)\b.{0,50}\bschedule\b"
+            r"|\bschedule\b.{0,50}\b(completed|overdue|pending|cancelled)\b"
+        ),
+        "hint": (
+            "\nSCHEDULE STATUS — this is an inspection_schedule question, NOT inspection_report:\n"
+            "  inspection_schedule.status values: PENDING | COMPLETED | OVERDUE | CANCELLED\n"
+            "  (different enum from inspection_report — 'COMPLETED' here, 'CLOSED' there)\n"
+            "  NO active column on inspection_schedule — never filter isched.active\n"
+            "  Columns: schedule_date (NOT scheduled_date), due_date, schedule_id, status\n\n"
+            "PATTERN for completed vs overdue in the schedule this year:\n"
+            "SELECT isched.status, COUNT(*) AS count\n"
+            "FROM inspection_schedule isched\n"
+            "WHERE isched.status IN ('COMPLETED','OVERDUE')\n"
+            "  AND EXTRACT(YEAR FROM isched.due_date) = EXTRACT(YEAR FROM CURRENT_DATE)\n"
+            "GROUP BY isched.status;\n"
         ),
     },
     # Fault 3/4/9 — Single-row comparison queries

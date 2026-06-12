@@ -46,6 +46,8 @@ ENUM_COLUMNS = {
 }
 
 BUSINESS_RULES = [
+    # NOTE: the observation↔CA cast direction below must match
+    # core.semantics_registry.observation_ca_join() — "aa.submission_id = ica.observation_id::varchar"
     "DRAFT inspections usually have NULL scores. Always add WHERE status != 'DRAFT' "
     "when querying inspection_score, unless the user explicitly asks about drafts.",
     "NEVER use SELECT *. Always specify the columns the user needs.",
@@ -53,10 +55,12 @@ BUSINESS_RULES = [
     "Use ILIKE for text matching, never LIKE.",
     "corrective_action_id is a human-readable ID like '2026/01/ST064/INS001_MA001', not a UUID.",
     "inspection_corrective_action.inspection_id is the PRIMARY FK to inspection_report.id.",
-    "inspection_corrective_action.observation_id → ai_answers.submission_id (cast to uuid: ica.observation_id = aa.submission_id::uuid) (DIRECT FK). "
-    "When user asks CAs for a specific observation, filter: WHERE ica.observation_id = aa.submission_id::uuid. "
-    "Do NOT filter by inspection_id alone — that returns ALL CAs for the inspection. "
-    "398 CAs have a non-NULL observation_id.",
+    "OBSERVATION → CORRECTIVE ACTION — two distinct paths, NEVER confuse them: "
+    "PATH 1 — CAs for a SPECIFIC observation: JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar "
+    "(cast the UUID side to varchar — NEVER aa.submission_id::uuid = ica.observation_id, NEVER ::text). "
+    "PATH 2 — ALL CAs for an inspection: JOIN ica ON ica.inspection_id = ir.id. "
+    "Use PATH 1 only when the user references a SPECIFIC observation; "
+    "use PATH 2 for 'corrective actions for this inspection' generally.",
     "Use LEFT JOIN (not INNER JOIN) for optional lookups like inspection_sub_type, "
     "entity, and inspection_report_remark.",
     "VOCABULARY — corrective action status: "

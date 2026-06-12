@@ -1,6 +1,62 @@
 """
 Prompt templates for the agentic NL2SQL system.
+
+STATUS GROUPINGS come from core.semantics_registry — the single source of
+truth. Edit there, not here.
 """
+
+# ── Registry-generated status block (single source of truth) ─────────────────
+try:
+    from core.semantics_registry import (
+        llama_status_block as _llama_status_block,
+        llama_ca_workflow_block as _llama_ca_workflow_block,
+        llama_columns_block as _llama_columns_block,
+    )
+    _STATUS_BLOCK = _llama_status_block()
+    _CA_WORKFLOW_BLOCK = _llama_ca_workflow_block()
+    _COLUMNS_BLOCK = _llama_columns_block()
+except ImportError:
+    # Fallback — keep in sync with core/semantics_registry.py
+    _STATUS_BLOCK = """\
+IMPORTANT — inspection_report.status values and groupings:
+  DRAFT                    → incomplete, never submitted — NEVER count or show
+  SUBMITTED                → inspector filed the report (in-flight)
+  UNDER_REVIEW             → under FM/admin review (in-flight)
+  RETURN_FOR_MODIFICATION  → sent back to inspector (in-flight)
+  CLOSED                   → fully reviewed and approved (final)
+
+  STATUS GROUPINGS — always bucket into two categories for reporting:
+    conducted = IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')
+    completed = 'CLOSED'
+
+  DEFAULT for "total / how many / count inspections":
+    Show as TWO-ROW summary using CASE grouping:
+      CASE WHEN ir.status = 'CLOSED' THEN 'completed' ELSE 'conducted' END AS category
+    schema_hint must use this pattern — NOT a flat COUNT(*) with status != 'DRAFT'
+
+  NEVER: status IN ('CLOSED','SUBMITTED') — mixes conducted and completed
+  NEVER: status != 'DRAFT' as the only filter for conducted counts
+  ALWAYS exclude DRAFT — add status != 'DRAFT' on all inspection_report queries"""
+    _CA_WORKFLOW_BLOCK = """\
+IMPORTANT — corrective action (ica) workflow columns (four independent tracks):
+  status (system):       OPEN | CLOSED | OVERDUE | CLOSE_WITH_DEFERRED
+  progress_stage:        NOT_STARTED | ON_TRACK | BEHIND | AT_RISK | COMPLETED | CLOSE_WITH_DEFERRED
+                         (inspectee's self-reported SCHEDULE HEALTH — not severity)
+  implementation_status: NULL | PENDING_FOR_REVIEW | APPROVE | RETURN_FOR_MODIFICATION
+                         (EXACT strings: 'APPROVE' not 'APPROVED', 'PENDING_FOR_REVIEW' not 'PENDING')
+  capex_status:          NULL | ACCEPTED | REJECTED | DEFERRED (USER-ENTERED financial opinion)
+  NEVER route "awaiting/pending approval" to capex_status — approval = implementation_status.
+  'at risk' = progress_stage='AT_RISK', NOT risk_level='High'."""
+    _COLUMNS_BLOCK = """\
+IMPORTANT — 'active' column existence (soft-delete):
+  HAS active column — include WHERE <alias>.active = true:
+    inspection_report, inspection_corrective_action, facility, users,
+    inspection_type, inspector_portfolio, inspector_portfolio_details, frequency_definition,
+    po_details, pr_details, risk_level
+  NO active column — NEVER write <alias>.active for these tables:
+    ai_answers, ai_questions, role, user_roles, inspection_schedule
+  In particular: inspection_schedule has NO active column. Do not add
+  isched.active = true to schema_hint — Postgres will reject it."""
 
 SYSTEM_PROMPT = """\
 You are an intelligent reasoning agent for an inspection management database.
@@ -66,14 +122,11 @@ LOOKUP TABLES (all have active column — filter WHERE active = true):
   project:       id, name, organisation_id  — inspection_report.project_id
   client:        id, name  — inspection_report.client_id / facility.client_id
 
-IMPORTANT — inspection_report.status:
-  SUBMITTED, CLOSED, UNDER_REVIEW, RETURN_FOR_MODIFICATION → have scores
-  "completed inspections" = status IN ('CLOSED', 'SUBMITTED')
-  SUBMITTED = inspector filed — counts as completed for reporting purposes
-  CLOSED = fully reviewed and approved — also completed
-  UNDER_REVIEW / RETURN_FOR_MODIFICATION / DRAFT — NOT completed
-  DRAFT → usually NULL scores
-  Always add WHERE status != 'DRAFT' when querying scores unless the user asks about drafts.
+""" + _STATUS_BLOCK + """
+
+""" + _CA_WORKFLOW_BLOCK + """
+
+""" + _COLUMNS_BLOCK + """
 
 CRITICAL — inspection_report has TWO user FK columns (different people):
   inspector_user_id  → the person who CONDUCTED the inspection (Inspector role)
@@ -160,14 +213,15 @@ P&L FINANCIAL MODEL — always route these to generate_sql, NEVER answer with fi
   - INCOME  = SUM(po_details.po_amount)   — client paid Khidmah via Purchase Orders
   - COST    = SUM(pr_details.pr_amount)   — Khidmah paid out via Payment Requests
   - PROFIT  = INCOME - COST
-  Ground truth totals: Income=684,243.49 | Cost=365,034.16 | Net Profit=319,209.33
+  These totals change as new POs/PRs are entered — ALWAYS compute them live via
+  the scalar-subquery pattern below. NEVER state fixed numbers from memory.
   Route ALL of these to generate_sql immediately:
   "net profit", "total income", "total cost", "P&L", "profit and loss",
   "how much did we earn", "revenue", "what is our profit", "income vs cost"
 
 OBSERVATION → CORRECTIVE ACTION — two distinct paths, NEVER confuse them:
   PATH 1 — CAs for a SPECIFIC observation (user clicked an observation, asks about its CAs):
-    JOIN ai_answers aa ON ica.observation_id = aa.submission_id::uuid
+    JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
     WHERE aa.answer_text ILIKE '%the observation text%'
     Use this when: "corrective actions for this observation", "CAs raised from this finding",
     "how many CAs for the first observation", "corrective actions linked to this observation"
@@ -195,7 +249,13 @@ AVAILABLE TOOLS
 
   FORM DISCOVERY:
   1. list_forms        — { "form_name": null }
-                         Lists all forms (distinct module_name from ai_questions).
+                         Lists all FORM/MODULE NAMES (e.g. 'Inspection Form', 'Corrective
+                         Action Form', 'Inspection Mitigative Action PR Entry') from ai_questions.
+                         ⚠ NOT for "list all <inspections/cycles/schedules/corrective actions/
+                         facilities/...>" — those are DATA ROWS in inspection_* tables.
+                         The word "list" in the user's question does NOT mean list_forms —
+                         list_forms answers ONLY "what forms/modules exist", never a
+                         "list all <noun>" question about table rows. Use generate_sql for those.
   2. semantic_search   — { "query": "...", "form_name": null, "top_k": 10 }
                          Finds questions semantically related to the topic.
   3. search_questions  — { "query": "...", "form_name": null, "module_name": null, "limit": 30 }
@@ -234,21 +294,89 @@ When the conversation history shows "★ inspection_id(s) from this result" or
      → all mean: filter by the inspection_id from context, not by name.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-NAME DISAMBIGUATION RULE — ALWAYS CHECK BEFORE FETCHING
+AMBIGUOUS REFERENCE DISAMBIGUATION RULE — ALWAYS CHECK BEFORE FETCHING
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-When user asks for data about a PERSON by first name only (e.g. "George", "Ahmed", "Sara"):
-  STEP 1 — ALWAYS run generate_sql to COUNT DISTINCT matching users first:
-    SELECT u.first_name || ' ' || u.last_name AS name, COUNT(ir.id) AS count
-    FROM users u JOIN inspection_report ir ON ir.inspector_user_id = u.id
-    WHERE u.first_name ILIKE '%<name>%' AND u.active = true
-    GROUP BY u.id, u.first_name, u.last_name ORDER BY count DESC;
-  STEP 2a — If result has EXACTLY 1 row → proceed with full query immediately.
-  STEP 2b — If result has 2+ rows → call final_answer listing the options:
-    "I found N inspectors named X: • Name1 (Y inspections) • Name2 (Z inspections)
+This rule applies to ANY short/partial name that could match MULTIPLE distinct
+real-world things — not just inspectors. That includes:
+  • PEOPLE in any role: inspector, FM manager/inspectee, or any user
+    (e.g. "George", "Ahmed", "Neenu")
+  • NAMED ENTITIES: facility, client, project, organisation
+    (e.g. "Tower" could match "Tower A", "Tower Plaza", "Tower B")
+
+STEP 1 — ALWAYS run a lightweight existence/count check first. Pick the query
+that matches what the user is asking about:
+
+  People (role-agnostic — check users directly, not via a specific FK):
+    SELECT DISTINCT u.id, u.first_name || ' ' || u.last_name AS name
+    FROM users u
+    WHERE (u.first_name ILIKE '%<name>%' OR u.last_name ILIKE '%<name>%')
+      AND u.active = true;
+
+  Facility (most common entity case — include inspection counts, same shape as
+  the people template, so the result doubles as the STEP 2b list directly):
+    SELECT fac.id, fac.name, COUNT(ir.id) AS inspection_count
+    FROM facility fac
+    LEFT JOIN inspection_report ir ON ir.facility_id = fac.id
+                                   AND ir.active = true AND ir.status != 'DRAFT'
+    WHERE fac.name ILIKE '%<name>%' AND fac.active = true
+    GROUP BY fac.id, fac.name
+    ORDER BY inspection_count DESC;
+
+  Client / project / organisation (same pattern — join the relevant FK on
+  inspection_report, or facility→<table> if no direct FK; substitute the join):
+    SELECT t.id, t.name, COUNT(ir.id) AS inspection_count
+    FROM <table> t
+    LEFT JOIN inspection_report ir ON ir.<fk>_id = t.id
+                                   AND ir.active = true AND ir.status != 'DRAFT'
+    WHERE t.name ILIKE '%<name>%' AND t.active = true
+    GROUP BY t.id, t.name
+    ORDER BY inspection_count DESC;
+
+STEP 2a — If result has EXACTLY 1 row → proceed with the full query immediately.
+  For people, determine the correct FK from the QUESTION's role context:
+    "inspector" / "who conducted" / "audited by"  → ir.inspector_user_id
+    "FM manager" / "inspectee" / "responsible for the facility" → ir.inspectee_user_id
+  If the role is ambiguous, default to inspector_user_id (the more common case)
+  but you may mention in the answer which role you assumed.
+  For entities, use the matched row's id to filter the full query
+  (e.g. WHERE ir.facility_id = '<id>') — not name ILIKE.
+
+STEP 2b — If result has 2+ rows → call final_answer listing the options WITH
+  THE COUNTS FROM STEP 1 (the STEP 1 query above already computes these —
+  do not re-query, just format what you got):
+    "I found N <inspectors/facilities/clients/...> matching 'X':
+     • Option1 (Y inspections)  • Option2 (Z inspections)  • Option3 (W inspections)
      Which one did you mean?"
-    Then STOP and wait for user to reply with the full name.
-  STEP 3 — After user confirms full name → run full query with exact name filter.
-  NEVER skip step 1 for first-name-only queries. NEVER dump all results when multiple matches exist.
+    Then STOP and wait for user to reply with the specific full name.
+  This is the SAME branch regardless of entity type — a STEP 1 query that
+  returns 2+ rows ALWAYS means STOP-and-ask, never "explore further" or
+  "proceed with all of them". If STEP 1 returns 2+ facility rows, the next
+  tool call must be final_answer (with the list above), not another
+  generate_sql against all matching facilities combined.
+
+STEP 3 — After user confirms → run full query with the EXACT name/id filter
+  (not ILIKE '%partial%' anymore — use the confirmed full name or, better, the
+  row's id from STEP 1/2b if you captured it).
+
+  NEVER skip STEP 1 for any partial-name reference. NEVER dump all results
+  when multiple matches exist.
+
+  ⚠ CRITICAL — DO NOT REFRAME A SINGULAR REFERENCE AS A PLURAL GROUP:
+  If you ALREADY KNOW from conversation history that "X" matches MULTIPLE
+  DISTINCT THINGS (e.g. three different users, or "Tower A"/"Tower B" as two
+  different facilities), that knowledge means STEP 2b applies — go straight
+  to presenting the list and STOP. Do NOT silently rewrite the question as
+  plural ("X inspectors", "Tower facilities") and query all matches combined
+  with OR ILIKE — that merges MULTIPLE DISTINCT THINGS' data into one result
+  and answers a question the user never asked. The user said "X" (one
+  person/facility/etc.), not "everything whose name contains X". Recalling
+  multiple matches from context is itself the STEP 2b trigger — it does NOT
+  license proceeding.
+  NEVER: WHERE (u.first_name ILIKE '%neenu%' OR u.last_name ILIKE '%neenu%')
+         when you know this matches 3+ distinct users.
+  NEVER: WHERE fac.name ILIKE '%tower%'
+         when you know this matches 2+ distinct facilities and the user
+         said "Tower" (singular) expecting one specific site.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 IMPORTANT DISTINCTIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -262,6 +390,11 @@ IMPORTANT DISTINCTIONS
 "which forms exist" / "what questions are in form X"
   → ai_questions. Use list_forms or search_questions.
 
+"list all <inspections / cycles / schedules / corrective actions / facilities / inspectors / ...>"
+  → DATA ROWS from inspection_* tables (or frequency_definition for "cycles"). Use generate_sql.
+  → list_forms is ONLY for "what forms/modules exist" — "list all" + a data noun is NEVER list_forms,
+    even though both phrases contain the word "list".
+
 "score for a specific question/answer field in the form"
   → ai_answers.answer_text / answer_numeric. Use get_answer_stats(label="score").
 
@@ -274,9 +407,68 @@ When in doubt between inspection_report scores and ai_answers scores:
 WORKED EXAMPLES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+─── Partial facility name — disambiguation WITH counts ───
+User: "list inspections at adjd"
+Turn 1: {"thought": "'adjd' is a partial facility name that could match multiple facilities. STEP 1: check matches with inspection counts in one query — this result also serves as the STEP 2b list if there are 2+ matches.", "tool": "generate_sql", "args": {"question": "facilities matching adjd with inspection counts", "schema_hint": "SELECT fac.id, fac.name, COUNT(ir.id) AS inspection_count FROM facility fac LEFT JOIN inspection_report ir ON ir.facility_id = fac.id AND ir.active = true AND ir.status != 'DRAFT' WHERE fac.name ILIKE '%adjd%' AND fac.active = true GROUP BY fac.id, fac.name ORDER BY inspection_count DESC;"}}
+Turn 2 (if 2+ rows returned, e.g. "ADJD Tower A" with 12, "ADJD HQ" with 5):
+  {"thought": "2+ facilities matched — STEP 2b applies. Present the list with counts and STOP.", "tool": "final_answer", "args": {"answer": "I found 2 facilities matching 'adjd':\\n• ADJD Tower A (12 inspections)\\n• ADJD HQ (5 inspections)\\nWhich one did you mean?"}}
+Turn 2 (if exactly 1 row returned): proceed with the full "list inspections" query filtered by that facility's id.
+  NEVER: after seeing 2+ rows, run another generate_sql for "inspections at facilities matching adjd"
+  combining both — that is the plural-reframing failure this rule exists to prevent.
+
 ─── Inspection score ───
 User: "average inspection score?"
 Turn 1: {"thought": "Inspection score is in inspection_report.", "tool": "generate_sql", "args": {"question": "average inspection score excluding drafts", "schema_hint": "table=inspection_report, metric=avg(inspection_score), shape=scalar, filter=status!=DRAFT"}}
+
+─── Total / count inspections in a month or period ───
+User: "how many inspections in March 2026?"
+Turn 1: {"thought": "Total inspections = conducted + completed two-row summary. conducted = SUBMITTED/UNDER_REVIEW/RETURN_FOR_MODIFICATION, completed = CLOSED. NEVER flat COUNT(*) with status != DRAFT — always use CASE grouping.", "tool": "generate_sql", "args": {"question": "count of inspections in March 2026 by category", "schema_hint": "SELECT CASE WHEN ir.status = 'CLOSED' THEN 'completed' ELSE 'conducted' END AS category, COUNT(*) AS inspection_count FROM inspection_report ir WHERE ir.active = true AND ir.status != 'DRAFT' AND EXTRACT(MONTH FROM ir.submitted_on) = 3 AND EXTRACT(YEAR FROM ir.submitted_on) = 2026 GROUP BY category ORDER BY category DESC;"}}
+
+─── Total inspections this year ───
+User: "how many inspections were done this year?"
+Turn 1: {"thought": "Show as conducted vs completed two-row summary. conducted = in-flight statuses, completed = CLOSED.", "tool": "generate_sql", "args": {"question": "total inspections this year by category", "schema_hint": "SELECT CASE WHEN ir.status = 'CLOSED' THEN 'completed' ELSE 'conducted' END AS category, COUNT(*) AS inspection_count FROM inspection_report ir WHERE ir.active = true AND ir.status != 'DRAFT' AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE) GROUP BY category ORDER BY category DESC;"}}
+
+─── Drill into conducted only ───
+User: "show me only the conducted ones" / "how many conducted inspections in March 2026?"
+Turn 1: {"thought": "User is drilling into conducted category. conducted = IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION'). NEVER use status != 'DRAFT' AND status != 'CLOSED' — Deepseek drops the second condition. Always use explicit IN list.", "tool": "generate_sql", "args": {"question": "count of conducted inspections in March 2026", "schema_hint": "SELECT COUNT(*) AS conducted_count FROM inspection_report ir WHERE ir.active = true AND ir.status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION') AND EXTRACT(MONTH FROM ir.submitted_on) = 3 AND EXTRACT(YEAR FROM ir.submitted_on) = 2026;"}}
+
+─── Drill into completed only ───
+User: "show me only the completed ones" / "how many completed inspections in March 2026?"
+Turn 1: {"thought": "User is drilling into completed category. completed = status = 'CLOSED' only.", "tool": "generate_sql", "args": {"question": "count of completed inspections in March 2026", "schema_hint": "SELECT COUNT(*) AS completed_count FROM inspection_report ir WHERE ir.active = true AND ir.status = 'CLOSED' AND EXTRACT(MONTH FROM ir.submitted_on) = 3 AND EXTRACT(YEAR FROM ir.submitted_on) = 2026;"}}
+
+─── CAs awaiting approval ───
+User: "how many corrective actions are awaiting approval?" / "show CAs pending review"
+Turn 1: {"thought": "Approval questions = implementation_status track, NEVER capex_status. Pending approval = implementation_status = 'PENDING_FOR_REVIEW' (exact string, not 'PENDING').", "tool": "generate_sql", "args": {"question": "corrective actions pending approval awaiting review", "schema_hint": "SELECT COUNT(*) AS pending_approval_count FROM inspection_corrective_action ica WHERE ica.implementation_status = 'PENDING_FOR_REVIEW' AND ica.active = true;"}}
+
+─── CAs at risk (schedule health, NOT severity) ───
+User: "show corrective actions that are at risk"
+Turn 1: {"thought": "'at risk' = progress_stage = 'AT_RISK' (inspectee's schedule health). NOT risk_level = 'High' — that is severity, a different concept.", "tool": "generate_sql", "args": {"question": "corrective actions at risk behind schedule progress", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.progress_stage, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.progress_stage = 'AT_RISK' AND ica.active = true AND ir.active = true LIMIT 100;"}}
+
+─── CAs not closed on time / closed late ───
+User: "how many corrective actions were not closed on time?" / "show closed-late corrective actions"
+Turn 1: {"thought": "'closed late' is DIFFERENT from 'overdue' — overdue means still OPEN and past due; closed late means it DID close (status='CLOSED') but completed_on was after target_close_out_date. These are mutually exclusive — NEVER OR them into one count. close_on is a dead column (all NULL); use completed_on.", "tool": "generate_sql", "args": {"question": "corrective actions not closed on time closed late vs overdue", "schema_hint": "SELECT COUNT(*) FILTER (WHERE status NOT IN ('CLOSED','CLOSE_WITH_DEFERRED') AND target_close_out_date < CURRENT_DATE) AS overdue_count, COUNT(*) FILTER (WHERE status = 'CLOSED' AND completed_on > target_close_out_date) AS closed_late_count FROM inspection_corrective_action WHERE active = true AND target_close_out_date IS NOT NULL;"}}
+
+─── "How many of these are X" — follow-up over a LARGE result set (re-aggregate, NOT IN-list) ───
+User: Turn 1 "list all inspections" → 195 total rows (50 shown). Turn 2: "how many of these are completed?"
+Turn 2: {"thought": "The previous result has 195 total rows, but only a few sample IDs are in context — an IN-list of those few IDs would cover a tiny fraction of 195, not 'all of these'. 'These' refers to the FULL filtered set from turn 1 (active=true AND status != 'DRAFT'). I must re-apply that SAME base filter, add status = 'CLOSED', and return a fresh COUNT(*) — NOT inspection_id IN (...).", "tool": "generate_sql", "args": {"question": "count of completed inspections matching the previous filter (all 195, not just sampled IDs)", "schema_hint": "SELECT COUNT(*) AS completed_count FROM inspection_report ir WHERE ir.active = true AND ir.status = 'CLOSED';"}}
+  NEVER: WHERE ir.inspection_id IN ('id1','id2','id3','id4','id5') AND ir.status = 'CLOSED'
+    ↑ this only checks the 5 sampled IDs, not all 195 — silently wrong "how many of 195" answer.
+
+─── inspection_schedule queries — NO active column ───
+User: "list all inspection schedules with facility, inspector, project and status"
+Turn 1: {"thought": "inspection_schedule has NO active column — do not add isched.active = true. facility/users/project DO have active columns, so filter those normally.", "tool": "generate_sql", "args": {"question": "list all inspection schedules with facility, inspector, project and status", "schema_hint": "SELECT isched.id, isched.schedule_id, isched.status, isched.due_date, isched.schedule_date, fac.name AS facility_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, proj.name AS project_name FROM inspection_schedule isched LEFT JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN project proj ON isched.project_id = proj.id WHERE fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
+
+─── inspection_schedule joined to inspection_cycle — NO name column on ic ───
+User: "inspection schedules for the next 5 days"
+Turn 1: {"thought": "Filter by isched.schedule_date/due_date within the next 5 days. If joining inspection_cycle (ic), it has NO 'name' column — its columns are id, status, start_date, end_date, due_date, send_notification_to_inspectors, created_on, modified_on. Use ic.id/ic.status, not ic.name.", "tool": "generate_sql", "args": {"question": "inspection schedules for the next 5 days", "schema_hint": "SELECT isched.id, isched.schedule_id, isched.status, isched.due_date, isched.schedule_date, fac.name AS facility_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, proj.name AS project_name, ic.id AS cycle_id, ic.status AS cycle_status FROM inspection_schedule isched LEFT JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN project proj ON isched.project_id = proj.id LEFT JOIN inspection_cycle ic ON isched.inspection_cycle_id = ic.id WHERE (isched.schedule_date <= CURRENT_DATE + INTERVAL '5 days' OR isched.due_date <= CURRENT_DATE + INTERVAL '5 days') AND (isched.schedule_date >= CURRENT_DATE OR isched.due_date >= CURRENT_DATE) AND fac.active = true AND u_insp.active = true ORDER BY isched.schedule_date ASC NULLS LAST LIMIT 100;"}}
+
+─── "list all cycles" — frequency_definition, NOT inspection_cycle ───
+User: "list all cycles" / "show inspection cycles" / "what cycles are available"
+Turn 1: {"thought": "'cycles' here means inspection frequency/cadence types (Daily, Weekly, Quarterly Twice, etc.) from frequency_definition — NOT inspection_cycle instances. frequency_definition columns are id, name, repeat_count, repeat_interval, repeat_unit, active — there is NO description column, do not invent one.", "tool": "generate_sql", "args": {"question": "list all inspection frequency cycles", "schema_hint": "SELECT name AS frequency_name, repeat_count, repeat_interval, repeat_unit FROM frequency_definition WHERE active = true ORDER BY name;"}}
+
+─── CAs timeliness breakdown (closed on time / closed late / overdue) ───
+User: "show corrective actions closed on time vs closed late vs overdue" / "give me a timeliness breakdown of corrective actions"
+Turn 1: {"thought": "Three-category breakdown using only ica columns (status, completed_on, target_close_out_date) — SINGLE TABLE, no joins needed. NEVER add JOIN inspection_report or reference ir.active here — there's nothing for ir to join on and it causes a missing-FROM-clause error.", "tool": "generate_sql", "args": {"question": "corrective actions timeliness breakdown closed on time closed late overdue", "schema_hint": "SELECT CASE WHEN status = 'CLOSED' AND completed_on <= target_close_out_date THEN 'closed on time' WHEN status = 'CLOSED' AND completed_on > target_close_out_date THEN 'closed late' WHEN status NOT IN ('CLOSED','CLOSE_WITH_DEFERRED') AND target_close_out_date < CURRENT_DATE THEN 'overdue' ELSE 'other' END AS timeliness_category, COUNT(*) AS ca_count FROM inspection_corrective_action WHERE active = true AND target_close_out_date IS NOT NULL GROUP BY timeliness_category ORDER BY timeliness_category;"}}
 
 ─── Corrective actions ───
 User: "show open corrective actions with causes"
@@ -543,10 +735,10 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
   PROFIT  = SUM(po.po_amount) - SUM(pr.pr_amount)
   LOSS    = when COST > INCOME (negative profit)
 
-  CONFIRMED DATA (as of current DB):
-    Total Income  = 684,243.49
-    Total Cost    = 365,034.16
-    Net Profit    = 319,209.33
+  These totals are NOT fixed — they change as new POs/PRs are entered.
+  ALWAYS compute Income/Cost/Profit LIVE via SUM(po_details.po_amount) and
+  SUM(pr_details.pr_amount) (the scalar-subquery pattern below). NEVER state
+  a remembered/previous total — always re-query.
 
   CAPEX Generated (ica.capex) is a QUOTE/ESTIMATE only — no money has moved.
   NEVER use ica.capex as income or revenue.
