@@ -21,7 +21,7 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from core.semantic import SemanticQuestionIndex, SeedExampleIndex
 from core.validator import SQLValidator
 from core.schema_introspector import introspect_schema
-from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT
+from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT, build_dynamic_prompt_additions
 from agent.tools import ToolRegistry
 from agent.tool_dispatcher import parse_tool_call, dispatch
 from core.business_rules import get_engine as get_rules_engine
@@ -550,7 +550,7 @@ class AgentOrchestrator:
             temperature=0.2, request_timeout=120.0,
             additional_kwargs={
                 "num_predict": 1024,
-                "num_ctx": 23000,
+                "num_ctx": 20000,
                 "think": False,   # Disable Qwen3 internal chain-of-thought — saves 8-15s per call
             })
         print(f"  ✓ Reasoning LLM ({chat_model})")
@@ -560,7 +560,7 @@ class AgentOrchestrator:
             temperature=0.0, request_timeout=120.0,
             additional_kwargs={
                 "num_predict": 1024,
-                "num_ctx": 20000,
+                "num_ctx": 16384,
                 "top_p": 0.9,
                 # Stop tokens prevent deepseek adding explanation text after SQL
                 # ";" must be first — stops generation immediately after the query ends
@@ -615,7 +615,7 @@ class AgentOrchestrator:
         def _emit(event):
             if on_step: on_step(event)
 
-        system_content = self._system_prompt
+        system_content = self._system_prompt + build_dynamic_prompt_additions(question)
         if session and session.turns:
             system_content += "\n\n" + session.build_context_block(question)
 
@@ -820,15 +820,20 @@ class AgentOrchestrator:
                     _last_total_count = exec_data.get("total_count", exec_data.get("row_count", 0))
                     _last_columns = exec_data.get("columns", [])
 
-                    if self._is_preparatory_result(question, er):
-                        rows_preview = json.dumps(exec_data.get("rows", [])[:10], default=str)
+                    if self._is_preparatory_result(question, er, sql):
                         messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
-                        messages.append(ChatMessage(role=MessageRole.USER, content=
-                            f"SQL: {sql}\nResult: {exec_data.get('row_count',0)} rows, "
-                            f"columns={exec_data.get('columns',[])}\n"
-                            f"Sample: {rows_preview}\n\n"
-                            f"Original question: \"{question}\"\n"
-                            f"If this answers it, call final_answer. Otherwise call the next tool."))
+                        if self._is_disambiguation_check(exec_data.get("columns", []), sql):
+                            followup = self._disambiguation_followup_message(question, sql, exec_data)
+                        else:
+                            rows_preview = json.dumps(exec_data.get("rows", [])[:10], default=str)
+                            followup = (
+                                f"SQL: {sql}\nResult: {exec_data.get('row_count',0)} rows, "
+                                f"columns={exec_data.get('columns',[])}\n"
+                                f"Sample: {rows_preview}\n\n"
+                                f"Original question: \"{question}\"\n"
+                                f"If this answers it, call final_answer. Otherwise call the next tool."
+                            )
+                        messages.append(ChatMessage(role=MessageRole.USER, content=followup))
                         continue
 
                     ans = self._synthesize(question, "execute_sql", er)
@@ -1490,11 +1495,120 @@ class AgentOrchestrator:
 
         return content
 
-    def _is_preparatory_result(self, question: str, exec_result: dict) -> bool:
+    @staticmethod
+    def _is_disambiguation_check(columns: list[str], sql: str) -> bool:
+        """
+        True if this result is an AMBIGUOUS REFERENCE RULE STEP 1 existence/count
+        check — both templates (people: id+name; entity: id+name+inspection_count)
+        produce this exact column shape combined with a partial-match ILIKE filter.
+        Shared by _is_preparatory_result (decides whether to loop back to Llama)
+        and the follow-up-message builder (decides which instructions to send).
+        """
+        col_set = {c.lower() for c in columns}
+        return (
+            col_set in ({"id", "name"}, {"id", "name", "inspection_count"})
+            and "ilike '%" in sql.lower()
+        )
+
+    def _disambiguation_followup_message(self, question: str, sql: str, exec_data: dict) -> str:
+        """
+        Build a STEP-2a/2b-specific follow-up message for a disambiguation STEP 1
+        result, instead of the generic "If this answers it, call final_answer"
+        message — which previously caused Llama to statistically summarize the
+        disambiguation table (MAX/SUM of inspection_count) instead of recognizing
+        2+ rows as the STEP 2b "which one did you mean?" trigger.
+        """
+        rows = exec_data.get("rows", [])
+        columns = [c.lower() for c in exec_data.get("columns", [])]
+        m = re.search(r"ilike '%(.+?)%'", sql, re.IGNORECASE)
+        name_filter = m.group(1) if m else "?"
+
+        if "inspection_count" in columns:
+            # Entity template — only candidates with inspections > 0 are useful
+            # answers to "show inspections at X"; zero-inspection facilities are
+            # real matches but not relevant choices.
+            nonzero = [r for r in rows if (r.get("inspection_count") or 0) > 0]
+            if len(nonzero) == 0:
+                return (
+                    f"STEP 1 disambiguation check found {len(rows)} facilities matching "
+                    f"'{name_filter}', but NONE have any inspections.\n"
+                    f"Original question: \"{question}\"\n"
+                    f"Call final_answer stating no inspections were found at any facility "
+                    f"matching '{name_filter}'."
+                )
+            elif len(nonzero) == 1:
+                r = nonzero[0]
+                return (
+                    f"STEP 1 disambiguation check: exactly ONE facility matching "
+                    f"'{name_filter}' has inspections — '{r.get('name')}' "
+                    f"(id={r.get('id')}, {r.get('inspection_count')} inspections).\n"
+                    f"Original question: \"{question}\"\n"
+                    f"This is STEP 2a — call generate_sql again, filtered by "
+                    f"WHERE fac.id = '{r.get('id')}' (not name ILIKE), to answer the "
+                    f"original question using that facility."
+                )
+            else:
+                options = "\n".join(
+                    f"  • {r.get('name')} ({r.get('inspection_count')} inspections)"
+                    for r in nonzero
+                )
+                return (
+                    f"STEP 1 disambiguation check: {len(nonzero)} facilities matching "
+                    f"'{name_filter}' have inspections (out of {len(rows)} total matches).\n"
+                    f"Original question: \"{question}\"\n"
+                    f"This is STEP 2b — call final_answer NOW with EXACTLY this format "
+                    f"(do not compute totals, leaders, sums, or any other statistic; do "
+                    f"not call generate_sql again):\n"
+                    f"\"I found {len(nonzero)} facilities matching '{name_filter}':\n"
+                    f"{options}\n"
+                    f"Which one did you mean?\""
+                )
+        else:
+            # People template — no count column, list all matched names
+            if len(rows) == 0:
+                return (
+                    f"STEP 1 disambiguation check found NO users matching "
+                    f"'{name_filter}'.\n"
+                    f"Original question: \"{question}\"\n"
+                    f"Call final_answer stating no matching person was found."
+                )
+            elif len(rows) == 1:
+                r = rows[0]
+                return (
+                    f"STEP 1 disambiguation check: exactly ONE person matches "
+                    f"'{name_filter}' — '{r.get('name')}' (id={r.get('id')}).\n"
+                    f"Original question: \"{question}\"\n"
+                    f"This is STEP 2a — call generate_sql again, filtered by that "
+                    f"person's id (e.g. WHERE u.id = '{r.get('id')}', joined via "
+                    f"inspector_user_id or inspectee_user_id per the question's role "
+                    f"wording), to answer the original question."
+                )
+            else:
+                options = "\n".join(f"  • {r.get('name')}" for r in rows)
+                return (
+                    f"STEP 1 disambiguation check: {len(rows)} people match "
+                    f"'{name_filter}'.\n"
+                    f"Original question: \"{question}\"\n"
+                    f"This is STEP 2b — call final_answer NOW with EXACTLY this format "
+                    f"(do not pick one, do not compute statistics, do not call "
+                    f"generate_sql again):\n"
+                    f"\"I found {len(rows)} people matching '{name_filter}':\n"
+                    f"{options}\n"
+                    f"Which one did you mean?\""
+                )
+
+    def _is_preparatory_result(self, question: str, exec_result: dict, sql: str = "") -> bool:
         q_lower = question.lower()
         data = exec_result.get("result", {})
         columns = [c.lower() for c in data.get("columns", [])]
         row_count = data.get("row_count", 0)
+
+        # AMBIGUOUS REFERENCE RULE STEP 1 check — see _is_disambiguation_check.
+        # Without this, STEP 1 results render directly as a table and Llama
+        # never gets to branch into STEP 2a/2b — the disambiguation flow
+        # silently becomes a dead-end table dump.
+        if self._is_disambiguation_check(columns, sql):
+            return True
 
         wants_content = bool(re.search(
             r'\b(question|label|answer|response|what.*in)\b', q_lower))

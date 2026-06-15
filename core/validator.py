@@ -241,12 +241,12 @@ class SQLValidator:
         "risk_level":         "does not exist as a column — risk_level_id is a UUID FK; JOIN risk_level rl ON ica.risk_level_id = rl.id → rl.name",
         # ICA columns that do not exist — common hallucinations
         "due_date":           "does not exist on inspection_corrective_action — use target_close_out_date",
-        "actual_date":        "does not exist on inspection_corrective_action — use close_on",
+        "actual_date":        "does not exist on inspection_corrective_action — use completed_on (for closed rows) or target_close_out_date (for deadline)",
         # mitigative_action_uuid is on po_details/pr_details — only block if qualified as ica.mitigative_action_uuid
         # "po.mitigative_action_uuid = ica.id" is CORRECT and must NOT be blocked
         "ica.mitigative_action_uuid": "does not exist on inspection_corrective_action — use po_details.mitigative_action_uuid = ica.id",
-        "completion_date":    "does not exist on inspection_corrective_action — use close_on or completed_on",
-        "resolution_date":    "does not exist on inspection_corrective_action — use close_on",
+        "completion_date":    "does not exist on inspection_corrective_action — use completed_on (actual closure timestamp, populated for CLOSED rows)",
+        "resolution_date":    "does not exist on inspection_corrective_action — use completed_on (actual closure timestamp for CLOSED rows)",
         "impact":             "does not exist as a column on ica — impact data is in ai_answers: JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aq.label = 'Impact'",
         # Other ghost columns seen in traces
         "corrective_action_description": "does not exist — use ica.corrective_action (the text field)",
@@ -569,17 +569,20 @@ class SQLValidator:
             ValidatorStats.record("STALE_DATE_LITERAL", is_retry_trigger=True)
             break  # one report is enough
 
-        # ── 10. close_on arithmetic — SOFT_WARN (not a hard fail) ─────────
-        # close_on is NULL for most records but arithmetic IS valid for the
-        # subset where it is populated. Block only with a soft advisory.
+        # ── 10. close_on arithmetic — HARD_FAIL (dead column, all NULL) ──────
+        # close_on is confirmed ALL-NULL — any arithmetic/comparison returns
+        # meaningless results. Registry: semantics_registry.py "DEAD COLUMN".
+        # business_rules.py block_close_on_arithmetic also blocks this at the
+        # INJECT layer; this validator check catches it at execution-time too.
         if self._CLOSE_ON_ARITH_RE.search(sql):
             issues.append(ValidationIssue(
-                "SOFT_WARN", "UNRELIABLE_COLUMN",
-                "Arithmetic on 'close_on' may be unreliable — column is NULL for most records",
-                detail="Alternative: COUNT(*) FILTER (WHERE status IN ('CLOSED','CLOSE_WITH_DEFERRED'))",
-                retryable=False,
+                "HARD_FAIL", "DEAD_COLUMN",
+                "BLOCKED: close_on is a DEAD COLUMN (all NULL) — use completed_on "
+                "for closure timing (populated for status='CLOSED' rows)",
+                detail="For closed-late: status='CLOSED' AND completed_on > target_close_out_date",
+                retryable=True,
             ))
-            ValidatorStats.record("UNRELIABLE_COLUMN", is_retry_trigger=False)
+            ValidatorStats.record("DEAD_COLUMN", is_retry_trigger=True)
 
         # ── 10b. TO_CHAR used as a WHERE filter — HARD_FAIL ───────────────
         # TO_CHAR(col, 'Month YYYY') = 'January 2026' silently returns 0 rows

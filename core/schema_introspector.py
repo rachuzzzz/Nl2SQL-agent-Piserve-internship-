@@ -322,6 +322,8 @@ USEFUL_COLUMNS = {
     "inspection_schedule": [
         "id", "status", "due_date", "scheduled_date",
         "facility_id", "inspector_id", "inspection_cycle_id", "portfolio_details_id",
+        # ⚠ NO 'active' column — inspection_schedule is NOT soft-deleted.
+        # ⚠ NO 'frequency_definition_id' column — frequency via portfolio_details_id → ipd.frequency_definition_id
     ],
     "inspector_portfolio_details": [
         "id", "portfolio_id", "facility_id",

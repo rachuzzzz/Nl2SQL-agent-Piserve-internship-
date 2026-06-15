@@ -12,6 +12,8 @@ STATUS GROUPINGS + CAST RULES come from core.semantics_registry — the single
 source of truth. Edit there, not here.
 """
 
+import re
+
 # ── Registry-generated blocks (single source of truth) ──────────────────────
 try:
     from core.semantics_registry import (
@@ -127,11 +129,7 @@ CORE_CONTEXT = """\
 --   Conversion rate = SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100
 --   High OPEX means Khidmah is absorbing costs the client should bear — a negative indicator
 --
-""" + _COUNTING_BLOCK + """
---
 """ + _COLUMNS_BLOCK + """
---
-""" + _CA_WORKFLOW_BLOCK + """
 --
 -- DATE FILTERING — month/year specific:
 --   CORRECT:  EXTRACT(MONTH FROM ir.submitted_on) = 1 AND EXTRACT(YEAR ...) = EXTRACT(YEAR FROM CURRENT_DATE)
@@ -3618,3 +3616,58 @@ LIMIT 200;
         'limit':  1,
     },
 ]
+
+# ── Conditional CORE_CONTEXT additions — included only when relevant ────────
+# Deepseek-side counterpart to prompts.py's CONDITIONAL_BLOCKS / EXAMPLES_TIER2.
+# _COUNTING_BLOCK (good practice/deviation/observation counting, ~148 tok) and
+# _CA_WORKFLOW_BLOCK (CA workflow columns, ~805 tok) were always-on parts of
+# CORE_CONTEXT before 2026-06-13's truncation fix — both grew this session and
+# are narrowly topical, so they're now conditional like their Llama-side
+# counterparts (CONDITIONAL_BLOCKS["CA workflow columns"] and the FORM-pattern
+# Tier-2 examples in prompts.py).
+#
+# Patterns are intentionally KEPT IN SYNC with prompts.py's CA/FORM patterns —
+# both sides should treat "is this question about corrective actions / form
+# answers" the same way. If you edit one, edit the other.
+CORE_CONTEXT_CONDITIONAL = [
+    {
+        "title": "CA workflow columns (Deepseek)",
+        "question_pattern": (
+            r"(?i)\bcorrective\s+actions?\b|\bCAs?\b|\bicas?\b"
+            r"|\bcapex\b|\bopex\b|\bdeferred\b"
+            r"|\bprogress[_\s]stage\b|\bimplementation[_\s]status\b"
+            r"|\bneeds?\s+attention\b|\bcritical\s+issues?\b"
+        ),
+        "get_text": lambda: _CA_WORKFLOW_BLOCK,
+    },
+    {
+        "title": "Good practice / deviation / observation counting (Deepseek)",
+        "question_pattern": (
+            r"(?i)\b(forms?|answer\w*|questions?|observations?|risk\s*levels?"
+            r"|deviations?|good\s+practice|total\s+score|ai_answers)\b"
+        ),
+        "get_text": lambda: _COUNTING_BLOCK,
+    },
+]
+
+
+def build_core_context_additions(question: str) -> str:
+    """
+    Return additional CORE_CONTEXT blocks whose question_pattern matches the
+    current question. Call from tools.py's generate_sql: append the result to
+    CORE_CONTEXT before building dynamic_examples.
+
+    Returns "" if nothing matches — no size penalty for unrelated questions.
+    """
+    if not question:
+        return ""
+    matched = []
+    for blk in CORE_CONTEXT_CONDITIONAL:
+        try:
+            if re.search(blk["question_pattern"], question):
+                matched.append(blk["get_text"]())
+        except re.error:
+            continue
+    if not matched:
+        return ""
+    return "\n--\n" + "\n--\n".join(matched)

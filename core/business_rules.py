@@ -155,6 +155,56 @@ REGISTRY: list[dict] = [
         ),
     },
 
+    # ── inspection_schedule has NO active column ──────────────────────────────
+    {
+        "id":          "block_isched_active",
+        "type":        BLOCK,
+        "description": "inspection_schedule has no 'active' column — will cause Postgres column-not-found error.",
+        "sql_pattern": r"\bisched\.active\b|\binspection_schedule\b[^;]*\bisched\.active\b",
+        "message": (
+            "WRONG COLUMN: inspection_schedule has no 'active' column and is NOT soft-deleted. "
+            "Remove WHERE isched.active = true — it will cause a Postgres column-not-found error. "
+            "inspection_schedule columns: id, status, due_date, scheduled_date, facility_id, "
+            "inspector_id, inspectee_id, project_id, portfolio_details_id, inspection_report_id, "
+            "inspection_cycle_id, created_on, modified_on."
+        ),
+    },
+
+    # ── inspection_schedule has NO frequency_definition_id column ────────────
+    {
+        "id":          "block_isched_frequency_definition_id",
+        "type":        BLOCK,
+        "description": "inspection_schedule has no frequency_definition_id — hallucinated column causing infinite retry loop.",
+        # Confirmed 2026-06-15: Deepseek repeatedly hallucinated
+        # LEFT JOIN frequency_definition fd ON isched.frequency_definition_id = fd.id
+        # across 5+ iterations because the retrieved seeds prominently feature
+        # frequency_definition joins in other contexts. The correct path to
+        # frequency is: isched.portfolio_details_id → ipd.frequency_definition_id → fd
+        # inspection_schedule columns: id, schedule_id, status, due_date,
+        # schedule_date, facility_id, inspector_id, inspectee_id, project_id,
+        # portfolio_details_id, inspection_report_id, created_on, modified_on
+        # NO: frequency_definition_id, active
+        "sql_pattern": r"\bisched\.frequency_definition_id\b|\binspection_schedule\b[^;]*\bfrequency_definition_id\b",
+        "message": (
+            "WRONG COLUMN: inspection_schedule has no 'frequency_definition_id' column. "
+            "inspection_schedule columns: id, schedule_id, status, due_date, schedule_date, "
+            "facility_id, inspector_id, inspectee_id, project_id, portfolio_details_id, "
+            "inspection_report_id — NO frequency_definition_id, NO active. "
+            "To get frequency: JOIN inspector_portfolio_details ipd ON isched.portfolio_details_id = ipd.id "
+            "JOIN frequency_definition fd ON ipd.frequency_definition_id = fd.id"
+        ),
+    },
+
+    # ── AUTOCORRECT: strip the hallucinated frequency_definition join ─────────
+    {
+        "id":          "autocorrect_isched_frequency_definition_join",
+        "type":        AUTOCORRECT,
+        "description": "Remove hallucinated LEFT JOIN frequency_definition fd ON isched.frequency_definition_id = fd.id.",
+        "sql_pattern": r"LEFT\s+JOIN\s+frequency_definition\s+\w+\s+ON\s+\w+\.frequency_definition_id\s*=\s*\w+\.id\s*",
+        "replacement": "",
+        "message": "[autocorrect] Removed hallucinated JOIN frequency_definition via non-existent isched.frequency_definition_id",
+    },
+
     # ── cycle-frequency join chain missing its defining subquery ─────────────
     {
         "id":          "block_cycle_frequency_missing_subquery",
