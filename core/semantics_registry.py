@@ -221,11 +221,10 @@ SEMANTICS: dict = {
         "unreliable_columns": {
             "pending_with":    "observed NULL across rows — derive 'who must act' from implementation_status",
             "adequacy_status": "currently NULL, future use",
-            "close_on":        "DEAD COLUMN — all values NULL. NEVER use for date filters/arithmetic. "
-                                "Use status-based counting instead.",
+            "close_on":        "column does not exist — NEVER use. Use completed_on for closure timing.",
         },
         "timeliness": {
-            # confirmed 2026-06-11: completed_on populated for CLOSED rows, close_on dead
+            # confirmed 2026-06-11: completed_on populated for CLOSED rows, close_on does not exist
             "completed_on": "the actual closure timestamp — populated for status='CLOSED' rows",
             "overdue": {
                 "meaning": "still OPEN and past deadline — has NOT closed yet",
@@ -518,7 +517,7 @@ def core_context_ca_workflow_block() -> str:
 --                              ({t['overdue']['meaning']})
 --   'not closed on time' / 'closed late' = {t['closed_late']['expr']}
 --                              ({t['closed_late']['meaning']})
---   close_on is a DEAD COLUMN (all NULL) — use completed_on for closure timing
+--   close_on does not exist — use completed_on for closure timing
 --   {t['invariant']}"""
 
 
@@ -587,7 +586,7 @@ def llama_ca_workflow_block() -> str:
   TIMELINESS — 'overdue' and 'closed late' are MUTUALLY EXCLUSIVE, NEVER OR them:
     'overdue' (still open, past due)     → {t['overdue']['expr']}
     'closed late' / 'not closed on time' → {t['closed_late']['expr']}
-    close_on is a DEAD COLUMN (always NULL) — use completed_on for closure timing."""
+    close_on does not exist — use completed_on for closure timing."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -618,7 +617,7 @@ _STALE_PATTERNS: list[tuple[str, str]] = [
     (r"mitigative_action_uuid\s*=\s*ir\.",
      "wrong join target: mitigative_action_uuid → ica.id, never ir.id (silent all-zero results)"),
     (r"\bclose_on\s*[<>]=?\s*\w",
-     "close_on is a dead column (all NULL) — use completed_on for closure timing"),
+     "close_on does not exist — use completed_on for closure timing"),
     (r"implementation_status\s*=\s*'APPROVED'",
      "wrong enum string: it is 'APPROVE' not 'APPROVED'"),
     (r"implementation_status\s*=\s*'PENDING'(?!_)",

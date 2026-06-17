@@ -453,6 +453,7 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
 - Use ILIKE for partial text matching on labels and names. NEVER use LIKE.
 - Use ILIKE for answer_text matching: aa.answer_text ILIKE '%High%' (answer_text stores plain strings but ILIKE is safer for partial matches).
 - Include LIMIT 100 unless aggregating.
+- For "top / most / best / worst" ranking queries, use LIMIT 10 (even if the user asks "which one" singular). This provides context for charts and lists while still highlighting the #1 result.
 - NEVER use SELECT *. Specify only the columns the user needs.
 - NEVER use SQL reserved words as aliases (is, as, in, on, by, do, if).
   Use: ir (inspection_report), ica (inspection_corrective_action),
@@ -482,8 +483,11 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
   NEVER use lowercase for enum comparisons.
 - When grouping by facility/type/client/inspector/project/country/region/organisation/entity,
   ALWAYS JOIN the lookup table and GROUP BY the name column. NEVER GROUP BY a UUID FK column.
-- For month display, ALWAYS use TO_CHAR(date_trunc('month', col), 'Month YYYY') AS month.
-  NEVER use EXTRACT(MONTH FROM col) — that returns a number, not a name.
+- For month display and chronological sorting, ALWAYS use DATE_TRUNC('month', col) for grouping and sorting.
+  Use: SELECT DATE_TRUNC('month', ir.submitted_on) AS month_idx, TO_CHAR(DATE_TRUNC('month', ir.submitted_on), 'Month YYYY') AS month_label, ...
+       GROUP BY month_idx, month_label
+       ORDER BY month_idx;
+  NEVER use only TO_CHAR(...) for grouping/sorting — it sorts alphabetically (April, August, December), which is incorrect for charts.
 - CALENDAR YEAR filter: EXTRACT(YEAR FROM col) = EXTRACT(YEAR FROM CURRENT_DATE)
   or: col >= date_trunc('year', CURRENT_DATE)
   NEVER: col > CURRENT_DATE - INTERVAL '1 year' — that is a rolling 365-day window, not a calendar year.
@@ -795,6 +799,22 @@ NEVER: LEFT JOIN po_details p ON ica.mitigative_action_uuid = p.mitigative_actio
 NEVER: LEFT JOIN po_details p ON p.mitigative_action_uuid = ica.mitigative_action_uuid (causes row fan-out)
 ALWAYS: Use scalar subqueries — one SELECT per metric, no JOIN needed for totals.
 Turn 1: {"thought": "Total capex summary — use scalar subqueries, no JOIN. mitigative_action_uuid on po_details points TO ica.id so a direct JOIN causes fan-out. Scalar subqueries give ONE clean row.", "tool": "generate_sql", "args": {"question": "total capex generated converted and lost", "schema_hint": "SELECT (SELECT COALESCE(SUM(capex),0) FROM inspection_corrective_action WHERE active=true AND capex>0) AS capex_generated, (SELECT COALESCE(SUM(po_amount),0) FROM po_details WHERE active=true) AS capex_converted, COALESCE((SELECT SUM(capex) FROM inspection_corrective_action WHERE active=true AND capex>0),0) - COALESCE((SELECT SUM(po_amount) FROM po_details WHERE active=true),0) AS capex_lost, (SELECT COALESCE(SUM(pr_amount),0) FROM pr_details WHERE active=true) AS opex_incurred;"}}
+""",
+    },
+    {
+        "title": "Financial data PO PR by facility",
+        "question_pattern": (
+            r"(?i)\b(po|pr|purchase\s+order|purchase\s+requisition|financial|income|cost|profit|p.?l|revenue)\b"
+            r".{0,50}\b(facility|site|location)\b"
+            r"|\b(facility|site|location)\b.{0,50}\b(po|pr|purchase|financial|income|cost|profit)\b"
+        ),
+        "text": """\\u2500\u2500\u2500 Financial data (PO/PR) for a specific facility \u2500\u2500\u2500
+User: "show financial data for Al Ghadeer" / "PO and PR amounts at [facility]" / "income and cost for [facility]"
+CRITICAL JOIN PATH: po_details.mitigative_action_uuid = ica.id  (ica.id is the UUID primary key)
+NEVER: po.mitigative_action_uuid = ica.corrective_action_id  \u2014 corrective_action_id is VARCHAR, causes type error
+NEVER: po.mitigative_action_uuid = ir.id  \u2014 matches zero rows
+ALWAYS pre-aggregate po_details and pr_details in CTEs to avoid row fan-out from LEFT JOIN.
+Turn 1: {"thought": "Financial data for a facility \u2014 must join po_details and pr_details via ica.id (UUID PK), NOT ica.corrective_action_id (varchar). Pre-aggregate in CTEs to avoid fan-out.", "tool": "generate_sql", "args": {"question": "financial data PO PR income cost for facility", "schema_hint": "WITH po_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_income FROM po_details WHERE active = true GROUP BY 1), pr_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_cost FROM pr_details WHERE active = true GROUP BY 1) SELECT fac.name AS facility_name, COALESCE(SUM(po.total_income),0) AS income, COALESCE(SUM(pr.total_cost),0) AS cost, COALESCE(SUM(po.total_income),0) - COALESCE(SUM(pr.total_cost),0) AS profit FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id LEFT JOIN po_agg po ON po.ica_id = ica.id LEFT JOIN pr_agg pr ON pr.ica_id = ica.id WHERE fac.name ILIKE '%[FACILITY]%' AND ica.active = true AND ir.active = true AND fac.active = true GROUP BY fac.id, fac.name;"}}
 """,
     },
     {

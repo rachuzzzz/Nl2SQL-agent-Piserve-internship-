@@ -102,6 +102,64 @@ REGISTRY: list[dict] = [
     # BLOCK — hard errors that cause SQL rejection
     # ══════════════════════════════════════════════════════════════════════════
 
+    # ── po/pr_details wrong join column ─────
+    {
+        "id":          "block_po_pr_wrong_join_column",
+        "type":        BLOCK,
+        "description": "po/pr_details.mitigative_action_uuid must join to ica.id (UUID PK), NEVER to ica.corrective_action_id (varchar).",
+        "sql_pattern": r"(?:po|pr)_details\b.*?\.mitigative_action_uuid\s*=\s*ica\.corrective_action_id",
+        "message":     (
+            "BLOCKED: po/pr_details.mitigative_action_uuid must join to ica.id (UUID primary key), "
+            "NOT ica.corrective_action_id (varchar — causes type error). "
+            "Correct: ON po.mitigative_action_uuid = ica.id. "
+            "Pre-aggregate in CTEs to avoid row fan-out."
+        ),
+        "hard_fail":   True,
+    },
+    # ── po/pr_details joined to ir.id instead of ica.id ─────
+    {
+        "id":          "block_po_pr_join_to_ir",
+        "type":        BLOCK,
+        "description": "po/pr_details.mitigative_action_uuid must join to ica.id, NEVER to ir.id (inspection_report). Joining to ir.id matches zero rows.",
+        "sql_pattern": r"mitigative_action_uuid\s*=\s*ir\.id",
+        "message":     (
+            "BLOCKED: po/pr_details.mitigative_action_uuid must join to ica.id (inspection_corrective_action UUID), "
+            "NOT ir.id (inspection_report) — that matches ZERO rows. "
+            "The ICA hop is mandatory: po_details → ica → inspection_report → facility. "
+            "Use CTEs: WITH po_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total FROM po_details WHERE active=true GROUP BY 1) "
+            "then LEFT JOIN po_agg po ON po.ica_id = ica.id"
+        ),
+        "hard_fail":   True,
+    },
+    # ── po_details + pr_details both directly joined causes row fan-out ─────
+    {
+        "id":          "block_po_pr_double_direct_join",
+        "type":        BLOCK,
+        "description": (
+            "Joining po_details AND pr_details directly into the same query (not via separate "
+            "pre-aggregated CTEs) causes a cross-join row multiplication when a CA has more than "
+            "one PO or PR row, silently corrupting SUM() results (confirmed in production "
+            "2026-06-15: a CA with 2 POs and 1 PR returned capex_generated=1000 instead of 2000, "
+            "and capex_converted=0 instead of 1000)."
+        ),
+        "sql_pattern": (
+            r"(?is)LEFT\s+JOIN\s+po_details\b.*?LEFT\s+JOIN\s+pr_details\b.*?GROUP\s+BY"
+            r"|LEFT\s+JOIN\s+pr_details\b.*?LEFT\s+JOIN\s+po_details\b.*?GROUP\s+BY"
+        ),
+        "message": (
+            "BLOCKED: po_details and pr_details are both directly LEFT JOINed into a GROUP BY query. "
+            "If a corrective action has more than one PO or PR row, this cross-joins them and corrupts "
+            "every SUM() in the result (confirmed bug: 2 POs + 1 PR returned half the correct capex). "
+            "ALWAYS pre-aggregate each table in its own CTE first:\n"
+            "WITH po_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po "
+            "FROM po_details WHERE active=true GROUP BY 1),\n"
+            "pr_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_pr "
+            "FROM pr_details WHERE active=true GROUP BY 1)\n"
+            "then LEFT JOIN po_agg ON po_agg.ica_id = ica.id and LEFT JOIN pr_agg ON pr_agg.ica_id = ica.id "
+            "in the outer query — each CTE returns at most one row per ica.id, so no fan-out is possible."
+        ),
+        "hard_fail":   True,
+    },
     # ── Organisation join always returns empty (FK unpopulated) ─────────────
     {
         "id":          "block_organisation_join",
@@ -205,6 +263,32 @@ REGISTRY: list[dict] = [
         "message": "[autocorrect] Removed hallucinated JOIN frequency_definition via non-existent isched.frequency_definition_id",
     },
 
+    # ── BLOCK: fac.name ILIKE inside CTE WHERE ───────────
+    {
+        "id":          "block_fac_filter_in_cte",
+        "type":        BLOCK,
+        "description": "fac.name ILIKE inside a CTE body causes 'column fac.name does not exist' error. Facility filter must be in the outer query WHERE clause.",
+        "sql_pattern": r"(?i)WITH\s+\w+\s+AS\s*\([^)]*AND\s+fac\.name\s+ILIKE",
+        "message": (
+            "BLOCKED: fac.name ILIKE inside a CTE WHERE clause causes 'column fac.name does not exist' "
+            "because fac (facility) is NOT joined inside the CTE. "
+            "The facility filter MUST go in the outer query WHERE clause, not inside a CTE. "
+            "Pattern: WITH po_agg AS (SELECT ir.facility_id, SUM(...) FROM po_details JOIN ica ON ... JOIN ir ON ... "
+            "WHERE ir.active=true GROUP BY ir.facility_id) "
+            "SELECT ... FROM facility fac LEFT JOIN po_agg ON po_agg.facility_id=fac.id "
+            "WHERE fac.name ILIKE '%[NAME]%' AND fac.active=true"
+        ),
+        "hard_fail": True,
+    },
+    # ── AUTOCORRECT: remove fac.name ILIKE from inside CTE bodies ─────
+    {
+        "id":          "autocorrect_fac_filter_in_cte",
+        "type":        AUTOCORRECT,
+        "description": "Remove fac.name ILIKE filter placed inside a CTE WHERE clause where fac is not in scope. Facility filter must be in the outer query.",
+        "sql_pattern": r"\s+AND\s+fac\.name\s+ILIKE\s+'%[^']*%'(?=\s*(?:GROUP BY|ORDER BY|LIMIT|\)))",
+        "replacement": "",
+        "message": "[autocorrect] Removed fac.name ILIKE from CTE body where fac is not in scope; facility filter must be in outer WHERE clause",
+    },
     # ── cycle-frequency join chain missing its defining subquery ─────────────
     {
         "id":          "block_cycle_frequency_missing_subquery",

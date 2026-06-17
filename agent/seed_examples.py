@@ -337,12 +337,14 @@ ORDER BY ca_count DESC;
         'limit':  None,
     },
     {
-        'nl':     'income cost and profit by facility P&L per facility revenue spend by facility capex converted vs opex incurred per facility',
+        'nl':     'income cost and profit by facility P&L per facility revenue spend by facility capex converted vs opex incurred per facility financial data PO PR purchase order purchase requisition by facility show POs and PRs at facility income and cost at specific facility',
         'sql':    """\
 -- P&L by facility: Income = SUM(po.po_amount), Cost = SUM(pr.pr_amount)
 -- CRITICAL JOIN PATH: mitigative_action_uuid → ica.id (the CA) — NEVER ir.id!
 -- po/pr_details → ica → inspection_report → facility (the ICA hop is mandatory)
 -- WRONG: mitigative_action_uuid = ir.id — matches ZERO rows → silent all-zero table
+-- FACILITY FILTER: NEVER put fac.name ILIKE inside a CTE — fac is not in scope there.
+-- Filter by fac.name ILIKE in the outer WHERE clause only, after joining facility.
 WITH po_agg AS (
     SELECT ir.facility_id, SUM(pd.po_amount) AS total_income
     FROM po_details pd
@@ -374,6 +376,42 @@ LIMIT 100;
         'domain': 'financial',
         'intent': 'ranked_list',
         'limit':  100,
+    },
+    {
+        'nl':     'financial data for specific facility PO income PR cost profit at one facility show POs and PRs for Al Ghadeer income and cost for facility name',
+        'sql':    """\
+-- Financial summary for a SPECIFIC facility by name
+-- CRITICAL: fac.name ILIKE filter goes in OUTER WHERE only — NEVER inside a CTE
+-- CTEs aggregate by facility_id; outer query joins facility and filters by name
+WITH po_agg AS (
+    SELECT ir.facility_id, SUM(pd.po_amount) AS total_income
+    FROM po_details pd
+    JOIN inspection_corrective_action ica ON pd.mitigative_action_uuid = ica.id
+    JOIN inspection_report ir ON ica.inspection_id = ir.id
+    WHERE ir.active = true AND ir.status != 'DRAFT' AND ica.active = true
+    GROUP BY ir.facility_id
+),
+pr_agg AS (
+    SELECT ir.facility_id, SUM(pr.pr_amount) AS total_cost
+    FROM pr_details pr
+    JOIN inspection_corrective_action ica ON pr.mitigative_action_uuid = ica.id
+    JOIN inspection_report ir ON ica.inspection_id = ir.id
+    WHERE ir.active = true AND ir.status != 'DRAFT' AND ica.active = true
+    GROUP BY ir.facility_id
+)
+SELECT fac.name AS facility_name,
+       COALESCE(po.total_income, 0)                               AS income,
+       COALESCE(pr.total_cost, 0)                                 AS cost,
+       COALESCE(po.total_income, 0) - COALESCE(pr.total_cost, 0)  AS profit
+FROM facility fac
+LEFT JOIN po_agg po ON po.facility_id = fac.id
+LEFT JOIN pr_agg pr ON pr.facility_id = fac.id
+WHERE fac.name ILIKE '%Al Ghadeer%'
+  AND fac.active = true;
+""",
+        'domain': 'financial',
+        'intent': 'aggregate',
+        'limit':  None,
     },
     {
         'nl':     'corrective actions not closed on time closed late past deadline late closure overdue when closed',
@@ -2466,6 +2504,46 @@ LIMIT 1;
         'domain': 'financial',
         'intent': 'single_value',
         'limit':  1,
+    },
+    {
+        'nl':     'capex breakdown for each corrective action at facility PO PR per corrective action conversion percentage per CA generated converted by corrective action',
+        'sql':    """\
+-- Per-corrective-action capex/PO/PR breakdown for a facility
+-- CRITICAL: pre-aggregate po_details and pr_details in SEPARATE CTEs before joining to ica.
+-- NEVER LEFT JOIN po_details AND pr_details directly into a GROUP BY query —
+-- if a CA has >1 PO row or >1 PR row, the cross-join multiplies rows and
+-- corrupts every SUM() (confirmed bug: 2 POs + 1 PR returned half the real capex).
+WITH po_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po, COUNT(*) AS po_count
+    FROM po_details WHERE active = true GROUP BY 1
+),
+pr_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_pr, COUNT(*) AS pr_count
+    FROM pr_details WHERE active = true GROUP BY 1
+)
+SELECT
+    ica.corrective_action_id,
+    ica.cause,
+    ica.corrective_action,
+    ica.responsible,
+    ica.status,
+    COALESCE(po.total_po, 0)                                              AS capex_generated,
+    COALESCE(pr.total_pr, 0)                                              AS capex_converted,
+    ROUND(COALESCE(pr.total_pr, 0) * 100.0 / NULLIF(po.total_po, 0), 2)   AS converted_percentage,
+    COALESCE(po.po_count, 0)                                              AS po_count,
+    COALESCE(pr.pr_count, 0)                                              AS pr_count
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+LEFT JOIN po_agg po ON po.ica_id = ica.id
+LEFT JOIN pr_agg pr ON pr.ica_id = ica.id
+WHERE fac.name ILIKE '%[FACILITY]%'
+  AND ica.active = true AND ir.active = true AND ir.status != 'DRAFT'
+ORDER BY ica.corrective_action_id;
+""",
+        'domain': 'financial',
+        'intent': 'per_row_breakdown',
+        'limit':  None,
     },
     {
         'nl':     'total capex generated converted lost and opex incurred',

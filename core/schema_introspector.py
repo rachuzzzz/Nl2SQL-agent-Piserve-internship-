@@ -81,7 +81,11 @@ BUSINESS_RULES = [
     "WHERE EXISTS (SELECT 1 FROM user_roles ur JOIN role r ON ur.role_id = r.id "
     "WHERE ur.user_id = u.id AND r.name = 'FM Manager'). "
     "FM Manager role names: fm_manager, fm_engineer, ad_fm, asst_fm_manager, fm_admin, fm_supervisor. "
-    "Inspector role names: internal_inspector, internal_auditor, external_inspector, external_auditor.",
+    "⚠ UNVERIFIED — these inspector role names have NEVER been confirmed against the live role table "
+    "and returned 0 rows in production (2026-06-15). Run `SELECT name FROM role` to get exact casing "
+    "before filtering: internal_inspector, internal_auditor, external_inspector, external_auditor. "
+    "FM-side roles ARE confirmed correct (Title Case with spaces, e.g. 'FM Manager') — inspector-side "
+    "roles likely follow the same convention, e.g. 'Internal Inspector' not 'internal_inspector'.",
 ]
 
 TABLE_RELATIONSHIPS = """\
@@ -176,7 +180,10 @@ USER ROLES:
   role.name values relevant to inspections:
     FM-side (inspectee):  FM Manager, FM Engineer, AD FM, Asst FM Manager,
                           FM Admin, FM Supervisor, hse_officer
-    Inspector-side:       internal_inspector, internal_auditor, external_inspector,
+    Inspector-side (⚠ UNVERIFIED, returned 0 rows 2026-06-15 — confirm exact
+                    casing with `SELECT name FROM role` before use; likely
+                    Title Case like FM-side, NOT snake_case):
+                          internal_inspector, internal_auditor, external_inspector,
                           external_auditor, hse_officer
   CRITICAL — use EXISTS subquery (not JOIN) to avoid row fan-out:
     WHERE EXISTS (

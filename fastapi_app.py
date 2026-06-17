@@ -26,7 +26,8 @@ from chart_advisor import advise, force_config, get_alternatives, classify_colum
 # Detects pure chart requests that need no new SQL — handled before the LLM.
 
 _VISUAL_KW = re.compile(
-    r'\b(chart|graph|plot|visual(i[sz]e|ization)?|bar|pie|line|doughnut|donut|scatter|draw)\b',
+    r'\b(chart|graph|plot|visual(i[sz]e|ization)?|bar|pie|line|doughnut|donut|scatter|draw)\b'
+    r'|\bshow\s+as\s+chart\b|\bas\s+(a\s+)?chart\b',
     re.IGNORECASE,
 )
 _DOMAIN_KW = re.compile(
@@ -130,6 +131,7 @@ class ChartConfig(BaseModel):
     conflict: bool = False
     requested_type: str | None = None
     requested_config: dict | None = None
+    alternatives: list[dict] = []
 
 class ChatResponse(BaseModel):
     answer: str
@@ -335,9 +337,11 @@ def _chart_suggestion_sentence(columns: list, rows: list) -> str:
         alts = _ALT_MAP.get(rtype, [])[:2]
         alt_str = " or a ".join(f"**{_TYPE_LABELS.get(a, a.title())}**" for a in alts)
         hint = rec["reason"]
+
+        signal = f"\n📊__CHART_AVAILABLE__:{rtype}:{hint}"
         if alts:
-            return f"\n\nI can visualize this as a **{rlabel}** ({hint}), or as a {alt_str} if you prefer — just say the word."
-        return f"\n\nI can visualize this as a **{rlabel}** ({hint}) — just ask."
+            return f"{signal}\n\nI can visualize this as a **{rlabel}** ({hint}), or as a {alt_str} if you prefer — just say the word."
+        return f"{signal}\n\nI can visualize this as a **{rlabel}** ({hint}) — just ask."
     except Exception:
         return ""
 
@@ -364,6 +368,7 @@ async def chat(req: ChatRequest):
                     conflict=conflict,
                     requested_type=requested if conflict else None,
                     requested_config=force_config(cols, rows, requested) if conflict else None,
+                    alternatives=rec.get("alternatives", []),
                 )
                 return ChatResponse(
                     answer="Here's the chart.",
@@ -414,10 +419,11 @@ async def chat(req: ChatRequest):
                     _result_cols = list(rows[0].keys())
                     _row_count = inner.get("row_count", len(rows))
 
-                    # Cache SQL for pagination — only when SQL was generated this turn
-                    if sql:
-                        sess_data["last_sql"]   = sql
-                        sess_data["last_total"] = _count_total(sql, orch)
+                    # Cache SQL for pagination — if it's a new or auto-paginated query
+                    exec_sql = sql or (step.args or {}).get("sql")
+                    if exec_sql:
+                        sess_data["last_sql"]   = exec_sql
+                        sess_data["last_total"] = inner.get("total_count", _row_count)
 
             elif step.tool == "get_answers":
                 # get_answers returns same shape as execute_sql — extract rows for frontend
@@ -450,6 +456,7 @@ async def chat(req: ChatRequest):
                     _ga_where = " AND ".join(_ga_filters)
                     sql = f"""SELECT ir.inspection_id, aa.module_name, aq.label AS question_label, COALESCE(aa.answer_text, aa.answer_numeric::text) AS answer_value, aa.score, aa.submitted_on FROM ai_answers aa LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id LEFT JOIN inspection_report ir ON aa.inspection_report_id = ir.id WHERE {_ga_where} ORDER BY aa.submitted_on DESC"""
                     sess_data["last_sql"] = sql
+                    sess_data["last_total"] = inner.get("total_count", _row_count)
 
             elif step.tool == "get_answer_stats":
                 # get_answer_stats returns value_breakdown — convert to table rows for frontend
@@ -469,6 +476,8 @@ async def chat(req: ChatRequest):
                     _result_cols = list(rows[0].keys()) if rows else []
                     _result_cols = ["answer", "count"]
                     _row_count = len(breakdown)
+                    sess_data["last_sql"] = None
+                    sess_data["last_total"] = None
 
             elif step.tool == "[parse_error]":
                 info.success = False
@@ -480,10 +489,10 @@ async def chat(req: ChatRequest):
 
         # Resolve pagination metadata now that last_total is populated
         _total_count = sess_data.get("last_total")
-        _has_more    = (
-            (_total_count is not None and _total_count > 50)
-            or _row_count >= 50
-        )
+        if _total_count is not None and _total_count != -1:
+            _has_more = _total_count > _row_count
+        else:
+            _has_more = _row_count >= 50
 
         # Generate a natural-language summary + chart suggestion for multi-row results
         if _result_rows and len(_result_rows) > 1 and not _chart_config:
@@ -657,25 +666,18 @@ async def get_chart(req: ChartRequest):
     rows = sess_data["last_raw_rows"]
 
     # Column picker overrides — user explicitly selected which cols to chart
-    if req.x_col or req.y_cols:
-        active_cols = []
-        if req.x_col and req.x_col in cols:
-            active_cols.append(req.x_col)
-        if req.y_cols:
-            active_cols.extend(c for c in req.y_cols if c in cols)
-        # Rebuild rows with only the selected columns
-        if active_cols:
-            cols = active_cols
-            rows = [{k: r[k] for k in active_cols if k in r} for r in rows]
+    lc_override = req.x_col
+    num_cols_override = req.y_cols
 
     if req.chart_type:
-        cfg = force_config(cols, rows, req.chart_type)
+        cfg = force_config(cols, rows, req.chart_type, lc=lc_override, num_cols=num_cols_override)
+        logging.info(f"Forcing chart {req.chart_type} for lc={lc_override}, nums={num_cols_override}. Config generated: {bool(cfg)}")
         if cfg is None:
             raise HTTPException(
                 status_code=422,
                 detail=f"Cannot build '{req.chart_type}' chart for this data shape."
             )
-            alts = get_alternatives(cols, rows, n=3)
+        alts = get_alternatives(cols, rows, n=3)
         return ChartConfig(
             chart_type=req.chart_type,
             reason=f"Requested by user via /chart {req.chart_type}",

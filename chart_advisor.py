@@ -105,7 +105,7 @@ _ALT_MAP: dict[str, list[str]] = {
 
 
 # ── Column classifier ─────────────────────────────────────────────────────────
-_DATE_RE   = re.compile(r'(date|month|year|week|\btime\b|period|quarter|\bday\b|created|modified|submitted|reported)', re.I)
+_DATE_RE   = re.compile(r'(date|month|year|week|\btime\b|period|quarter|\bday\b|created|modified|submitted|reported|month_idx|month_label)', re.I)
 _PCT_RE    = re.compile(r'(pct|percent|rate|ratio|share|proportion|conversion)', re.I)
 _SCORE_RE  = re.compile(r'(score|rating|grade|index)', re.I)
 _INCOME_RE = re.compile(r'(income|revenue|po_amount|converted|earned)', re.I)
@@ -136,6 +136,23 @@ def _classify(columns, rows):
         if _is_date_col(col, vals): out["date"].append(col)
         elif _is_numeric(vals):     out["numeric"].append(col)
         else:                       out["category"].append(col)
+    
+    # Priority fix: if we have month_idx and month_label, prefer month_label for display
+    # but ensure it's treated as a date (it's already in date list if it matched RE)
+    if "month_idx" in columns and "month_label" in columns:
+        if "month_label" in out["category"]:
+            out["category"].remove("month_label")
+            out["date"].append("month_label")
+        # Ensure month_label is the primary date for X-axis
+        if "month_label" in out["date"]:
+            out["date"].remove("month_label")
+            out["date"].insert(0, "month_label")
+        # Hide month_idx from numeric so it doesn't break rule #6 (Heatmap)
+        if "month_idx" in out["numeric"]:
+            out["numeric"].remove("month_idx")
+        if "month_idx" in out["date"]:
+            out["date"].remove("month_idx")
+    
     return out
 
 def _lbl(col): return col.replace("_", " ").title()
@@ -632,6 +649,29 @@ def _rules_advise(columns, rows):
     if dates:
         lc = dates[0]
         labels = [str(r.get(lc)) for r in rows]
+        
+        # 4a. Breakdown over time: Date + Category + Numeric
+        if cats and len(nums) == 1 and n > 5:
+            # Pivot data for stacked bar: rows=dates, columns=categories
+            cat_col = cats[0]
+            val_col = nums[0]
+            unique_cats = list(dict.fromkeys(str(r.get(cat_col)) for r in rows))
+            unique_dates = list(dict.fromkeys(str(r.get(lc)) for r in rows))
+            
+            # If we have a reasonable number of categories and dates, stack them
+            if 2 <= len(unique_cats) <= 12 and len(unique_dates) >= 2:
+                pivot_rows = []
+                for d in unique_dates:
+                    row_data = {lc: d}
+                    for c in unique_cats:
+                        # Find value for this date and category
+                        val = next((_coerce(r.get(val_col)) for r in rows if str(r.get(lc)) == d and str(r.get(cat_col)) == c), 0)
+                        row_data[c] = val
+                    pivot_rows.append(row_data)
+                
+                return _result("stacked_bar", f"Breakdown of '{val_col}' by '{cat_col}' over time", "high",
+                               lc, unique_cats, _stacked_bar(unique_dates, unique_cats, pivot_rows))
+
         if len(nums) == 1:
             use_area = any(kw in nums[0].lower() for kw in ("total","cumul","volume","amount","sum"))
             ct = "area" if use_area else "line"
@@ -657,9 +697,10 @@ def _rules_advise(columns, rows):
             return _result("radar", f"Multi-metric profile per '{lc}' — radar", "medium",
                            lc, nums[:6], _radar(lc, nums[:6], rows))
 
-    # ── 6. Heatmap — two categorical dimensions ────────────────────────────────
-    if len(cats) == 2 and len(nums) == 1 and n >= 4:
-        rc, cc, nc = cats[0], cats[1], nums[0]
+    # ── 6. Heatmap — two categorical dimensions × one numeric. ─────────────────
+    all_cats = cats + dates
+    if len(all_cats) >= 2 and len(nums) == 1 and n >= 4:
+        rc, cc, nc = all_cats[0], all_cats[1], nums[0]
         if _cardinality([r.get(rc) for r in rows]) >= 2 and _cardinality([r.get(cc) for r in rows]) >= 2:
             return _result("heatmap", f"Grid of '{rc}' × '{cc}' — heatmap", "high",
                            rc, nums, _heatmap(rc, cc, nc, rows))
@@ -733,8 +774,9 @@ def _build_config(chart_type, lc, num_cols, labels, rows):
         return _radar(lc, num_cols[:6], rows)
     if chart_type == "heatmap":
         t = _classify(list({lc} | set(num_cols)) if lc else num_cols, rows)
-        if len(t["category"]) >= 2 and t["numeric"]:
-            return _heatmap(t["category"][0], t["category"][1], t["numeric"][0], rows)
+        all_dims = t["category"] + t["date"]
+        if len(all_dims) >= 2 and t["numeric"]:
+            return _heatmap(all_dims[0], all_dims[1], t["numeric"][0], rows)
     if chart_type == "waterfall" and num_cols:
         vals = [_coerce(r.get(num_cols[0])) or 0 for r in rows]
         return _waterfall(labels, vals, num_cols[0])
@@ -861,12 +903,14 @@ def advise(columns, rows):
     return result
 
 
-def force_config(columns, rows, chart_type):
+def force_config(columns, rows, chart_type, lc=None, num_cols=None):
     """Force a specific chart type regardless of recommendation."""
     if not rows or not columns or chart_type not in _VALID_TYPES:
         return None
     t  = _classify(columns, rows)
-    lc = t["category"][0] if t["category"] else (t["date"][0] if t["date"] else columns[0])
+    if not lc:
+        lc = t["category"][0] if t["category"] else (t["date"][0] if t["date"] else columns[0])
     labels   = [str(r.get(lc)) for r in rows]
-    num_cols = t["numeric"] or [columns[-1]]
+    if not num_cols:
+        num_cols = t["numeric"] or [columns[-1]]
     return _build_config(chart_type, lc, num_cols, labels, rows) or _bar(labels, num_cols, rows)

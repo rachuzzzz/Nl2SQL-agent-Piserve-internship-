@@ -333,7 +333,7 @@ TEST_SET = [
         "expected_contains": ["quarter", "closed"],
         "expected_nonempty": False,
         "expected_llm_calls": 1,
-        "notes": "close_on arithmetic blocked by validator — answer uses status-based closure rate",
+        "notes": "close_on does not exist — answer must use completed_on for status-based closure rate",
     },
     {
         "id": "TRD-03", "category": "Trends",
@@ -729,7 +729,7 @@ TEST_SET = [
         "expected_contains": ["closed", "time", "late", "on_time", "overdue"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
-        "notes": "FILTER: status=CLOSED AND close_on <= target vs > target",
+        "notes": "FILTER: status=CLOSED AND completed_on <= target_close_out_date vs > target_close_out_date",
     },
     {
         "id": "AGG-EXT-03", "category": "Extended Aggregate",

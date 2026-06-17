@@ -299,9 +299,12 @@ class ConversationSession:
             r"that\s+inspector|that\s+cycle|that\s+person)\b",
             re.IGNORECASE,
         )
+        # A question is "clearly fresh" only when it introduces a wholly new subject.
+        # INTENTIONALLY NARROW: question-starters like "how many", "what", "show", "list"
+        # appear constantly in follow-ups ("how many are completed", "show the open ones")
+        # and must NOT suppress the active context.
         _FRESH_SUBJECT_RE = re.compile(
-            r"\b(what|which|show|list|give|find|how\s+many|average|total|"
-            r"all\s+\w+|most\s+recent(?!ly)|most\s+common|latest)\b",
+            r"\b(most\s+recent(?!ly)|most\s+common|latest)\b",
             re.IGNORECASE,
         )
         is_followup = bool(_FOLLOWUP_RE.search(current_question))
@@ -395,9 +398,12 @@ class ConversationSession:
                 )
             elif active_type == "facility":
                 lines.append(
-                    f"ACTIVE CONTEXT — The conversation is about facility '{active_label}'."
-                    f" When user says 'that facility', 'that site'"
-                    f" — filter by fac.name ILIKE '%{active_label}%'."
+                    f"ACTIVE CONTEXT — The conversation is scoped to facility '{active_label}'."
+                    f" ALL follow-up questions about corrective actions, inspections, scores,"
+                    f" or form answers should include a facility filter"
+                    f" (fac.name ILIKE '%{active_label}%') unless the user explicitly asks"
+                    f" for a global/all-facilities view."
+                    f" Do NOT query globally when the context is scoped to this facility."
                 )
             elif active_type == "corrective_action":
                 lines.append(
@@ -1041,14 +1047,16 @@ class AgentOrchestrator:
             active_subject_type = "facility"
             active_subject_value = fac_names[0]
             active_subject_label = fac_names[0]
-        # If previous turn had a cycle scope and this result has no conflicting subject,
-        # inherit the cycle scope so it persists across multi-turn drilldowns
+        # If previous turn had a scoped subject (cycle or facility) and this result
+        # has no conflicting subject (e.g. a COUNT query with no facility_name column),
+        # inherit the scope so it persists across multi-turn drilldowns.
         elif session and session.turns:
-            prev_turn = session.turns[-1]
-            if prev_turn.active_subject_type == "cycle" and prev_turn.active_subject_value:
-                active_subject_type = "cycle"
-                active_subject_value = prev_turn.active_subject_value
-                active_subject_label = prev_turn.active_subject_label
+            for prev_turn in reversed(session.turns):
+                if prev_turn.active_subject_type and prev_turn.active_subject_value:
+                    active_subject_type = prev_turn.active_subject_type
+                    active_subject_value = prev_turn.active_subject_value
+                    active_subject_label = prev_turn.active_subject_label
+                    break
 
         if session is not None:
             # MT-03 fix: if we have a facility name but no inspection_id (e.g. MT-01
@@ -1541,11 +1549,12 @@ class AgentOrchestrator:
                 return (
                     f"STEP 1 disambiguation check: exactly ONE facility matching "
                     f"'{name_filter}' has inspections — '{r.get('name')}' "
-                    f"(id={r.get('id')}, {r.get('inspection_count')} inspections).\n"
+                    f"({r.get('inspection_count')} inspections).\n"
                     f"Original question: \"{question}\"\n"
-                    f"This is STEP 2a — call generate_sql again, filtered by "
-                    f"WHERE fac.id = '{r.get('id')}' (not name ILIKE), to answer the "
-                    f"original question using that facility."
+                    f"This is STEP 2a — call generate_sql again using "
+                    f"fac.name ILIKE '%{r.get('name')}%' to filter by this facility. "
+                    f"Do NOT use fac.id UUID — the SQL model ignores UUID filters "
+                    f"and will generate ILIKE anyway. Use the exact name directly."
                 )
             else:
                 options = "\n".join(
@@ -1574,14 +1583,18 @@ class AgentOrchestrator:
                 )
             elif len(rows) == 1:
                 r = rows[0]
+                _name_parts = str(r.get('name', '')).split()
+                _first = _name_parts[0] if _name_parts else name_filter
+                _last = _name_parts[-1] if len(_name_parts) > 1 else ''
                 return (
                     f"STEP 1 disambiguation check: exactly ONE person matches "
-                    f"'{name_filter}' — '{r.get('name')}' (id={r.get('id')}).\n"
+                    f"'{name_filter}' — '{r.get('name')}'.\n"
                     f"Original question: \"{question}\"\n"
-                    f"This is STEP 2a — call generate_sql again, filtered by that "
-                    f"person's id (e.g. WHERE u.id = '{r.get('id')}', joined via "
-                    f"inspector_user_id or inspectee_user_id per the question's role "
-                    f"wording), to answer the original question."
+                    f"This is STEP 2a — call generate_sql again filtered by name: "
+                    f"WHERE u.first_name ILIKE '%{_first}%' AND u.last_name ILIKE '%{_last}%' "
+                    f"(joined via inspector_user_id or inspectee_user_id per the question's "
+                    f"role wording). Do NOT use u.id UUID — the SQL model ignores UUID "
+                    f"filters and will generate ILIKE anyway."
                 )
             else:
                 options = "\n".join(f"  • {r.get('name')}" for r in rows)

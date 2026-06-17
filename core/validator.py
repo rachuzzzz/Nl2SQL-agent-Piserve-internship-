@@ -570,14 +570,14 @@ class SQLValidator:
             break  # one report is enough
 
         # ── 10. close_on arithmetic — HARD_FAIL (dead column, all NULL) ──────
-        # close_on is confirmed ALL-NULL — any arithmetic/comparison returns
-        # meaningless results. Registry: semantics_registry.py "DEAD COLUMN".
+        # close_on does not exist — any reference to it fails at the DB level.
+        
         # business_rules.py block_close_on_arithmetic also blocks this at the
         # INJECT layer; this validator check catches it at execution-time too.
         if self._CLOSE_ON_ARITH_RE.search(sql):
             issues.append(ValidationIssue(
                 "HARD_FAIL", "DEAD_COLUMN",
-                "BLOCKED: close_on is a DEAD COLUMN (all NULL) — use completed_on "
+                "BLOCKED: close_on does not exist — use completed_on "
                 "for closure timing (populated for status='CLOSED' rows)",
                 detail="For closed-late: status='CLOSED' AND completed_on > target_close_out_date",
                 retryable=True,
