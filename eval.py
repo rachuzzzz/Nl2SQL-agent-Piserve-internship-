@@ -333,7 +333,7 @@ TEST_SET = [
         "expected_contains": ["quarter", "closed"],
         "expected_nonempty": False,
         "expected_llm_calls": 1,
-        "notes": "close_on arithmetic blocked by validator — answer uses status-based closure rate",
+        "notes": "close_on does not exist — answer must use completed_on for status-based closure rate",
     },
     {
         "id": "TRD-03", "category": "Trends",
@@ -729,7 +729,7 @@ TEST_SET = [
         "expected_contains": ["closed", "time", "late", "on_time", "overdue"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
-        "notes": "FILTER: status=CLOSED AND close_on <= target vs > target",
+        "notes": "FILTER: status=CLOSED AND completed_on <= target_close_out_date vs > target_close_out_date",
     },
     {
         "id": "AGG-EXT-03", "category": "Extended Aggregate",
@@ -894,6 +894,13 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
             # ── empty-result detection ───────────────────────────────────────
             empty = _is_empty_result(result.answer)
 
+            # ── ground-truth comparison (result-level correctness) ──────────
+            try:
+                from eval_truth import run_truth_check, extract_agent_rows
+                tm = run_truth_check(orch.db_engine, qid, extract_agent_rows(result))
+            except Exception as _te:  # truth layer must never crash the eval
+                tm = {"covered": False, "truth_match": None, "detail": f"err: {_te}"}
+
             # Force fail when we know the result must not be empty
             forced_fail = bool(test.get("expected_nonempty") and empty)
             real_pass   = result.success and not forced_fail
@@ -914,6 +921,9 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
                 empty_result=empty,
                 forced_fail=forced_fail,
                 real_pass=real_pass,
+                truth_covered=tm["covered"],
+                truth_match=tm["truth_match"],
+                truth_detail=tm["detail"],
                 answer_preview=result.answer[:250],
                 success=result.success,
                 manual_score=None,
@@ -926,8 +936,14 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
                     else "🟡" if result.stats.total_llm_calls <= 3 else "🔴")
             kw_str = f"{kh}/{kt}" if kt else "n/a"
             status = "✅" if real_pass else ("❌ EMPTY" if forced_fail else "❌")
+            truth_str = ""
+            if tm["covered"]:
+                truth_str = (" | truth ✓" if tm["truth_match"]
+                             else f" | truth ✗ ({tm['detail'][:60]})"
+                             if tm["truth_match"] is False
+                             else " | truth ?")
             print(f"         {perf} {wall:.1f}s | {result.stats.total_llm_calls} calls | "
-                  f"kw {kw_str} | SQL {'OK' if se == 0 else str(se) + ' err'} | {status}")
+                  f"kw {kw_str} | SQL {'OK' if se == 0 else str(se) + ' err'} | {status}{truth_str}")
             print(f"         -> {result.answer[:100]}\n")
 
         except Exception as e:
@@ -997,6 +1013,20 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
     print(f"  Avg kw hit:   {avg_kp}%  (over {len(kp_vals)} keyword-tested questions)")
     print(f"  SQL errors:   {tot_se}  |  Parse errors: {tot_pe}")
 
+    # ── ground-truth summary ─────────────────────────────────────────────────
+    truth_rows = [r for r in results if r.get("truth_covered")]
+    truth_pass = sum(1 for r in truth_rows if r.get("truth_match") is True)
+    truth_fail = [r for r in truth_rows if r.get("truth_match") is False]
+    truth_err  = [r for r in truth_rows if r.get("truth_match") is None]
+    if truth_rows:
+        print(f"  TRUTH MATCH:  {truth_pass}/{len(truth_rows)} "
+              f"({100 * truth_pass // len(truth_rows)}%)  "
+              f"— result-level correctness on covered cases")
+        for r in truth_fail:
+            print(f"    ✗ {r['id']:<8} {r['truth_detail'][:90]}")
+        for r in truth_err:
+            print(f"    ? {r['id']:<8} {r['truth_detail'][:90]}")
+
     # ── forced-fail detail ───────────────────────────────────────────────────
     ff_rows = [r for r in results if r["forced_fail"]]
     if ff_rows:
@@ -1020,6 +1050,8 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
             sql_errors_total=tot_se,
             parse_errors_total=tot_pe,
             forced_fails=forced_fails,
+            truth_covered=len(truth_rows),
+            truth_pass=truth_pass,
             results=results,
         ), f, indent=2)
     print(f"\n  Results saved -> {fname}\n")

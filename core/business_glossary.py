@@ -24,6 +24,30 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+# ── Semantics registry (single source of truth for status definitions) ───────
+try:
+    from core.semantics_registry import (
+        completed_required_regex as _completed_required_regex,
+        conducted_required_regex as _conducted_required_regex,
+        old_completed_forbidden_regex as _old_completed_forbidden_regex,
+        completed_filter as _completed_filter,
+        conducted_in_list as _conducted_in_list,
+    )
+    _COMPLETED_REQUIRED  = _completed_required_regex()
+    _CONDUCTED_REQUIRED  = _conducted_required_regex()
+    _OLD_COMPLETED_BAD   = _old_completed_forbidden_regex()
+    _COMPLETED_SQL       = f"status {_completed_filter()}"
+    _CONDUCTED_SQL       = f"status IN {_conducted_in_list()}"
+except ImportError:
+    # Fallback — keep in sync with core/semantics_registry.py
+    _COMPLETED_REQUIRED = r"status\s*=\s*'CLOSED'"
+    _CONDUCTED_REQUIRED = (
+        r"status\s*IN\s*\([^)]*(?:'SUBMITTED'|'UNDER_REVIEW'|'RETURN_FOR_MODIFICATION')[^)]*\)"
+    )
+    _OLD_COMPLETED_BAD  = r"status\s*IN\s*\(\s*'CLOSED'\s*,\s*'SUBMITTED'\s*\)"
+    _COMPLETED_SQL      = "status = 'CLOSED'"
+    _CONDUCTED_SQL      = "status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')"
+
 
 # ---------------------------------------------------------------------------
 # Glossary entry
@@ -92,13 +116,34 @@ _RAW: list[dict] = [
     {
         "id": "completed_inspections",
         "terms": ["completed inspection", "completed inspections", "completion"],
-        "required_pattern": r"status\s*(?:IN|!=|=|NOT\s+IN)",
+        "required_pattern": _COMPLETED_REQUIRED,
         "forbidden_patterns": [
-            # The single biggest silent corruption: "completed" → status='CLOSED' only
-            r"status\s*=\s*'CLOSED'\s*(?:AND|ORDER|GROUP|LIMIT|;|$)",
+            # OLD WRONG definition — completed != CLOSED+SUBMITTED.
+            # SUBMITTED is 'conducted' (in-flight), not 'completed'.
+            _OLD_COMPLETED_BAD,
         ],
-        "correct_sql": "status IN ('CLOSED', 'SUBMITTED')",
-        "message": "completed inspections = status IN ('CLOSED', 'SUBMITTED') — UNDER_REVIEW and RETURN_FOR_MODIFICATION are NOT completed",
+        "correct_sql": _COMPLETED_SQL,
+        "message": (
+            f"completed inspections = {_COMPLETED_SQL} only "
+            f"(fully reviewed and approved). "
+            f"SUBMITTED/UNDER_REVIEW/RETURN_FOR_MODIFICATION are 'conducted' (in-flight), not completed."
+        ),
+        "severity": "SOFT_WARN",
+    },
+    {
+        "id": "conducted_inspections",
+        "terms": ["conducted inspection", "conducted inspections", "in-flight inspection",
+                   "in progress inspection", "inspections in progress"],
+        "required_pattern": _CONDUCTED_REQUIRED,
+        "forbidden_patterns": [
+            # status != 'DRAFT' alone is too broad — it includes CLOSED (completed)
+            r"status\s*!=\s*'DRAFT'\s*(?:AND|ORDER|GROUP|LIMIT|;|$)",
+        ],
+        "correct_sql": _CONDUCTED_SQL,
+        "message": (
+            f"conducted inspections = {_CONDUCTED_SQL} — in-flight, "
+            f"excludes both DRAFT (not started) and CLOSED (completed)."
+        ),
         "severity": "SOFT_WARN",
     },
     {
@@ -232,8 +277,17 @@ _RAW: list[dict] = [
         ],
         "required_pattern": r"AVG\s*\(",
         "forbidden_patterns": [],
-        "correct_sql": "SELECT AVG(obs_count) FROM (SELECT ir.inspection_id, COUNT(*) AS obs_count FROM ... GROUP BY ir.inspection_id) sub",
-        "message": "average per inspection requires nested aggregation: AVG(COUNT per group) — not just GROUP BY inspection_id",
+        "correct_sql": (
+            "SELECT AVG(obs_count) FROM (SELECT ir.inspection_id, COUNT(*) AS obs_count "
+            "FROM ... GROUP BY ir.inspection_id) sub  -- generic shape; "
+            "if obs_count = OBSERVATIONS specifically, use "
+            "COUNT(DISTINCT aa.submission_id) not COUNT(*) (see registry counting.observations_per_inspection — "
+            "ai_answers has multiple rows per observation)"
+        ),
+        "message": (
+            "average per inspection requires nested aggregation: AVG(COUNT per group) — not just GROUP BY inspection_id. "
+            "If counting OBSERVATIONS per inspection, the inner COUNT must be COUNT(DISTINCT aa.submission_id), not COUNT(*)."
+        ),
         "severity": "SOFT_WARN",
     },
     {
@@ -276,14 +330,17 @@ _RAW: list[dict] = [
     {
         "id": "capex_lost",
         "terms": ["capex lost", "lost capex", "capex loss"],
-        "required_pattern": r"po_details|po\.po_amount|po_by_ica",
-        "forbidden_patterns": [
-            r"capex_status\s*(?:=|IN)\s*['\(]*REJECTED",
-            r"capex_status\s*(?:=|IN)\s*['\(]*DEFERRED",
-        ],
-        "correct_sql": "SUM(ica.capex) - (SELECT SUM(po_amount) FROM po_details) AS capex_lost",
-        "message": "CAPEX Lost = SUM(ica.capex) - SUM(po.po_amount) — NOT WHERE capex_status='REJECTED'",
-        "severity": "HARD_FAIL",
+        # Two valid shapes: (1) the arithmetic AGGREGATE (SUM(ica.capex) - SUM(po.po_amount))
+        # via po_details, OR (2) a LISTING query filtered by capex_status='REJECTED'
+        # (e.g. "capex lost from rejected corrective actions" — see business_rules.py
+        # block_capex_status_rejected_as_loss, narrowed 2026-06-12 to allow exactly this).
+        # Previously required_pattern only accepted (1), contradicting this entry's
+        # own message which already said (2) is valid — aligned now.
+        "required_pattern": r"po_details|po\.po_amount|po_by_ica|capex_status\s*=\s*'REJECTED'",
+        "forbidden_patterns": [],
+        "correct_sql": "SUM(ica.capex) WHERE ica.active=true AND ica.capex>0 MINUS SUM(po_details.po_amount) WHERE po_details.active=true — arithmetic gap",
+        "message": "CAPEX Lost = SUM(ica.capex) - SUM(po.po_amount) — arithmetic gap. capex_status=REJECTED is a valid filter for rejected CA queries.",
+        "severity": "SOFT_WARN",
     },
     {
         "id": "capex_generated",

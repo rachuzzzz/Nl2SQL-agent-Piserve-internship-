@@ -21,7 +21,7 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from core.semantic import SemanticQuestionIndex, SeedExampleIndex
 from core.validator import SQLValidator
 from core.schema_introspector import introspect_schema
-from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT
+from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT, build_dynamic_prompt_additions
 from agent.tools import ToolRegistry
 from agent.tool_dispatcher import parse_tool_call, dispatch
 from core.business_rules import get_engine as get_rules_engine
@@ -70,7 +70,7 @@ def _detect_truncation(raw: str) -> str | None:
         return f"TRUNCATED — {open_b} unclosed brace(s)"
     if open_q:
         return "TRUNCATED — odd number of quotes (mid-string cut)"
-    if not stripped.endswith(("}","}")):
+    if not stripped.endswith(("}", "]")):
         return f"SUSPICIOUS — ends with: {repr(stripped[-30:])}"
     return None
 
@@ -161,13 +161,23 @@ def _has_uuid_leak(rows: list, columns: list) -> list[str]:
 # These notes survive deepseek's seed-example bias because they are placed in
 # Qwen's message (not in schema_hint which deepseek may override with seeds).
 # Rule: give the exact fix as a constraint, never a full replacement SQL.
+#
+# STATUS + CAST notes are generated from core.semantics_registry — the single
+# source of truth. Never hardcode status groupings or cast directions here.
+try:
+    from core.semantics_registry import constraint_note_status, constraint_note_cast
+    _NOTE_STATUS = constraint_note_status()
+    _NOTE_CAST = constraint_note_cast()
+except ImportError:
+    # Fallback literals — keep in sync with core/semantics_registry.py
+    _NOTE_STATUS = (
+        "-- completed = status = 'CLOSED' | conducted = status IN "
+        "('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION') | always exclude DRAFT"
+    )
+    _NOTE_CAST = "-- JOIN ON aa.submission_id = ica.observation_id::varchar"
+
 _CONSTRAINT_NOTE_MAP = {
-    "WRONG_CAST_DIR": (
-        "-- CAST RULE: JOIN ON ica.observation_id = aa.submission_id::uuid\n"
-        "--   ica.observation_id is uuid; aa.submission_id is varchar → cast the varchar side\n"
-        "--   NEVER: aa.submission_id = ica.observation_id::uuid  (reversed)\n"
-        "--   NEVER: ica.observation_id::text = aa.submission_id  (wrong side cast)"
-    ),
+    "WRONG_CAST_DIR": _NOTE_CAST,
     "IMPOSSIBLE_JOIN": (
         "-- Check the join path carefully. Use get_schema to verify FK columns."
     ),
@@ -177,9 +187,28 @@ _CONSTRAINT_NOTE_MAP = {
         "--   WHERE aq.label = 'Observation'  (or whichever label)\n"
         "-- ai_answers also has NO 'form_name' column — it has 'module_name'."
     ),
+    "CYCLE_FREQUENCY_MISSING_SUBQUERY": (
+        "-- 'list all cycles' / 'cycle types' = frequency_definition directly, NO inspection_cycle join:\n"
+        "--   SELECT name AS frequency_name, repeat_count, repeat_interval, repeat_unit\n"
+        "--   FROM frequency_definition WHERE active = true ORDER BY name;\n"
+        "-- The ic->ip->ipd->fd join chain with status='COMPLETED' is ONLY for\n"
+        "--   'the MOST RECENT completed cycle' and REQUIRES:\n"
+        "--   WHERE ic.id = (SELECT id FROM inspection_cycle WHERE status='COMPLETED'\n"
+        "--                   ORDER BY end_date DESC LIMIT 1)"
+    ),
+    "UNDEFINED_ALIAS": (
+        "-- A table alias was referenced in WHERE/SELECT but never introduced via FROM/JOIN.\n"
+        "--   EITHER add the missing JOIN for that alias (if you need its columns),\n"
+        "--   OR remove every reference to that alias if the table isn't actually needed.\n"
+        "--   Re-check every alias used (ica, ir, fac, u, ...) has a matching\n"
+        "--   'FROM <table> <alias>' or 'JOIN <table> <alias>' in the query."
+    ),
     "WRONG_JOIN": (
         "-- 'responsible' and 'pending_with' are VARCHAR enums, not UUID FKs.\n"
-        "--   Do NOT join to users table on these columns."
+        "--   Do NOT join to users table on these columns.\n"
+        "-- 'responsible party' = ica.responsible directly (CLIENT | INTERNAL_OPERATIONS | SUB_CONTRACTOR)\n"
+        "--   SELECT ica.responsible AS responsible_party — NO JOIN to users needed or possible.\n"
+        "--   If a previous attempt added LEFT JOIN users ON ica.responsible = '...', REMOVE that join entirely."
     ),
     "UUID_IN_SELECT": (
         "-- ir.id is the UUID primary key — never SELECT it for display.\n"
@@ -203,11 +232,7 @@ _CONSTRAINT_NOTE_MAP = {
         "--   NEVER truncate to 'STXXX/INSXXX' — always use the complete value the user provided.\n"
         "--   Example: WHERE ir.inspection_id = '2026/01/ST074/INS002'"
     ),
-    "MISSING_COMPLETED_STATUS": (
-        "-- 'completed' inspections require: WHERE ir.status IN ('CLOSED','SUBMITTED')\n"
-        "--   status != 'DRAFT' alone is NOT sufficient — it includes IN_PROGRESS, UNDER_REVIEW etc.\n"
-        "--   Always add: AND ir.status IN ('CLOSED','SUBMITTED')"
-    ),
+    "MISSING_COMPLETED_STATUS": _NOTE_STATUS,
     # Fired when business_rules.py BLOCK rules trigger (error code is "BUSINESS_RULE").
     # The most common cause is block_capex_left_join_multiplication or
     # block_cte_reference_without_definition.  The note gives deepseek the two
@@ -274,9 +299,12 @@ class ConversationSession:
             r"that\s+inspector|that\s+cycle|that\s+person)\b",
             re.IGNORECASE,
         )
+        # A question is "clearly fresh" only when it introduces a wholly new subject.
+        # INTENTIONALLY NARROW: question-starters like "how many", "what", "show", "list"
+        # appear constantly in follow-ups ("how many are completed", "show the open ones")
+        # and must NOT suppress the active context.
         _FRESH_SUBJECT_RE = re.compile(
-            r"\b(what|which|show|list|give|find|how\s+many|average|total|"
-            r"all\s+\w+|most\s+recent(?!ly)|most\s+common|latest)\b",
+            r"\b(most\s+recent(?!ly)|most\s+common|latest)\b",
             re.IGNORECASE,
         )
         is_followup = bool(_FOLLOWUP_RE.search(current_question))
@@ -370,9 +398,12 @@ class ConversationSession:
                 )
             elif active_type == "facility":
                 lines.append(
-                    f"ACTIVE CONTEXT — The conversation is about facility '{active_label}'."
-                    f" When user says 'that facility', 'that site'"
-                    f" — filter by fac.name ILIKE '%{active_label}%'."
+                    f"ACTIVE CONTEXT — The conversation is scoped to facility '{active_label}'."
+                    f" ALL follow-up questions about corrective actions, inspections, scores,"
+                    f" or form answers should include a facility filter"
+                    f" (fac.name ILIKE '%{active_label}%') unless the user explicitly asks"
+                    f" for a global/all-facilities view."
+                    f" Do NOT query globally when the context is scoped to this facility."
                 )
             elif active_type == "corrective_action":
                 lines.append(
@@ -390,10 +421,35 @@ class ConversationSession:
                 )
             elif last.inspection_ids:
                 ids_str = ", ".join(f"\'{i}\'" for i in last.inspection_ids[:5])
-                lines.append(
-                    f"CONTEXT — The conversation involves inspections: {ids_str}."
-                    f" Filter by inspection_id IN ({ids_str}) when user references 'those'."
-                )
+                if last.total_count > len(last.inspection_ids):
+                    # The captured IDs are only a SAMPLE of a larger result set
+                    # (e.g. 5 captured out of 195 total). An IN-list of these 5
+                    # can NEVER represent "all"/"those"/"these" — it would silently
+                    # answer over 5 rows instead of all {total_count}.
+                    # Give Llama the previous SQL so it can re-apply the SAME
+                    # base filters as a fresh aggregate, NOT an IN-list.
+                    prev_sql_snippet = " ".join(last.sql.split())[:500] if last.sql else "(not available)"
+                    lines.append(
+                        f"CONTEXT — The previous result had {last.total_count} total rows; "
+                        f"only {len(last.inspection_ids)} sample IDs were captured ({ids_str})."
+                        f" These {len(last.inspection_ids)} IDs are NOT the full set.\n"
+                        f"  If the user asks 'how many of these/those/them are X' (an aggregate"
+                        f" over the FULL {last.total_count}-row result), do NOT filter by"
+                        f" inspection_id IN (...) — that covers only"
+                        f" {len(last.inspection_ids)} of {last.total_count} rows.\n"
+                        f"  INSTEAD: reuse the SAME FROM/JOIN/WHERE filters as the previous"
+                        f" query below, add the new condition (e.g. status = 'CLOSED'), and"
+                        f" return a fresh COUNT(*) — a complete recount, not a sample filter.\n"
+                        f"  Previous SQL: {prev_sql_snippet}"
+                    )
+                else:
+                    # The captured IDs ARE the complete result set (small result,
+                    # e.g. "inspections by George" → 3 rows) — IN-list is valid here.
+                    lines.append(
+                        f"CONTEXT — The conversation involves inspections: {ids_str}"
+                        f" (this is the COMPLETE result set, {last.total_count or len(last.inspection_ids)} total)."
+                        f" Filter by inspection_id IN ({ids_str}) when user references 'those'."
+                    )
             elif last.facility_names and len(last.facility_names) == 1:
                 lines.append(
                     f"CONTEXT — The conversation is about facility '{last.facility_names[0]}'."
@@ -500,7 +556,7 @@ class AgentOrchestrator:
             temperature=0.2, request_timeout=120.0,
             additional_kwargs={
                 "num_predict": 1024,
-                "num_ctx": 16384,
+                "num_ctx": 20000,
                 "think": False,   # Disable Qwen3 internal chain-of-thought — saves 8-15s per call
             })
         print(f"  ✓ Reasoning LLM ({chat_model})")
@@ -565,7 +621,7 @@ class AgentOrchestrator:
         def _emit(event):
             if on_step: on_step(event)
 
-        system_content = self._system_prompt
+        system_content = self._system_prompt + build_dynamic_prompt_additions(question)
         if session and session.turns:
             system_content += "\n\n" + session.build_context_block(question)
 
@@ -770,15 +826,20 @@ class AgentOrchestrator:
                     _last_total_count = exec_data.get("total_count", exec_data.get("row_count", 0))
                     _last_columns = exec_data.get("columns", [])
 
-                    if self._is_preparatory_result(question, er):
-                        rows_preview = json.dumps(exec_data.get("rows", [])[:10], default=str)
+                    if self._is_preparatory_result(question, er, sql):
                         messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
-                        messages.append(ChatMessage(role=MessageRole.USER, content=
-                            f"SQL: {sql}\nResult: {exec_data.get('row_count',0)} rows, "
-                            f"columns={exec_data.get('columns',[])}\n"
-                            f"Sample: {rows_preview}\n\n"
-                            f"Original question: \"{question}\"\n"
-                            f"If this answers it, call final_answer. Otherwise call the next tool."))
+                        if self._is_disambiguation_check(exec_data.get("columns", []), sql):
+                            followup = self._disambiguation_followup_message(question, sql, exec_data)
+                        else:
+                            rows_preview = json.dumps(exec_data.get("rows", [])[:10], default=str)
+                            followup = (
+                                f"SQL: {sql}\nResult: {exec_data.get('row_count',0)} rows, "
+                                f"columns={exec_data.get('columns',[])}\n"
+                                f"Sample: {rows_preview}\n\n"
+                                f"Original question: \"{question}\"\n"
+                                f"If this answers it, call final_answer. Otherwise call the next tool."
+                            )
+                        messages.append(ChatMessage(role=MessageRole.USER, content=followup))
                         continue
 
                     ans = self._synthesize(question, "execute_sql", er)
@@ -986,14 +1047,16 @@ class AgentOrchestrator:
             active_subject_type = "facility"
             active_subject_value = fac_names[0]
             active_subject_label = fac_names[0]
-        # If previous turn had a cycle scope and this result has no conflicting subject,
-        # inherit the cycle scope so it persists across multi-turn drilldowns
+        # If previous turn had a scoped subject (cycle or facility) and this result
+        # has no conflicting subject (e.g. a COUNT query with no facility_name column),
+        # inherit the scope so it persists across multi-turn drilldowns.
         elif session and session.turns:
-            prev_turn = session.turns[-1]
-            if prev_turn.active_subject_type == "cycle" and prev_turn.active_subject_value:
-                active_subject_type = "cycle"
-                active_subject_value = prev_turn.active_subject_value
-                active_subject_label = prev_turn.active_subject_label
+            for prev_turn in reversed(session.turns):
+                if prev_turn.active_subject_type and prev_turn.active_subject_value:
+                    active_subject_type = prev_turn.active_subject_type
+                    active_subject_value = prev_turn.active_subject_value
+                    active_subject_label = prev_turn.active_subject_label
+                    break
 
         if session is not None:
             # MT-03 fix: if we have a facility name but no inspection_id (e.g. MT-01
@@ -1440,11 +1503,125 @@ class AgentOrchestrator:
 
         return content
 
-    def _is_preparatory_result(self, question: str, exec_result: dict) -> bool:
+    @staticmethod
+    def _is_disambiguation_check(columns: list[str], sql: str) -> bool:
+        """
+        True if this result is an AMBIGUOUS REFERENCE RULE STEP 1 existence/count
+        check — both templates (people: id+name; entity: id+name+inspection_count)
+        produce this exact column shape combined with a partial-match ILIKE filter.
+        Shared by _is_preparatory_result (decides whether to loop back to Llama)
+        and the follow-up-message builder (decides which instructions to send).
+        """
+        col_set = {c.lower() for c in columns}
+        return (
+            col_set in ({"id", "name"}, {"id", "name", "inspection_count"})
+            and "ilike '%" in sql.lower()
+        )
+
+    def _disambiguation_followup_message(self, question: str, sql: str, exec_data: dict) -> str:
+        """
+        Build a STEP-2a/2b-specific follow-up message for a disambiguation STEP 1
+        result, instead of the generic "If this answers it, call final_answer"
+        message — which previously caused Llama to statistically summarize the
+        disambiguation table (MAX/SUM of inspection_count) instead of recognizing
+        2+ rows as the STEP 2b "which one did you mean?" trigger.
+        """
+        rows = exec_data.get("rows", [])
+        columns = [c.lower() for c in exec_data.get("columns", [])]
+        m = re.search(r"ilike '%(.+?)%'", sql, re.IGNORECASE)
+        name_filter = m.group(1) if m else "?"
+
+        if "inspection_count" in columns:
+            # Entity template — only candidates with inspections > 0 are useful
+            # answers to "show inspections at X"; zero-inspection facilities are
+            # real matches but not relevant choices.
+            nonzero = [r for r in rows if (r.get("inspection_count") or 0) > 0]
+            if len(nonzero) == 0:
+                return (
+                    f"STEP 1 disambiguation check found {len(rows)} facilities matching "
+                    f"'{name_filter}', but NONE have any inspections.\n"
+                    f"Original question: \"{question}\"\n"
+                    f"Call final_answer stating no inspections were found at any facility "
+                    f"matching '{name_filter}'."
+                )
+            elif len(nonzero) == 1:
+                r = nonzero[0]
+                return (
+                    f"STEP 1 disambiguation check: exactly ONE facility matching "
+                    f"'{name_filter}' has inspections — '{r.get('name')}' "
+                    f"({r.get('inspection_count')} inspections).\n"
+                    f"Original question: \"{question}\"\n"
+                    f"This is STEP 2a — call generate_sql again using "
+                    f"fac.name ILIKE '%{r.get('name')}%' to filter by this facility. "
+                    f"Do NOT use fac.id UUID — the SQL model ignores UUID filters "
+                    f"and will generate ILIKE anyway. Use the exact name directly."
+                )
+            else:
+                options = "\n".join(
+                    f"  • {r.get('name')} ({r.get('inspection_count')} inspections)"
+                    for r in nonzero
+                )
+                return (
+                    f"STEP 1 disambiguation check: {len(nonzero)} facilities matching "
+                    f"'{name_filter}' have inspections (out of {len(rows)} total matches).\n"
+                    f"Original question: \"{question}\"\n"
+                    f"This is STEP 2b — call final_answer NOW with EXACTLY this format "
+                    f"(do not compute totals, leaders, sums, or any other statistic; do "
+                    f"not call generate_sql again):\n"
+                    f"\"I found {len(nonzero)} facilities matching '{name_filter}':\n"
+                    f"{options}\n"
+                    f"Which one did you mean?\""
+                )
+        else:
+            # People template — no count column, list all matched names
+            if len(rows) == 0:
+                return (
+                    f"STEP 1 disambiguation check found NO users matching "
+                    f"'{name_filter}'.\n"
+                    f"Original question: \"{question}\"\n"
+                    f"Call final_answer stating no matching person was found."
+                )
+            elif len(rows) == 1:
+                r = rows[0]
+                _name_parts = str(r.get('name', '')).split()
+                _first = _name_parts[0] if _name_parts else name_filter
+                _last = _name_parts[-1] if len(_name_parts) > 1 else ''
+                return (
+                    f"STEP 1 disambiguation check: exactly ONE person matches "
+                    f"'{name_filter}' — '{r.get('name')}'.\n"
+                    f"Original question: \"{question}\"\n"
+                    f"This is STEP 2a — call generate_sql again filtered by name: "
+                    f"WHERE u.first_name ILIKE '%{_first}%' AND u.last_name ILIKE '%{_last}%' "
+                    f"(joined via inspector_user_id or inspectee_user_id per the question's "
+                    f"role wording). Do NOT use u.id UUID — the SQL model ignores UUID "
+                    f"filters and will generate ILIKE anyway."
+                )
+            else:
+                options = "\n".join(f"  • {r.get('name')}" for r in rows)
+                return (
+                    f"STEP 1 disambiguation check: {len(rows)} people match "
+                    f"'{name_filter}'.\n"
+                    f"Original question: \"{question}\"\n"
+                    f"This is STEP 2b — call final_answer NOW with EXACTLY this format "
+                    f"(do not pick one, do not compute statistics, do not call "
+                    f"generate_sql again):\n"
+                    f"\"I found {len(rows)} people matching '{name_filter}':\n"
+                    f"{options}\n"
+                    f"Which one did you mean?\""
+                )
+
+    def _is_preparatory_result(self, question: str, exec_result: dict, sql: str = "") -> bool:
         q_lower = question.lower()
         data = exec_result.get("result", {})
         columns = [c.lower() for c in data.get("columns", [])]
         row_count = data.get("row_count", 0)
+
+        # AMBIGUOUS REFERENCE RULE STEP 1 check — see _is_disambiguation_check.
+        # Without this, STEP 1 results render directly as a table and Llama
+        # never gets to branch into STEP 2a/2b — the disambiguation flow
+        # silently becomes a dead-end table dump.
+        if self._is_disambiguation_check(columns, sql):
+            return True
 
         wants_content = bool(re.search(
             r'\b(question|label|answer|response|what.*in)\b', q_lower))

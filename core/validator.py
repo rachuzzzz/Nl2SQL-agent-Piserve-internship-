@@ -239,6 +239,14 @@ class SQLValidator:
         # capex_status DOES exist (unsuppressed) — do not flag it
         "adequacy_status":    "does not exist — adequacy workflow not active",
         "risk_level":         "does not exist as a column — risk_level_id is a UUID FK; JOIN risk_level rl ON ica.risk_level_id = rl.id → rl.name",
+        # ICA columns that do not exist — common hallucinations
+        "due_date":           "does not exist on inspection_corrective_action — use target_close_out_date",
+        "actual_date":        "does not exist on inspection_corrective_action — use completed_on (for closed rows) or target_close_out_date (for deadline)",
+        # mitigative_action_uuid is on po_details/pr_details — only block if qualified as ica.mitigative_action_uuid
+        # "po.mitigative_action_uuid = ica.id" is CORRECT and must NOT be blocked
+        "ica.mitigative_action_uuid": "does not exist on inspection_corrective_action — use po_details.mitigative_action_uuid = ica.id",
+        "completion_date":    "does not exist on inspection_corrective_action — use completed_on (actual closure timestamp, populated for CLOSED rows)",
+        "resolution_date":    "does not exist on inspection_corrective_action — use completed_on (actual closure timestamp for CLOSED rows)",
         "impact":             "does not exist as a column on ica — impact data is in ai_answers: JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aq.label = 'Impact'",
         # Other ghost columns seen in traces
         "corrective_action_description": "does not exist — use ica.corrective_action (the text field)",
@@ -267,16 +275,13 @@ class SQLValidator:
         (r'\bisched\.inspection_id\b|\binspection_schedule\.inspection_id\b',
          'inspection_schedule has no inspection_id — use inspection_report_id FK'),
         # ── observation → ai_answers cast direction ───────────────────────────
-        # CORRECT cast: ica.observation_id = aa.submission_id::uuid
-        #   (ica.observation_id is uuid, aa.submission_id is varchar — cast the varchar)
-        # WRONG casts caught below:
-        #   aa.submission_id = ica.observation_id::uuid  (reversed)
-        #   ica.observation_id::text = aa.submission_id  (wrong side cast)
-        (r'\baa\.submission_id\s*=\s*ica\.observation_id(?:::\w+)?\b',
-         'Wrong cast direction. Correct: ica.observation_id = aa.submission_id::uuid '
-         '(cast the varchar submission_id to uuid, not the uuid observation_id)'),
+        # CORRECT cast: aa.submission_id = ica.observation_id::varchar
+        #   (ica.observation_id is uuid, aa.submission_id is varchar — cast uuid to varchar)
+        #   Verified in pgAdmin: aa.submission_id = ica.observation_id::varchar works correctly
+        # WRONG cast caught below:
+        #   ica.observation_id::text = aa.submission_id  (wrong side assignment)
         (r'\bica\.observation_id\s*::\s*text\s*=\s*aa\.submission_id\b',
-         'Wrong cast direction. Correct: ica.observation_id = aa.submission_id::uuid'),
+         'Wrong cast — use: aa.submission_id = ica.observation_id::varchar'),
     ]
 
     # UUID FK columns — SOFT_WARN if selected without their lookup JOIN
@@ -413,24 +418,37 @@ class SQLValidator:
         # deepseek confabulates risk/deferral columns that don't exist on ICA.
         # Proven in traces: capex_status, adequacy_status, times_deferred.
         # Also guards ir.current_qtr_score / ir.last_qtr_score ghost columns.
-        ica_used = bool(re.search(
-            r'\b(inspection_corrective_action|ica|ic)\b', sql_lower
-        ))
+        #
+        # ALIAS AMBIGUITY (fixed 2026-06-11): "ic" is ALSO the conventional
+        # alias for inspection_cycle (e.g. "JOIN inspection_cycle ic ON ...").
+        # A bare \bic\b match previously activated this whole section for
+        # queries that have NO inspection_corrective_action table at all —
+        # then a query selecting isched.due_date (valid — inspection_schedule
+        # HAS a due_date column) was wrongly flagged as a hallucinated ICA
+        # column. Fix: only treat "ica"/"ic" as ICA aliases if
+        # inspection_corrective_action actually appears in FROM/JOIN; extract
+        # its real alias(es) from there instead of guessing.
+        _ica_table_used = bool(re.search(r'\binspection_corrective_action\b', sql_lower))
+        _ica_aliases: set[str] = {"ica", "inspection_corrective_action"}
+        for _m in re.finditer(r'\binspection_corrective_action\s+(?:as\s+)?(\w+)', sql_lower):
+            _ica_aliases.add(_m.group(1))
+        ica_used = _ica_table_used or bool(re.search(r'\bica\b', sql_lower))
         if ica_used:
             for col, hint in self.HALLUCINATED_ICA_COLUMNS.items():
                 qualified_only = col in self._ICA_QUALIFIED_ONLY_COLS
                 hit = False
-                for alias in ("ica", "ic", "inspection_corrective_action", "icr", "ca"):
+                for alias in _ica_aliases:
                     if re.search(rf"\b{re.escape(alias)}\.{re.escape(col)}\b", sql_lower):
                         hit = True
                         break
                 if not hit and not qualified_only:
                     # Unqualified bare reference — only flag in clause positions
                     # (ORDER BY, WHERE, SELECT column list) to avoid matching aliases/comments.
-                    # Exclude occurrences that follow AS (alias declarations).
-                    col_pattern = rf"(?<!as\s)(?<!as  )\b{re.escape(col)}\b"
+                    # (?<![\w.]) excludes BOTH "foo_due_date" (different identifier) AND
+                    # "isched.due_date" (validly qualified to a DIFFERENT table that
+                    # legitimately has this column, e.g. inspection_schedule.due_date).
                     if re.search(
-                        rf"(?:order\s+by|where\s|select\s)[^;]*\b{re.escape(col)}\b",
+                        rf"(?:order\s+by|where\s|select\s)[^;]*(?<![\w.]){re.escape(col)}\b",
                         sql_lower, re.DOTALL
                     ) and not re.search(
                         rf"\bAS\s+{re.escape(col)}\b",
@@ -480,6 +498,17 @@ class SQLValidator:
                         detail="ir.inspection_id is the human-readable varchar '2026/04/ST001/INS001'",
                     ))
                     ValidatorStats.record("UUID_IN_SELECT", is_retry_trigger=True)
+
+        # ── 6b. Undefined table aliases — column refs to aliases not in FROM/JOIN ──
+        # Catches: SELECT ... WHERE ir.active = true  with NO "FROM/JOIN ... ir"
+        # anywhere in the query. Postgres rejects this at execution time with
+        # 'missing FROM-clause entry for table "ir"', but plain-regex validation
+        # passes it since 'ir.active' LOOKS like a valid qualified column.
+        # Observed 2026-06-11: this exact pattern passed validation twice in a
+        # row (Deepseek kept dropping the JOIN while keeping ir.active in WHERE),
+        # burning 3 retries before Llama finally added the missing JOIN.
+        if _HAS_SQLGLOT:
+            _check_undefined_table_aliases(sql, issues)
 
         # ── 7. Dynamic fb_{uuid} table references ─────────────────────────
         if self._DYNAMIC_TABLE_RE.search(sql):
@@ -540,17 +569,20 @@ class SQLValidator:
             ValidatorStats.record("STALE_DATE_LITERAL", is_retry_trigger=True)
             break  # one report is enough
 
-        # ── 10. close_on arithmetic — SOFT_WARN (not a hard fail) ─────────
-        # close_on is NULL for most records but arithmetic IS valid for the
-        # subset where it is populated. Block only with a soft advisory.
+        # ── 10. close_on arithmetic — HARD_FAIL (dead column, all NULL) ──────
+        # close_on does not exist — any reference to it fails at the DB level.
+        
+        # business_rules.py block_close_on_arithmetic also blocks this at the
+        # INJECT layer; this validator check catches it at execution-time too.
         if self._CLOSE_ON_ARITH_RE.search(sql):
             issues.append(ValidationIssue(
-                "SOFT_WARN", "UNRELIABLE_COLUMN",
-                "Arithmetic on 'close_on' may be unreliable — column is NULL for most records",
-                detail="Alternative: COUNT(*) FILTER (WHERE status IN ('CLOSED','CLOSE_WITH_DEFERRED'))",
-                retryable=False,
+                "HARD_FAIL", "DEAD_COLUMN",
+                "BLOCKED: close_on does not exist — use completed_on "
+                "for closure timing (populated for status='CLOSED' rows)",
+                detail="For closed-late: status='CLOSED' AND completed_on > target_close_out_date",
+                retryable=True,
             ))
-            ValidatorStats.record("UNRELIABLE_COLUMN", is_retry_trigger=False)
+            ValidatorStats.record("DEAD_COLUMN", is_retry_trigger=True)
 
         # ── 10b. TO_CHAR used as a WHERE filter — HARD_FAIL ───────────────
         # TO_CHAR(col, 'Month YYYY') = 'January 2026' silently returns 0 rows
@@ -1216,6 +1248,73 @@ def _strip_nested_parens(sql: str) -> str:
         elif depth > 0:
             result[i] = ' '
     return ''.join(result)
+
+
+def _check_undefined_table_aliases(sql: str, issues: list[ValidationIssue]) -> None:
+    """
+    Use sqlglot AST to verify every table-qualified column reference (alias.col)
+    corresponds to a table/alias actually introduced by FROM/JOIN in some scope
+    that contains it (including CTEs and subqueries).
+
+    This catches the class of error where Deepseek drops a JOIN but leaves a
+    WHERE/SELECT reference to that table's alias — SQL that LOOKS syntactically
+    plausible to regex checks but Postgres rejects with:
+        missing FROM-clause entry for table "ir"
+
+    Conservative by design — false negatives are OK (we'd rather miss a case
+    than block valid SQL): we collect ALL aliases/table-names introduced
+    ANYWHERE in the statement (any scope) into one set, plus a few universal
+    aliases that legitimately appear without local definition in some dialects.
+    A reference is only flagged if its qualifier appears NOWHERE as an
+    introduced table/alias/CTE-name in the entire statement.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, dialect="postgres")
+    except Exception:
+        return
+
+    introduced: set[str] = set()
+
+    # Every table reference contributes its alias (if any) and its bare name.
+    for t in tree.find_all(exp.Table):
+        if t.alias:
+            introduced.add(t.alias.lower())
+        # bare table name is also a valid qualifier (e.g. "inspection_report.facility_id")
+        if t.name:
+            introduced.add(t.name.lower())
+
+    # CTE names (WITH foo AS (...) — "foo" can be referenced like a table)
+    for cte in tree.find_all(exp.CTE):
+        if cte.alias:
+            introduced.add(cte.alias.lower())
+
+    # Subquery aliases: (SELECT ...) AS sub
+    for sq in tree.find_all(exp.Subquery):
+        if sq.alias:
+            introduced.add(sq.alias.lower())
+
+    if not introduced:
+        return  # couldn't determine scope — fail safe, don't block
+
+    # Collect all qualified column references: <alias>.<col>
+    undefined: set[str] = set()
+    for col in tree.find_all(exp.Column):
+        if col.table and col.table.lower() not in introduced:
+            undefined.add(col.table.lower())
+
+    if undefined:
+        bad = ", ".join(sorted(undefined))
+        issues.append(ValidationIssue(
+            "HARD_FAIL", "UNDEFINED_ALIAS",
+            f"Table alias '{bad}' is used in WHERE/SELECT but not introduced "
+            f"by any FROM/JOIN — add the missing JOIN or remove the reference",
+            detail=(
+                f"Aliases referenced but never joined: {bad}. "
+                f"Tables/aliases actually in scope: {', '.join(sorted(introduced))}. "
+                f"Postgres would reject this with 'missing FROM-clause entry for table \"{sorted(undefined)[0]}\"'."
+            ),
+        ))
+        ValidatorStats.record("UNDEFINED_ALIAS", is_retry_trigger=True)
 
 
 def _check_ir_id_in_select_ast(sql: str, issues: list[ValidationIssue]) -> None:

@@ -113,14 +113,18 @@ JOIN_GRAPH: dict[str, dict[str, tuple]] = {
     # ── lookup tables (typically leaf nodes) ──────────────────────────────
     "facility": {
         "inspection_report": ("ir",  "ir.facility_id = fac.id"),
-        "organisation":      ("org", "org.id = fac.organization_id"),   # American spelling on FK
+        # organisation edge REMOVED — facility.organization_id is all-NULL (confirmed).
+        # business_rules.py block_organisation_join hard-blocks JOIN organisation.
+        # See: semantics_registry.py / block_organisation_join in business_rules.py.
         "country":           ("c",   "c.id = fac.country_id"),
         "region":            ("reg", "reg.id = fac.region_id"),
         # client_id does not exist on facility — client reached via inspection_report.client_id
     },
-    "organisation": {
-        "facility":          ("fac", "fac.organization_id = org.id"),   # American spelling on FK
-    },
+    # organisation table entry REMOVED — FK from facility is all-NULL, join always
+    # returns zero rows, and business_rules hard-blocks it. Keeping it here caused
+    # the agent to attempt the join path before hitting the block rule (wasteful).
+    # If organisation data is ever needed, revisit once FK is populated.
+    # "organisation": { ... },  # DEAD — do not re-enable without schema confirmation
     "country": {
         "facility":          ("fac", "fac.country_id = c.id"),
         "region":            ("reg", "reg.country_id = c.id"),

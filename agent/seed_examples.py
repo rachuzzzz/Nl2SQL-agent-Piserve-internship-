@@ -7,20 +7,97 @@ Each entry is a dict with:
   domain: financial | corrective_action | inspection | schedule | form_answers | general
   intent: single_value | ranked_list | aggregate | filter | trend
   limit:  int or None — the LIMIT value in the SQL
+
+STATUS GROUPINGS + CAST RULES come from core.semantics_registry — the single
+source of truth. Edit there, not here.
 """
+
+import re
+
+# ── Registry-generated blocks (single source of truth) ──────────────────────
+try:
+    from core.semantics_registry import (
+        core_context_status_block as _status_block,
+        core_context_cast_block as _cast_block,
+        core_context_counting_block as _counting_block,
+        core_context_columns_block as _columns_block,
+        core_context_ca_workflow_block as _ca_workflow_block,
+    )
+    _STATUS_BLOCK = _status_block()
+    _CAST_BLOCK = _cast_block()
+    _COUNTING_BLOCK = _counting_block()
+    _COLUMNS_BLOCK = _columns_block()
+    _CA_WORKFLOW_BLOCK = _ca_workflow_block()
+except ImportError:
+    # Fallback — keep in sync with core/semantics_registry.py
+    _STATUS_BLOCK = """\
+-- DRAFT RECORDS ARE NEVER COUNTED — GLOBAL RULE:
+--   DRAFT inspections are incomplete — they must NEVER appear in any count, list, average, or aggregate.
+--
+-- STATUS GROUPINGS — always bucket into two categories (never expose raw status names to user):
+--   conducted  = status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION') — in-flight
+--   completed  = status = 'CLOSED'                                                — fully approved
+--
+-- DEFAULT for "total inspections / how many inspections / inspections in <month>":
+--   Show as TWO-ROW summary using CASE grouping:
+--     CASE WHEN ir.status = 'CLOSED' THEN 'completed' ELSE 'conducted' END AS category
+--   NEVER show raw status breakdown (SUBMITTED/UNDER_REVIEW/etc) unless user explicitly asks
+--   NEVER use status IN ('CLOSED','SUBMITTED') — that mixes conducted and completed
+--   NEVER use status != 'DRAFT' alone for conducted — CLOSED is not conducted"""
+    _CAST_BLOCK = """\
+-- OBSERVATION → CA JOIN — exact form:
+--   aa.submission_id = ica.observation_id::varchar
+--   NEVER: aa.submission_id::uuid = ica.observation_id
+--   NEVER: ica.observation_id::text = aa.submission_id"""
+    _COUNTING_BLOCK = """\
+-- GOOD PRACTICE / DEVIATION COUNTING — always COUNT(DISTINCT ir.id), NEVER COUNT(*):
+--   each inspection is Good Practice OR Deviation (mutually exclusive); COUNT(*) on ai_answers rows overcounts.
+--   Same rule applies to deviation counts.
+--   WRONG:  SELECT COUNT(*) ... WHERE aq.label='Observation Type' AND aa.answer_text ILIKE '%Good Practice%'
+--   CORRECT: SELECT COUNT(DISTINCT ir.id) ... same filters
+-- OBSERVATIONS PER INSPECTION — use COUNT(DISTINCT aa.submission_id):
+--   one submission_id per observation group; COUNT(*) counts every answer row (Risk Level, Impact, ...)"""
+    _COLUMNS_BLOCK = """\
+-- SOFT-DELETE: these tables have an 'active' boolean column — ALWAYS filter WHERE active = true:
+--   inspection_report, inspection_corrective_action, facility, users,
+--   inspection_type, inspector_portfolio, inspector_portfolio_details,
+--   frequency_definition, po_details, pr_details, risk_level
+-- NO active column: ai_answers, ai_questions, role, user_roles, inspection_schedule
+--   NEVER use aa.active or aq.active — these columns do not exist"""
+    _CA_WORKFLOW_BLOCK = """\
+-- CORRECTIVE ACTION WORKFLOW — four independent tracks on ica:
+--   status (system):            OPEN | CLOSED | OVERDUE | CLOSE_WITH_DEFERRED
+--   progress_stage (inspectee): NOT_STARTED, ON_TRACK, BEHIND, AT_RISK, COMPLETED, CLOSE_WITH_DEFERRED
+--   implementation_status (reviewers): NULL | PENDING_FOR_REVIEW | APPROVE | RETURN_FOR_MODIFICATION
+--     EXACT STRINGS: 'APPROVE' not 'APPROVED' — 'PENDING_FOR_REVIEW' not 'PENDING'
+--   capex_status (USER-ENTERED, declarative only): NULL | ACCEPTED | REJECTED | DEFERRED
+--     po_details is the authoritative money record — POs legitimately exist on REJECTED rows
+-- INVARIANTS:
+--   status = 'CLOSED'  ⟺  implementation_status = 'APPROVE' (closure IS the approval)
+--   RETURN_FOR_MODIFICATION resets progress_stage to NULL — progress_stage='COMPLETED' MISSES returned CAs
+--   inspection_report closes only when ALL its CAs are closed
+-- TRAP: 'at risk' = progress_stage='AT_RISK' (schedule health), NOT risk_level='High' (severity)"""
 
 CORE_CONTEXT = """\
 
 ### SQL RULES FOR DEEPSEEK (not for end user):
 -- ir.inspection_id (VARCHAR) = display id | ir.id (UUID) = JOIN/subquery only, NEVER SELECT
 -- ICA join: ON ica.inspection_id = ir.id  (NOT ir.inspection_id = ica.inspection_id)
--- completed = status IN ('CLOSED','SUBMITTED') | responsible: 'CLIENT','INTERNAL_OPERATIONS','SUB_CONTRACTOR'
--- completed inspections filter: ALWAYS use status IN ('CLOSED','SUBMITTED') — NOT status != 'DRAFT'
---   status != 'DRAFT' includes IN_PROGRESS, UNDER_REVIEW, RETURN_FOR_MODIFICATION — NOT completed
+-- responsible: 'CLIENT','INTERNAL_OPERATIONS','SUB_CONTRACTOR'
+""" + _STATUS_BLOCK + """
+--
+""" + _CAST_BLOCK + """
 --
 -- inspection_schedule columns: schedule_date (NOT scheduled_date), due_date, schedule_id, status
 --   NEVER: sched.scheduled_date — column is schedule_date
 --   NEVER: sched.active — inspection_schedule has no active column
+--
+-- UNION / UNION ALL TYPE SAFETY:
+--   Every column position must have the SAME type in all branches.
+--   NEVER 'N/A' placeholder against a date/numeric/enum column — runtime type-mismatch error.
+--   Placeholders must be explicitly typed: NULL::text, NULL::date, NULL::numeric.
+--   When mixing tables, cast real date/enum columns ::text in BOTH branches.
+--   PREFER scalar subqueries in one row over UNION of heterogeneous tables.
 -- NEVER: ir.id in SELECT | NEVER: ica.risk_level_id vs string | NEVER: GROUP BY ica.risk_level_id
 -- completed_cycle = status='COMPLETED' (NOT 'CLOSED', NOT status!='DRAFT')
 -- NEVER: ipd.cycle_id (no such column on inspector_portfolio_details)
@@ -52,12 +129,7 @@ CORE_CONTEXT = """\
 --   Conversion rate = SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100
 --   High OPEX means Khidmah is absorbing costs the client should bear — a negative indicator
 --
--- SOFT-DELETE: these tables have an 'active' boolean column — ALWAYS filter WHERE active = true:
---   inspection_report, inspection_corrective_action, facility, users,
---   inspection_type, inspector_portfolio, inspector_portfolio_details,
---   frequency_definition, po_details, pr_details, risk_level
--- NO active column: ai_answers, ai_questions, role, user_roles, inspection_schedule
---   NEVER use aa.active or aq.active — these columns do not exist
+""" + _COLUMNS_BLOCK + """
 --
 -- DATE FILTERING — month/year specific:
 --   CORRECT:  EXTRACT(MONTH FROM ir.submitted_on) = 1 AND EXTRACT(YEAR ...) = EXTRACT(YEAR FROM CURRENT_DATE)
@@ -90,22 +162,107 @@ JOIN users u   ON ir.inspector_user_id = u.id
 JOIN facility fac ON ir.facility_id = fac.id
 JOIN inspection_type it ON ir.inspection_type_id = it.id
 WHERE ir.inspection_id = '2026/01/ST074/INS002'
-  AND ir.active = true;
+  AND ir.active = true
+  AND ir.status != 'DRAFT';
 """,
         'domain': 'inspection',
         'intent': 'single_value',
         'limit':  1,
     },
     {
-        'nl':     'how many inspections were completed this year',
+        'nl':     'how many inspections were completed this year total inspections this year inspections in 2026 how many inspections in a month',
         'sql':    """\
+-- DEFAULT for "total/how many inspections" — show as conducted vs completed two-row summary
+-- conducted = SUBMITTED + UNDER_REVIEW + RETURN_FOR_MODIFICATION (in-flight, non-draft, non-closed)
+-- completed = CLOSED only
+-- NEVER show raw status breakdown unless user explicitly asks to drill in
+SELECT
+    CASE WHEN ir.status = 'CLOSED' THEN 'completed' ELSE 'conducted' END AS category,
+    COUNT(*) AS inspection_count
+FROM inspection_report ir
+WHERE ir.active = true
+  AND ir.status != 'DRAFT'
+  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
+GROUP BY category
+ORDER BY category DESC;
+""",
+        'domain': 'inspection',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'total inspections in a specific month inspections in March 2026 inspections in February how many inspections in March',
+        'sql':    """\
+-- For a specific month/year: conducted vs completed two-row summary
+-- conducted = IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')
+-- completed = CLOSED
+SELECT
+    CASE WHEN ir.status = 'CLOSED' THEN 'completed' ELSE 'conducted' END AS category,
+    COUNT(*) AS inspection_count
+FROM inspection_report ir
+WHERE ir.active = true
+  AND ir.status != 'DRAFT'
+  AND EXTRACT(MONTH FROM ir.submitted_on) = 3
+  AND EXTRACT(YEAR FROM ir.submitted_on) = 2026
+GROUP BY category
+ORDER BY category DESC;
+""",
+        'domain': 'inspection',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'show only conducted inspections drill into conducted how many conducted inspections in March',
+        'sql':    """\
+-- Drill-down into conducted only
+-- conducted = IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')
+-- NEVER: status != 'DRAFT' AND status != 'CLOSED' — use explicit IN list, Deepseek drops double negation
+SELECT COUNT(*) AS conducted_count
+FROM inspection_report ir
+WHERE ir.active = true
+  AND ir.status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')
+  AND EXTRACT(MONTH FROM ir.submitted_on) = 3
+  AND EXTRACT(YEAR FROM ir.submitted_on) = 2026;
+""",
+        'domain': 'inspection',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'show only completed inspections drill into completed how many completed inspections in March',
+        'sql':    """\
+-- Drill-down into completed only
+-- completed = status = 'CLOSED' only
 SELECT COUNT(*) AS completed_count
 FROM inspection_report ir
 WHERE ir.active = true
-  AND ir.status IN ('CLOSED','SUBMITTED')
-  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE);
+  AND ir.status = 'CLOSED'
+  AND EXTRACT(MONTH FROM ir.submitted_on) = 3
+  AND EXTRACT(YEAR FROM ir.submitted_on) = 2026;
 """,
         'domain': 'inspection',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'what needs attention right now critical issues urgent items what should I look at dashboard summary action items',
+        'sql':    """\
+-- "Needs attention" dashboard — ONE ROW of scalar subqueries.
+-- NEVER UNION ALL heterogeneous tables (CA list + schedule list) — column types
+-- clash ('N/A' text vs date/enum) and the query fails at runtime.
+SELECT
+    (SELECT COUNT(*) FROM inspection_corrective_action
+     WHERE status = 'OVERDUE' AND active = true)                    AS overdue_corrective_actions,
+    (SELECT COUNT(*) FROM inspection_corrective_action
+     WHERE status = 'OPEN' AND active = true)                       AS open_corrective_actions,
+    (SELECT COUNT(*) FROM inspection_schedule
+     WHERE status = 'OVERDUE')                                      AS overdue_scheduled_inspections,
+    (SELECT COUNT(*) FROM inspection_corrective_action ica
+     JOIN risk_level rl ON ica.risk_level_id = rl.id
+     WHERE rl.name = 'High' AND ica.status IN ('OPEN','OVERDUE')
+       AND ica.active = true)                                       AS high_risk_open_cas;
+""",
+        'domain': 'corrective_action',
         'intent': 'aggregate',
         'limit':  None,
     },
@@ -118,6 +275,181 @@ WHERE ica.active = true AND ica.status = 'OPEN';
 """,
         'domain': 'corrective_action',
         'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'corrective actions pending approval awaiting review CAs waiting for FM manager approval pending review',
+        'sql':    """\
+-- Pending approval = implementation_status = 'PENDING_FOR_REVIEW' (EXACT string — not 'PENDING')
+-- These are CAs the inspectee marked COMPLETED, awaiting FM manager + inspector approval
+SELECT ica.corrective_action_id, ica.cause, ica.corrective_action,
+       ica.responsible, ica.progress_stage, ica.implementation_status,
+       fac.name AS facility_name, ir.inspection_id
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE ica.implementation_status = 'PENDING_FOR_REVIEW'
+  AND ica.active = true AND ir.active = true
+ORDER BY ica.target_close_out_date ASC NULLS LAST
+LIMIT 100;
+""",
+        'domain': 'corrective_action',
+        'intent': 'filter',
+        'limit':  100,
+    },
+    {
+        'nl':     'corrective actions sent back returned for modification rejected by reviewer CAs returned to inspectee',
+        'sql':    """\
+-- Sent back = implementation_status = 'RETURN_FOR_MODIFICATION'
+-- NOTE: this resets progress_stage to NULL — do not also filter progress_stage
+SELECT ica.corrective_action_id, ica.cause, ica.corrective_action,
+       ica.responsible, ica.implementation_status,
+       fac.name AS facility_name, ir.inspection_id
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE ica.implementation_status = 'RETURN_FOR_MODIFICATION'
+  AND ica.active = true AND ir.active = true
+ORDER BY ica.target_close_out_date ASC NULLS LAST
+LIMIT 100;
+""",
+        'domain': 'corrective_action',
+        'intent': 'filter',
+        'limit':  100,
+    },
+    {
+        'nl':     'corrective actions at risk behind schedule on track not started progress breakdown CA progress status',
+        'sql':    """\
+-- progress_stage = inspectee's self-reported SCHEDULE HEALTH (not severity!)
+-- 'at risk' here = progress_stage='AT_RISK' — NOT risk_level='High'
+-- Values: NOT_STARTED, ON_TRACK, BEHIND, AT_RISK, COMPLETED, CLOSE_WITH_DEFERRED
+-- NULL progress_stage = not started yet (fresh CA)
+SELECT COALESCE(ica.progress_stage, 'NOT_STARTED') AS progress_stage,
+       COUNT(*) AS ca_count
+FROM inspection_corrective_action ica
+WHERE ica.active = true
+  AND ica.status != 'CLOSED'
+GROUP BY ica.progress_stage
+ORDER BY ca_count DESC;
+""",
+        'domain': 'corrective_action',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'income cost and profit by facility P&L per facility revenue spend by facility capex converted vs opex incurred per facility financial data PO PR purchase order purchase requisition by facility show POs and PRs at facility income and cost at specific facility',
+        'sql':    """\
+-- P&L by facility: Income = SUM(po.po_amount), Cost = SUM(pr.pr_amount)
+-- CRITICAL JOIN PATH: mitigative_action_uuid → ica.id (the CA) — NEVER ir.id!
+-- po/pr_details → ica → inspection_report → facility (the ICA hop is mandatory)
+-- WRONG: mitigative_action_uuid = ir.id — matches ZERO rows → silent all-zero table
+-- FACILITY FILTER: NEVER put fac.name ILIKE inside a CTE — fac is not in scope there.
+-- Filter by fac.name ILIKE in the outer WHERE clause only, after joining facility.
+WITH po_agg AS (
+    SELECT ir.facility_id, SUM(pd.po_amount) AS total_income
+    FROM po_details pd
+    JOIN inspection_corrective_action ica ON pd.mitigative_action_uuid = ica.id
+    JOIN inspection_report ir ON ica.inspection_id = ir.id
+    WHERE ir.active = true AND ir.status != 'DRAFT' AND ica.active = true
+    GROUP BY ir.facility_id
+),
+pr_agg AS (
+    SELECT ir.facility_id, SUM(pr.pr_amount) AS total_cost
+    FROM pr_details pr
+    JOIN inspection_corrective_action ica ON pr.mitigative_action_uuid = ica.id
+    JOIN inspection_report ir ON ica.inspection_id = ir.id
+    WHERE ir.active = true AND ir.status != 'DRAFT' AND ica.active = true
+    GROUP BY ir.facility_id
+)
+SELECT fac.name AS facility_name,
+       COALESCE(po.total_income, 0)                              AS income,
+       COALESCE(pr.total_cost, 0)                                AS cost,
+       COALESCE(po.total_income, 0) - COALESCE(pr.total_cost, 0) AS profit
+FROM facility fac
+LEFT JOIN po_agg po ON po.facility_id = fac.id
+LEFT JOIN pr_agg pr ON pr.facility_id = fac.id
+WHERE fac.active = true
+  AND (po.total_income IS NOT NULL OR pr.total_cost IS NOT NULL)
+ORDER BY income DESC
+LIMIT 100;
+""",
+        'domain': 'financial',
+        'intent': 'ranked_list',
+        'limit':  100,
+    },
+    {
+        'nl':     'financial data for specific facility PO income PR cost profit at one facility show POs and PRs for Al Ghadeer income and cost for facility name',
+        'sql':    """\
+-- Financial summary for a SPECIFIC facility by name
+-- CRITICAL: fac.name ILIKE filter goes in OUTER WHERE only — NEVER inside a CTE
+-- CTEs aggregate by facility_id; outer query joins facility and filters by name
+WITH po_agg AS (
+    SELECT ir.facility_id, SUM(pd.po_amount) AS total_income
+    FROM po_details pd
+    JOIN inspection_corrective_action ica ON pd.mitigative_action_uuid = ica.id
+    JOIN inspection_report ir ON ica.inspection_id = ir.id
+    WHERE ir.active = true AND ir.status != 'DRAFT' AND ica.active = true
+    GROUP BY ir.facility_id
+),
+pr_agg AS (
+    SELECT ir.facility_id, SUM(pr.pr_amount) AS total_cost
+    FROM pr_details pr
+    JOIN inspection_corrective_action ica ON pr.mitigative_action_uuid = ica.id
+    JOIN inspection_report ir ON ica.inspection_id = ir.id
+    WHERE ir.active = true AND ir.status != 'DRAFT' AND ica.active = true
+    GROUP BY ir.facility_id
+)
+SELECT fac.name AS facility_name,
+       COALESCE(po.total_income, 0)                               AS income,
+       COALESCE(pr.total_cost, 0)                                 AS cost,
+       COALESCE(po.total_income, 0) - COALESCE(pr.total_cost, 0)  AS profit
+FROM facility fac
+LEFT JOIN po_agg po ON po.facility_id = fac.id
+LEFT JOIN pr_agg pr ON pr.facility_id = fac.id
+WHERE fac.name ILIKE '%Al Ghadeer%'
+  AND fac.active = true;
+""",
+        'domain': 'financial',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'corrective actions not closed on time closed late past deadline late closure overdue when closed',
+        'sql':    """\
+-- 'closed late' / 'not closed on time' — MUTUALLY EXCLUSIVE from 'overdue':
+--   overdue     = still OPEN, past due, has NOT closed yet
+--   closed_late = DID close (status='CLOSED'), but completed_on was after target_close_out_date
+-- close_on is a DEAD COLUMN (all NULL) — use completed_on for closure timing
+-- NEVER OR these two concepts together into one count
+SELECT
+    COUNT(*) FILTER (
+        WHERE status NOT IN ('CLOSED','CLOSE_WITH_DEFERRED')
+          AND target_close_out_date < CURRENT_DATE
+    ) AS overdue_count,
+    COUNT(*) FILTER (
+        WHERE status = 'CLOSED' AND completed_on > target_close_out_date
+    ) AS closed_late_count
+FROM inspection_corrective_action
+WHERE active = true AND target_close_out_date IS NOT NULL;
+""",
+        'domain': 'corrective_action',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'list all cycles show inspection cycles what cycles are available inspection frequency cycles cycle types',
+        'sql':    """\
+-- "cycles" = inspection frequency/cadence types from frequency_definition
+-- (Daily, Weekly, Quarterly Twice, etc.) — NOT inspection_cycle (cycle INSTANCES).
+-- frequency_definition columns: id, name, repeat_count, repeat_interval, repeat_unit, active
+-- NO 'description' column — do not select fd.description (hallucinated column)
+SELECT name AS frequency_name, repeat_count, repeat_interval, repeat_unit
+FROM frequency_definition
+WHERE active = true
+ORDER BY name;
+""",
+        'domain': 'general',
+        'intent': 'filter',
         'limit':  None,
     },
     {
@@ -341,15 +673,21 @@ FROM (
         'limit':  None,
     },
     {
-        'nl':     'how many inspections were completed this month vs last month',
+        'nl':     'how many inspections were completed this month vs last month conducted completed comparison month over month',
         'sql':    """\
--- USE THIS EXACT SQL — single-row FILTER comparison, NOT GROUP BY:
--- Single-row FILTER form — NOT GROUP BY
+-- Month-over-month: conducted vs completed two-row summary for this month and last month
+-- conducted = SUBMITTED + UNDER_REVIEW + RETURN_FOR_MODIFICATION
+-- completed = CLOSED
 SELECT
-  COUNT(*) FILTER (WHERE date_trunc('month', ir.submitted_on) = date_trunc('month', NOW())) AS this_month_count,
-  COUNT(*) FILTER (WHERE date_trunc('month', ir.submitted_on) = date_trunc('month', NOW()-INTERVAL '1 month')) AS last_month_count
+    CASE WHEN ir.status = 'CLOSED' THEN 'completed' ELSE 'conducted' END AS category,
+    COUNT(*) FILTER (WHERE date_trunc('month', ir.submitted_on) = date_trunc('month', NOW()))            AS this_month,
+    COUNT(*) FILTER (WHERE date_trunc('month', ir.submitted_on) = date_trunc('month', NOW() - INTERVAL '1 month')) AS last_month
 FROM inspection_report ir
-WHERE ir.active = true AND ir.status IN ('CLOSED','SUBMITTED');
+WHERE ir.active = true
+  AND ir.status != 'DRAFT'
+  AND ir.submitted_on >= date_trunc('month', NOW() - INTERVAL '1 month')
+GROUP BY category
+ORDER BY category DESC;
 """,
         'domain': 'inspection',
         'intent': 'aggregate',
@@ -398,7 +736,7 @@ ORDER BY date_trunc('month', ir.submitted_on);
 -- MONTH FILTER — use EXTRACT for dynamic month+year, NEVER TO_CHAR in WHERE, NEVER hardcode year
 -- For "January this year": EXTRACT(MONTH FROM ir.submitted_on) = 1 AND EXTRACT(YEAR ...) = EXTRACT(YEAR FROM CURRENT_DATE)
 -- For "January 2026" specifically: EXTRACT(MONTH ...) = 1 AND EXTRACT(YEAR ...) = 2026
--- completed inspections = status IN ('CLOSED','SUBMITTED') — NOT status != 'DRAFT'
+-- status != 'DRAFT' used here since listing inspections (not filtering by completed/conducted)
 SELECT ir.inspection_id,
        fac.name AS facility_name,
        it.name  AS inspection_type_name,
@@ -408,7 +746,7 @@ FROM inspection_report ir
 JOIN facility fac ON ir.facility_id = fac.id
 JOIN inspection_type it ON ir.inspection_type_id = it.id
 WHERE ir.active = true
-  AND ir.status IN ('CLOSED','SUBMITTED')
+  AND ir.status != 'DRAFT'
   AND EXTRACT(MONTH FROM ir.submitted_on) = 1
   AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
 ORDER BY ir.submitted_on DESC
@@ -572,18 +910,70 @@ GROUP BY fac.name ORDER BY avg_score DESC LIMIT 50;
     {
         'nl':     'which inspector has conducted the most inspections this year',
         'sql':    """\
+-- conducted = IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION') — in-flight, not closed
+-- completed = CLOSED only
+-- assigned  = all non-draft reports
 SELECT u.first_name || ' ' || u.last_name AS inspector_name,
-       COUNT(*) AS inspection_count
+       COUNT(*) AS assigned,
+       COUNT(*) FILTER (WHERE ir.status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')) AS conducted,
+       COUNT(*) FILTER (WHERE ir.status = 'CLOSED') AS completed
 FROM inspection_report ir
 JOIN users u ON ir.inspector_user_id = u.id
-WHERE ir.status != 'DRAFT'
+WHERE ir.active = true
+  AND ir.status != 'DRAFT'
   AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
 GROUP BY u.id, u.first_name, u.last_name
-ORDER BY inspection_count DESC LIMIT 1;
+ORDER BY conducted DESC LIMIT 1;
 """,
         'domain': 'inspection',
         'intent': 'single_value',
         'limit':  1,
+    },
+    {
+        # Inspector performance summary — assigned, conducted, observations, high-risk.
+        # CRITICAL DEFINITIONS (match the application):
+        #   assigned   = COUNT(ir.id)                              — all reports linked to inspector
+        #   conducted  = COUNT FILTER (WHERE status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION'))
+        #   total_observations = SUM of distinct observation submissions per inspection
+        #                        (one per ai_answers.submission_id group, NOT COUNT(*) on answer rows)
+        #   high_risk_observations = observations where risk level answer = 'High'
+        # NEVER join ai_answers twice in the main query (fan-out/cross-join).
+        # Pre-aggregate observations in a CTE to avoid row multiplication.
+        # NEVER join inspection_schedule — it is irrelevant to inspector performance counts.
+        'nl':     'inspector performance summary assigned conducted observations high risk inspector report breakdown inspector stats',
+        'sql':    """\
+-- Inspector performance: assigned, conducted, total observations, high-risk observations
+-- conducted = SUBMITTED only (NOT status != 'DRAFT' — that overcounts)
+-- Observations pre-aggregated in CTE to prevent double-join fan-out
+WITH obs AS (
+    SELECT aa.inspection_report_id,
+           COUNT(DISTINCT aa.submission_id)   AS total_obs,
+           COUNT(DISTINCT CASE
+               WHEN aq.label = 'Risk Level' AND aa.answer_text ILIKE '%High%'
+               THEN aa.submission_id END)     AS high_risk_obs
+    FROM ai_answers aa
+    JOIN ai_questions aq ON aa.element_id = aq.element_id
+    WHERE aa.module_name = 'Inspection Form'
+    GROUP BY aa.inspection_report_id
+)
+SELECT u.first_name || ' ' || u.last_name          AS inspector_name,
+       COUNT(ir.id)                                AS assigned,
+       COUNT(ir.id) FILTER (WHERE ir.status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')) AS conducted,
+       COUNT(ir.id) FILTER (WHERE ir.status = 'CLOSED') AS completed,
+       COALESCE(SUM(obs.total_obs), 0)             AS total_observations,
+       COALESCE(SUM(obs.high_risk_obs), 0)         AS high_risk_observations
+FROM users u
+JOIN inspection_report ir ON ir.inspector_user_id = u.id
+    AND ir.active = true
+LEFT JOIN obs ON obs.inspection_report_id = ir.id
+WHERE u.active = true AND ir.status != 'DRAFT'
+GROUP BY u.id, u.first_name, u.last_name
+ORDER BY conducted DESC NULLS LAST
+LIMIT 100;
+""",
+        'domain': 'inspection',
+        'intent': 'ranked_list',
+        'limit':  100,
     },
     {
         'nl':     'show average inspection score by inspection type',
@@ -888,7 +1278,8 @@ GROUP BY aa.answer_text ORDER BY frequency DESC LIMIT 20;
 -- 'Observation' label = free-text field, 'Observation Type' = Deviation | Good Practice dropdown
 -- NEVER: aq.label ILIKE '%Observation%' — that matches BOTH and overcounts
 -- aa.answer_text ILIKE '%Deviation%' matches the enum value 'Deviation'
-SELECT COUNT(*) AS deviation_count
+-- BUSINESS RULE: each inspection is Good Practice OR Deviation — count DISTINCT reports not answer rows
+SELECT COUNT(DISTINCT ir.id) AS deviation_count
 FROM ai_answers aa
 JOIN ai_questions aq ON aa.element_id = aq.element_id
 JOIN inspection_report ir ON aa.inspection_report_id = ir.id
@@ -908,7 +1299,10 @@ WHERE aq.label = 'Observation Type'
         'nl':     'count good practice observations raised at a facility this year',
         'sql':    """\
 -- CORRECT: aq.label = 'Observation Type' for the dropdown, answer_text = 'Good Practice'
-SELECT COUNT(*) AS good_practice_count
+-- BUSINESS RULE: an inspection is classified as EITHER good practice OR deviation (not both).
+-- Count DISTINCT inspection reports — NOT COUNT(*) answer rows — to avoid double-counting.
+-- COUNT(*) would overcount if a report has multiple 'Observation Type' answer rows.
+SELECT COUNT(DISTINCT ir.id) AS good_practice_count
 FROM ai_answers aa
 JOIN ai_questions aq ON aa.element_id = aq.element_id
 JOIN inspection_report ir ON aa.inspection_report_id = ir.id
@@ -923,6 +1317,33 @@ WHERE aq.label = 'Observation Type'
         'domain': 'form_answers',
         'intent': 'aggregate',
         'limit':  None,
+    },
+    {
+        'nl':     'good practice count by facility which facility has most good practice inspections top facilities good practice ranked',
+        'sql':    """\
+-- Good practice count PER FACILITY — count DISTINCT inspection reports, NOT answer rows.
+-- BUSINESS RULE: each inspection is classified as Good Practice OR Deviation (mutually exclusive).
+-- COUNT(*) overcounts; COUNT(DISTINCT ir.id) correctly counts one per report.
+-- NEVER use COUNT(*) for good practice / deviation per-facility counts.
+SELECT fac.name AS facility_name,
+       COUNT(DISTINCT ir.id) AS good_practice_count
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE aq.label = 'Observation Type'
+  AND aa.answer_text ILIKE '%Good Practice%'
+  AND aa.module_name = 'Inspection Form'
+  AND fac.active = true
+  AND ir.active = true
+  AND ir.status != 'DRAFT'
+GROUP BY fac.id, fac.name
+ORDER BY good_practice_count DESC
+LIMIT 10;
+""",
+        'domain': 'form_answers',
+        'intent': 'ranked_list',
+        'limit':  10,
     },
     {
         'nl':     'which facilities have never had a good practice observation facilities without good practice',
@@ -1216,9 +1637,10 @@ ORDER BY aa.score DESC LIMIT 10;
     },
     {
         'nl':     'show corrective actions linked to a specific observation CAs for observation corrective actions for this observation corrective actions for first observation corrective actions raised from this finding',
-        'sql':    """-- OBSERVATION → CA PATH: use ica.observation_id = aa.submission_id::uuid
+        'sql':    """-- OBSERVATION → CA PATH: aa.submission_id = ica.observation_id::varchar
+-- Cast UUID side to varchar — NOT aa.submission_id::uuid (submission_id is varchar, observation_id is UUID)
 -- This is the DIRECT link — NOT ica.inspection_id = ir.id (that returns ALL CAs in the inspection)
--- CORRECT: filter by ica.observation_id = aa.submission_id::uuid (direct FK — 398 CAs have this)
+-- CORRECT: aa.submission_id = ica.observation_id::varchar  (398 CAs have non-NULL observation_id)
 -- NOT: JOIN inspection_report ir ON ica.inspection_id = ir.id (returns ALL CAs for the whole inspection)
 SELECT ica.corrective_action_id,
        ica.cause,
@@ -1229,7 +1651,7 @@ SELECT ica.corrective_action_id,
        ica.capex,
        aa.answer_text AS linked_observation
 FROM inspection_corrective_action ica
-JOIN ai_answers aa ON ica.observation_id = aa.submission_id::uuid
+JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
 WHERE ica.observation_id IS NOT NULL
   AND ica.active = true
   AND aa.answer_text ILIKE '%observation_text%'
@@ -1241,12 +1663,13 @@ ORDER BY ica.corrective_action_id;
     },
     {
         'nl':     'which observation triggered the most corrective actions observation with most CAs',
-        'sql':    """-- Use ica.observation_id → ai_answers.submission_id (cast to uuid: ica.observation_id = aa.submission_id::uuid) to group CAs by observation
+        'sql':    """-- CAST direction: aa.submission_id = ica.observation_id::varchar
+-- submission_id is varchar, observation_id is UUID — cast UUID to varchar, NOT varchar to uuid
 SELECT aa.answer_text AS observation,
        COUNT(ica.id)  AS ca_count,
        ir.inspection_id
 FROM inspection_corrective_action ica
-JOIN ai_answers aa ON ica.observation_id = aa.submission_id::uuid
+JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
 JOIN inspection_report ir ON aa.inspection_report_id = ir.id
 WHERE ica.active = true AND ica.observation_id IS NOT NULL
 GROUP BY aa.id, aa.answer_text, ir.inspection_id
@@ -1904,6 +2327,9 @@ ORDER BY ir.submitted_on DESC LIMIT 50;
 -- CYCLE FREQUENCY PATH: ic.id -> ip(ip.cycle_id=ic.id) -> ipd(ipd.portfolio_id=ip.id) -> fd
 -- NEVER: ipd.cycle_id  |  completed_cycle = status='COMPLETED'
 -- NOTE: use DISTINCT subquery shape, not GROUP BY, for this lookup
+-- SCOPE: this is for ONE SPECIFIC cycle (by UUID). For "list all cycles" /
+-- "what cycles are available" use the frequency_definition query instead
+-- (no inspection_cycle join needed at all for that question).
 SELECT DISTINCT fd.name AS frequency_name,
        fd.repeat_count, fd.repeat_interval, fd.repeat_unit
 FROM inspection_cycle ic
@@ -1924,6 +2350,13 @@ WHERE ic.id = '<CYCLE_UUID>'
 -- USE THIS EXACT SQL for most-recent-cycle frequency — ONLY for cycle queries:
 -- completed_cycle = status = 'COMPLETED' (not CLOSED, not status != 'DRAFT')
 -- Join: ic -> ip(ip.cycle_id=ic.id) -> ipd(ipd.portfolio_id=ip.id) -> fd
+-- SCOPE: this is for the SINGLE MOST RECENT cycle — the subquery
+-- "WHERE ic.id = (SELECT id FROM inspection_cycle WHERE status='COMPLETED'
+-- ORDER BY end_date DESC LIMIT 1)" is REQUIRED and selects exactly ONE cycle.
+-- DROPPING this subquery turns the query into "frequencies for ALL completed
+-- cycles" — a DIFFERENT question. If the user asked "list all cycles" /
+-- "what cycles are available", do NOT use this shape at all — use the
+-- frequency_definition query (no inspection_cycle join) instead.
 SELECT DISTINCT fd.name AS frequency_name,
        fd.repeat_count, fd.repeat_interval, fd.repeat_unit
 FROM inspection_cycle ic
@@ -2071,6 +2504,46 @@ LIMIT 1;
         'domain': 'financial',
         'intent': 'single_value',
         'limit':  1,
+    },
+    {
+        'nl':     'capex breakdown for each corrective action at facility PO PR per corrective action conversion percentage per CA generated converted by corrective action',
+        'sql':    """\
+-- Per-corrective-action capex/PO/PR breakdown for a facility
+-- CRITICAL: pre-aggregate po_details and pr_details in SEPARATE CTEs before joining to ica.
+-- NEVER LEFT JOIN po_details AND pr_details directly into a GROUP BY query —
+-- if a CA has >1 PO row or >1 PR row, the cross-join multiplies rows and
+-- corrupts every SUM() (confirmed bug: 2 POs + 1 PR returned half the real capex).
+WITH po_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po, COUNT(*) AS po_count
+    FROM po_details WHERE active = true GROUP BY 1
+),
+pr_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_pr, COUNT(*) AS pr_count
+    FROM pr_details WHERE active = true GROUP BY 1
+)
+SELECT
+    ica.corrective_action_id,
+    ica.cause,
+    ica.corrective_action,
+    ica.responsible,
+    ica.status,
+    COALESCE(po.total_po, 0)                                              AS capex_generated,
+    COALESCE(pr.total_pr, 0)                                              AS capex_converted,
+    ROUND(COALESCE(pr.total_pr, 0) * 100.0 / NULLIF(po.total_po, 0), 2)   AS converted_percentage,
+    COALESCE(po.po_count, 0)                                              AS po_count,
+    COALESCE(pr.pr_count, 0)                                              AS pr_count
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+LEFT JOIN po_agg po ON po.ica_id = ica.id
+LEFT JOIN pr_agg pr ON pr.ica_id = ica.id
+WHERE fac.name ILIKE '%[FACILITY]%'
+  AND ica.active = true AND ir.active = true AND ir.status != 'DRAFT'
+ORDER BY ica.corrective_action_id;
+""",
+        'domain': 'financial',
+        'intent': 'per_row_breakdown',
+        'limit':  None,
     },
     {
         'nl':     'total capex generated converted lost and opex incurred',
@@ -3126,16 +3599,18 @@ ORDER BY high_risk_count DESC LIMIT 10;
         'nl':     'how many inspections were scheduled vs completed this month scheduled completed comparison',
         'sql':    """\
 -- Scheduled = rows in inspection_schedule for this month
--- Completed = rows in inspection_report with CLOSED or SUBMITTED status for this month
+-- Conducted = SUBMITTED + UNDER_REVIEW + RETURN_FOR_MODIFICATION
+-- Completed = CLOSED only
 SELECT
     (SELECT COUNT(*)
      FROM inspection_schedule
      WHERE date_trunc('month', due_date) = date_trunc('month', CURRENT_DATE)) AS scheduled_count,
-    (SELECT COUNT(*)
-     FROM inspection_report
-     WHERE status IN ('CLOSED', 'SUBMITTED')
-       AND date_trunc('month', submitted_on) = date_trunc('month', CURRENT_DATE)
-       AND active = true) AS completed_count;
+    COUNT(*) FILTER (WHERE ir.status != 'CLOSED') AS conducted_count,
+    COUNT(*) FILTER (WHERE ir.status = 'CLOSED')  AS completed_count
+FROM inspection_report ir
+WHERE ir.active = true
+  AND ir.status != 'DRAFT'
+  AND date_trunc('month', ir.submitted_on) = date_trunc('month', CURRENT_DATE);
 """,
         'domain': 'schedule',
         'intent': 'aggregate',
@@ -3219,3 +3694,58 @@ LIMIT 200;
         'limit':  1,
     },
 ]
+
+# ── Conditional CORE_CONTEXT additions — included only when relevant ────────
+# Deepseek-side counterpart to prompts.py's CONDITIONAL_BLOCKS / EXAMPLES_TIER2.
+# _COUNTING_BLOCK (good practice/deviation/observation counting, ~148 tok) and
+# _CA_WORKFLOW_BLOCK (CA workflow columns, ~805 tok) were always-on parts of
+# CORE_CONTEXT before 2026-06-13's truncation fix — both grew this session and
+# are narrowly topical, so they're now conditional like their Llama-side
+# counterparts (CONDITIONAL_BLOCKS["CA workflow columns"] and the FORM-pattern
+# Tier-2 examples in prompts.py).
+#
+# Patterns are intentionally KEPT IN SYNC with prompts.py's CA/FORM patterns —
+# both sides should treat "is this question about corrective actions / form
+# answers" the same way. If you edit one, edit the other.
+CORE_CONTEXT_CONDITIONAL = [
+    {
+        "title": "CA workflow columns (Deepseek)",
+        "question_pattern": (
+            r"(?i)\bcorrective\s+actions?\b|\bCAs?\b|\bicas?\b"
+            r"|\bcapex\b|\bopex\b|\bdeferred\b"
+            r"|\bprogress[_\s]stage\b|\bimplementation[_\s]status\b"
+            r"|\bneeds?\s+attention\b|\bcritical\s+issues?\b"
+        ),
+        "get_text": lambda: _CA_WORKFLOW_BLOCK,
+    },
+    {
+        "title": "Good practice / deviation / observation counting (Deepseek)",
+        "question_pattern": (
+            r"(?i)\b(forms?|answer\w*|questions?|observations?|risk\s*levels?"
+            r"|deviations?|good\s+practice|total\s+score|ai_answers)\b"
+        ),
+        "get_text": lambda: _COUNTING_BLOCK,
+    },
+]
+
+
+def build_core_context_additions(question: str) -> str:
+    """
+    Return additional CORE_CONTEXT blocks whose question_pattern matches the
+    current question. Call from tools.py's generate_sql: append the result to
+    CORE_CONTEXT before building dynamic_examples.
+
+    Returns "" if nothing matches — no size penalty for unrelated questions.
+    """
+    if not question:
+        return ""
+    matched = []
+    for blk in CORE_CONTEXT_CONDITIONAL:
+        try:
+            if re.search(blk["question_pattern"], question):
+                matched.append(blk["get_text"]())
+        except re.error:
+            continue
+    if not matched:
+        return ""
+    return "\n--\n" + "\n--\n".join(matched)

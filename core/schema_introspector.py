@@ -46,6 +46,8 @@ ENUM_COLUMNS = {
 }
 
 BUSINESS_RULES = [
+    # NOTE: the observation↔CA cast direction below must match
+    # core.semantics_registry.observation_ca_join() — "aa.submission_id = ica.observation_id::varchar"
     "DRAFT inspections usually have NULL scores. Always add WHERE status != 'DRAFT' "
     "when querying inspection_score, unless the user explicitly asks about drafts.",
     "NEVER use SELECT *. Always specify the columns the user needs.",
@@ -53,10 +55,12 @@ BUSINESS_RULES = [
     "Use ILIKE for text matching, never LIKE.",
     "corrective_action_id is a human-readable ID like '2026/01/ST064/INS001_MA001', not a UUID.",
     "inspection_corrective_action.inspection_id is the PRIMARY FK to inspection_report.id.",
-    "inspection_corrective_action.observation_id → ai_answers.submission_id (cast to uuid: ica.observation_id = aa.submission_id::uuid) (DIRECT FK). "
-    "When user asks CAs for a specific observation, filter: WHERE ica.observation_id = aa.submission_id::uuid. "
-    "Do NOT filter by inspection_id alone — that returns ALL CAs for the inspection. "
-    "398 CAs have a non-NULL observation_id.",
+    "OBSERVATION → CORRECTIVE ACTION — two distinct paths, NEVER confuse them: "
+    "PATH 1 — CAs for a SPECIFIC observation: JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar "
+    "(cast the UUID side to varchar — NEVER aa.submission_id::uuid = ica.observation_id, NEVER ::text). "
+    "PATH 2 — ALL CAs for an inspection: JOIN ica ON ica.inspection_id = ir.id. "
+    "Use PATH 1 only when the user references a SPECIFIC observation; "
+    "use PATH 2 for 'corrective actions for this inspection' generally.",
     "Use LEFT JOIN (not INNER JOIN) for optional lookups like inspection_sub_type, "
     "entity, and inspection_report_remark.",
     "VOCABULARY — corrective action status: "
@@ -77,7 +81,11 @@ BUSINESS_RULES = [
     "WHERE EXISTS (SELECT 1 FROM user_roles ur JOIN role r ON ur.role_id = r.id "
     "WHERE ur.user_id = u.id AND r.name = 'FM Manager'). "
     "FM Manager role names: fm_manager, fm_engineer, ad_fm, asst_fm_manager, fm_admin, fm_supervisor. "
-    "Inspector role names: internal_inspector, internal_auditor, external_inspector, external_auditor.",
+    "⚠ UNVERIFIED — these inspector role names have NEVER been confirmed against the live role table "
+    "and returned 0 rows in production (2026-06-15). Run `SELECT name FROM role` to get exact casing "
+    "before filtering: internal_inspector, internal_auditor, external_inspector, external_auditor. "
+    "FM-side roles ARE confirmed correct (Title Case with spaces, e.g. 'FM Manager') — inspector-side "
+    "roles likely follow the same convention, e.g. 'Internal Inspector' not 'internal_inspector'.",
 ]
 
 TABLE_RELATIONSHIPS = """\
@@ -172,7 +180,10 @@ USER ROLES:
   role.name values relevant to inspections:
     FM-side (inspectee):  FM Manager, FM Engineer, AD FM, Asst FM Manager,
                           FM Admin, FM Supervisor, hse_officer
-    Inspector-side:       internal_inspector, internal_auditor, external_inspector,
+    Inspector-side (⚠ UNVERIFIED, returned 0 rows 2026-06-15 — confirm exact
+                    casing with `SELECT name FROM role` before use; likely
+                    Title Case like FM-side, NOT snake_case):
+                          internal_inspector, internal_auditor, external_inspector,
                           external_auditor, hse_officer
   CRITICAL — use EXISTS subquery (not JOIN) to avoid row fan-out:
     WHERE EXISTS (
@@ -318,6 +329,8 @@ USEFUL_COLUMNS = {
     "inspection_schedule": [
         "id", "status", "due_date", "scheduled_date",
         "facility_id", "inspector_id", "inspection_cycle_id", "portfolio_details_id",
+        # ⚠ NO 'active' column — inspection_schedule is NOT soft-deleted.
+        # ⚠ NO 'frequency_definition_id' column — frequency via portfolio_details_id → ipd.frequency_definition_id
     ],
     "inspector_portfolio_details": [
         "id", "portfolio_id", "facility_id",
