@@ -774,10 +774,10 @@ TEST_SET = [
     {
         "id": "FIN-03", "category": "Financial",
         "question": "which fm managers generate the most capex",
-        "expected_contains": ["inspector", "capex"],
+        "expected_contains": ["inspectee_user_id", "capex"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
-        "notes": "inspector_user_id → users JOIN ica JOIN po_details",
+        "notes": "FM managers = inspectee_user_id (NOT inspector_user_id) → users JOIN ica GROUP BY inspectee",
     },
     {
         "id": "FIN-04", "category": "Financial",
@@ -805,11 +805,11 @@ TEST_SET = [
     },
     {
         "id": "FIN-07", "category": "Financial",
-        "question": "compare capex generated vs capex converted by inspector",
-        "expected_contains": ["inspector", "generated", "converted"],
+        "question": "compare capex generated vs capex converted by FM manager",
+        "expected_contains": ["inspectee_user_id", "generated", "converted"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
-        "notes": "ica.capex vs SUM(po.po_amount) per inspector",
+        "notes": "FM managers (inspectee_user_id) generate capex via CAs — NOT inspector_user_id. SUM(ica.capex) vs SUM(po.po_amount) per FM manager",
     },
 ]
 

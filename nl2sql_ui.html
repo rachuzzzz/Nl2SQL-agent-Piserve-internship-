@@ -89,24 +89,19 @@ body::before {
 .sdot.busy { background:var(--amber); box-shadow:0 0 7px var(--amber); animation:blink .65s ease-in-out infinite; }
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
 
-/* ── OVERLAY ─────────────────────────────────────────── */
-.overlay {
-  position:fixed; inset:0; z-index:200;
-  background:rgba(0,0,0,.55); backdrop-filter:blur(6px) saturate(.8);
-  opacity:0; pointer-events:none; transition:opacity .25s;
-}
-.overlay.show { opacity:1; pointer-events:all; }
+/* ── CONTENT ROW ─────────────────────────────────────── */
+.content-row { flex:1; display:flex; overflow:hidden; min-height:0; }
 
 /* ── SLIDE PANELS ────────────────────────────────────── */
-.panel {
-  position:fixed; top:0; bottom:0; width:var(--panel-w); z-index:210;
-  background:var(--surface); display:flex; flex-direction:column;
-  transition:transform .38s var(--ease);
+.panel { flex-shrink:0; width:0; overflow:hidden; transition:width .38s var(--ease); display:flex; }
+.panel.show { width:var(--panel-w); }
+.panel-inner {
+  width:var(--panel-w); flex:1;
+  display:flex; flex-direction:column;
+  background:var(--surface); overflow:hidden;
 }
-.panel-l { left:0; border-right:1px solid var(--border); transform:translateX(calc(-1 * var(--panel-w) - 2px)); }
-.panel-r { right:0; border-left:1px solid var(--border); transform:translateX(calc(var(--panel-w) + 2px)); }
-.panel-l.show { transform:translateX(0); }
-.panel-r.show { transform:translateX(0); }
+.panel-l .panel-inner { border-right:1px solid var(--border); }
+.panel-r .panel-inner { border-left:1px solid var(--border); }
 
 .panel-hd {
   height:56px; flex-shrink:0;
@@ -226,7 +221,7 @@ body::before {
 .dnil { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; height:160px; color:var(--text4); font-family:var(--mono); font-size:11px; text-align:center; }
 
 /* ── CHAT ────────────────────────────────────────────── */
-.chat { flex:1; display:flex; flex-direction:column; overflow:hidden; position:relative; }
+.chat { flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; position:relative; }
 .chat::after {
   content:''; position:absolute; bottom:0; left:50%; transform:translateX(-50%);
   width:700px; height:250px; pointer-events:none;
@@ -266,8 +261,16 @@ body::before {
 .aname {
   font-family:var(--mono); font-size:10px; font-weight:600;
   color:var(--text3); letter-spacing:.08em; text-transform:uppercase; margin-bottom:9px;
+  display:flex; align-items:center; gap:6px;
 }
 .atext { font-size:14.5px; line-height:1.8; color:var(--text); white-space:pre-wrap; }
+.spk-btn {
+  background:none; border:none; cursor:pointer; padding:2px 4px; border-radius:5px;
+  font-size:12px; opacity:0.4; transition:opacity .15s, background .15s; line-height:1;
+}
+.spk-btn:hover { opacity:1; background:var(--border); }
+.spk-btn.playing { opacity:1; color:var(--indigo,#6366f1); }
+.spk-btn:disabled { cursor:default; opacity:0.25; }
 
 .mts { font-family:var(--mono); font-size:10px; color:var(--text4); margin-top:7px; padding:0 2px; }
 
@@ -412,61 +415,66 @@ kbd {
     </div>
   </header>
 
-  <!-- OVERLAY -->
-  <div class="overlay" id="ovl" onclick="closeAll()"></div>
+  <div class="content-row">
 
-  <!-- HISTORY PANEL -->
-  <div class="panel panel-l" id="hpanel">
-    <div class="panel-hd">
-      <div class="panel-hd-left">
-        <div class="panel-hd-icon">🕐</div>
-        <span class="panel-hd-title">History</span>
-      </div>
-      <button class="x-btn" onclick="closeAll()">✕</button>
-    </div>
-    <div class="hist-body" id="hbody">
-      <div class="hist-nil" id="hnil"><span style="font-size:26px">🗂</span><span>No queries yet</span></div>
-    </div>
-  </div>
-
-  <!-- DEBUG PANEL -->
-  <div class="panel panel-r" id="dpanel">
-    <div class="panel-hd">
-      <div class="panel-hd-left">
-        <div class="panel-hd-icon">⚙</div>
-        <span class="panel-hd-title">Debug</span>
-      </div>
-      <button class="x-btn" onclick="closeAll()">✕</button>
-    </div>
-    <div class="dtabs">
-      <button class="dtab on" id="dts" onclick="dtab('s')">Stats</button>
-      <button class="dtab"    id="dtt" onclick="dtab('t')">Steps</button>
-      <button class="dtab"    id="dtq" onclick="dtab('q')">SQL</button>
-    </div>
-    <div class="dbody" id="dbody">
-      <div class="dnil"><span style="font-size:26px;opacity:.3">◈</span><span>Run a query to see<br>debug info</span></div>
-    </div>
-  </div>
-
-  <!-- CHAT -->
-  <div class="chat">
-    <div class="msgs" id="msgs">
-      <div class="empty" id="emp">
-        <div class="eicon">🔍</div>
-        <div class="etitle">Ask about your<br><em>inspections</em></div>
-        <div class="esub">Findings, corrective actions, scores, form responses — all in plain English.</div>
-      </div>
-    </div>
-
-    <div class="izone">
-      <div style="width:100%;max-width:720px;display:flex;flex-direction:column">
-        <div class="icard">
-          <textarea id="qi" rows="1" placeholder="Ask anything about your inspection data…"></textarea>
-          <button class="sbtn" id="sbtn" onclick="go()">↑</button>
+    <!-- HISTORY PANEL -->
+    <div class="panel panel-l" id="hpanel">
+      <div class="panel-inner">
+        <div class="panel-hd">
+          <div class="panel-hd-left">
+            <div class="panel-hd-icon">🕐</div>
+            <span class="panel-hd-title">History</span>
+          </div>
+          <button class="x-btn" onclick="toggle('h')">✕</button>
         </div>
-        <div class="ihint"><kbd>Enter</kbd> send &nbsp;·&nbsp; <kbd>Shift ↵</kbd> newline &nbsp;·&nbsp; <kbd>↑</kbd> last query</div>
+        <div class="hist-body" id="hbody">
+          <div class="hist-nil" id="hnil"><span style="font-size:26px">🗂</span><span>No queries yet</span></div>
+        </div>
       </div>
     </div>
+
+    <!-- CHAT -->
+    <div class="chat">
+      <div class="msgs" id="msgs">
+        <div class="empty" id="emp">
+          <div class="eicon">🔍</div>
+          <div class="etitle">Ask about your<br><em>inspections</em></div>
+          <div class="esub">Findings, corrective actions, scores, form responses — all in plain English.</div>
+        </div>
+      </div>
+
+      <div class="izone">
+        <div style="width:100%;max-width:720px;display:flex;flex-direction:column">
+          <div class="icard">
+            <textarea id="qi" rows="1" placeholder="Ask anything about your inspection data…"></textarea>
+            <button class="sbtn" id="sbtn" onclick="go()">↑</button>
+          </div>
+          <div class="ihint"><kbd>Enter</kbd> send &nbsp;·&nbsp; <kbd>Shift ↵</kbd> newline &nbsp;·&nbsp; <kbd>↑</kbd> last query</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DEBUG PANEL -->
+    <div class="panel panel-r" id="dpanel">
+      <div class="panel-inner">
+        <div class="panel-hd">
+          <div class="panel-hd-left">
+            <div class="panel-hd-icon">⚙</div>
+            <span class="panel-hd-title">Debug</span>
+          </div>
+          <button class="x-btn" onclick="toggle('d')">✕</button>
+        </div>
+        <div class="dtabs">
+          <button class="dtab on" id="dts" onclick="dtab('s')">Stats</button>
+          <button class="dtab"    id="dtt" onclick="dtab('t')">Steps</button>
+          <button class="dtab"    id="dtq" onclick="dtab('q')">SQL</button>
+        </div>
+        <div class="dbody" id="dbody">
+          <div class="dnil"><span style="font-size:26px;opacity:.3">◈</span><span>Run a query to see<br>debug info</span></div>
+        </div>
+      </div>
+    </div>
+
   </div>
 
 </div>
@@ -480,7 +488,6 @@ const qi    = document.getElementById('qi');
 const sbtn  = document.getElementById('sbtn');
 const sdot  = document.getElementById('sdot');
 const stxt  = document.getElementById('stxt');
-const ovl   = document.getElementById('ovl');
 
 // ── Input ──────────────────────────────────────────────
 qi.addEventListener('input', resize);
@@ -504,13 +511,12 @@ function toggle(id) {
   const isOpen = p.classList.contains('show');
   document.getElementById(oPanel).classList.remove('show');
   document.getElementById(oBtn).classList.remove('on');
-  if (isOpen) { p.classList.remove('show'); b.classList.remove('on'); ovl.classList.remove('show'); }
-  else { p.classList.add('show'); b.classList.add('on'); ovl.classList.add('show'); }
+  if (isOpen) { p.classList.remove('show'); b.classList.remove('on'); }
+  else { p.classList.add('show'); b.classList.add('on'); }
 }
 function closeAll() {
   ['hpanel','dpanel'].forEach(id=>document.getElementById(id).classList.remove('show'));
   ['hbtn','dbtn'].forEach(id=>document.getElementById(id).classList.remove('on'));
-  ovl.classList.remove('show');
 }
 
 // ── Send ───────────────────────────────────────────────
@@ -543,7 +549,7 @@ function addUser(text) {
 function addAI(ans, tbl) {
   const w = mk('mwrap');
   const t = tbl?.rows?.length ? buildTbl(tbl) : '';
-  w.innerHTML = `<div class="arow"><div class="aav">✦</div><div class="abody"><div class="aname">InspectAI</div><div class="atext">${x(ans)}</div>${t}</div></div><div class="mts" style="padding-left:45px">${ts()}</div>`;
+  w.innerHTML = `<div class="arow"><div class="aav">✦</div><div class="abody"><div class="aname">InspectAI<button class="spk-btn" title="Read aloud" onclick="playTTS(this)">🔊</button></div><div class="atext">${x(ans)}</div>${t}</div></div><div class="mts" style="padding-left:45px">${ts()}</div>`;
   msgs.appendChild(w); bot();
 }
 function addThinking() {
@@ -555,6 +561,52 @@ function addErr(msg) {
   const w=mk('mwrap');
   w.innerHTML=`<div class="arow"><div class="aav" style="background:var(--rose)">!</div><div class="abody"><div class="aname">Error</div><div class="errbub">${x(msg)}</div></div></div>`;
   msgs.appendChild(w); bot();
+}
+
+// ── TTS ────────────────────────────────────────────────
+let _ttsAudio = null;
+
+async function playTTS(btn) {
+  // If something is already playing, stop it first
+  if (_ttsAudio) {
+    _ttsAudio.pause();
+    _ttsAudio = null;
+    document.querySelectorAll('.spk-btn.playing').forEach(b => {
+      b.textContent = '🔊'; b.classList.remove('playing');
+    });
+    // If we clicked the same button, that's a stop — done
+    if (btn.dataset.playing === '1') { btn.dataset.playing = ''; return; }
+  }
+
+  const text = btn.closest('.abody').querySelector('.atext').textContent;
+  if (!text.trim()) return;
+
+  btn.textContent = '⏳'; btn.disabled = true; btn.dataset.playing = '';
+
+  try {
+    const res = await fetch('/api/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    _ttsAudio  = new Audio(url);
+
+    btn.textContent = '⏹'; btn.classList.add('playing');
+    btn.disabled = false; btn.dataset.playing = '1';
+
+    _ttsAudio.onended = () => {
+      btn.textContent = '🔊'; btn.classList.remove('playing');
+      btn.dataset.playing = ''; URL.revokeObjectURL(url); _ttsAudio = null;
+    };
+    _ttsAudio.play();
+  } catch(e) {
+    btn.textContent = '🔊'; btn.disabled = false; btn.dataset.playing = '';
+    console.error('TTS error:', e);
+  }
 }
 
 // ── Table ──────────────────────────────────────────────
@@ -574,7 +626,7 @@ function addHistItem(q) {
   document.getElementById('hnil')?.remove();
   const e=document.createElement('div'); e.className='hist-item on';
   e.innerHTML=`<div class="hist-q">${x(q)}</div><div class="hist-ts">${ts()}</div>`;
-  e.onclick=()=>{ qi.value=q; resize(); qi.focus(); closeAll(); };
+  e.onclick=()=>{ qi.value=q; resize(); qi.focus(); toggle('h'); };
   document.querySelectorAll('.hist-item').forEach(i=>i.classList.remove('on'));
   document.getElementById('hbody').prepend(e);
 }

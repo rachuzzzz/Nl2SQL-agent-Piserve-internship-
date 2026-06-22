@@ -295,7 +295,7 @@ AI_TABLES = [
 USEFUL_COLUMNS = {
     "inspection_report": [
         "inspection_id",    # VARCHAR display id — use this NOT ir.id (UUID)
-        "inspection_score", "gp_score", "status",
+        "inspection_score", "status",
         "submitted_on", "start_date_time",
         "facility_id", "inspection_type_id", "inspector_user_id", "inspectee_user_id",
         "project_id", "client_id",
@@ -351,7 +351,7 @@ USEFUL_COLUMNS = {
     ],
     "ai_answers": [
         "inspection_id", "inspection_report_id", "element_id", "module_name",
-        "answer_text", "answer_numeric", "score", "score_type", "max_score",
+        "answer_text", "answer_text_raw", "answer_numeric", "score", "score_type", "max_score",
         "submitted_on",
     ],
 }
@@ -512,7 +512,7 @@ class DatabaseSchema:
             "Standard JOIN:\n"
             "  FROM ai_answers aa\n"
             "  LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
-            "  JOIN inspection_report ir ON aa.inspection_id = ir.id"
+            "  JOIN inspection_report ir ON aa.inspection_report_id = ir.id"
         )
         return "\n".join(lines)
 

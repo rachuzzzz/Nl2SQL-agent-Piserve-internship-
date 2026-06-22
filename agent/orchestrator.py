@@ -551,6 +551,9 @@ class AgentOrchestrator:
             examples=SEED_EXAMPLES,
         )
 
+        self.chat_model_name = chat_model
+        self.sql_model_name  = sql_model
+
         print(f"  Configuring reasoning LLM: {chat_model}...")
         self.reasoning_llm = Ollama(model=chat_model, base_url=ollama_url,
             temperature=0.2, request_timeout=120.0,
@@ -1390,10 +1393,10 @@ class AgentOrchestrator:
                         "SELECT corrective_action_id, cause, corrective_action, responsible, status\n"
                         "FROM inspection_corrective_action WHERE status = 'OPEN' LIMIT 100;"
                     )
-                elif re.search(r'\b(inspection.?score|gp.?score|hour|inspector)\b', q_lower):
+                elif re.search(r'\b(inspection.?score|hour|inspector)\b', q_lower):
                     hint = (
                         "\n\nFALLBACK SQL:\n"
-                        "SELECT inspection_score, gp_score, status, submitted_on\n"
+                        "SELECT inspection_score, status, submitted_on\n"
                         "FROM inspection_report WHERE status != 'DRAFT' LIMIT 50;"
                     )
                 elif re.search(r'\b(answer|response|submission)\b', q_lower):
@@ -1628,7 +1631,7 @@ class AgentOrchestrator:
         has_content = any(c in columns for c in [
             # Actual DB column names
             "label", "answer_text", "answer_numeric",
-            "inspection_score", "gp_score", "total_inspection_hours",
+            "inspection_score", "total_inspection_hours",
             "cause", "correction", "corrective_action", "responsible",
             "status", "progress_stage", "capex", "opex",
             "target_close_out_date", "schedule_date", "due_date",

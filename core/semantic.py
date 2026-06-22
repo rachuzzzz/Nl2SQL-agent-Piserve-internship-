@@ -54,6 +54,7 @@ class SemanticQuestionIndex:
         self.top_k = top_k
         self.labels = []
         self.embeddings = None
+        self._penalty_weights: Optional[np.ndarray] = None
         self._db_engine = db_engine
         self._built_at: Optional[datetime] = None
         # form_name → question count, used for weight normalization
@@ -167,10 +168,29 @@ class SemanticQuestionIndex:
             enriched = f"{label_text} [{form_name}]" if form_name else label_text
             texts.append(enriched)
 
-        self.embeddings = np.array([
-            self.embed_model.get_text_embedding(t) for t in texts
-        ])
+        self.embeddings = np.array(
+            self.embed_model.get_text_embedding_batch(texts)
+        )
         self._built_at = datetime.now()
+
+        # Pre-compute per-label penalty weights so search() can apply them
+        # via a single numpy multiply instead of a Python for loop.
+        if self._form_question_counts:
+            counts = sorted(self._form_question_counts.values())
+            median_count = counts[len(counts) // 2] if counts else 1
+            weights = []
+            for lbl in self.labels:
+                if (lbl["entity_type"] == "QUESTION" and lbl["form_name"]
+                        and median_count > 0):
+                    fc = self._form_question_counts.get(lbl["form_name"], 1)
+                    w = (1.0 / (1.0 + math.log(fc / median_count))
+                         if fc > median_count else 1.0)
+                else:
+                    w = 1.0
+                weights.append(w)
+            self._penalty_weights = np.array(weights, dtype=np.float32)
+        else:
+            self._penalty_weights = np.ones(len(self.labels), dtype=np.float32)
 
         type_counts = {}
         for lbl in self.labels:
@@ -198,6 +218,7 @@ class SemanticQuestionIndex:
         prev = len(self.labels)
         self.labels = []
         self.embeddings = None
+        self._penalty_weights = None
         self._form_question_counts = {}
         self._build_index(self._db_engine)
         delta = len(self.labels) - prev
@@ -220,30 +241,9 @@ class SemanticQuestionIndex:
         norms = np.where(norms == 0, 1, norms)
         scores = np.dot(self.embeddings, q_emb) / norms
 
-        # ------------------------------------------------------------------ #
-        # Form-weight normalization (Problem 1)                               #
-        # ------------------------------------------------------------------ #
-        # Apply a dampened inverse-frequency penalty to questions from
-        # over-represented forms.  A form with 738 questions should not occupy
-        # 7 of the top 10 slots for an unrelated query.
-        #
-        # Penalty formula:
-        #   if form_count > median_count:
-        #     weight = 1 / (1 + log(form_count / median_count))
-        #   else:
-        #     weight = 1.0  (no penalty for average-or-below-size forms)
-        #
-        # This dampens large forms without eliminating them — a genuinely
-        # relevant result from a large form will still rank highly.
-        if self._form_question_counts:
-            counts = sorted(self._form_question_counts.values())
-            median_count = counts[len(counts) // 2] if counts else 1
-            for i, lbl in enumerate(self.labels):
-                if lbl["entity_type"] == "QUESTION" and lbl["form_name"]:
-                    form_count = self._form_question_counts.get(lbl["form_name"], 1)
-                    if form_count > median_count and median_count > 0:
-                        penalty = 1.0 / (1.0 + math.log(form_count / median_count))
-                        scores[i] *= penalty
+        # Form-weight normalization: pre-computed in _build_index(), applied in one op.
+        if self._penalty_weights is not None:
+            scores *= self._penalty_weights
 
         mask = np.ones(len(self.labels), dtype=bool)
         if entity_type:
@@ -343,9 +343,9 @@ class SeedExampleIndex:
                 tag  = f'[{dom}]' if dom else ''
                 nl_texts.append(f"{tag} {nl}" if tag else nl)
 
-            self.embeddings = np.array([
-                embed_model.get_text_embedding(t) for t in nl_texts
-            ])
+            self.embeddings = np.array(
+                embed_model.get_text_embedding_batch(nl_texts)
+            )
 
             # Stage 2 fallback embeddings: NL + SQL table tokens
             aug_texts = [
@@ -355,9 +355,9 @@ class SeedExampleIndex:
                 )
                 for ex in self.examples
             ]
-            self._augmented_embeddings = np.array([
-                embed_model.get_text_embedding(t) for t in aug_texts
-            ])
+            self._augmented_embeddings = np.array(
+                embed_model.get_text_embedding_batch(aug_texts)
+            )
 
             # Keep legacy _seed_tags for domain boost in retrieve()
             self._seed_tags = [f'[{d}]' if d else '' for d in self._seed_domains]
@@ -505,6 +505,9 @@ class SeedExampleIndex:
             return []
 
         # ── Stage 2: reranking ────────────────────────────────────────────────
+        # Skip reranking entirely when stage 1 already has a high-confidence
+        # top candidate — avoids a second embedding call for clear matches.
+        top_score = candidates[0][1] if candidates else 0.0
         if self._cross_encoder is not None:
             pairs = [
                 (query, self.examples[i]['nl'] if isinstance(self.examples[i], dict) else self.examples[i][0])
@@ -515,6 +518,9 @@ class SeedExampleIndex:
                 zip([i for i, _ in candidates], ce_scores),
                 key=lambda x: x[1], reverse=True
             )
+        elif top_score >= 0.85:
+            # High-confidence stage 1 result — skip aug embedding call
+            reranked = candidates
         else:
             aug_query = f"{query} | context: inspection management facility corrective action capex opex"
             q_aug_emb = np.array(self.embed_model.get_text_embedding(aug_query))

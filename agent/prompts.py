@@ -99,6 +99,48 @@ Rules:
   Data questions include: how many, average, total, which facility, which inspector,
   show me, list, what is the score, percentage, count, top, rank, best, worst.
 
+AMBIGUITY RULE — Ask the user only when it genuinely matters:
+  Only ask for clarification when the different interpretations would return data that
+  CONTRADICTS or MISLEADS — not simply when the grouping scope is unspecified.
+
+  ASK when:
+  • "best inspector" / "top inspector" with no metric — AVG(inspection_score) vs volume vs
+    findings are fundamentally different and one could mislead (see INSPECTOR PERFORMANCE rule).
+  • The PREVIOUS turn was NOT already a clarification answer. If the user just answered
+    "which metric?" in the last message, DO NOT ask again — execute with their answer.
+
+  DO NOT ASK when:
+  • The metric is clear in context: "highest compliance" in an inspection system = highest
+    inspection_score. "Most inspections" = COUNT. "Lowest score" = MIN. Just run it.
+  • Only the grouping level is unspecified ("most good practices" — facility? inspector?):
+    pick the most natural grouping (facility for site metrics, inspector for person metrics)
+    and run the query. If multiple groupings are useful, show the top result for each.
+  • The user is clearly following up on the previous turn — treat their message as the
+    clarification answer and proceed immediately.
+  • A date range is missing for a non-trending question — use a sensible default (all time
+    or current year) and state the assumption in the answer.
+
+  Format when clarification IS needed — ask ALL ambiguous dimensions in ONE message:
+    If both entity type (inspector vs FM manager) AND metric are unclear, ask both together.
+    NEVER ask entity type in one turn, then metric in the next — that forces the user to reply twice.
+
+    Inspector options (inspectors CONDUCT inspections):
+      • Most inspections conducted
+      • Most observations/deviations found
+      • Most high-risk observations found
+
+    FM manager options (FM managers are INSPECTEES — they do NOT conduct inspections):
+      • Most capex converted (highest PO amounts paid by client)
+      • Most corrective actions closed
+      • Highest average facility compliance score
+
+  Combined example (both entity and metric unclear):
+  {"thought": "Both entity type (inspector vs FM manager) and metric are ambiguous. I will ask both dimensions in ONE message.",
+   "tool": "final_answer",
+   "args": {"answer": "Could you clarify who and what 'best' means?\n\n**If you mean Inspectors** (people who conduct inspections):\n• Most inspections conducted\n• Most observations/findings raised\n• Most high-risk observations found\n\n**If you mean FM Managers** (facility managers being inspected):\n• Most capex converted (highest PO amounts paid)\n• Most corrective actions closed\n• Highest average facility compliance score\n\nJust say which group and metric and I'll pull the data."}}
+
+  Do NOT ask for clarification more than once per topic in a conversation.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 INSPECTION WORKFLOW — plain relational tables
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -145,6 +187,19 @@ CRITICAL — inspection_report has TWO user FK columns (different people):
   Wrong:  JOIN users u ON ir.inspector_user_id = u.id
           WHERE EXISTS (... ur.user_id = ir.inspectee_user_id ...)  ← two different people
 
+FM MANAGER PERFORMANCE — FM managers are INSPECTEES (inspectee_user_id), never inspectors.
+  FM managers do NOT conduct inspections and do NOT raise observations.
+  NEVER suggest "most inspections conducted" or "most observations found" for FM managers.
+
+  FM manager performance is measured by:
+    1. Capex converted  → SUM(po_details.po_amount) joined via:
+                          ica → inspection_report → inspectee_user_id → users
+                          LEFT JOIN po_details ON po_details.mitigative_action_uuid = ica.id
+    2. CAs closed       → COUNT(ica) WHERE ica.status = 'CLOSED' GROUP BY inspectee_user_id
+    3. Open / overdue   → COUNT(ica) WHERE ica.status != 'CLOSED'
+    4. Facility compliance → AVG(ir.inspection_score) WHERE inspector_user_id ... (their sites)
+       Only use this when explicitly asked; label it avg_facility_compliance_score.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORM ANSWERS — flat ai_* tables
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -164,11 +219,15 @@ FORM ANSWERS — flat ai_* tables
     also have rows in ai_answers. No ETL lag applies.
 
   IMPORTANT — answer_text encoding:
-    Dropdown/checkbox answers are stored as plain strings — NOT JSON.
-    e.g. Risk Level answer is stored as:       High
-         Observation Type answer is stored as: Deviation
-    Use exact match for known values: aa.answer_text ILIKE '%High%'
-    Use ILIKE only for partial/unknown values: aa.answer_text ILIKE '%keyword%'
+    Dropdown/checkbox answers are stored as plain strings (normalized).
+    e.g. Risk Level answer:    'High' | 'Medium' | 'Low' | 'No Active Risk'  (single value)
+         Observation Type:     'Deviation' | 'Good Practice'                  (single value)
+         Impact (multi-select): 'Health & Safety (HS), Environmental, Legal / Regulatory'
+                                (comma-joined when multiple categories selected)
+    Single-value fields: aa.answer_text = 'High' works; ILIKE '%High%' also works.
+    Impact (multi-select): MUST use ILIKE — aa.answer_text ILIKE '%Health & Safety%'
+                           because the full string may contain multiple categories.
+    The raw pre-normalization values are preserved in aa.answer_text_raw if needed.
     The question label is separate: aq.label = 'Risk Level'
 
 ROUTING — FORM ANSWER QUERIES:
@@ -357,6 +416,28 @@ When in doubt between inspection_report scores and ai_answers scores:
   → inspection_report.inspection_score is the OVERALL inspection score.
   → ai_answers.answer_text contains per-question text answers which may include scores.
   → Prefer inspection_report for aggregate score questions.
+
+CRITICAL — INSPECTOR PERFORMANCE vs SITE COMPLIANCE SCORE:
+  AVG(ir.inspection_score) grouped by inspector measures the average compliance of the
+  SITES that inspector was assigned to — NOT how good the inspector is.
+  An inspector assigned only to well-run facilities will always rank first regardless of skill.
+
+  DO NOT use AVG(ir.inspection_score) when the question is about:
+    "best/worst/top performing inspector", "inspector performance", "inspector ranking",
+    "which inspector does the best job", "most effective inspector"
+
+  USE INSTEAD (the correct inspector performance metrics):
+    - inspection volume:      COUNT(ir.id) AS assigned
+    - observations found:     COUNT(DISTINCT aa.submission_id) (pre-aggregated in a CTE)
+    - high-risk observations: COUNT(DISTINCT CASE WHEN risk level = 'High' THEN submission_id END)
+    - corrective actions:     COUNT(*) from inspection_corrective_action
+
+  AVG(ir.inspection_score) per inspector IS appropriate only when the user explicitly asks:
+    "what is the average site score for each inspector's assigned inspections"
+    "which inspector's sites score highest on average" — i.e. a site-quality question scoped to inspector.
+
+  NEVER alias the same aggregate expression under two different names (e.g. COUNT(*) AS x AND
+  COUNT(*) AS y in the same SELECT) — it adds a useless duplicate column to results.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WORKED EXAMPLES
@@ -620,7 +701,8 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
     element_id           uuid  → JOIN to ai_questions.element_id
     inspection_report_id uuid  → JOIN to inspection_report.id
     inspection_id        varchar
-    answer_text          text
+    answer_text          text   ← normalized plain string (use this for all filtering/display)
+    answer_text_raw      text   ← original pre-normalization value (JSON arrays/uuids) — for audit only
     answer_numeric       numeric
     score                numeric  ← weighted points earned for this answer (range 1–27 in data)
     score_type           varchar
@@ -643,17 +725,21 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
                            Higher score = more/higher-weight categories selected
                            NEVER treat Impact as High/Medium/Low severity — it is category-based
                            To filter by category: aa.answer_text ILIKE '%Health & Safety%'
-      'Risk Level'       — risk score (range observed: 1–5)
+      'Risk Level'       — FORM CONFIG ARTIFACT: score is set at form publication time, NOT by the inspector's answer
+                           Current forms always score=4; legacy forms always score=1 regardless of answer
+                           NEVER use aa.score WHERE label='Risk Level' for severity analysis — it is meaningless
+                           To analyse actual risk level: use aa.answer_text ILIKE '%High%' / '%Medium%' etc.
                            answer_text values: 'High', 'Medium', 'Low', 'No Active Risk'
-      'Observation Type' — type score (range observed: 1)
+      'Observation Type' — type score (range observed: 1, also a form config artifact — not meaningful)
                            answer_text values: 'Deviation', 'Good Practice'
     'Observation' (free-text) has NO score — NEVER use WHERE aq.label = 'Observation' AND aa.score IS NOT NULL
 
+    SEVERITY SIGNAL — aa.score WHERE label='Impact' is the ONLY valid severity metric from ai_answers:
     "observation with highest impact score" → WHERE aq.label = 'Impact' ORDER BY aa.score DESC LIMIT N
-    "highest scoring answer for inspector X" → ORDER BY aa.score DESC WHERE aq.label IN ('Impact','Risk Level','Observation Type')
-    "inspector with best form scores"        → GROUP BY inspector, AVG(aa.score) WHERE aq.label IN ('Impact','Risk Level','Observation Type')
-    "facility with best scored answers"      → GROUP BY fac.name, AVG(aa.score) WHERE aq.label IN ('Impact','Risk Level','Observation Type')
-    "total score for an inspection"          → SUM(aa.score) WHERE inspection_report_id = X
+    "highest scoring answer for inspector X" → ORDER BY aa.score DESC WHERE aq.label = 'Impact'
+    "inspector with best form scores"        → GROUP BY inspector, AVG(aa.score) WHERE aq.label = 'Impact'
+    "facility with best scored answers"      → GROUP BY fac.name, AVG(aa.score) WHERE aq.label = 'Impact'
+    "total score for an inspection"          → SUM(aa.score) WHERE inspection_report_id = X AND aq.label = 'Impact'
     ALWAYS filter: WHERE aa.score IS NOT NULL AND aa.module_name = 'Inspection Form'
     module_id            uuid
     submitted_on         timestamptz
@@ -669,12 +755,15 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
     JOIN inspection_report ir ON aa.inspection_report_id = ir.id
 
   CRITICAL — answer_text encoding:
-    Dropdown/checkbox answers are stored as plain strings — NOT JSON arrays.
-    e.g. Risk Level answer is stored as: High        (not ["High|uuid"])
-         Observation Type answer:        Deviation   (not ["Deviation|uuid"])
-    Use ILIKE for answer_text matching: aa.answer_text ILIKE '%High%'
-    For distribution/grouping queries use: GROUP BY aa.answer_text (returns all values)
-    Known answer values: 'High', 'Medium', 'Low', 'No Active Risk', 'Deviation', 'Good Practice'
+    Dropdown/checkbox answers are stored as plain strings (normalized).
+    e.g. Risk Level:          'High', 'Medium', 'Low', 'No Active Risk'  (single value — = works)
+         Observation Type:    'Deviation', 'Good Practice'               (single value — = works)
+         Impact (multi-select): 'Health & Safety (HS), Environmental'   (comma-joined — ILIKE required)
+    Single-value fields: exact match aa.answer_text = 'High' works; ILIKE '%High%' also safe.
+    Impact MUST use ILIKE: aa.answer_text ILIKE '%Health & Safety%'  (value is a comma-joined list)
+    For distribution/grouping: GROUP BY aa.answer_text returns clean readable values.
+    Raw pre-normalization values (JSON arrays with uuids) are in aa.answer_text_raw.
+    Known values: 'High', 'Medium', 'Low', 'No Active Risk', 'Deviation', 'Good Practice'
 
   CRITICAL — ai_answers spans ALL 16 modules:
     When user says 'the form', 'the inspection form', 'what they filled' without
@@ -924,7 +1013,7 @@ Turn 1: {"thought": "Need ai_answers filtered by question label='Observation' AN
 
 ─── Form answers: filter by answer value ───
 User: "show all high risk observations"
-Turn 1: {"thought": "User wants observation TEXT for inspections where Risk Level answer = High. Must use TWO arms: subquery gets inspection_report_ids where Risk Level=High, outer query gets Observation answer_text for those inspections. NEVER return risk level rows themselves — return the observation text.", "tool": "generate_sql", "args": {"question": "observation text for inspections where risk level is high", "schema_hint": "SELECT obs.answer_text AS observation, ir.inspection_id, ir.submitted_on FROM ai_answers obs JOIN ai_questions obs_q ON obs.element_id = obs_q.element_id JOIN inspection_report ir ON obs.inspection_report_id = ir.id WHERE obs_q.label = 'Observation' AND obs.inspection_report_id IN (SELECT aa2.inspection_report_id FROM ai_answers aa2 JOIN ai_questions aq2 ON aa2.element_id = aq2.element_id WHERE aq2.label = 'Risk Level' AND aa2.answer_text = 'High') AND ir.status != 'DRAFT' AND ir.active = true ORDER BY ir.submitted_on DESC LIMIT 100;"}}
+Turn 1: {"thought": "User wants observation TEXT for inspections where Risk Level answer = High. Must use TWO arms: subquery gets inspection_report_ids where Risk Level=High, outer query gets Observation answer_text for those inspections. NEVER return risk level rows themselves — return the observation text.", "tool": "generate_sql", "args": {"question": "observation text for inspections where risk level is high", "schema_hint": "SELECT obs.answer_text AS observation, ir.inspection_id, ir.submitted_on FROM ai_answers obs JOIN ai_questions obs_q ON obs.element_id = obs_q.element_id JOIN inspection_report ir ON obs.inspection_report_id = ir.id WHERE obs_q.label = 'Observation' AND obs.inspection_report_id IN (SELECT aa2.inspection_report_id FROM ai_answers aa2 JOIN ai_questions aq2 ON aa2.element_id = aq2.element_id WHERE aq2.label = 'Risk Level' AND aa2.answer_text ILIKE '%High%') AND ir.status != 'DRAFT' AND ir.active = true ORDER BY ir.submitted_on DESC LIMIT 100;"}}
 
 ─── Form answers: by inspection ───
 User: "all answers in inspection INS-2024-001"
@@ -992,6 +1081,72 @@ Turn 1: {"thought": "list_forms gives distinct form names.", "tool": "list_forms
 ─── Average form answer score ───
 User: "average score in the fire safety form"
 Turn 1: {"thought": "Aggregate over ai_answer.answer_text for fire safety.", "tool": "get_answer_stats", "args": {"form_name": "fire safety", "label": "score"}}
+""",
+    },
+    {
+        "title": "Inspector performance ranking — DO NOT use AVG(inspection_score)",
+        "question_pattern": (
+            r"(?i)\b(best|top|worst|poorest|highest|lowest)\b.{0,30}\b(inspector|inspectors)\b"
+            r"|\b(inspector|inspectors)\b.{0,30}\b(perform\w*|rank\w*|effective\w*|produc\w*)\b"
+            r"|\bwhich\s+inspector\b.{0,30}\b(best|worst|most|highest|top)\b"
+            r"|\binspector\b.{0,30}\b(leaderboard|ranking|comparison)\b"
+        ),
+        "text": """\
+─── Inspector performance ranking ───
+CRITICAL: DO NOT use AVG(ir.inspection_score) to rank inspectors.
+inspection_score measures SITE compliance quality, not inspector skill.
+An inspector assigned only to well-run facilities always ranks first — facility bias.
+
+"Best inspector" is AMBIGUOUS. The correct behaviour is:
+  • If question says "best by volume / most inspections" → rank by COUNT(ir.id) conducted
+  • If question says "most thorough / most observations / most findings" → rank by observation count
+  • If question says "average site score" or explicitly mentions inspection_score → ok to use AVG(ir.inspection_score) but label it avg_site_score and add inspection_count alongside
+  • If "best" is vague → use the CTE pattern (volume + observations + high-risk) OR ask for clarification
+
+NEVER alias the same aggregate twice (COUNT(*) AS x AND COUNT(*) AS y in same SELECT).
+
+User: "who are the top 10 best performing inspectors?"
+Turn 1: {"thought": "'Best performing' is ambiguous — volume? findings? site score? I must NOT use AVG(inspection_score). I should ask for clarification.", "tool": "final_answer", "args": {"answer": "Could you clarify what you mean by 'best performing'?\n• Most inspections conducted\n• Most observations/deviations found\n• Most high-risk observations found\n• Highest average site compliance score (note: this reflects facility quality, not inspector skill)\n\nLet me know and I'll pull the right data."}}
+
+User follow-up: "most inspections conducted" (user answered the clarification — EXECUTE NOW, do NOT ask again)
+Turn 1: {"thought": "User just clarified: 'most inspections conducted' = volume. Previous turn was my clarification question. I must NOT ask again — proceed immediately with CTE pattern.", "tool": "generate_sql", "args": {"question": "top inspectors by inspection volume and observations found", "schema_hint": "WITH obs AS (SELECT aa.inspection_report_id, COUNT(DISTINCT aa.submission_id) AS total_obs, COUNT(DISTINCT CASE WHEN aq.label = 'Risk Level' AND aa.answer_text ILIKE '%High%' THEN aa.submission_id END) AS high_risk_obs FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.module_name = 'Inspection Form' GROUP BY aa.inspection_report_id) SELECT u.first_name || ' ' || u.last_name AS inspector_name, COUNT(ir.id) AS assigned, COUNT(ir.id) FILTER (WHERE ir.status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION','CLOSED')) AS conducted, COALESCE(SUM(obs.total_obs),0) AS total_observations, COALESCE(SUM(obs.high_risk_obs),0) AS high_risk_observations FROM users u JOIN inspection_report ir ON ir.inspector_user_id = u.id AND ir.active = true LEFT JOIN obs ON obs.inspection_report_id = ir.id WHERE u.active = true AND ir.status != 'DRAFT' GROUP BY u.id, u.first_name, u.last_name ORDER BY conducted DESC LIMIT 10;"}}
+
+User: "which inspector has the lowest average inspection score?" (explicitly about inspection_score)
+Turn 1: {"thought": "User explicitly asked for average inspection_score per inspector — this is the avg SITE score for their assigned inspections, not inspector quality. I'll label it clearly.", "tool": "generate_sql", "args": {"question": "inspector with lowest average site inspection score", "schema_hint": "SELECT u.first_name || ' ' || u.last_name AS inspector_name, ROUND(AVG(ir.inspection_score)::numeric, 2) AS avg_site_score, COUNT(*) AS inspection_count FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id WHERE ir.status != 'DRAFT' AND ir.inspection_score IS NOT NULL GROUP BY u.id, u.first_name, u.last_name ORDER BY avg_site_score ASC LIMIT 1;"}}
+""",
+    },
+    {
+        "title": "FM manager performance ranking — domain-correct metrics, NOT inspector metrics",
+        "question_pattern": (
+            r"(?i)\b(best|top|worst|highest|lowest|top\s+\d+)\b.{0,40}\b(manager|managers|fm\s+manager|facility\s+manager)\b"
+            r"|\b(manager|fm\s+manager|facility\s+manager)s?\b.{0,30}\b(perform\w*|rank\w*|best|top|worst|leaderboard)\b"
+            r"|\bwhich\s+(manager|fm\s+manager|facility\s+manager)\b.{0,30}\b(best|most|highest|top)\b"
+        ),
+        "text": """\
+─── FM manager performance ranking ───
+CRITICAL: FM managers are INSPECTEES (inspectee_user_id). They do NOT conduct inspections.
+NEVER offer "most inspections conducted" or "most observations found" for FM managers.
+
+FM manager metrics (domain-correct):
+  • Capex converted: SUM(po_details.po_amount) via inspectee_user_id
+  • Corrective actions closed: COUNT(ica WHERE status='CLOSED')
+  • Open / overdue CAs: COUNT(ica WHERE status != 'CLOSED')
+  • Average facility compliance: AVG(ir.inspection_score) on their sites
+
+"Best manager" is AMBIGUOUS on two dimensions: entity type AND metric.
+When both are unclear → ask BOTH in ONE message (never two separate turns).
+
+User: "who are the top 10 best managers?"
+Turn 1: {"thought": "'Manager' is ambiguous (inspector vs FM manager) and 'best' metric is also unknown. I must ask BOTH dimensions together in ONE message — not ask entity first then metric next turn.", "tool": "final_answer", "args": {"answer": "Could you clarify who and what 'best' means?\n\n**If you mean Inspectors** (people who conduct inspections):\n• Most inspections conducted\n• Most observations/findings raised\n• Most high-risk observations found\n\n**If you mean FM Managers** (facility managers being inspected):\n• Most capex converted (highest PO amounts paid by client)\n• Most corrective actions closed\n• Highest average facility compliance score\n\nJust say which group and metric and I'll pull the data."}}
+
+User follow-up: "i mean FM managers by most capex converted" (user answered both — DO NOT ask again, execute immediately)
+Turn 1: {"thought": "User clarified: FM managers (inspectee_user_id) ranked by capex converted (po_details). Previous turn was my clarification. I must NOT ask again. Proceed.", "tool": "generate_sql", "args": {"question": "top FM managers by capex converted using po_details", "schema_hint": "WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po FROM po_details WHERE active = true GROUP BY 1) SELECT u.first_name || ' ' || u.last_name AS fm_manager, COALESCE(SUM(ica.capex), 0) AS capex_generated, COALESCE(SUM(p.total_po), 0) AS capex_converted, ROUND(COALESCE(SUM(p.total_po), 0) * 100.0 / NULLIF(SUM(ica.capex), 0), 1) AS conversion_rate_pct FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id AND ir.active = true JOIN users u ON ir.inspectee_user_id = u.id AND u.active = true LEFT JOIN po_by_ica p ON p.ica_id = ica.id WHERE ica.active = true AND ica.capex > 0 GROUP BY u.id, u.first_name, u.last_name ORDER BY capex_converted DESC LIMIT 10;"}}
+
+User follow-up: "i mean FM managers" alone (user answered entity only — ask metric ONCE more with FM-correct options, then stop asking)
+Turn 1: {"thought": "User clarified entity = FM managers. I know to use inspectee_user_id. Still need metric — I will ask ONCE more about metric only, with FM-manager-appropriate options, NEVER inspector options.", "tool": "final_answer", "args": {"answer": "Got it — FM managers. What metric should I use to rank them?\n• Most capex converted (highest PO amounts paid by client)\n• Most corrective actions closed\n• Highest average facility compliance score\n\nLet me know and I'll run it."}}
+
+User follow-up after "i mean FM managers": "most capex converted" (DO NOT ask again — execute immediately)
+Turn 1: {"thought": "User answered metric. Entity already confirmed (FM managers = inspectee_user_id). Metric = capex converted = SUM(po_details.po_amount). Must NOT ask again.", "tool": "generate_sql", "args": {"question": "top FM managers by capex converted using po_details", "schema_hint": "WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po FROM po_details WHERE active = true GROUP BY 1) SELECT u.first_name || ' ' || u.last_name AS fm_manager, COALESCE(SUM(ica.capex), 0) AS capex_generated, COALESCE(SUM(p.total_po), 0) AS capex_converted FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id AND ir.active = true JOIN users u ON ir.inspectee_user_id = u.id AND u.active = true LEFT JOIN po_by_ica p ON p.ica_id = ica.id WHERE ica.active = true AND ica.capex > 0 GROUP BY u.id, u.first_name, u.last_name ORDER BY capex_converted DESC LIMIT 10;"}}
 """,
     },
 ]
