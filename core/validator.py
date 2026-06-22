@@ -589,16 +589,19 @@ class SQLValidator:
         # because PostgreSQL pads month names: 'January   2026' ≠ 'January 2026'.
         # This pattern is ONLY valid for GROUP BY labels / SELECT display.
         if re.search(r'\bto_char\b', sql_lower):
-            # Detect: to_char(...'Month YYYY'...) = '...' anywhere in the SQL
-            # Use a flat scan (not [^)]+) to handle nested calls like date_trunc('month',...)
+            # Detect: to_char(..., 'Month YYYY') = '...' — the = must immediately follow
+            # the closing ) of the to_char() call to avoid false positives where a distant
+            # = ' later in the query (e.g. ir.status != 'DRAFT') is incorrectly matched.
             tochar_month_eq = re.search(
-                r"\bto_char\b[^;]*'month\s+yyyy'[^;]*=\s*'",
+                r"\bto_char\b[^;]*'month\s+yyyy'\s*\)\s*=\s*'",
                 sql_lower, re.IGNORECASE | re.DOTALL,
             )
             if tochar_month_eq:
-                # Confirm a WHERE keyword precedes this pattern (not just SELECT/GROUP BY)
+                # Confirm a WHERE keyword precedes this pattern (not just SELECT/GROUP BY).
+                # Only look for WHERE after the last SELECT to avoid matching CTE WHERE clauses.
                 before = sql_lower[:tochar_month_eq.start()]
-                in_where = bool(re.search(r'\bwhere\b', before))
+                last_select = max((m.end() for m in re.finditer(r'\bselect\b', before)), default=0)
+                in_where = bool(re.search(r'\bwhere\b', before[last_select:]))
                 if in_where:
                     issues.append(ValidationIssue(
                         "HARD_FAIL", "TOCHAR_WHERE_FILTER",
@@ -731,7 +734,12 @@ class SQLValidator:
             r'GROUP\s+BY\s+(date_trunc|EXTRACT|TO_CHAR|\d+)',
             sql, re.IGNORECASE
         ))
-        if has_group_by and not _is_trend_groupby:
+        # Allow GROUP BY when FILTER aggregates are already present — the query
+        # is using the correct FILTER pattern and GROUP BY just adds a breakdown
+        # dimension (e.g. CASE WHEN status='CLOSED' GROUP BY that CASE alias).
+        _has_filter_aggregates = bool(re.search(r'\bFILTER\s*\(', sql, re.IGNORECASE))
+
+        if has_group_by and not _is_trend_groupby and not _has_filter_aggregates:
             # Build domain-specific retry message
             q_lower_shape = question.lower()
             _is_ca_comparison = bool(re.search(

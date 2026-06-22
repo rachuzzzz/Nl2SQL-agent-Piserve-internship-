@@ -58,7 +58,7 @@ EVAL_CASES = [
     {
         "id": "ADM-06",
         "question": "How many inspections were returned for modification this month?",
-        "keywords": ["inspection_report", "RETURNED", "COUNT"],
+        "keywords": ["inspection_report", "RETURN_FOR_MODIFICATION", "COUNT"],
         "category": "overview",
     },
     {
@@ -193,10 +193,10 @@ EVAL_CASES = [
 
     {
         "id": "FM-01",
-        "question": "Who are the top 5 performing FM managers?",
+        "question": "Who are the top 5 FM managers by capex conversion rate?",
         "keywords": ["inspectee_user_id", "po_details", "po_amount", "SUM", "conversion"],
         "category": "fm_manager",
-        "note": "Performance = high conversion rate + low OPEX — must use inspectee_user_id",
+        "note": "Specific metric avoids ambiguity clarification. Must use inspectee_user_id. Conversion = SUM(po_amount)/NULLIF(SUM(capex),0)*100",
     },
     {
         "id": "FM-02",

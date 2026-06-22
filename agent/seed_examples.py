@@ -154,7 +154,6 @@ SELECT ir.inspection_id,
        fac.name AS facility_name,
        it.name  AS inspection_type_name,
        ir.inspection_score,
-       ir.gp_score,
        ir.status,
        ir.submitted_on
 FROM inspection_report ir
@@ -767,7 +766,7 @@ JOIN ai_answers risk_aa ON risk_aa.inspection_report_id = aa.inspection_report_i
 JOIN ai_questions risk_aq ON risk_aa.element_id = risk_aq.element_id
 JOIN inspection_report ir ON aa.inspection_report_id = ir.id
 WHERE aq.label = 'Observation'
-  AND risk_aq.label = 'Risk Level' AND risk_aa.answer_text = 'High'
+  AND risk_aq.label = 'Risk Level' AND risk_aa.answer_text ILIKE '%High%'
   AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
 GROUP BY date_trunc('month', ir.submitted_on)
 ORDER BY high_risk_count DESC LIMIT 1;
@@ -940,9 +939,12 @@ ORDER BY conducted DESC LIMIT 1;
         # NEVER join ai_answers twice in the main query (fan-out/cross-join).
         # Pre-aggregate observations in a CTE to avoid row multiplication.
         # NEVER join inspection_schedule — it is irrelevant to inspector performance counts.
-        'nl':     'inspector performance summary assigned conducted observations high risk inspector report breakdown inspector stats',
+        # NEVER use AVG(ir.inspection_score) here — that's avg SITE compliance, not inspector quality.
+        'nl':     'inspector performance summary assigned conducted observations high risk inspector report breakdown inspector stats best performing inspector top inspectors by performance which inspector performs best inspector ranking inspector effectiveness who is best inspector',
         'sql':    """\
 -- Inspector performance: assigned, conducted, total observations, high-risk observations
+-- NEVER rank by AVG(ir.inspection_score) — that measures avg site compliance of assigned
+-- facilities, not inspector quality. Tough-site inspectors will always rank last unfairly.
 -- conducted = SUBMITTED only (NOT status != 'DRAFT' — that overcounts)
 -- Observations pre-aggregated in CTE to prevent double-join fan-out
 WITH obs AS (
@@ -1442,7 +1444,7 @@ JOIN ai_questions aq ON aa.element_id = aq.element_id
 JOIN inspection_report ir ON aa.inspection_report_id = ir.id
 JOIN ai_answers obs ON obs.inspection_report_id = ir.id
 JOIN ai_questions obs_q ON obs.element_id = obs_q.element_id
-WHERE aq.label = 'Risk Level' AND aa.answer_text = 'High'
+WHERE aq.label = 'Risk Level' AND aa.answer_text ILIKE '%High%'
   AND obs_q.label = 'Observation'
   AND ir.status != 'DRAFT'
 ORDER BY ir.submitted_on DESC LIMIT 100;
@@ -1522,23 +1524,24 @@ ORDER BY aq.label;
     {
         'nl':     'which inspector gets the highest form answer scores best scoring inspector',
         'sql':    """\
--- aa.score is ONLY populated for: 'Impact', 'Risk Level', 'Observation Type'
--- 'Observation' free-text has no score — always filter on scored labels
+-- aa.score is meaningful ONLY for 'Impact' (range 1-27, severity signal)
+-- Risk Level and Observation Type scores are form config artifacts (always 4 or 1) — ignore for scoring
+-- 'Observation' free-text has no score — never filter aq.label = 'Observation' for scores
 SELECT u.first_name || ' ' || u.last_name AS inspector_name,
-       ROUND(AVG(aa.score)::numeric, 2) AS avg_answer_score,
-       SUM(aa.score)                    AS total_score,
-       COUNT(aa.id)                     AS answer_count
+       ROUND(AVG(aa.score)::numeric, 2) AS avg_impact_score,
+       SUM(aa.score)                    AS total_impact_score,
+       COUNT(aa.id)                     AS observation_count
 FROM ai_answers aa
 JOIN ai_questions aq ON aa.element_id = aq.element_id
 JOIN inspection_report ir ON aa.inspection_report_id = ir.id
 JOIN users u ON ir.inspector_user_id = u.id
 WHERE aa.score IS NOT NULL
-  AND aq.label IN ('Impact', 'Risk Level', 'Observation Type')
+  AND aq.label = 'Impact'
   AND aa.module_name = 'Inspection Form'
   AND ir.active = true AND ir.status != 'DRAFT'
   AND u.active = true
 GROUP BY u.id, u.first_name, u.last_name
-ORDER BY avg_answer_score DESC LIMIT 10;
+ORDER BY avg_impact_score DESC LIMIT 10;
 """,
         'domain': 'form_answers',
         'intent': 'ranked_list',
@@ -1547,21 +1550,22 @@ ORDER BY avg_answer_score DESC LIMIT 10;
     {
         'nl':     'which facility has the best form answer scores highest scored observations facility',
         'sql':    """\
--- aa.score is ONLY populated for: 'Impact', 'Risk Level', 'Observation Type'
+-- aa.score meaningful ONLY for 'Impact' (range 1-27, severity signal)
+-- Risk Level and Observation Type scores are form config artifacts — never use for ranking
 SELECT fac.name AS facility_name,
-       ROUND(AVG(aa.score)::numeric, 2) AS avg_answer_score,
-       COUNT(aa.id)                     AS answer_count
+       ROUND(AVG(aa.score)::numeric, 2) AS avg_impact_score,
+       COUNT(aa.id)                     AS observation_count
 FROM ai_answers aa
 JOIN ai_questions aq ON aa.element_id = aq.element_id
 JOIN inspection_report ir ON aa.inspection_report_id = ir.id
 JOIN facility fac ON ir.facility_id = fac.id
 WHERE aa.score IS NOT NULL
-  AND aq.label IN ('Impact', 'Risk Level', 'Observation Type')
+  AND aq.label = 'Impact'
   AND aa.module_name = 'Inspection Form'
   AND ir.active = true AND ir.status != 'DRAFT'
   AND fac.active = true
 GROUP BY fac.id, fac.name
-ORDER BY avg_answer_score DESC LIMIT 20;
+ORDER BY avg_impact_score DESC LIMIT 20;
 """,
         'domain': 'form_answers',
         'intent': 'ranked_list',
@@ -1682,9 +1686,9 @@ ORDER BY ca_count DESC LIMIT 10;
     {
         'nl':     'show observation with highest score for a specific inspector highest impact score',
         'sql':    """\
--- aa.score is ONLY populated for: 'Impact', 'Risk Level', 'Observation Type'
+-- aa.score is meaningful ONLY for 'Impact' (range 1-27, severity signal)
+-- Risk Level and Observation Type scores are form config artifacts (always 4 or 1) — never rank by them
 -- 'Observation' (free-text field) has NO score — never filter aq.label = 'Observation' for scores
--- For highest scoring answer use Impact (scores up to 27) or Risk Level or Observation Type
 -- Always wrap OR name conditions in parentheses to avoid precedence bug
 SELECT aq.label AS question_type,
        aa.answer_text AS answer,
@@ -1697,7 +1701,7 @@ JOIN ai_questions aq ON aa.element_id = aq.element_id
 JOIN inspection_report ir ON aa.inspection_report_id = ir.id
 JOIN users u ON ir.inspector_user_id = u.id
 WHERE (u.first_name ILIKE '%inspector_name%' OR u.last_name ILIKE '%inspector_name%')
-  AND aq.label IN ('Impact', 'Risk Level', 'Observation Type')
+  AND aq.label = 'Impact'
   AND aa.score IS NOT NULL
   AND aa.module_name = 'Inspection Form'
   AND ir.active = true AND ir.status != 'DRAFT'
@@ -1732,9 +1736,11 @@ GROUP BY ir.inspection_id;
         'nl':     'what is the risk level breakdown of all corrective actions',
         'sql':    """\
 -- ICA risk_level_id is UUID FK — NEVER compare to string, NEVER GROUP BY UUID
+-- Filter by ica.active only — do NOT reference ir.active without joining inspection_report
 SELECT rl.name AS risk_level_name, COUNT(*) AS action_count
 FROM inspection_corrective_action ica
 JOIN risk_level rl ON ica.risk_level_id = rl.id
+WHERE ica.active = true
 GROUP BY rl.name ORDER BY action_count DESC;
 """,
         'domain': 'corrective_action',
@@ -1880,15 +1886,23 @@ ORDER BY improvement DESC LIMIT 1;
         'limit':  1,
     },
     {
-        'nl':     'which inspector has the lowest average inspection score',
+        # NOTE: inspection_score measures SITE compliance, not inspector quality.
+        # This query answers "which inspector's assigned sites score lowest on average" —
+        # it does NOT identify a poor-performing inspector (they may just work tough sites).
+        # Use ONLY when the user explicitly asks about average site scores per inspector.
+        # For actual inspector performance → use the CTE pattern with observations/volume.
+        'nl':     'which inspector has the lowest average inspection score average site score by inspector',
         'sql':    """\
+-- avg_site_score = avg site compliance score of inspections assigned to this inspector
+-- NOT a measure of inspector quality — tough-site inspectors will always rank last
 SELECT u.first_name || ' ' || u.last_name AS inspector_name,
-       ROUND(AVG(ir.inspection_score)::numeric, 2) AS avg_score
+       ROUND(AVG(ir.inspection_score)::numeric, 2) AS avg_site_score,
+       COUNT(*) AS inspection_count
 FROM inspection_report ir
 JOIN users u ON ir.inspector_user_id = u.id
 WHERE ir.status != 'DRAFT' AND ir.inspection_score IS NOT NULL
 GROUP BY u.id, u.first_name, u.last_name
-ORDER BY avg_score ASC LIMIT 1;
+ORDER BY avg_site_score ASC LIMIT 1;
 """,
         'domain': 'inspection',
         'intent': 'single_value',

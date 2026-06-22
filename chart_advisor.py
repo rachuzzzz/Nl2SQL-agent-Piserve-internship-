@@ -64,43 +64,51 @@ _AXLINE  = "#374151"
 _VALID_TYPES = {
     "bar", "horizontal_bar", "stacked_bar",
     "line", "area",
-    "pie", "doughnut",
+    "pie", "doughnut", "nightingale",
     "scatter",
     "radar",
     "heatmap",
+    "calendar_heatmap",
     "waterfall",
+    "funnel",
     "gauge",
 }
 
 _TYPE_LABELS = {
-    "bar":           "Bar Chart",
-    "horizontal_bar":"Horizontal Bar",
-    "stacked_bar":   "Stacked Bar",
-    "line":          "Line Chart",
-    "area":          "Area Chart",
-    "pie":           "Pie Chart",
-    "doughnut":      "Doughnut Chart",
-    "scatter":       "Scatter Plot",
-    "radar":         "Radar Chart",
-    "heatmap":       "Heatmap",
-    "waterfall":     "Waterfall Chart",
-    "gauge":         "Gauge",
+    "bar":              "Bar Chart",
+    "horizontal_bar":   "Horizontal Bar",
+    "stacked_bar":      "Stacked Bar",
+    "line":             "Line Chart",
+    "area":             "Area Chart",
+    "pie":              "Pie Chart",
+    "doughnut":         "Doughnut Chart",
+    "nightingale":      "Nightingale Chart",
+    "scatter":          "Scatter Plot",
+    "radar":            "Radar Chart",
+    "heatmap":          "Heatmap",
+    "calendar_heatmap": "Calendar Heatmap",
+    "waterfall":        "Waterfall Chart",
+    "funnel":           "Funnel Chart",
+    "gauge":            "Gauge",
 }
 
 # Alternatives map — what makes sense as a second/third option for each type
 _ALT_MAP: dict[str, list[str]] = {
-    "bar":           ["horizontal_bar", "line"],
-    "horizontal_bar":["bar", "stacked_bar"],
-    "stacked_bar":   ["bar", "area"],
-    "line":          ["area", "bar"],
-    "area":          ["line", "stacked_bar"],
-    "pie":           ["doughnut", "bar"],
-    "doughnut":      ["pie", "bar"],
-    "scatter":       ["bar", "line"],
-    "radar":         ["bar", "line"],
-    "heatmap":       ["bar", "scatter"],
-    "waterfall":     ["bar", "line"],
-    "gauge":         ["bar"],
+    "bar":              ["horizontal_bar", "line", "funnel"],
+    "horizontal_bar":   ["bar", "stacked_bar"],
+    "stacked_bar":      ["bar", "area"],
+    "line":             ["area", "bar", "calendar_heatmap"],
+    "area":             ["line", "stacked_bar"],
+    "pie":              ["doughnut", "nightingale", "bar"],
+    "doughnut":         ["pie", "nightingale", "bar"],
+    "nightingale":      ["doughnut", "pie", "bar"],
+    "scatter":          ["bar", "line"],
+    "radar":            ["bar", "line"],
+    "heatmap":          ["bar", "scatter"],
+    "calendar_heatmap": ["line", "bar", "heatmap"],
+    "waterfall":        ["bar", "line"],
+    "funnel":           ["horizontal_bar", "bar"],
+    "gauge":            ["bar"],
 }
 
 
@@ -112,10 +120,19 @@ _INCOME_RE = re.compile(r'(income|revenue|po_amount|converted|earned)', re.I)
 _COST_RE   = re.compile(r'(cost|opex|pr_amount|expenditure|spent|loss)', re.I)
 _PROFIT_RE = re.compile(r'(profit|net|margin|gain)', re.I)
 _CAPEX_RE  = re.compile(r'(capex|opex|budget|amount)', re.I)
+_WORKFLOW_RE = re.compile(r'(status|state|phase|stage|step|pipeline|funnel|tier)', re.I)
 
 def _is_date_col(col, vals):
     if _DATE_RE.search(col): return True
-    return any(re.match(r'\d{4}[-/]\d{2}', str(v)) for v in vals[:5] if v)
+    # Value must look like a real date — no alpha chars in the first 10 chars
+    # (filters out IDs like "2026/05/ST078/INS001" that start with YYYY/MM/)
+    non_null = [v for v in vals[:10] if v is not None]
+    if not non_null: return False
+    date_like = [
+        v for v in non_null
+        if re.match(r'\d{4}[-/]\d{2}', str(v)) and not re.search(r'[A-Za-z]', str(v)[:10])
+    ]
+    return len(date_like) >= max(1, len(non_null) // 2)
 
 def _coerce(v) -> float | None:
     if isinstance(v, (int, float)): return float(v)
@@ -336,8 +353,8 @@ def _line(labels, num_cols, rows, area=False):
     })
 
 
-def _pie(labels, values, doughnut=False):
-    """Pie or doughnut chart."""
+def _pie(labels, values, doughnut=False, rose=False):
+    """Pie, doughnut, or nightingale (rose) chart."""
     data = [
         {"name": str(lbl), "value": _coerce(val)}
         for lbl, val in zip(labels, values)
@@ -362,6 +379,11 @@ def _pie(labels, values, doughnut=False):
             "formatter": "{b}: {d}%",
             "color": _LABEL, "fontSize": 11,
         }
+        
+    if rose:
+        extra_series["roseType"] = "radius"
+        # Nightingale charts often look better with a slightly smaller radius to accommodate varying lengths
+        radius = ["15%", "70%"] if doughnut else "75%"
 
     return _base({
         "tooltip": _tt_item(),
@@ -537,6 +559,66 @@ def _waterfall(labels, values, col_name):
     })
 
 
+def _nightingale(labels, values):
+    """Nightingale (rose) chart. Wraps _pie with rose=True."""
+    return _pie(labels, values, doughnut=False, rose=True)
+
+def _funnel(labels, values, col_name, sort_order="descending"):
+    """Funnel chart for workflow or sequential drop-off data."""
+    data = []
+    for lbl, val in zip(labels, values):
+        v = _coerce(val)
+        if v is not None:
+            data.append({"name": str(lbl), "value": v})
+            
+    # Calculate max for visual scaling
+    max_val = max((d["value"] for d in data), default=100)
+
+    return _base({
+        "tooltip": {
+            **_tt_item(),
+            "formatter": "{a} <br/>{b} : {c}",
+        },
+        "legend": _legend(labels, show=True),
+        "series": [{
+            "name": _lbl(col_name),
+            "type": "funnel",
+            "left": "10%",
+            "top": 60,
+            "bottom": 60,
+            "width": "80%",
+            "min": 0,
+            "max": max_val,
+            "minSize": "0%",
+            "maxSize": "100%",
+            "sort": sort_order, # 'descending', 'ascending', or 'none'
+            "gap": 2,
+            "label": {
+                "show": True,
+                "position": "inside",
+                "color": "#fff",
+                "fontSize": 12,
+            },
+            "labelLine": {
+                "length": 10,
+                "lineStyle": {
+                    "width": 1,
+                    "type": "solid"
+                }
+            },
+            "itemStyle": {
+                "borderColor": "#fff",
+                "borderWidth": 1
+            },
+            "emphasis": {
+                "label": {
+                    "fontSize": 14
+                }
+            },
+            "data": data
+        }]
+    })
+
 def _gauge(value, label, max_val=100.0):
     """
     Gauge — opt-in only (user explicitly requested it).
@@ -568,6 +650,102 @@ def _gauge(value, label, max_val=100.0):
                 "offsetCenter": [0, "30%"],
             },
             "data": [{"value": round(value, 1), "name": label}],
+        }],
+    })
+
+
+def _calendar_heatmap(date_col, val_col, rows):
+    """Calendar heatmap (GitHub-style) for day-level activity data.
+    When val_col is None or yields no numeric data, falls back to counting rows per day."""
+    from collections import defaultdict
+    date_agg: dict = defaultdict(float)
+    found_numeric = False
+
+    for r in rows:
+        dv = r.get(date_col)
+        if dv is None:
+            continue
+        ds = str(dv)[:10]
+        if not re.match(r'\d{4}-\d{2}-\d{2}', ds):
+            continue
+        if val_col is not None:
+            v = _coerce(r.get(val_col))
+            if v is not None:
+                date_agg[ds] += v
+                found_numeric = True
+            else:
+                date_agg[ds]  # ensure key exists for fallback
+        else:
+            date_agg[ds] += 1
+
+    # val_col given but all non-numeric → fall back to row-count per day
+    if val_col is not None and not found_numeric:
+        date_agg = defaultdict(float)
+        for r in rows:
+            dv = r.get(date_col)
+            if dv is None:
+                continue
+            ds = str(dv)[:10]
+            if re.match(r'\d{4}-\d{2}-\d{2}', ds):
+                date_agg[ds] += 1
+        val_col = None  # label as "Count" below
+
+    data = [[ds, v] for ds, v in sorted(date_agg.items()) if v > 0]
+    if not data:
+        return None
+
+    date_strs = sorted(d[0] for d in data)
+    years = sorted(set(d[:4] for d in date_strs))
+
+    if len(years) == 1:
+        cal_range = years[0]
+    else:
+        cal_range = [date_strs[0], date_strs[-1]]
+
+    all_vals = [d[1] for d in data]
+    vmin, vmax = min(all_vals), max(all_vals)
+
+    return _base({
+        "calendar": {
+            "range": cal_range,
+            "cellSize": ["auto", 18],
+            "top": 60,
+            "left": 44,
+            "right": 20,
+            "dayLabel": {
+                "firstDay": 1,
+                "color": _LABEL, "fontSize": 10,
+                "nameMap": ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"],
+            },
+            "monthLabel": {"color": _LABEL, "fontSize": 10},
+            "yearLabel":  {"color": _LABEL, "fontSize": 12, "position": "left"},
+            "itemStyle": {
+                "color": "rgba(255,255,255,0.03)",
+                "borderColor": "rgba(255,255,255,0.08)",
+                "borderWidth": 1,
+            },
+            "splitLine": {"lineStyle": {"color": "rgba(255,255,255,0.1)", "width": 1}},
+        },
+        "tooltip": {
+            **_tt_item(),
+            "formatter": "{b}: {c}",
+        },
+        "visualMap": {
+            "min": vmin, "max": vmax,
+            "calculable": True,
+            "orient": "horizontal", "left": "center", "bottom": "8px",
+            "textStyle": {"color": _LABEL},
+            "inRange": {"color": ["#1e2a42", "#6366f1", "#10b981"]},
+        },
+        "series": [{
+            "type": "heatmap",
+            "coordinateSystem": "calendar",
+            "name": _lbl(val_col) if val_col else "Count",
+            "data": data,
+            "label": {"show": False},
+            "emphasis": {
+                "itemStyle": {"shadowBlur": 10, "shadowColor": "rgba(99,102,241,0.5)"},
+            },
         }],
     })
 
@@ -645,8 +823,34 @@ def _rules_advise(columns, rows):
         return _result("waterfall", "P&L decomposition — waterfall", "high",
                        lc, nums[:3], _waterfall(metric_labels, metric_vals, nums[0]))
 
+    # ── 6. Heatmap — two categorical dimensions × one numeric. ─────────────────
+    all_cats = cats + dates
+    if len(all_cats) >= 2 and len(nums) == 1 and n >= 4:
+        rc, cc, nc = all_cats[0], all_cats[1], nums[0]
+        if _cardinality([r.get(rc) for r in rows]) >= 2 and _cardinality([r.get(cc) for r in rows]) >= 2:
+            return _result("heatmap", f"Grid of '{rc}' × '{cc}' — heatmap", "high",
+                           rc, nums, _heatmap(rc, cc, nc, rows))
+
+    # ── 3.5 Calendar heatmap — day-level dates (YYYY-MM-DD), ≥7 unique days ───
+    if dates and len(nums) <= 1 and n >= 7:
+        dc = dates[0]
+        day_like = [
+            str(r.get(dc, ''))[:10] for r in rows
+            if r.get(dc) and re.match(r'\d{4}-\d{2}-\d{2}', str(r.get(dc, ''))[:10])
+        ]
+        if len(set(day_like)) >= 7:
+            vc = nums[0] if nums else None
+            cfg = _calendar_heatmap(dc, vc, rows)
+            if cfg:
+                reason = (
+                    f"Daily {_lbl(vc)} across {len(set(day_like))} days — calendar heatmap"
+                    if vc else
+                    f"Inspections per day across {len(set(day_like))} days — calendar heatmap"
+                )
+                return _result("calendar_heatmap", reason, "high", dc, nums, cfg)
+
     # ── 4. Time-series ─────────────────────────────────────────────────────────
-    if dates:
+    if dates and _cardinality([r.get(dates[0]) for r in rows]) >= 3:
         lc = dates[0]
         labels = [str(r.get(lc)) for r in rows]
         
@@ -673,7 +877,7 @@ def _rules_advise(columns, rows):
                                lc, unique_cats, _stacked_bar(unique_dates, unique_cats, pivot_rows))
 
         if len(nums) == 1:
-            use_area = any(kw in nums[0].lower() for kw in ("total","cumul","volume","amount","sum"))
+            use_area = any(kw in nums[0].lower() for kw in ("total","cumul","volume","sum"))
             ct = "area" if use_area else "line"
             return _result(ct, f"Time-series on '{lc}'", "high",
                            lc, nums, _line(labels, nums, rows, area=use_area))
@@ -697,19 +901,34 @@ def _rules_advise(columns, rows):
             return _result("radar", f"Multi-metric profile per '{lc}' — radar", "medium",
                            lc, nums[:6], _radar(lc, nums[:6], rows))
 
-    # ── 6. Heatmap — two categorical dimensions × one numeric. ─────────────────
-    all_cats = cats + dates
-    if len(all_cats) >= 2 and len(nums) == 1 and n >= 4:
-        rc, cc, nc = all_cats[0], all_cats[1], nums[0]
-        if _cardinality([r.get(rc) for r in rows]) >= 2 and _cardinality([r.get(cc) for r in rows]) >= 2:
-            return _result("heatmap", f"Grid of '{rc}' × '{cc}' — heatmap", "high",
-                           rc, nums, _heatmap(rc, cc, nc, rows))
+    # ── 6.5 Funnel — workflow progression ──────────────────────────────────────
+    if cats and len(nums) == 1 and n <= 12:
+        lc, nc = cats[0], nums[0]
+        # Check if the column name implies a workflow or status
+        is_workflow = bool(_WORKFLOW_RE.search(lc))
+        # Or if the values themselves look like workflow stages
+        if not is_workflow:
+            sample_vals = [str(r.get(lc, "")).lower() for r in rows[:5]]
+            workflow_keywords = {"open", "pending", "progress", "review", "approved", "closed", "resolved", "rejected", "lead", "opportunity", "qualified", "won", "lost"}
+            if any(any(kw in val for kw in workflow_keywords) for val in sample_vals):
+                is_workflow = True
+                
+        if is_workflow:
+            return _result("funnel", f"Workflow/Stage progression — funnel", "high",
+                           lc, nums, _funnel([str(r.get(lc)) for r in rows], [_coerce(r.get(nc)) for r in rows], nc, sort_order="descending"))
 
-    # ── 7. Low-cardinality single metric → doughnut ────────────────────────────
+    # ── 7. Low-cardinality single metric → doughnut or nightingale ─────────────
     if cats and len(nums) == 1 and 3 <= n <= 8:
         lc, vc = cats[0], nums[0]
+        vals = [_coerce(r.get(vc)) for r in rows if _coerce(r.get(vc)) is not None]
+        
+        # Nightingale for high variance, doughnut for more even distributions
+        if vals and min(vals) > 0 and (max(vals) / min(vals)) >= 3.0:
+            return _result("nightingale", f"Variable magnitude across {n} categories", "high",
+                           lc, nums, _nightingale([str(r.get(lc)) for r in rows], [_coerce(r.get(vc)) for r in rows]))
+            
         return _result("doughnut", f"Part-of-whole across {n} categories", "high",
-                       lc, nums, _pie([str(r.get(lc)) for r in rows], [r.get(vc) for r in rows], doughnut=True))
+                       lc, nums, _pie([str(r.get(lc)) for r in rows], [_coerce(r.get(vc)) for r in rows], doughnut=True))
 
     # ── 8. Single numeric — bar or horizontal bar ─────────────────────────────
     if cats and len(nums) == 1:
@@ -768,6 +987,14 @@ def _build_config(chart_type, lc, num_cols, labels, rows):
         vc = num_cols[0] if num_cols else None
         if not vc: return None
         return _pie(labels, [r.get(vc) for r in rows], doughnut=(chart_type=="doughnut"))
+    if chart_type == "nightingale":
+        vc = num_cols[0] if num_cols else None
+        if not vc: return None
+        return _nightingale(labels, [r.get(vc) for r in rows])
+    if chart_type == "funnel":
+        vc = num_cols[0] if num_cols else None
+        if not vc: return None
+        return _funnel(labels, [r.get(vc) for r in rows], vc, sort_order="descending")
     if chart_type == "scatter" and len(num_cols) >= 2:
         return _scatter(num_cols[0], num_cols[1], rows)
     if chart_type == "radar" and len(num_cols) >= 3:
@@ -780,6 +1007,11 @@ def _build_config(chart_type, lc, num_cols, labels, rows):
     if chart_type == "waterfall" and num_cols:
         vals = [_coerce(r.get(num_cols[0])) or 0 for r in rows]
         return _waterfall(labels, vals, num_cols[0])
+    if chart_type == "calendar_heatmap":
+        vc = num_cols[0] if num_cols else None
+        if lc:
+            return _calendar_heatmap(lc, vc, rows)
+        return None
     if chart_type == "gauge" and num_cols and rows:
         v = _coerce(rows[0].get(num_cols[0])) or 0
         return _gauge(v, _lbl(num_cols[0]))
@@ -909,8 +1141,114 @@ def force_config(columns, rows, chart_type, lc=None, num_cols=None):
         return None
     t  = _classify(columns, rows)
     if not lc:
-        lc = t["category"][0] if t["category"] else (t["date"][0] if t["date"] else columns[0])
+        if chart_type == "calendar_heatmap":
+            # Prefer date column over category column for calendar charts
+            lc = t["date"][0] if t["date"] else (t["category"][0] if t["category"] else columns[0])
+        else:
+            lc = t["category"][0] if t["category"] else (t["date"][0] if t["date"] else columns[0])
     labels   = [str(r.get(lc)) for r in rows]
     if not num_cols:
-        num_cols = t["numeric"] or [columns[-1]]
-    return _build_config(chart_type, lc, num_cols, labels, rows) or _bar(labels, num_cols, rows)
+        if chart_type == "calendar_heatmap":
+            num_cols = t["numeric"]  # may be [] — count mode handled inside builder
+        else:
+            num_cols = t["numeric"] or [columns[-1]]
+    cfg = _build_config(chart_type, lc, num_cols, labels, rows)
+    if cfg is not None:
+        return cfg
+    if chart_type == "calendar_heatmap":
+        return None  # let API surface a 400 — don't silently fall back to bar
+    return _bar(labels, num_cols, rows)
+
+
+# ── Dashboard helpers ──────────────────────────────────────────────────────────
+
+def _prioritize_cards(cards: list) -> list:
+    """Sort: financial (capex/income/cost/profit) → score/pct → everything else."""
+    def _rank(card):
+        col = card.get("_col", "")
+        if _INCOME_RE.search(col) or _PROFIT_RE.search(col) or _CAPEX_RE.search(col) or _COST_RE.search(col):
+            return 0
+        if _SCORE_RE.search(col) or _PCT_RE.search(col):
+            return 1
+        return 2
+    return sorted(cards, key=_rank)
+
+
+def build_kpi_cards(columns: list, rows: list, max_cards: int = 4) -> list:
+    """
+    Derive summary KPI cards from a result set.
+    Score/pct columns  → avg + range (min/max).
+    Other numeric      → total sum.
+    First cat column   → count distinct.
+    Returns at most max_cards cards, prioritised: financial > score/pct > count.
+    """
+    t = _classify(columns, rows)
+    cards = []
+    range_added = False  # only one range card
+
+    for col in t["numeric"]:
+        vals = [_coerce(r.get(col)) for r in rows]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            continue
+        is_score = bool(_SCORE_RE.search(col) or _PCT_RE.search(col))
+        if is_score:
+            cards.append({
+                "label": f"Avg {_lbl(col)}",
+                "value": round(sum(vals) / len(vals), 2),
+                "kind":  "avg",
+                "icon":  "star",
+                "_col":  col,
+            })
+            if not range_added:
+                cards.append({
+                    "label":  f"{_lbl(col)} Range",
+                    "value":  round(min(vals), 2),   # min
+                    "value2": round(max(vals), 2),   # max
+                    "kind":   "range",
+                    "icon":   "range",
+                    "_col":   col,
+                })
+                range_added = True
+        else:
+            cards.append({
+                "label": f"Total {_lbl(col)}",
+                "value": round(sum(vals), 2),
+                "kind":  "sum",
+                "icon":  "list",
+                "_col":  col,
+            })
+
+    # Count-distinct card for the first categorical column
+    for col in t["category"]:
+        raw_vals = [r.get(col) for r in rows if r.get(col) is not None]
+        distinct = len(set(str(v) for v in raw_vals))
+        if distinct >= 2:
+            cards.append({
+                "label": f"Unique {_lbl(col)}",
+                "value": distinct,
+                "kind":  "distinct",
+                "icon":  "hash",
+                "_col":  col,
+            })
+            break  # one distinct card is enough
+
+    prioritized = _prioritize_cards(cards)[:max_cards]
+    return [{k: v for k, v in c.items() if k != "_col"} for c in prioritized]
+
+
+def should_show_dashboard(columns: list, rows: list, chart_config: dict | None) -> bool:
+    """
+    Gate: show the full animated dashboard only when all four conditions hold:
+      1. The chart advisor found a valid chart type (not None).
+      2. The result has ≥3 rows (fewer rows are better served by plain answer).
+      3. There is at least one date or category column (a sensible axis exists).
+      4. There is at least one numeric column (something to summarise on cards).
+    Single-value queries, filter/detail lists, and no-chart shapes stay as plain answers.
+    """
+    if not chart_config or not chart_config.get("chart_type"):
+        return False
+    if len(rows) < 3:
+        return False
+    t = _classify(columns, rows)
+    return bool(t["date"] or t["category"]) and len(t["numeric"]) >= 1

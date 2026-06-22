@@ -7,10 +7,14 @@ Install:  pip install fastapi uvicorn
 Run:      uvicorn fastapi_app:app --reload --port 8000
 """
 
+import asyncio
 import time
 import os
 import sys
-from fastapi import FastAPI, HTTPException
+import tempfile
+import subprocess
+import numpy as np
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -18,9 +22,66 @@ import re
 import logging
 from contextlib import asynccontextmanager
 
+# ── TTS — lazy-loaded on first /api/tts call ──────────────────────────────────
+_tts_model = None
+
+_TTS_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+_TTS_MODEL  = os.path.join(_TTS_DIR, "kokoro-v1.0.onnx")
+_TTS_VOICES = os.path.join(_TTS_DIR, "voices-v1.0.bin")
+
+def _get_tts():
+    global _tts_model
+    if _tts_model is None:
+        from kokoro_onnx import Kokoro
+        logging.info("Loading Kokoro TTS …")
+        _tts_model = Kokoro(_TTS_MODEL, _TTS_VOICES)
+        logging.info("Kokoro TTS ready.")
+    return _tts_model
+
+_MD_STRIP = re.compile(
+    r'\*\*(.+?)\*\*'       # **bold**
+    r'|\*(.+?)\*'          # *italic*
+    r'|`[^`]*`'            # `code`
+    r'|#{1,6}\s+'          # ## headings
+    r'|\|[^\n]*'           # | table cells
+    r'|^[-|=]+$'           # table separator rows
+    r'|\[([^\]]*)\]\([^)]*\)',  # [link](url) → keep label
+    re.MULTILINE,
+)
+
+def _clean_for_tts(text: str) -> str:
+    text = _MD_STRIP.sub(lambda m: m.group(1) or m.group(2) or m.group(3) or '', text)
+    # Expand common patterns that confuse espeak word-count alignment
+    text = re.sub(r'(\d+)%', r'\1 percent', text)
+    text = re.sub(r'\$(\d[\d,]*)', r'\1 dollars', text)
+    text = re.sub(r'(\d+)/(\d+)', r'\1 out of \2', text)
+    text = re.sub(r'(\d{4})-(\d{2})-(\d{2})', r'\1 \2 \3', text)  # ISO dates
+    text = re.sub(r'\n+', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()[:800]
+
+# ── ASR — lazy-loaded on first /api/transcribe call ───────────────────────────
+_asr_pipeline = None
+
+def _get_asr():
+    global _asr_pipeline
+    if _asr_pipeline is None:
+        import torch
+        from transformers import pipeline as hf_pipeline
+        device = 0 if torch.cuda.is_available() else -1
+        logging.info("Loading openai/whisper-tiny on %s …", "GPU" if device == 0 else "CPU")
+        _asr_pipeline = hf_pipeline(
+            "automatic-speech-recognition",
+            model="openai/whisper-tiny",
+            device=device,
+            generate_kwargs={"language": "en", "task": "transcribe"},
+        )
+        logging.info("ASR model ready.")
+    return _asr_pipeline
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from chart_advisor import advise, force_config, get_alternatives, classify_columns
+from chart_advisor import advise, force_config, get_alternatives, classify_columns, build_kpi_cards, should_show_dashboard
 
 # ── Chart follow-up fast-path ──────────────────────────────────────────────────
 # Detects pure chart requests that need no new SQL — handled before the LLM.
@@ -90,6 +151,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
@@ -132,6 +194,12 @@ class ChartConfig(BaseModel):
     requested_type: str | None = None
     requested_config: dict | None = None
     alternatives: list[dict] = []
+    x_label: str | None = None      # category / x-axis column name
+    y_labels: list[str] = []        # value column name(s)
+
+class DashboardData(BaseModel):
+    show: bool = False
+    cards: list[dict] = []   # [{label, value, kind, icon}]
 
 class ChatResponse(BaseModel):
     answer: str
@@ -147,6 +215,7 @@ class ChatResponse(BaseModel):
     session_id: str
     result_data: ResultData | None = None
     chart_config: ChartConfig | None = None
+    dashboard: DashboardData | None = None
 
 class SessionInfo(BaseModel):
     session_id: str
@@ -271,6 +340,35 @@ def _generate_summary(question: str, columns: list, rows: list) -> str:
             if v >= 1_000: return f"{v:,.0f}"
             return f"{v:.2f}"
 
+        def _fmt_label(v) -> str:
+            """Return a human-readable label, formatting datetimes nicely."""
+            import re
+            from datetime import datetime, date
+            s = str(v).strip()
+            # Already a date/datetime object
+            if isinstance(v, datetime):
+                return v.strftime("%b %-d, %Y")
+            if isinstance(v, date):
+                return v.strftime("%b %-d, %Y")
+            # ISO timestamp strings: 2026-01-01 00:00:00+00:00 or 2026-01-01T00:00:00Z
+            if re.match(r'^\d{4}-\d{2}-\d{2}[ T]', s):
+                try:
+                    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                    # If time is midnight, show date only
+                    if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+                        return dt.strftime("%b %-d, %Y")
+                    return dt.strftime("%b %-d, %Y %H:%M")
+                except Exception:
+                    pass
+            # Plain date string: 2026-01-01
+            if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
+                try:
+                    dt = datetime.strptime(s, "%Y-%m-%d")
+                    return dt.strftime("%b %-d, %Y")
+                except Exception:
+                    pass
+            return s
+
         num_cols, cat_cols = [], []
         for col in columns:
             sample = [rows[i].get(col) for i in range(min(5, len(rows))) if rows[i].get(col) is not None]
@@ -292,7 +390,7 @@ def _generate_summary(question: str, columns: list, rows: list) -> str:
             for cc in cat_cols:
                 lv = top_row.get(cc)
                 if lv and str(lv).strip() not in ("None", ""):
-                    label = str(lv).strip()
+                    label = _fmt_label(lv)
                     break
             col_label = nc.replace("_", " ").title()
             if label:
@@ -369,6 +467,8 @@ async def chat(req: ChatRequest):
                     requested_type=requested if conflict else None,
                     requested_config=force_config(cols, rows, requested) if conflict else None,
                     alternatives=rec.get("alternatives", []),
+                    x_label=rec.get("labels_column"),
+                    y_labels=rec.get("values_columns") or [],
                 )
                 return ChatResponse(
                     answer="Here's the chart.",
@@ -381,7 +481,9 @@ async def chat(req: ChatRequest):
                 )
 
         t0 = time.time()
-        result = orch.query(req.message, session=sess_data["session"])
+        result = await asyncio.to_thread(
+            orch.query, req.message, session=sess_data["session"]
+        )
         elapsed_ms = int((time.time() - t0) * 1000)
         sess_data["message_count"] += 1
 
@@ -393,6 +495,8 @@ async def chat(req: ChatRequest):
         _result_cols: list = []
         _row_count: int = 0
         _chart_config: ChartConfig | None = None
+        _dashboard: DashboardData | None = None
+        _skip_dashboard: bool = False  # set True for non-SQL tool results (get_answers, get_answer_stats)
 
         for step in result.steps:
             thought = getattr(step, "thought", "") or ""
@@ -457,6 +561,7 @@ async def chat(req: ChatRequest):
                     sql = f"""SELECT ir.inspection_id, aa.module_name, aq.label AS question_label, COALESCE(aa.answer_text, aa.answer_numeric::text) AS answer_value, aa.score, aa.submitted_on FROM ai_answers aa LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id LEFT JOIN inspection_report ir ON aa.inspection_report_id = ir.id WHERE {_ga_where} ORDER BY aa.submitted_on DESC"""
                     sess_data["last_sql"] = sql
                     sess_data["last_total"] = inner.get("total_count", _row_count)
+                    _skip_dashboard = True
 
             elif step.tool == "get_answer_stats":
                 # get_answer_stats returns value_breakdown — convert to table rows for frontend
@@ -478,6 +583,7 @@ async def chat(req: ChatRequest):
                     _row_count = len(breakdown)
                     sess_data["last_sql"] = None
                     sess_data["last_total"] = None
+                    _skip_dashboard = True
 
             elif step.tool == "[parse_error]":
                 info.success = False
@@ -494,16 +600,46 @@ async def chat(req: ChatRequest):
         else:
             _has_more = _row_count >= 50
 
-        # Generate a natural-language summary + chart suggestion for multi-row results
-        if _result_rows and len(_result_rows) > 1 and not _chart_config:
-            # Use _result_rows (stringified) — _coerce() in _generate_summary handles string numbers
-            # Avoids the sess_data.get() empty-list bug with last_raw_rows
+        # Generate answer text; decide whether to show dashboard or plain chart suggestion
+        if _result_rows and len(_result_rows) > 1 and not _chart_config and not _skip_dashboard:
             summary = _generate_summary(req.message, _result_cols, _result_rows)
             display_answer = summary if summary else _clean_answer(result.answer, _result_rows)
             raw_for_chart = sess_data["last_raw_rows"] if sess_data.get("last_raw_rows") else _result_rows
-            suggestion = _chart_suggestion_sentence(_result_cols, raw_for_chart)
-            if suggestion:
-                display_answer += suggestion
+
+            rec = advise(_result_cols, raw_for_chart)
+            if should_show_dashboard(_result_cols, raw_for_chart, rec):
+                # Dashboard path: embed chart_config directly; KPI cards computed here.
+                # The frontend renders dashboard-display (cards + chart + table) instead of
+                # the plain "Show as chart" button — no __CHART_AVAILABLE__ signal needed.
+                _chart_config = ChartConfig(
+                    chart_type=rec["chart_type"],
+                    reason=rec["reason"],
+                    confidence=rec["confidence"],
+                    config=rec["config"],
+                    conflict=False,
+                    requested_type=None,
+                    requested_config=None,
+                    alternatives=rec.get("alternatives", []),
+                    x_label=rec.get("labels_column"),
+                    y_labels=rec.get("values_columns") or [],
+                )
+                _dashboard = DashboardData(
+                    show=True,
+                    cards=build_kpi_cards(_result_cols, raw_for_chart),
+                )
+            else:
+                _dashboard = DashboardData(show=False, cards=[])
+                if rec.get("chart_type"):
+                    rtype  = rec["chart_type"]
+                    rlabel = _TYPE_LABELS.get(rtype, rtype.title())
+                    alts   = _ALT_MAP.get(rtype, [])[:2]
+                    hint   = rec["reason"]
+                    signal = f"\n📊__CHART_AVAILABLE__:{rtype}:{hint}"
+                    alt_str = " or a ".join(f"**{_TYPE_LABELS.get(a, a.title())}**" for a in alts)
+                    if alts:
+                        display_answer += f"{signal}\n\nI can visualize this as a **{rlabel}** ({hint}), or as a {alt_str} if you prefer — just say the word."
+                    else:
+                        display_answer += f"{signal}\n\nI can visualize this as a **{rlabel}** ({hint}) — just ask."
         else:
             display_answer = _clean_answer(result.answer, _result_rows)
 
@@ -530,6 +666,7 @@ async def chat(req: ChatRequest):
                 sql=sql,   # the base SQL — frontend sends this back for per-message pagination
             ) if _result_rows else None,
             chart_config=_chart_config,
+            dashboard=_dashboard,
         )
 
     except Exception as exc:
@@ -677,16 +814,36 @@ async def get_chart(req: ChartRequest):
                 status_code=422,
                 detail=f"Cannot build '{req.chart_type}' chart for this data shape."
             )
+        # Determine real confidence by comparing forced type to what the advisor recommends
+        _COMPAT = [
+            {"bar", "horizontal_bar", "stacked_bar", "waterfall"},
+            {"line", "area", "calendar_heatmap"},
+            {"pie", "doughnut", "nightingale"},
+        ]
+        rec = advise(cols, rows)
+        rec_type = rec.get("chart_type")
+        if req.chart_type == rec_type:
+            forced_confidence = "high"
+        elif any(req.chart_type in g and rec_type in g for g in _COMPAT if rec_type):
+            forced_confidence = "medium"
+        else:
+            forced_confidence = "low"
+
         alts = get_alternatives(cols, rows, n=3)
+        # x_label / y_labels from the advisor rec (covers forced type too)
+        _x = rec.get("labels_column") if rec else (lc_override or (cols[0] if cols else None))
+        _y = rec.get("values_columns") or (num_cols_override or [])
         return ChartConfig(
             chart_type=req.chart_type,
             reason=f"Requested by user via /chart {req.chart_type}",
-            confidence="high",
+            confidence=forced_confidence,
             config=cfg,
             conflict=False,
             requested_type=None,
             requested_config=None,
             alternatives=alts,
+            x_label=_x,
+            y_labels=_y,
         )
     else:
         rec = advise(cols, rows)
@@ -704,6 +861,8 @@ async def get_chart(req: ChartRequest):
             requested_type=None,
             requested_config=None,
             alternatives=rec.get("alternatives", []),
+            x_label=rec.get("labels_column"),
+            y_labels=rec.get("values_columns") or [],
         )
 
 
@@ -752,7 +911,14 @@ async def get_last_columns(session_id: str):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "model": "qwen3.5:9b + qwen2.5-coder"}
+    if _orch is not None:
+        model_label = f"{_orch.chat_model_name} + {_orch.sql_model_name}"
+    else:
+        import os
+        chat = os.getenv("OLLAMA_CHAT_MODEL", "—")
+        sql  = os.getenv("OLLAMA_SQL_MODEL",  "—")
+        model_label = f"{chat} + {sql}"
+    return {"status": "ok", "model": model_label}
 
 @app.get("/api/ready")
 async def ready():
@@ -761,6 +927,116 @@ async def ready():
     if _orch is None:
         return JSONResponse(status_code=503, content={"status": "loading"})
     return {"status": "ready"}
+
+
+# ── ASR ───────────────────────────────────────────────────────────────────────
+@app.post("/api/transcribe")
+async def transcribe(audio: UploadFile = File(...)):
+    """
+    Accepts any browser audio blob (WebM/Opus, WAV, MP4 …),
+    converts to 16 kHz mono WAV via ffmpeg, then transcribes
+    with dimavz/whisper-tiny.  Returns {"text": "..."}.
+    """
+    raw = await audio.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty audio upload")
+
+    suffix = ".webm"
+    ct = audio.content_type or ""
+    if "wav" in ct:   suffix = ".wav"
+    elif "mp4" in ct: suffix = ".mp4"
+    elif "ogg" in ct: suffix = ".ogg"
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fin:
+        fin.write(raw)
+        in_path = fin.name
+
+    out_path = in_path.replace(suffix, "_16k.wav")
+    try:
+        # Decode & resample to 16 kHz mono PCM WAV
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", in_path,
+             "-ar", "16000", "-ac", "1", "-f", "wav", out_path],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise HTTPException(status_code=422,
+                                detail="Audio conversion failed: " + result.stderr.decode()[-300:])
+
+        import soundfile as sf
+        data, sr = sf.read(out_path, dtype="float32")
+        if data.ndim > 1:
+            data = data.mean(axis=1)  # stereo → mono (safety)
+
+        pipe = _get_asr()
+        out  = pipe({"array": data, "sampling_rate": sr})
+        text = out.get("text", "").strip()
+        return {"text": text}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.exception("Transcription error")
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        for p in (in_path, out_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+# ── TTS ───────────────────────────────────────────────────────────────────────
+class TTSRequest(BaseModel):
+    text: str
+
+@app.post("/api/tts")
+async def tts(req: TTSRequest):
+    """
+    Converts answer text to speech using Kokoro-ONNX (CPU).
+    Strips markdown, caps at 800 chars, returns audio/wav.
+    """
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="No text provided")
+
+    clean = _clean_for_tts(req.text)
+    if not clean:
+        raise HTTPException(status_code=400, detail="Nothing to speak after stripping markdown")
+
+    try:
+        import io
+        import soundfile as sf
+        from fastapi.responses import Response
+
+        import warnings
+        kokoro = _get_tts()
+        def _synthesize():
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*words count mismatch.*")
+                return kokoro.create(clean, voice="af_bella", speed=1.05, lang="en-us")
+        samples, sample_rate = await asyncio.to_thread(_synthesize)
+        buf = io.BytesIO()
+        sf.write(buf, samples, sample_rate, format="WAV", subtype="PCM_16")
+        buf.seek(0)
+        return Response(content=buf.read(), media_type="audio/wav")
+
+    except Exception as exc:
+        logging.exception("TTS error")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Serve Angular build (must be last — catches all non-API routes) ───────────
+_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "inspectai-chat", "dist", "inspectai-chat", "browser")
+if os.path.isdir(_DIST):
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import FileResponse
+
+    @app.get("/", include_in_schema=False)
+    async def spa_root():
+        return FileResponse(os.path.join(_DIST, "index.html"))
+
+    app.mount("/", StaticFiles(directory=_DIST, html=True), name="spa")
 
 
 if __name__ == "__main__":
