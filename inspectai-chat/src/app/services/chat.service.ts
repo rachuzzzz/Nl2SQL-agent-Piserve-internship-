@@ -1,7 +1,7 @@
 import { Injectable } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { BehaviorSubject, Observable, tap } from 'rxjs';
-import { ChatResponse, Conversation, Message, ResultData, DashboardData, parseChartSignal } from '../models/chat.model';
+import { ChatResponse, Conversation, Message, ResultData, parseChartSignal } from '../models/chat.model';
 
 function uuid(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -70,7 +70,15 @@ export class ChatService {
           this.lastDebug$.next(res);
           this.loading$.next(false);
         },
-        error: () => { this.loading$.next(false); },
+        error: (err) => {
+          const detail = err?.error?.detail ?? err?.message ?? 'An error occurred. Please try again.';
+          const errMsg: Message = {
+            id: uuid(), role: 'ai', text: `⚠ ${detail}`, timestamp: new Date(),
+          };
+          conv.messages.push(errMsg);
+          this.activeConversation$.next({ ...conv });
+          this.loading$.next(false);
+        },
       })
     );
   }

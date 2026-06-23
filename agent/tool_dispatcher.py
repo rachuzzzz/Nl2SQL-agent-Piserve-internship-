@@ -125,28 +125,65 @@ def _reconstruct_fragmented_schema_hint(args: dict) -> dict:
     return cleaned
 
 
+def _escape_newlines_in_strings(text: str) -> str:
+    """Escape literal newlines/carriage-returns inside JSON string values.
+
+    LLMs sometimes emit multi-line answers as literal newlines rather than \\n,
+    producing invalid JSON that json_repair cannot always recover when combined
+    with a truncated (missing closing brace) output.
+    """
+    result = []
+    in_string = False
+    escape_next = False
+    for char in text:
+        if escape_next:
+            result.append(char)
+            escape_next = False
+        elif char == '\\':
+            result.append(char)
+            escape_next = True
+        elif char == '"':
+            result.append(char)
+            in_string = not in_string
+        elif in_string and char == '\n':
+            result.append('\\n')
+        elif in_string and char == '\r':
+            result.append('\\r')
+        else:
+            result.append(char)
+    return ''.join(result)
+
+
 def _try_parse(text: str, raw_output: str) -> dict[str, Any] | None:
     """Try json.loads then json_repair on a candidate string. Returns None on failure."""
-    # Standard parse first — zero overhead when the model is well-behaved
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict) and "tool" in parsed:
-            return _validate_tool_call(parsed, raw_output)
-    except (json.JSONDecodeError, ValueError):
-        pass
+    # Build candidate list: preprocessed version first (escapes literal newlines in strings),
+    # then original as fallback. Preprocessing is tried first because json_repair on the
+    # original with literal newlines + a missing closing brace returns args:{} — appearing
+    # to succeed while silently losing the answer content.
+    preprocessed = _escape_newlines_in_strings(text)
+    candidates_to_try = [preprocessed, text] if preprocessed != text else [text]
 
-    # json_repair: handles truncated JSON, unquoted keys, real newlines in strings,
-    # single quotes, trailing commas, missing closing brackets — all common LLM bugs
-    if _HAS_JSON_REPAIR:
+    for candidate in candidates_to_try:
+        # Standard parse — zero overhead when model output is well-formed
         try:
-            repaired = json_repair.repair_json(text, return_objects=True)
-            # repair_json may return a list if it found multiple objects; take first dict with "tool"
-            candidates = repaired if isinstance(repaired, list) else [repaired]
-            for obj in candidates:
-                if isinstance(obj, dict) and "tool" in obj:
-                    return _validate_tool_call(obj, raw_output)
-        except Exception:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict) and "tool" in parsed:
+                return _validate_tool_call(parsed, raw_output)
+        except (json.JSONDecodeError, ValueError):
             pass
+
+        # json_repair: handles truncated JSON, unquoted keys, trailing commas,
+        # missing closing brackets — all common LLM bugs
+        if _HAS_JSON_REPAIR:
+            try:
+                repaired = json_repair.repair_json(candidate, return_objects=True)
+                # repair_json may return a list if it found multiple objects
+                objs = repaired if isinstance(repaired, list) else [repaired]
+                for obj in objs:
+                    if isinstance(obj, dict) and "tool" in obj:
+                        return _validate_tool_call(obj, raw_output)
+            except Exception:
+                pass
 
     return None
 
