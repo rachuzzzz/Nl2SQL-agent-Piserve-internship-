@@ -457,6 +457,15 @@ async def chat(req: ChatRequest):
             cols = sess_data["last_cols"]
             rows = sess_data["last_raw_rows"]
             requested = _extract_requested_type(req.message)
+
+            # Calendar heatmap needs the full date range, not just the cached 50 rows.
+            _cal_needed = (requested == "calendar_heatmap") or (not requested and advise(cols, rows).get("chart_type") == "calendar_heatmap")
+            if _cal_needed and sess_data.get("last_sql"):
+                _full = _refetch_for_calendar(sess_data["last_sql"], orch)
+                if _full:
+                    rows = _full
+                    cols = list(_full[0].keys())
+
             rec = advise(cols, rows)
             if rec.get("chart_type"):
                 if requested:
@@ -712,6 +721,28 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+def _refetch_for_calendar(sql: str, orch, limit: int = 1000) -> list[dict]:
+    """Re-run sql with a higher row limit for calendar heatmap charts.
+    Calendar charts need the full date range — the default 50-row cache
+    only covers the most recent 50 inspections, leaving the rest of the
+    calendar blank. Returns [] on any error so callers can fall back."""
+    import re as _re
+    from sqlalchemy import text as sql_text
+    try:
+        stripped = _re.sub(
+            r'\bLIMIT\s+\d+(\s+OFFSET\s+\d+)?\s*;?\s*$', '',
+            sql.strip(), flags=_re.IGNORECASE
+        ).strip().rstrip(';')
+        full_sql = f"{stripped}\nLIMIT {limit};"
+        with orch.db_engine.connect() as conn:
+            result = conn.execute(sql_text(full_sql))
+            rows = result.fetchall()
+            cols = list(result.keys())
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception:
+        return []
+
+
 def _count_total(sql: str, orch) -> int | None:
     """
     Count total rows for the SQL query without LIMIT/OFFSET.
@@ -840,6 +871,14 @@ async def get_chart(req: ChartRequest):
 
     cols = sess_data["last_cols"]
     rows = sess_data["last_raw_rows"]
+
+    # Calendar heatmap needs the full date range, not just the cached 50 rows.
+    _cal_needed = (req.chart_type == "calendar_heatmap") or (not req.chart_type and advise(cols, rows).get("chart_type") == "calendar_heatmap")
+    if _cal_needed and sess_data.get("last_sql") and _orch:
+        _full = _refetch_for_calendar(sess_data["last_sql"], _orch)
+        if _full:
+            rows = _full
+            cols = list(_full[0].keys())
 
     # Column picker overrides — user explicitly selected which cols to chart
     lc_override = req.x_col
