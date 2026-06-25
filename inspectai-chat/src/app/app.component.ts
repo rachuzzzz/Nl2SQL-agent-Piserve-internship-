@@ -1,15 +1,88 @@
 import { Component, Inject, PLATFORM_ID, OnInit, ChangeDetectorRef } from '@angular/core';
 import { CommonModule, isPlatformBrowser } from '@angular/common';
-import { HttpClient } from '@angular/common/http';
+import { FormsModule } from '@angular/forms';
+import { HttpClient, HttpHeaders } from '@angular/common/http';
 import { ChatWindowComponent } from './components/chat-window/chat-window.component';
 import { DebugPanelComponent } from './components/debug-panel/debug-panel.component';
 import { HistorySidebarComponent } from './components/history-sidebar/history-sidebar.component';
 
+const OAUTH_URL       = 'https://10.77.20.51/oauth/token?_format=json';
+const OAUTH_CLIENT_ID = '78XrNvZXXG4sZEggH1G3RKzcCtKxXWyr1VGxf_gfWws';
+const OAUTH_SECRET    = '78XrNvZXXG4sZEggH1G3RKzcCtKxXWyr1VGxf_gfWws';
+const TOKEN_KEY       = 'inspectai_access_token';
+
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [CommonModule, ChatWindowComponent, DebugPanelComponent, HistorySidebarComponent],
+  imports: [CommonModule, FormsModule, ChatWindowComponent, DebugPanelComponent, HistorySidebarComponent],
   template: `
+    <!-- ── Login page ── -->
+    <div class="login-screen" *ngIf="showLogin">
+      <div class="splash-orb splash-orb-1"></div>
+      <div class="splash-orb splash-orb-2"></div>
+      <div class="splash-orb splash-orb-3"></div>
+      <div class="splash-grid"></div>
+      <div class="login-card">
+        <div class="login-logo-ring">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#3fbdad" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round"
+              d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"/>
+          </svg>
+        </div>
+        <div class="login-brand">InspectAI</div>
+        <div class="login-sub">نظام التفتيش الذكي &nbsp;·&nbsp; Sign in to continue</div>
+
+        <form class="login-form" (ngSubmit)="doLogin()" #loginForm="ngForm">
+          <div class="field-wrap">
+            <label class="field-label">Username</label>
+            <div class="field-inner" [class.field-focus]="userFocus">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2M12 11a4 4 0 100-8 4 4 0 000 8z"/>
+              </svg>
+              <input
+                type="text" name="username" [(ngModel)]="loginUsername"
+                placeholder="Enter your username" autocomplete="username" required
+                (focus)="userFocus=true" (blur)="userFocus=false" />
+            </div>
+          </div>
+
+          <div class="field-wrap">
+            <label class="field-label">Password</label>
+            <div class="field-inner" [class.field-focus]="passFocus">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                <path stroke-linecap="round" d="M7 11V7a5 5 0 0110 0v4"/>
+              </svg>
+              <input
+                [type]="showPass ? 'text' : 'password'" name="password" [(ngModel)]="loginPassword"
+                placeholder="Enter your password" autocomplete="current-password" required
+                (focus)="passFocus=true" (blur)="passFocus=false" />
+              <button type="button" class="pass-toggle" (click)="showPass=!showPass" tabindex="-1">
+                <svg *ngIf="!showPass" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                </svg>
+                <svg *ngIf="showPass" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24M1 1l22 22"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="login-error" *ngIf="loginError">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            {{ loginError }}
+          </div>
+
+          <button type="submit" class="login-btn" [disabled]="loginLoading || !loginUsername || !loginPassword">
+            <span *ngIf="!loginLoading">Sign In</span>
+            <span *ngIf="loginLoading" class="login-spinner"></span>
+          </button>
+        </form>
+      </div>
+    </div>
+
     <!-- Arabic welcome splash -->
     <div class="splash" *ngIf="showSplash" [class.pan-away]="splashOut">
       <div class="splash-orb splash-orb-1"></div>
@@ -256,6 +329,117 @@ import { HistorySidebarComponent } from './components/history-sidebar/history-si
       background: linear-gradient(to bottom, transparent, #070d18);
     }
 
+    /* ── Login screen ── */
+    .login-screen {
+      position: fixed; inset: 0; z-index: 10000;
+      background: radial-gradient(ellipse at 50% 38%, #162034 0%, #0e1826 55%, #070d18 100%);
+      display: flex; align-items: center; justify-content: center; overflow: hidden;
+    }
+
+    .login-card {
+      position: relative; z-index: 2;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(63,189,173,0.18);
+      border-radius: 20px;
+      padding: 40px 36px 36px;
+      width: 100%; max-width: 380px;
+      box-shadow: 0 24px 64px rgba(0,0,0,0.5), 0 0 0 1px rgba(63,189,173,0.08), inset 0 1px 0 rgba(255,255,255,0.06);
+      backdrop-filter: blur(20px);
+      animation: card-in 0.55s cubic-bezier(0.16,1,0.3,1) 0.1s both;
+      display: flex; flex-direction: column; align-items: center;
+    }
+    @keyframes card-in {
+      from { opacity:0; transform: translateY(24px) scale(0.97); }
+      to   { opacity:1; transform: translateY(0) scale(1); }
+    }
+
+    .login-logo-ring {
+      width: 60px; height: 60px; border-radius: 16px;
+      background: rgba(63,189,173,0.08);
+      border: 1px solid rgba(63,189,173,0.25);
+      box-shadow: 0 0 32px rgba(63,189,173,0.18), inset 0 1px 0 rgba(255,255,255,0.06);
+      display: flex; align-items: center; justify-content: center; margin-bottom: 18px;
+    }
+    .login-logo-ring svg { width: 28px; height: 28px; }
+
+    .login-brand {
+      font-family: 'Inter', sans-serif;
+      font-size: 20px; font-weight: 700; color: #fff; letter-spacing: -0.4px; margin-bottom: 6px;
+    }
+    .login-sub {
+      font-family: 'Cairo', 'Inter', sans-serif;
+      font-size: 11.5px; color: rgba(63,189,173,0.6); letter-spacing: 0.5px;
+      margin-bottom: 28px; text-align: center;
+    }
+
+    .login-form { width: 100%; display: flex; flex-direction: column; gap: 14px; }
+
+    .field-wrap { display: flex; flex-direction: column; gap: 6px; }
+    .field-label {
+      font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px;
+      color: rgba(160,174,192,0.7);
+    }
+    .field-inner {
+      display: flex; align-items: center; gap: 10px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 10px; padding: 0 14px;
+      transition: border-color 0.18s, box-shadow 0.18s;
+    }
+    .field-inner.field-focus {
+      border-color: rgba(63,189,173,0.5);
+      box-shadow: 0 0 0 3px rgba(63,189,173,0.1);
+    }
+    .field-inner svg { width: 15px; height: 15px; stroke: rgba(160,174,192,0.5); flex-shrink: 0; }
+    .field-inner input {
+      flex: 1; background: transparent; border: none; outline: none;
+      font-family: 'Inter', sans-serif; font-size: 13.5px; color: #fff;
+      padding: 11px 0;
+    }
+    .field-inner input::placeholder { color: rgba(160,174,192,0.35); }
+
+    .pass-toggle {
+      background: transparent; border: none; cursor: pointer; padding: 4px;
+      color: rgba(160,174,192,0.45); display: flex; align-items: center;
+      transition: color 0.15s;
+    }
+    .pass-toggle:hover { color: rgba(63,189,173,0.8); }
+    .pass-toggle svg { width: 15px; height: 15px; }
+
+    .login-error {
+      display: flex; align-items: center; gap: 8px;
+      background: rgba(220,38,38,0.1); border: 1px solid rgba(220,38,38,0.25);
+      border-radius: 8px; padding: 9px 12px;
+      font-size: 12px; color: #f87171; line-height: 1.4;
+    }
+    .login-error svg { width: 15px; height: 15px; flex-shrink: 0; }
+
+    .login-btn {
+      margin-top: 4px;
+      width: 100%; padding: 12px;
+      background: linear-gradient(145deg, #3fbdad, #32a89a);
+      border: none; border-radius: 10px;
+      font-family: 'Inter', sans-serif; font-size: 14px; font-weight: 600;
+      color: #0f1923; cursor: pointer;
+      box-shadow: 0 4px 16px rgba(63,189,173,0.3);
+      transition: all 0.18s;
+      display: flex; align-items: center; justify-content: center; min-height: 44px;
+    }
+    .login-btn:hover:not(:disabled) {
+      background: linear-gradient(145deg, #4dcebf, #3fbdad);
+      box-shadow: 0 6px 20px rgba(63,189,173,0.4); transform: translateY(-1px);
+    }
+    .login-btn:active:not(:disabled) { transform: translateY(0); }
+    .login-btn:disabled { opacity: 0.5; cursor: not-allowed; box-shadow: none; }
+
+    .login-spinner {
+      width: 18px; height: 18px; border-radius: 50%;
+      border: 2px solid rgba(15,25,35,0.3);
+      border-top-color: #0f1923;
+      animation: spin 0.7s linear infinite; display: inline-block;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
     /* ── Theme button ── */
     .btn-theme {
       background: rgba(255,255,255,0.06);
@@ -275,8 +459,17 @@ import { HistorySidebarComponent } from './components/history-sidebar/history-si
 export class AppComponent implements OnInit {
   isDark      = false;
   modelLabel  = 'Loading…';
-  showSplash  = true;
+  showSplash  = false;
   splashOut   = false;
+  showLogin   = true;
+
+  loginUsername = '';
+  loginPassword = '';
+  loginError    = '';
+  loginLoading  = false;
+  showPass      = false;
+  userFocus     = false;
+  passFocus     = false;
 
   private readonly API = '/api';
 
@@ -293,13 +486,53 @@ export class AppComponent implements OnInit {
         this.isDark = true;
         document.body.setAttribute('data-theme', 'dark');
       }
+      if (localStorage.getItem(TOKEN_KEY)) {
+        this.showLogin = false;
+        this._startSplash();
+      }
     }
+  }
+
+  doLogin() {
+    if (!this.loginUsername || !this.loginPassword || this.loginLoading) return;
+    this.loginLoading = true;
+    this.loginError   = '';
+
+    const body = new URLSearchParams({
+      grant_type:    'password',
+      client_id:     OAUTH_CLIENT_ID,
+      client_secret: OAUTH_SECRET,
+      username:      this.loginUsername,
+      password:      this.loginPassword,
+    });
+    const headers = new HttpHeaders({ 'Content-Type': 'application/x-www-form-urlencoded' });
+
+    this.http.post<{ access_token: string }>(OAUTH_URL, body.toString(), { headers }).subscribe({
+      next: res => {
+        if (isPlatformBrowser(this.platformId)) {
+          localStorage.setItem(TOKEN_KEY, res.access_token);
+        }
+        this.loginLoading = false;
+        this.showLogin    = false;
+        this._startSplash();
+        this.cdr.detectChanges();
+      },
+      error: err => {
+        this.loginLoading = false;
+        this.loginError   = err?.error?.message || err?.error?.error_description || 'Invalid credentials. Please try again.';
+        this.cdr.detectChanges();
+      },
+    });
+  }
+
+  private _startSplash() {
+    this.showSplash = true;
+    this.http.get<{ status: string; model: string }>(this.API + '/health').subscribe({
+      next: res  => { this.modelLabel = res.model ?? 'unknown'; this.cdr.detectChanges(); },
+      error: ()  => { this.modelLabel = 'offline'; this.cdr.detectChanges(); },
+    });
     setTimeout(() => { this.splashOut  = true;  this.cdr.detectChanges(); }, 2600);
     setTimeout(() => { this.showSplash = false; this.cdr.detectChanges(); }, 3400);
-    this.http.get<{ status: string; model: string }>(this.API + '/health').subscribe({
-      next: res  => { this.modelLabel = res.model ?? 'unknown'; },
-      error: ()  => { this.modelLabel = 'offline'; },
-    });
   }
 
   toggleTheme() {
