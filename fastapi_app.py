@@ -987,6 +987,43 @@ async def get_last_columns(session_id: str):
     }
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/login")
+async def login(req: LoginRequest):
+    """Proxy OAuth password-grant to the identity server.
+    Client credentials never leave the backend."""
+    import httpx
+    oauth_url     = os.getenv("OAUTH_URL", "https://10.77.20.51/oauth/token?_format=json")
+    client_id     = os.getenv("CLIENT_ID", "").strip()
+    client_secret = os.getenv("CLIENT_SECRET", "").strip()
+
+    payload = {
+        "grant_type":    "password",
+        "client_id":     client_id,
+        "client_secret": client_secret,
+        "username":      req.username,
+        "password":      req.password,
+    }
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=15) as client:
+            resp = await client.post(oauth_url, data=payload)
+        if resp.status_code == 200:
+            return resp.json()
+        try:
+            detail = resp.json().get("error_description") or resp.json().get("message") or resp.text
+        except Exception:
+            detail = resp.text
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Identity server unreachable: {exc}")
+
+
 @app.get("/api/health")
 async def health():
     if _orch is not None:

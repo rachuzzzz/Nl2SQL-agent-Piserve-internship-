@@ -1,15 +1,12 @@
 import { Component, Inject, PLATFORM_ID, OnInit, ChangeDetectorRef } from '@angular/core';
 import { CommonModule, isPlatformBrowser } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { HttpClient, HttpHeaders } from '@angular/common/http';
+import { HttpClient } from '@angular/common/http';
 import { ChatWindowComponent } from './components/chat-window/chat-window.component';
 import { DebugPanelComponent } from './components/debug-panel/debug-panel.component';
 import { HistorySidebarComponent } from './components/history-sidebar/history-sidebar.component';
 
-const OAUTH_URL       = 'https://10.77.20.51/oauth/token?_format=json';
-const OAUTH_CLIENT_ID = '78XrNvZXXG4sZEggH1G3RKzcCtKxXWyr1VGxf_gfWws';
-const OAUTH_SECRET    = '78XrNvZXXG4sZEggH1G3RKzcCtKxXWyr1VGxf_gfWws';
-const TOKEN_KEY       = 'inspectai_access_token';
+const TOKEN_KEY = 'inspectai_access_token';
 
 @Component({
   selector: 'app-root',
@@ -498,16 +495,10 @@ export class AppComponent implements OnInit {
     this.loginLoading = true;
     this.loginError   = '';
 
-    const body = new URLSearchParams({
-      grant_type:    'password',
-      client_id:     OAUTH_CLIENT_ID,
-      client_secret: OAUTH_SECRET,
-      username:      this.loginUsername,
-      password:      this.loginPassword,
-    });
-    const headers = new HttpHeaders({ 'Content-Type': 'application/x-www-form-urlencoded' });
-
-    this.http.post<{ access_token: string }>(OAUTH_URL, body.toString(), { headers }).subscribe({
+    this.http.post<{ access_token: string }>('/api/login', {
+      username: this.loginUsername,
+      password: this.loginPassword,
+    }).subscribe({
       next: res => {
         if (isPlatformBrowser(this.platformId)) {
           localStorage.setItem(TOKEN_KEY, res.access_token);
