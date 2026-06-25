@@ -376,6 +376,7 @@ app-dashboard-display {
   width: 100%;
   max-width: 100%;
   align-self: stretch;
+  min-width: 0;
 }
 
 /* Dashboard messages expand beyond the standard 780px bubble cap    */

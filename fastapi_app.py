@@ -459,17 +459,34 @@ async def chat(req: ChatRequest):
             requested = _extract_requested_type(req.message)
             rec = advise(cols, rows)
             if rec.get("chart_type"):
-                conflict = bool(requested and requested != rec["chart_type"])
-                cc = ChartConfig(
-                    chart_type=rec["chart_type"], reason=rec["reason"],
-                    confidence=rec["confidence"], config=rec["config"],
-                    conflict=conflict,
-                    requested_type=requested if conflict else None,
-                    requested_config=force_config(cols, rows, requested) if conflict else None,
-                    alternatives=rec.get("alternatives", []),
-                    x_label=rec.get("labels_column"),
-                    y_labels=rec.get("values_columns") or [],
-                )
+                if requested:
+                    # User explicitly typed /chart <type> — show it directly,
+                    # no conflict banner. The advisor config is the fallback only
+                    # if force_config returns nothing (e.g. unsupported combination).
+                    req_cfg = force_config(cols, rows, requested) or rec["config"]
+                    cc = ChartConfig(
+                        chart_type=requested,
+                        reason=f"Showing {requested.replace('_', ' ').title()} as requested",
+                        confidence="medium",
+                        config=req_cfg,
+                        conflict=False,
+                        requested_type=None,
+                        requested_config=None,
+                        alternatives=rec.get("alternatives", []),
+                        x_label=rec.get("labels_column"),
+                        y_labels=rec.get("values_columns") or [],
+                    )
+                else:
+                    cc = ChartConfig(
+                        chart_type=rec["chart_type"], reason=rec["reason"],
+                        confidence=rec["confidence"], config=rec["config"],
+                        conflict=False,
+                        requested_type=None,
+                        requested_config=None,
+                        alternatives=rec.get("alternatives", []),
+                        x_label=rec.get("labels_column"),
+                        y_labels=rec.get("values_columns") or [],
+                    )
                 return ChatResponse(
                     answer="Here's the chart.",
                     sql=None, reasoning=None,
@@ -642,6 +659,28 @@ async def chat(req: ChatRequest):
                         display_answer += f"{signal}\n\nI can visualize this as a **{rlabel}** ({hint}) — just ask."
         else:
             display_answer = _clean_answer(result.answer, _result_rows)
+
+        # Single-row P&L waterfall: auto-embed chart even when len == 1.
+        # The len > 1 gate above skips single-row results, but a high-confidence
+        # waterfall (income/cost/profit columns) should always show a chart.
+        if (not _chart_config and not _skip_dashboard
+                and _result_rows and len(_result_rows) == 1):
+            raw_for_chart = sess_data["last_raw_rows"] if sess_data.get("last_raw_rows") else _result_rows
+            _pl_rec = advise(_result_cols, raw_for_chart)
+            if _pl_rec.get("chart_type") == "waterfall" and _pl_rec.get("confidence") == "high":
+                _chart_config = ChartConfig(
+                    chart_type=_pl_rec["chart_type"],
+                    reason=_pl_rec["reason"],
+                    confidence=_pl_rec["confidence"],
+                    config=_pl_rec["config"],
+                    conflict=False,
+                    requested_type=None,
+                    requested_config=None,
+                    alternatives=_pl_rec.get("alternatives", []),
+                    x_label=_pl_rec.get("labels_column"),
+                    y_labels=_pl_rec.get("values_columns") or [],
+                )
+                _dashboard = _dashboard or DashboardData(show=False, cards=[])
 
         return ChatResponse(
             answer=display_answer,

@@ -6,7 +6,7 @@ import {
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
-import { ChartConfig, ColumnMeta } from '../../models/chat.model';
+import { ChartConfig, ChartAlt, ColumnMeta } from '../../models/chat.model';
 import * as echarts from 'echarts';
 
 @Component({
@@ -15,23 +15,23 @@ import * as echarts from 'echarts';
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [CommonModule, FormsModule],
   template: `
-    <div class="chart-backdrop" *ngIf="isFullscreen"
+    <div class="chart-backdrop" *ngIf="isFullscreen && !noOverlay"
          [style.top.px]="fsBounds?.top"
          [style.left.px]="fsBounds?.left"
          [style.right.px]="fsBounds?.right"
          [style.bottom.px]="fsBounds?.bottom"
          (click)="toggleFullscreen()"></div>
-    
-    <div class="chart-placeholder" *ngIf="isFullscreen">
+
+    <div class="chart-placeholder" *ngIf="isFullscreen && !noOverlay">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
       <span>Chart is expanded in a separate view</span>
     </div>
 
-    <div class="chart-card" [class.fullscreen]="isFullscreen"
-         [style.top.px]="isFullscreen && fsBounds ? fsBounds.top    : null"
-         [style.left.px]="isFullscreen && fsBounds ? fsBounds.left   : null"
-         [style.right.px]="isFullscreen && fsBounds ? fsBounds.right  : null"
-         [style.bottom.px]="isFullscreen && fsBounds ? fsBounds.bottom : null">
+    <div class="chart-card" [class.fullscreen]="isFullscreen && !noOverlay"
+         [style.top.px]="isFullscreen && !noOverlay && fsBounds ? fsBounds.top    : null"
+         [style.left.px]="isFullscreen && !noOverlay && fsBounds ? fsBounds.left   : null"
+         [style.right.px]="isFullscreen && !noOverlay && fsBounds ? fsBounds.right  : null"
+         [style.bottom.px]="isFullscreen && !noOverlay && fsBounds ? fsBounds.bottom : null">
       <!-- ── Conflict banner ── -->
       <div class="suggestion-bar" *ngIf="showConflict">
         <span class="suggestion-text">
@@ -72,28 +72,8 @@ import * as echarts from 'echarts';
 
         <!-- Right: type switcher + axis toggle + zoom -->
         <div class="chart-header-right">
-          <!-- Control mode header bar: type switcher + axis button -->
+          <!-- Control mode header bar: axis button only (switcher moved to footer) -->
           <ng-container *ngIf="mode === 'control'">
-            <div class="alt-switcher" *ngIf="availableAlts.length > 0">
-              <button *ngFor="let alt of availableAlts" class="btn-alt"
-                [class.active]="activeType === alt.chart_type"
-                (click)="switchToAlt(alt)" [title]="alt.label">
-                <ng-container [ngSwitch]="iconGroup(alt.chart_type)">
-                  <svg *ngSwitchCase="'bar'"      viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M9.5 2a.5.5 0 00-.5.5v11a.5.5 0 001 0v-11a.5.5 0 00-.5-.5zM6.5 5a.5.5 0 00-.5.5v8a.5.5 0 001 0v-8a.5.5 0 00-.5-.5zM3.5 8a.5.5 0 00-.5.5v5a.5.5 0 001 0v-5a.5.5 0 00-.5-.5z"/></svg>
-                  <svg *ngSwitchCase="'hbar'"     viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M2 4h6v2H2V4zm0 3h10v2H2V7zm0 3h4v2H2v-2z"/></svg>
-                  <svg *ngSwitchCase="'line'"     viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path fill-rule="evenodd" d="M1 13l4-4 3 2 4-5 3 2-1 1-2-1-4 5-3-2-3 3-1-1z" clip-rule="evenodd"/></svg>
-                  <svg *ngSwitchCase="'pie'"      viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zM0 8a8 8 0 1116 0A8 8 0 010 8z"/><path d="M8 1v7h7A7 7 0 008 1z"/></svg>
-                  <svg *ngSwitchCase="'scatter'"  viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><circle cx="3" cy="12" r="1.5"/><circle cx="7" cy="7" r="1.5"/><circle cx="12" cy="4" r="1.5"/></svg>
-                  <svg *ngSwitchCase="'radar'"    viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M8 2l1.5 4.5H14l-3.7 2.7 1.4 4.3L8 11 4.3 13.5l1.4-4.3L2 6.5h4.5L8 2z"/></svg>
-                  <svg *ngSwitchCase="'heatmap'"  viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M1 1h4v4H1V1zm5 0h4v4H6V1zm5 0h4v4h-4V1zM1 6h4v4H1V6zm5 0h4v4H6V6zm5 0h4v4h-4V6z"/></svg>
-                  <svg *ngSwitchCase="'calendar'" viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path fill-rule="evenodd" d="M4 1a.5.5 0 01.5.5V2h7v-.5a.5.5 0 011 0V2h.5A1.5 1.5 0 0114.5 3.5v10A1.5 1.5 0 0113 15H3a1.5 1.5 0 01-1.5-1.5v-10A1.5 1.5 0 013 2h.5v-.5A.5.5 0 014 1zM2 5.5v8A.5.5 0 003 14h10a.5.5 0 00.5-.5V5.5H2zm2 1h2v2H4v-2zm3 0h2v2H7v-2zm3 0h2v2h-2v-2zM4 9h2v2H4V9zm3 0h2v2H7V9z" clip-rule="evenodd"/></svg>
-                  <svg *ngSwitchCase="'waterfall'" viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M1 12h2v2H1v-2zM4 8h2v6H4V8zM7 6h2v8H7V6zM10 3h2v11h-2V3z"/></svg>
-                  <svg *ngSwitchCase="'funnel'"    viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path fill-rule="evenodd" d="M2.5 3A1.5 1.5 0 014 1.5h8A1.5 1.5 0 0113.5 3v1.5a1.5 1.5 0 01-.44 1.06L10 8.62v4.88a1.5 1.5 0 01-2.22 1.31l-1.5-.75A1.5 1.5 0 015.5 12.7V8.62L2.44 5.56A1.5 1.5 0 012.5 4.5V3z" clip-rule="evenodd"/></svg>
-                  <svg *ngSwitchDefault            viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M8 1a7 7 0 100 14A7 7 0 008 1z"/></svg>
-                </ng-container>
-                <span>{{ alt.label }}</span>
-              </button>
-            </div>
             <button class="btn-ctrl btn-axis"
               [class.active]="showAxisPicker"
               [disabled]="!cols"
@@ -155,6 +135,31 @@ import * as echarts from 'echarts';
       <!-- ── Chart canvas ── -->
       <div class="chart-body" *ngIf="activeConfig">
         <div #chartDiv [style.height]="chartHeight" class="echarts-host"></div>
+      </div>
+
+      <!-- ── Chart-type switcher footer (control mode only) ── -->
+      <div class="alt-footer" *ngIf="mode === 'control' && availableAlts.length > 0 && activeConfig">
+        <span class="alt-footer-label">View as</span>
+        <div class="alt-switcher">
+          <button *ngFor="let alt of availableAlts" class="btn-alt"
+            [class.active]="activeType === alt.chart_type"
+            (click)="switchToAlt(alt)" [title]="alt.label">
+            <ng-container [ngSwitch]="iconGroup(alt.chart_type)">
+              <svg *ngSwitchCase="'bar'"      viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M9.5 2a.5.5 0 00-.5.5v11a.5.5 0 001 0v-11a.5.5 0 00-.5-.5zM6.5 5a.5.5 0 00-.5.5v8a.5.5 0 001 0v-8a.5.5 0 00-.5-.5zM3.5 8a.5.5 0 00-.5.5v5a.5.5 0 001 0v-5a.5.5 0 00-.5-.5z"/></svg>
+              <svg *ngSwitchCase="'hbar'"     viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M2 4h6v2H2V4zm0 3h10v2H2V7zm0 3h4v2H2v-2z"/></svg>
+              <svg *ngSwitchCase="'line'"     viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path fill-rule="evenodd" d="M1 13l4-4 3 2 4-5 3 2-1 1-2-1-4 5-3-2-3 3-1-1z" clip-rule="evenodd"/></svg>
+              <svg *ngSwitchCase="'pie'"      viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zM0 8a8 8 0 1116 0A8 8 0 010 8z"/><path d="M8 1v7h7A7 7 0 008 1z"/></svg>
+              <svg *ngSwitchCase="'scatter'"  viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><circle cx="3" cy="12" r="1.5"/><circle cx="7" cy="7" r="1.5"/><circle cx="12" cy="4" r="1.5"/></svg>
+              <svg *ngSwitchCase="'radar'"    viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M8 2l1.5 4.5H14l-3.7 2.7 1.4 4.3L8 11 4.3 13.5l1.4-4.3L2 6.5h4.5L8 2z"/></svg>
+              <svg *ngSwitchCase="'heatmap'"  viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M1 1h4v4H1V1zm5 0h4v4H6V1zm5 0h4v4h-4V1zM1 6h4v4H1V6zm5 0h4v4H6V6zm5 0h4v4h-4V6z"/></svg>
+              <svg *ngSwitchCase="'calendar'" viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path fill-rule="evenodd" d="M4 1a.5.5 0 01.5.5V2h7v-.5a.5.5 0 011 0V2h.5A1.5 1.5 0 0114.5 3.5v10A1.5 1.5 0 0113 15H3a1.5 1.5 0 01-1.5-1.5v-10A1.5 1.5 0 013 2h.5v-.5A.5.5 0 014 1zM2 5.5v8A.5.5 0 003 14h10a.5.5 0 00.5-.5V5.5H2zm2 1h2v2H4v-2zm3 0h2v2H7v-2zm3 0h2v2h-2v-2zM4 9h2v2H4V9zm3 0h2v2H7V9z" clip-rule="evenodd"/></svg>
+              <svg *ngSwitchCase="'waterfall'" viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M1 12h2v2H1v-2zM4 8h2v6H4V8zM7 6h2v8H7V6zM10 3h2v11h-2V3z"/></svg>
+              <svg *ngSwitchCase="'funnel'"    viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path fill-rule="evenodd" d="M2.5 3A1.5 1.5 0 014 1.5h8A1.5 1.5 0 0113.5 3v1.5a1.5 1.5 0 01-.44 1.06L10 8.62v4.88a1.5 1.5 0 01-2.22 1.31l-1.5-.75A1.5 1.5 0 015.5 12.7V8.62L2.44 5.56A1.5 1.5 0 012.5 4.5V3z" clip-rule="evenodd"/></svg>
+              <svg *ngSwitchDefault            viewBox="0 0 16 16" fill="currentColor" width="13" height="13"><path d="M8 1a7 7 0 100 14A7 7 0 008 1z"/></svg>
+            </ng-container>
+            <span>{{ alt.label }}</span>
+          </button>
+        </div>
       </div>
     </div>
   `,
@@ -250,15 +255,21 @@ import * as echarts from 'echarts';
     .axis-error { margin-top: 6px; font-size: 11.5px; color: #dc2626; font-weight: 500; }
     .axis-hint  { font-size: 11.5px; color: var(--chart-text-muted); font-style: italic; }
 
-    .chart-body { padding: 16px 16px 20px; background: transparent; }
-    .echarts-host { width: 100%; display: block; }
+    .chart-body { padding: 16px 16px 20px; background: transparent; min-width: 0; overflow: hidden; }
+    .echarts-host { width: 100%; display: block; overflow: hidden; }
+
+    /* Alt-switcher footer — full-width row below the chart */
+    .alt-footer { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-top: 1px solid var(--chart-border); background: var(--chart-axis-bg); flex-wrap: wrap; }
+    .alt-footer-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px; color: var(--chart-text-muted); white-space: nowrap; font-family: ui-sans-serif,system-ui,sans-serif; flex-shrink: 0; }
   `],
 })
 export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, AfterViewChecked {
-  @HostBinding('class.is-fullscreen') get isFullscreenClass() { return this.isFullscreen; }
+  @HostBinding('class.is-fullscreen') get isFullscreenClass() { return this.isFullscreen && !this.noOverlay; }
   @Input()  cfg!: ChartConfig;
   @Input()  sessionId: string = '';
   @Input()  mode: 'quick' | 'control' = 'quick';  // 'control' shows switcher + axis panel
+  @Input()  noOverlay: boolean = false;  // when true, fullscreen emits event only; parent handles layout
+  @Input()  resizeTrigger: number = 0;  // increment from parent to force chart.resize()
   @Output() fullscreenChange = new EventEmitter<boolean>();
   @ViewChild('chartDiv') chartDivRef!: ElementRef<HTMLDivElement>;
 
@@ -289,6 +300,9 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
   private chart: echarts.ECharts | null = null;
   private needsRender = false;
   private resizeObs: ResizeObserver | null = null;
+  private resizeTimer: any = null;
+  private transitionEndCb: ((e: Event) => void) | null = null;
+  private initTimers: any[] = [];
   private calZoom = 1;
 
   private readonly TYPE_LABELS: Record<string, string> = {
@@ -330,7 +344,7 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
     return [...this.cols.categories, ...this.cols.dates];
   }
   get chartHeight(): string {
-    if (this.isFullscreen) return '100%';
+    if (this.isFullscreen && !this.noOverlay) return '100%';
     if (!this.activeConfig) return '400px';
     if (this.activeType === 'horizontal_bar') {
       const yData = this.activeConfig?.yAxis?.data;
@@ -377,6 +391,16 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
       this.destroyChart();
       this.init();
     }
+    if (c['resizeTrigger'] && !c['resizeTrigger'].firstChange) {
+      this.zone.runOutsideAngular(() => {
+        requestAnimationFrame(() => {
+          this.chart?.resize();
+          setTimeout(() => this.chart?.resize(), 50);
+          setTimeout(() => this.chart?.resize(), 200);
+          setTimeout(() => this.chart?.resize(), 500);
+        });
+      });
+    }
   }
 
   private init() {
@@ -384,7 +408,15 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
     this.hasZoomed = false; this.resolvedConflict = false;
     this.showAxisPicker = this.mode === 'control'; this.axisError = '';
     this.cols = null; this.colsLoadError = false;
-    this.availableAlts = (this.cfg.alternatives ?? []).filter(a => a.chart_type !== this.cfg.chart_type).slice(0,3);
+    const altList = (this.cfg.alternatives ?? []).filter(a => a.chart_type !== this.cfg.chart_type).slice(0, 3);
+    // Prepend the primary chart so the user can always switch back to it.
+    // The switcher is only shown when there is at least one alternative.
+    const primaryAlt: ChartAlt = {
+      chart_type: this.cfg.chart_type ?? '',
+      label: this.typeLabel(this.cfg.chart_type),
+      config: this.cfg.config,
+    };
+    this.availableAlts = altList.length > 0 ? [primaryAlt, ...altList] : [];
     if (this.cfg.conflict) {
       this.showConflict = true; this.activeConfig = null; this.activeType = null;
     } else {
@@ -400,9 +432,10 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
   useRecommended() { this.activeConfig = this.cfg.config; this.activeType = this.cfg.chart_type; this.showConflict = false; this.resolvedConflict = true; this.needsRender = true; }
   useRequested()   { this.activeConfig = this.cfg.requested_config ?? this.cfg.config; this.activeType = this.cfg.requested_type ?? this.cfg.chart_type; this.showConflict = false; this.resolvedConflict = true; this.needsRender = true; }
 
-  switchToAlt(alt: {chart_type: string; label: string; config: any}) {
+  switchToAlt(alt: ChartAlt) {
     this.destroyChart();
     this.activeConfig = alt.config; this.activeType = alt.chart_type; this.needsRender = true;
+    this.cdr.markForCheck();
   }
 
   // ── Axis picker ───────────────────────────────────────────────────────────
@@ -426,7 +459,9 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
         this.destroyChart();
         this.activeConfig = cfg.config;
         this.activeType   = cfg.chart_type;
-        this.availableAlts = (cfg.alternatives ?? []).filter(a => a.chart_type !== cfg.chart_type).slice(0,3);
+        const axisAltList = (cfg.alternatives ?? []).filter(a => a.chart_type !== cfg.chart_type).slice(0, 3);
+        const axisPrimary: ChartAlt = { chart_type: cfg.chart_type ?? '', label: this.typeLabel(cfg.chart_type), config: cfg.config };
+        this.availableAlts = axisAltList.length > 0 ? [axisPrimary, ...axisAltList] : [];
         this.needsRender  = true;
         this.cdr.markForCheck();
       },
@@ -494,7 +529,7 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
   toggleFullscreen(): void {
     this.isFullscreen = !this.isFullscreen;
 
-    if (this.isFullscreen) {
+    if (!this.noOverlay && this.isFullscreen) {
       // Measure the nearest .chat-main ancestor so the expanded chart fills
       // exactly that area (bounded by header + sidebars), not the full viewport.
       const host: HTMLElement = this.elRef.nativeElement;
@@ -522,7 +557,17 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
 
   ngAfterViewChecked() {
     if (this.needsRender && this.chartDivRef?.nativeElement && this.activeConfig) {
-      this.renderChart(); this.needsRender = false;
+      this.needsRender = false;
+      // Defer into the browser's next animation frame so the layout pass has
+      // already run. Without this, echarts.init() reads clientWidth = 0 because
+      // the DOM was just mutated (by *ngIf) but the browser hasn't measured yet.
+      this.zone.runOutsideAngular(() => {
+        requestAnimationFrame(() => {
+          if (this.chartDivRef?.nativeElement && this.activeConfig) {
+            this.renderChart();
+          }
+        });
+      });
     }
   }
 
@@ -542,8 +587,37 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
         }, { passive: false });
       }
       el.addEventListener('dblclick', () => this.zone.run(() => this.resetZoom()));
-      this.resizeObs = new ResizeObserver(() => this.chart?.resize());
+      this.resizeObs = new ResizeObserver(() => {
+        this.chart?.resize();
+        this._syncHbarXRotation();
+        this._syncPieLegendSize();
+        clearTimeout(this.resizeTimer);
+        this.resizeTimer = setTimeout(() => {
+          this.chart?.resize();
+          this._syncHbarXRotation();
+          this._syncPieLegendSize();
+        }, 320);
+      });
       this.resizeObs.observe(el);
+      this.resizeObs.observe(this.elRef.nativeElement);
+
+      // transitionend fires on document whenever a CSS transition completes.
+      // The sidebars use `transition: width`, so this fires reliably when a
+      // panel is opened or closed — even if the ResizeObserver misses it.
+      this.transitionEndCb = (e: Event) => {
+        if ((e as TransitionEvent).propertyName === 'width') {
+          this.chart?.resize();
+          this._syncHbarXRotation();
+          this._syncPieLegendSize();
+        }
+      };
+      document.addEventListener('transitionend', this.transitionEndCb);
+
+      // Timed retries: guarantee the chart reaches its correct size on first
+      // render and after any layout change, regardless of browser quirks.
+      this.initTimers = [0, 150, 350, 700].map(ms =>
+        setTimeout(() => this.chart?.resize(), ms)
+      );
     });
   }
 
@@ -597,14 +671,63 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
       return html;
     };
 
-    opt.tooltip = { ...(opt.tooltip ?? {}), trigger: isCartesian ? 'axis' : 'item', formatter: htmlFormatter, backgroundColor: tBg, borderColor: tBorder, borderWidth: 1, padding: [12,16], confine: true, textStyle: { color: tTextColor, fontSize: 12, fontFamily: 'ui-sans-serif,system-ui,sans-serif' }, extraCssText: 'border-radius:12px;box-shadow:0 10px 25px -5px rgba(0,0,0,0.25); backdrop-filter: blur(8px);', axisPointer: isCartesian ? { type:'cross', crossStyle:{color:tBorder,width:1}, lineStyle:{color:isDark ? '#475569' : '#dce9ff',width:1,type:'dashed'}, label:{backgroundColor:'#2563eb',color:'#fff',fontSize:11,borderRadius:4,padding:[3,6]} } : undefined };
-    if (opt.legend) opt.legend = { ...opt.legend, type:'scroll', inactiveColor:isDark ? '#475569' : '#d1d5db', textStyle:{color:tTextMuted,fontSize:12,fontFamily:'ui-sans-serif,system-ui,sans-serif'}, pageTextStyle:{color:tTextMuted,fontSize:11}, pageIconColor:'#2563eb', pageIconInactiveColor:isDark ? '#475569' : '#d1d5db' };
+    // Scatter uses trigger:'item' (hover a point) and its string formatter from Python
+    // (shows both X and Y values). Overriding to 'axis' or htmlFormatter breaks it.
+    const isScatter = chartType === 'scatter';
+    opt.tooltip = { ...(opt.tooltip ?? {}), trigger: (isCartesian && !isScatter) ? 'axis' : 'item', formatter: isScatter ? (opt.tooltip?.formatter ?? htmlFormatter) : htmlFormatter, backgroundColor: tBg, borderColor: tBorder, borderWidth: 1, padding: [12,16], confine: true, textStyle: { color: tTextColor, fontSize: 12, fontFamily: 'ui-sans-serif,system-ui,sans-serif' }, extraCssText: 'border-radius:12px;box-shadow:0 10px 25px -5px rgba(0,0,0,0.25); backdrop-filter: blur(8px);', axisPointer: (isCartesian && !isScatter) ? { type:'cross', crossStyle:{color:tBorder,width:1}, lineStyle:{color:isDark ? '#475569' : '#dce9ff',width:1,type:'dashed'}, label:{backgroundColor:'#2563eb',color:'#fff',fontSize:11,borderRadius:4,padding:[3,6]} } : undefined };
+    if (opt.legend) {
+      const isPieFamily = ['pie','doughnut','nightingale'].includes(chartType ?? '');
+      const containerW  = this.elRef.nativeElement.clientWidth || 9999;
+      // Scale legend text down for pie/doughnut/nightingale in narrow containers
+      // (both panels open or non-expanded). Thresholds: <420 → 9px, <560 → 10px, else 12px.
+      const legendFontSize = isPieFamily
+        ? (containerW < 420 ? 9 : containerW < 560 ? 10 : 11)
+        : 12;
+      const legendIconSize = isPieFamily && containerW < 560 ? 8 : 10;
+      opt.legend = {
+        ...opt.legend,
+        type: 'scroll',
+        inactiveColor: isDark ? '#475569' : '#d1d5db',
+        // Merge textStyle — preserve width/overflow/truncate set by chart_advisor
+        textStyle: {
+          ...(opt.legend.textStyle ?? {}),
+          color: tTextMuted,
+          fontSize: legendFontSize,
+          fontFamily: 'ui-sans-serif,system-ui,sans-serif',
+        },
+        itemWidth:  legendIconSize,
+        itemHeight: legendIconSize,
+        pageTextStyle: { color: tTextMuted, fontSize: 10 },
+        pageIconColor: '#2563eb',
+        pageIconInactiveColor: isDark ? '#475569' : '#d1d5db',
+      };
+    }
     if (isCartesian) {
       const isHbar = chartType === 'horizontal_bar';
       opt.grid = { ...(opt.grid ?? {}), left:'1%', right:'2%', top: seriesCount > 1 ? '52px' : '18px', bottom:'68px', containLabel:true };
       const styleAxis = (ax: any) => { ax.axisLabel = { ...(ax.axisLabel ?? {}), color:tTextMuted, fontSize:11, fontFamily:'ui-sans-serif,system-ui,sans-serif', hideOverlap:false }; ax.axisLine = {lineStyle:{color:tBorder}}; ax.axisTick = {lineStyle:{color:tBorder},show:false}; ax.splitLine = {lineStyle:{color:isDark ? '#1e293b' : '#f1f3f7',type:'solid'}}; return ax; };
       if (opt.xAxis) { const a = Array.isArray(opt.xAxis)?opt.xAxis:[opt.xAxis]; opt.xAxis = Array.isArray(opt.xAxis)?a.map(styleAxis):styleAxis(a[0]); }
       if (opt.yAxis) { const a = Array.isArray(opt.yAxis)?opt.yAxis:[opt.yAxis]; opt.yAxis = Array.isArray(opt.yAxis)?a.map(styleAxis):styleAxis(a[0]); }
+      // Rotate category x-axis labels when many values would overlap
+      if (!isHbar && opt.xAxis) {
+        const xArr = Array.isArray(opt.xAxis) ? opt.xAxis : [opt.xAxis];
+        const xLen = xArr[0]?.data?.length ?? 0;
+        if (xLen > 6) {
+          const rotate = xLen > 12 ? 90 : 45;
+          xArr.forEach((ax: any) => {
+            ax.axisLabel = { ...(ax.axisLabel ?? {}), rotate, interval: 0 };
+          });
+        }
+      }
+      // Rotate horizontal-bar value x-axis labels vertically when container is narrow
+      if (isHbar && opt.xAxis) {
+        const containerW = this.elRef.nativeElement.clientWidth || 9999;
+        const rotate = containerW < 480 ? 90 : 0;
+        const xArr = Array.isArray(opt.xAxis) ? opt.xAxis : [opt.xAxis];
+        xArr.forEach((ax: any) => {
+          ax.axisLabel = { ...(ax.axisLabel ?? {}), rotate, hideOverlap: true };
+        });
+      }
       if (this.isZoomable) {
         const xData = Array.isArray(opt.xAxis)?opt.xAxis[0]?.data:opt.xAxis?.data;
         const yData = Array.isArray(opt.yAxis)?opt.yAxis[0]?.data:opt.yAxis?.data;
@@ -634,6 +757,17 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
       });
     }
     if (isRadar && opt.radar) opt.radar = { ...opt.radar, axisName:{color:'#6b7280',fontSize:11}, splitLine:{lineStyle:{color:'#f1f3f7'}}, splitArea:{show:true,areaStyle:{color:['#fafafa','#f3f4f6']}}, axisLine:{lineStyle:{color:'#e4e7ed'}} };
+    // Gauge: ticks and labels use "inherit" (arc color) which is readable in dark mode
+    // but may clash in light mode. Override explicitly for reliable cross-theme rendering.
+    if (chartType === 'gauge' && opt.series) {
+      opt.series.forEach((s: any) => {
+        if (s.type !== 'gauge') return;
+        if (s.axisTick?.lineStyle)  s.axisTick.lineStyle  = { ...s.axisTick.lineStyle,  color: isDark ? '#ffffff' : tBorder };
+        if (s.splitLine?.lineStyle) s.splitLine.lineStyle = { ...s.splitLine.lineStyle, color: isDark ? '#ffffff' : tBorder };
+        if (s.axisLabel) s.axisLabel = { ...s.axisLabel,   color: tTextMuted, fontSize: 11 };
+        if (s.detail)   s.detail    = { ...s.detail,       color: tTextColor };
+      });
+    }
     if (opt.series) {
       opt.series.forEach((s: any, i: number) => {
         const c = PALETTE[i % PALETTE.length];
@@ -641,8 +775,15 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
           if (!isWaterfall) {
             s.itemStyle = { ...(s.itemStyle??{}), borderRadius:[5,5,0,0], color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:c},{offset:1,color:c+'99'}]) };
           } else {
-            const bc = s.itemStyle?.color??c;
-            if (typeof bc==='string') s.itemStyle = {...s.itemStyle, color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:bc},{offset:1,color:bc+'aa'}])};
+            // Waterfall: only gradient-ify series that have an explicit hex color.
+            // The transparent base series has color='transparent'; appending 'aa' yields
+            // 'transparentaa' — an invalid CSS color that throws a canvas DOMException
+            // and silently aborts rendering of ALL series, leaving an empty chart.
+            const bc = s.itemStyle?.color;
+            if (bc && typeof bc === 'string' && bc.startsWith('#')) {
+              s.itemStyle = {...s.itemStyle, color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:bc},{offset:1,color:bc+'aa'}])};
+            }
+            // transparent base and per-item-colored bars: leave itemStyle untouched
           }
           s.barMaxWidth = s.barMaxWidth??48;
           s.emphasis = {focus:'series',itemStyle:{shadowBlur:12,shadowColor:c+'55',shadowOffsetY:-3,borderRadius:[5,5,0,0]}};
@@ -693,7 +834,35 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
     return opt;
   }
 
-  private destroyChart() { this.calZoom = 1; this.resizeObs?.disconnect(); this.resizeObs=null; if (this.chart) { this.chart.dispose(); this.chart=null; } }
+  private _syncPieLegendSize() {
+    const isPieFamily = ['pie','doughnut','nightingale'].includes(this.activeType ?? '');
+    if (!isPieFamily || !this.chart) return;
+    const w = this.elRef.nativeElement.clientWidth;
+    if (!w) return;
+    const fontSize  = w < 420 ? 9 : w < 560 ? 10 : 11;
+    const iconSize  = w < 560 ? 8 : 10;
+    this.chart.setOption({ legend: { textStyle: { fontSize }, itemWidth: iconSize, itemHeight: iconSize } }, false);
+  }
+
+  private _syncHbarXRotation() {
+    if (this.activeType !== 'horizontal_bar' || !this.chart) return;
+    const w = this.elRef.nativeElement.clientWidth;
+    if (!w) return;
+    const rotate = w < 480 ? 90 : 0;
+    this.chart.setOption({ xAxis: { axisLabel: { rotate } } }, false);
+  }
+
+  private destroyChart() {
+    this.calZoom = 1;
+    clearTimeout(this.resizeTimer); this.resizeTimer = null;
+    this.resizeObs?.disconnect(); this.resizeObs = null;
+    if (this.transitionEndCb) {
+      document.removeEventListener('transitionend', this.transitionEndCb);
+      this.transitionEndCb = null;
+    }
+    this.initTimers.forEach(t => clearTimeout(t)); this.initTimers = [];
+    if (this.chart) { this.chart.dispose(); this.chart = null; }
+  }
   ngOnDestroy() { 
     this.destroyChart(); 
     if (this.themeObserver) this.themeObserver.disconnect();

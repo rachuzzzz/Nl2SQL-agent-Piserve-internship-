@@ -62,31 +62,33 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
         </div>
       </div>
 
-      <!-- Chart + Table side by side -->
+      <!-- Chart + Table: side-by-side or stacked -->
       <div class="data-grid"
-           [class.chart-only]="tableExpanded"
-           [class.table-only]="chartExpanded">
+           [class.stacked]="stackedMode !== 'none'"
+           [class.table-first]="stackedMode === 'table-first'">
 
         <!-- Chart panel -->
-        <div class="panel panel-chart" [class.panel-hidden]="tableExpanded">
+        <div class="panel panel-chart">
           <app-chart-display
             [cfg]="chartConfig"
             [sessionId]="sessionId"
             [mode]="'control'"
+            [noOverlay]="true"
+            [resizeTrigger]="chartResizeTrigger"
             (fullscreenChange)="onChartFullscreen($event)">
           </app-chart-display>
         </div>
 
         <!-- Table panel -->
-        <div class="panel panel-table" [class.panel-hidden]="chartExpanded">
+        <div class="panel panel-table">
           <div class="panel-toolbar">
             <button class="btn-panel-expand"
-                    (click)="tableExpanded = !tableExpanded"
-                    [title]="tableExpanded ? 'Restore side-by-side' : 'Expand table'">
-              <svg *ngIf="!tableExpanded" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                    (click)="toggleTableStack()"
+                    [title]="stackedMode === 'table-first' ? 'Restore side-by-side' : 'Expand table & chart'">
+              <svg *ngIf="stackedMode !== 'table-first'" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
                 <path d="M1.5 1.5v4h1.5v-2.5h2.5v-1.5h-4zm4 13h-2.5v-2.5h-1.5v4h4v-1.5zm9-9h-1.5v2.5h-2.5v1.5h4v-4zm-4 7h2.5v-2.5h1.5v4h-4v-1.5z"/>
               </svg>
-              <svg *ngIf="tableExpanded" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+              <svg *ngIf="stackedMode === 'table-first'" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
                 <path d="M5.5 5.5v-4h-1.5v2.5h-2.5v1.5h4zm-4 5h2.5v2.5h1.5v-4h-4v1.5zm9-5h1.5v-2.5h2.5v-1.5h-4v4zm4 5h-2.5v2.5h-1.5v-4h4v1.5z"/>
               </svg>
             </button>
@@ -213,31 +215,33 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
     }
     .kpi-range-max { color: #d97706; }
 
-    /* ── Side-by-side grid ── */
+    /* ── Side-by-side grid (default) ── */
     .data-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 12px;
+      gap: 16px;
       align-items: start;
-      transition: grid-template-columns 0.25s ease;
     }
 
-    /* Table expanded → chart collapses */
-    .data-grid.chart-only {
-      grid-template-columns: 0 1fr;
-    }
-    /* Chart native fullscreen active → show table full width */
-    .data-grid.table-only {
-      grid-template-columns: 1fr 0;
+    /* Stacked mode: collapse to single column — each panel fills 100% width */
+    .data-grid.stacked {
+      grid-template-columns: 1fr;
     }
 
-    .panel { min-width: 0; overflow: hidden; transition: opacity 0.2s ease; }
-    .panel-hidden { opacity: 0; pointer-events: none; }
+    .panel { min-width: 0; overflow: hidden; width: 100%; }
 
-    /* ── Table toolbar (expand button) ── */
+    /* Default visual order */
+    .panel-chart { order: 1; }
+    .panel-table  { order: 2; }
+
+    /* Table-first: swap so table appears above chart */
+    .data-grid.table-first .panel-chart { order: 2; }
+    .data-grid.table-first .panel-table  { order: 1; }
+
+    /* ── Panel toolbars (expand buttons) ── */
     .panel-toolbar {
       display: flex; align-items: center; justify-content: flex-end;
-      padding: 5px 2px 6px;
+      padding: 4px 2px 4px;
     }
     .btn-panel-expand {
       display: flex; align-items: center; justify-content: center;
@@ -253,18 +257,14 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
       box-shadow: 0 0 0 2px rgba(37,99,235,0.1);
     }
 
-    /* Collapse to stacked on narrow containers */
+    /* Always stack on very narrow containers */
     @media (max-width: 680px) {
-      .data-grid,
-      .data-grid.chart-only,
-      .data-grid.table-only { grid-template-columns: 1fr; }
-      .panel-hidden { display: none; }
+      .data-grid { grid-template-columns: 1fr; }
     }
 
     /* Respect reduced motion */
     @media (prefers-reduced-motion: reduce) {
       .kpi-card { transition: none; opacity: 1; transform: none !important; }
-      .data-grid { transition: none; }
     }
   `],
 })
@@ -277,8 +277,8 @@ export class DashboardDisplayComponent implements OnChanges, AfterViewInit, OnDe
 
   displayValues: number[] = [];
   entered:       boolean[] = [];
-  tableExpanded  = false;
-  chartExpanded  = false;
+  stackedMode: 'none' | 'chart-first' | 'table-first' = 'none';
+  chartResizeTrigger = 0;
 
   private timers: any[] = [];
   private destroyed = false;
@@ -310,9 +310,15 @@ export class DashboardDisplayComponent implements OnChanges, AfterViewInit, OnDe
     this.timers = [];
   }
 
-  /** Called by chart-display when it enters/exits its own fullscreen overlay. */
+  toggleTableStack(): void {
+    this.stackedMode = this.stackedMode === 'table-first' ? 'none' : 'table-first';
+    this.chartResizeTrigger++;
+    this.cdr.markForCheck();
+  }
+
   onChartFullscreen(isFullscreen: boolean): void {
-    this.chartExpanded = isFullscreen;
+    this.stackedMode = isFullscreen ? 'chart-first' : 'none';
+    this.chartResizeTrigger++;
     this.cdr.markForCheck();
   }
 
