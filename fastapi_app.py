@@ -447,7 +447,7 @@ def _chart_suggestion_sentence(columns: list, rows: list) -> str:
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, _: None = Depends(require_auth)):
     try:
         orch = _orch
         sess_data = get_or_create_session(req.session_id)
@@ -784,7 +784,7 @@ def _paginate_sql(sql: str, page: int, page_size: int) -> str:
 
 
 @app.post("/api/page")
-async def get_page(req: PageRequest):
+async def get_page(req: PageRequest, _: None = Depends(require_auth)):
     """
     Return a specific page of a SQL result without an LLM call.
     Uses req.sql if provided (preferred — each message carries its own SQL),
@@ -846,13 +846,13 @@ async def get_session_info(session_id: str):
 
 
 @app.delete("/api/sessions/{session_id}")
-async def clear_session(session_id: str):
+async def clear_session(session_id: str, _: None = Depends(require_auth)):
     _sessions.pop(session_id, None)
     return {"status": "cleared", "session_id": session_id}
 
 
 @app.post("/api/chart")
-async def get_chart(req: ChartRequest):
+async def get_chart(req: ChartRequest, _: None = Depends(require_auth)):
     """
     Slash-command chart endpoint — /chart [type?]
     Generates or regenerates a chart from the session's last result.
@@ -945,7 +945,7 @@ async def get_chart(req: ChartRequest):
 
 
 @app.get("/api/sql/{session_id}")
-async def get_last_sql(session_id: str):
+async def get_last_sql(session_id: str, _: None = Depends(require_auth)):
     """
     Slash-command /sql endpoint.
     Returns the last generated SQL for this session.
@@ -963,7 +963,7 @@ async def get_last_sql(session_id: str):
 
 
 @app.get("/api/columns/{session_id}")
-async def get_last_columns(session_id: str):
+async def get_last_columns(session_id: str, _: None = Depends(require_auth)):
     """
     Returns available columns and their types from the last result.
     Used by the column picker when user wants to customise a chart.
@@ -992,6 +992,34 @@ class LoginRequest(BaseModel):
     password: str
 
 
+# ── Token store ────────────────────────────────────────────────────────────────
+# Maps access_token → expiry (unix timestamp). Populated on /api/login and
+# checked by require_auth on every protected route. Cleared on server restart
+# (intentional — users re-authenticate after a deploy).
+import time as _time
+from fastapi.security import HTTPBearer as _HTTPBearer, HTTPAuthorizationCredentials as _HTTPCreds
+
+_valid_tokens: dict[str, float] = {}
+_bearer_scheme = _HTTPBearer(auto_error=False)
+
+
+def _register_token(token: str, expires_in: int = 3600) -> None:
+    _valid_tokens[token] = _time.time() + expires_in
+    # Prune expired tokens to prevent unbounded growth
+    now = _time.time()
+    expired = [t for t, exp in list(_valid_tokens.items()) if exp < now]
+    for t in expired:
+        _valid_tokens.pop(t, None)
+
+
+async def require_auth(
+    credentials: _HTTPCreds | None = Depends(_bearer_scheme),
+) -> None:
+    token = credentials.credentials if credentials else None
+    if not token or _valid_tokens.get(token, 0) < _time.time():
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+
 @app.post("/api/login")
 async def login(req: LoginRequest):
     """Proxy OAuth password-grant to the identity server.
@@ -1000,6 +1028,10 @@ async def login(req: LoginRequest):
     oauth_url     = os.getenv("OAUTH_URL", "https://10.77.20.51/oauth/token?_format=json")
     client_id     = os.getenv("CLIENT_ID", "").strip()
     client_secret = os.getenv("CLIENT_SECRET", "").strip()
+    # Use a custom CA bundle if provided (required for internal servers with
+    # self-signed certs). Falls back to system CAs — never disables verification.
+    ca_cert = os.getenv("OAUTH_CA_CERT", "").strip()
+    verify: str | bool = ca_cert if ca_cert else True
 
     payload = {
         "grant_type":    "password",
@@ -1009,19 +1041,22 @@ async def login(req: LoginRequest):
         "password":      req.password,
     }
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as client:
+        async with httpx.AsyncClient(verify=verify, timeout=15) as client:
             resp = await client.post(oauth_url, data=payload)
         if resp.status_code == 200:
-            return resp.json()
+            data = resp.json()
+            _register_token(data["access_token"], int(data.get("expires_in", 3600)))
+            return data
         try:
-            detail = resp.json().get("error_description") or resp.json().get("message") or resp.text
+            detail = resp.json().get("error_description") or resp.json().get("message") or "Invalid credentials"
         except Exception:
-            detail = resp.text
+            detail = "Invalid credentials"
         raise HTTPException(status_code=resp.status_code, detail=detail)
     except HTTPException:
         raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Identity server unreachable: {exc}")
+    except Exception:
+        logging.exception("OAuth proxy error")
+        raise HTTPException(status_code=502, detail="Authentication service unavailable")
 
 
 @app.get("/api/health")
@@ -1046,7 +1081,7 @@ async def ready():
 
 # ── ASR ───────────────────────────────────────────────────────────────────────
 @app.post("/api/transcribe")
-async def transcribe(audio: UploadFile = File(...)):
+async def transcribe(audio: UploadFile = File(...), _: None = Depends(require_auth)):
     """
     Accepts any browser audio blob (WebM/Opus, WAV, MP4 …),
     converts to 16 kHz mono WAV via ffmpeg, then transcribes
@@ -1106,7 +1141,7 @@ class TTSRequest(BaseModel):
     text: str
 
 @app.post("/api/tts")
-async def tts(req: TTSRequest):
+async def tts(req: TTSRequest, _: None = Depends(require_auth)):
     """
     Converts answer text to speech using Kokoro-ONNX (CPU).
     Strips markdown, caps at 800 chars, returns audio/wav.
