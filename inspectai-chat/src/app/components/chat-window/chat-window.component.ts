@@ -66,7 +66,7 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
         <div *ngFor="let msg of messages; trackBy: trackMsg"
              class="msg"
              [class.msg-user]="msg.role === 'user'"
-             [class.msg-wide]="msg.role === 'ai' && !!msg.dashboard?.show">
+             [class.msg-wide]="(msg.role === 'ai' && !!msg.dashboard?.show) || expandedChartMsgs.has(msg.id)">
           <div class="avatar"
             [class.avatar-ai]="msg.role === 'ai'"
             [class.avatar-user]="msg.role === 'user'">
@@ -115,7 +115,10 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
                 *ngIf="msg.role === 'ai' && msg.chartConfig"
                 [cfg]="msg.chartConfig!"
                 [sessionId]="sessionId"
-                [mode]="msg.chartMode ?? 'quick'">
+                [mode]="msg.chartMode ?? 'quick'"
+                [noOverlay]="true"
+                [resizeTrigger]="chartResizeTriggers.get(msg.id) ?? 0"
+                (fullscreenChange)="onMsgChartFullscreen(msg.id, $event)">
               </app-chart-display>
 
             </ng-container>
@@ -414,6 +417,9 @@ export class ChatWindowComponent implements AfterViewChecked {
   pendingChartType: string | null = null;
   columnPickerInfo: { columns: string[]; categories: string[]; numerics: string[]; dates: string[] } | null = null;
 
+  expandedChartMsgs   = new Set<string>();
+  chartResizeTriggers = new Map<string, number>();
+
   isRecording    = false;
   isTranscribing = false;
   micError       = '';
@@ -643,6 +649,16 @@ export class ChatWindowComponent implements AfterViewChecked {
         this.cdr.markForCheck();
       },
     });
+  }
+
+  onMsgChartFullscreen(msgId: string, isFullscreen: boolean): void {
+    if (isFullscreen) {
+      this.expandedChartMsgs.add(msgId);
+    } else {
+      this.expandedChartMsgs.delete(msgId);
+    }
+    this.chartResizeTriggers.set(msgId, (this.chartResizeTriggers.get(msgId) ?? 0) + 1);
+    this.cdr.markForCheck();
   }
 
   send(text: string): void {

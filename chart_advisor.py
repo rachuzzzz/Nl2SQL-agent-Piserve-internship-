@@ -116,11 +116,17 @@ _ALT_MAP: dict[str, list[str]] = {
 _DATE_RE   = re.compile(r'(date|month|year|week|\btime\b|period|quarter|\bday\b|created|modified|submitted|reported|month_idx|month_label)', re.I)
 _PCT_RE    = re.compile(r'(pct|percent|rate|ratio|share|proportion|conversion)', re.I)
 _SCORE_RE  = re.compile(r'(score|rating|grade|index)', re.I)
-_INCOME_RE = re.compile(r'(income|revenue|po_amount|converted|earned)', re.I)
-_COST_RE   = re.compile(r'(cost|opex|pr_amount|expenditure|spent|loss)', re.I)
-_PROFIT_RE = re.compile(r'(profit|net|margin|gain)', re.I)
+_INCOME_RE = re.compile(r'(income|revenue|po_amount|po_total|total_po|converted|earned|receipt|billing|invoic)', re.I)
+_COST_RE   = re.compile(r'(cost|opex|pr_amount|pr_total|total_pr|expenditure|expense|spent|loss|outflow|paid)', re.I)
+_PROFIT_RE = re.compile(r'(profit|net|margin|gain|balance|surplus)', re.I)
 _CAPEX_RE  = re.compile(r'(capex|opex|budget|amount)', re.I)
 _WORKFLOW_RE = re.compile(r'(status|state|phase|stage|step|pipeline|funnel|tier)', re.I)
+_RADAR_DIM_KW = {
+    'safety', 'hygiene', 'health', 'quality', 'compliance', 'structure',
+    'document', 'fire', 'electric', 'mechanic', 'plumbing', 'hvac',
+    'cleanliness', 'maintenance', 'security', 'environment', 'waste',
+    'inspection', 'audit', 'check', 'survey', 'assessment',
+}
 
 def _is_date_col(col, vals):
     if _DATE_RE.search(col): return True
@@ -360,44 +366,58 @@ def _pie(labels, values, doughnut=False, rose=False):
         for lbl, val in zip(labels, values)
         if _coerce(val) is not None
     ]
+    n = len(data)
     radius = ["42%", "70%"] if doughnut else "68%"
+    # Shift pie left so the vertical right-side legend has clear space.
+    center = ["38%", "50%"]
+
+    # With many slices the outward label lines fan across the full chart width and
+    # collide with the right-side legend.  Above the threshold, suppress all slice
+    # labels — the scroll legend and hover tooltip are sufficient for identification.
+    LABEL_THRESHOLD = 8
+    show_labels = n <= LABEL_THRESHOLD
 
     extra_series = {}
     if doughnut:
         extra_series["label"] = {
-            "show": True,
+            "show": show_labels,
             "formatter": "{b}\n{d}%",
             "color": _LABEL, "fontSize": 11,
         }
-        extra_series["labelLine"] = {"length": 12, "length2": 8}
-        # Centre label showing total
+        extra_series["labelLine"] = {"show": show_labels, "length": 12, "length2": 8}
         total = sum(d["value"] for d in data if d["value"])
-        extra_series["center"] = ["40%", "50%"]
     else:
         extra_series["label"] = {
-            "show": True,
+            "show": show_labels,
             "formatter": "{b}: {d}%",
             "color": _LABEL, "fontSize": 11,
         }
-        
+        extra_series["labelLine"] = {"show": show_labels}
+
     if rose:
         extra_series["roseType"] = "radius"
-        # Nightingale charts often look better with a slightly smaller radius to accommodate varying lengths
-        radius = ["15%", "70%"] if doughnut else "75%"
+        radius = ["15%", "65%"] if doughnut else "68%"
 
     return _base({
         "tooltip": _tt_item(),
         "legend": {
-            "orient": "vertical", "right": "2%", "top": "middle",
-            "itemGap": 10, "itemWidth": 10, "itemHeight": 10, "icon": "circle",
-            "textStyle": {"color": _LABEL, "fontSize": 11},
+            # type:scroll paginates the list — no unbounded growth that overlaps the chart.
+            "type": "scroll",
+            "orient": "vertical", "right": "2%", "top": "10%", "height": "80%",
+            "itemGap": 8, "itemWidth": 10, "itemHeight": 10, "icon": "circle",
+            "pageIconColor": _LABEL,
+            "pageTextStyle": {"color": _LABEL, "fontSize": 10},
+            "textStyle": {
+                "color": _LABEL, "fontSize": 11,
+                "width": 110, "overflow": "truncate",
+            },
         },
         "series": [{
-            "type": "pie", "radius": radius,
+            "type": "pie", "radius": radius, "center": center,
             "data": data,
             "emphasis": {
                 "itemStyle": {"shadowBlur": 12, "shadowColor": "rgba(0,0,0,0.35)"},
-                "label": {"fontSize": 13},
+                "label": {"show": show_labels, "fontSize": 13},
             },
             "itemStyle": {"borderRadius": 4, "borderWidth": 2, "borderColor": "rgba(0,0,0,0.15)"},
             **extra_series,
@@ -559,6 +579,34 @@ def _waterfall(labels, values, col_name):
     })
 
 
+def _radar_pivot(cat_col, num_col, rows):
+    """Radar from aggregated data: each row is a spoke (category-value → score)."""
+    max_val = max((_coerce(r.get(num_col)) or 0 for r in rows), default=1)
+    indicators = [{"name": _lbl(str(r.get(cat_col, ''))), "max": round(max_val * 1.2, 1)} for r in rows]
+    values = [_coerce(r.get(num_col)) or 0 for r in rows]
+    return _base({
+        "tooltip": {**_tt_item(), "formatter": None},
+        "legend": {"show": False},
+        "radar": {
+            "indicator": indicators,
+            "shape": "polygon",
+            "axisName": {"color": _LABEL, "fontSize": 11},
+            "splitLine": {"lineStyle": {"color": _GRID}},
+            "splitArea": {"show": True, "areaStyle": {"color": ["rgba(255,255,255,0.01)", "rgba(255,255,255,0.03)"]}},
+            "axisLine":  {"lineStyle": {"color": _AXLINE}},
+            "center": ["50%", "54%"], "radius": "68%",
+        },
+        "series": [{
+            "type": "radar",
+            "data": [{"value": values, "name": "Score"}],
+            "emphasis": {"focus": "series"},
+            "symbol": "circle", "symbolSize": 4,
+            "lineStyle": {"width": 2},
+            "areaStyle": {"opacity": 0.15},
+        }],
+    })
+
+
 def _nightingale(labels, values):
     """Nightingale (rose) chart. Wraps _pie with rose=True."""
     return _pie(labels, values, doughnut=False, rose=True)
@@ -619,11 +667,13 @@ def _funnel(labels, values, col_name, sort_order="descending"):
         }]
     })
 
-def _gauge(value, label, max_val=100.0):
-    """
-    Gauge — opt-in only (user explicitly requested it).
-    NOT auto-routed from the rules engine.
-    """
+def _gauge(value, label, max_val=None):
+    if max_val is None:
+        if value <= 100:
+            max_val = 100.0
+        else:
+            magnitude = 10 ** (len(str(int(value))) - 1)
+            max_val = float((int(value) // magnitude + 1) * magnitude)
     return _base({
         "series": [{
             "type": "gauge",
@@ -643,11 +693,16 @@ def _gauge(value, label, max_val=100.0):
             "axisTick": {"distance": -24, "length": 6, "lineStyle": {"color":"#fff","width":1}},
             "splitLine": {"distance": -30, "length": 14, "lineStyle": {"color":"#fff","width":2}},
             "axisLabel": {"color": "inherit", "distance": 38, "fontSize": 11},
+            "title": {
+                "fontSize": 13, "fontWeight": 500,
+                "color": "inherit",
+                "offsetCenter": [0, "45%"],
+            },
             "detail": {
                 "valueAnimation": True,
-                "formatter": f"{{value}}\n{label}",
-                "color": "inherit", "fontSize": 20, "fontWeight": 500,
-                "offsetCenter": [0, "30%"],
+                "formatter": "{value}",
+                "color": "inherit", "fontSize": 24, "fontWeight": 700,
+                "offsetCenter": [0, "18%"],
             },
             "data": [{"value": round(value, 1), "name": label}],
         }],
@@ -789,6 +844,12 @@ def _rules_advise(columns, rows):
 
     # ── 1. Single-row KPI ─────────────────────────────────────────────────────
     if n == 1:
+        # Single score/rate in 0-100 → gauge (column name must signal a bounded metric)
+        if len(nums) == 1 and not cats:
+            v = _coerce(rows[0].get(nums[0]))
+            if v is not None and 0 <= v <= 100 and (_SCORE_RE.search(nums[0]) or _PCT_RE.search(nums[0])):
+                return _result("gauge", f"{_lbl(nums[0])} KPI — gauge", "high",
+                               None, nums, _gauge(v, _lbl(nums[0])))
         # P&L single row → waterfall across metric names
         if len(nums) >= 2 and (has_income or has_cost or has_profit):
             metric_labels = [_lbl(c) for c in nums]
@@ -892,13 +953,16 @@ def _rules_advise(columns, rows):
     # ── 5. Radar — multi-metric profile across few entities ───────────────────
     if cats and len(nums) >= 2 and n <= 12:
         lc = cats[0]
+        all_scores = all(bool(_SCORE_RE.search(nc) or _PCT_RE.search(nc)) for nc in nums[:6])
         ranges = []
         for nc in nums[:6]:
             vals = [_coerce(r.get(nc)) for r in rows if _coerce(r.get(nc)) is not None]
             if vals: ranges.append(max(vals) - min(vals))
         similar_scale = not ranges or (max(ranges) / max(min(ranges), 0.001)) < 1000
-        if similar_scale and n <= 8:
-            return _result("radar", f"Multi-metric profile per '{lc}' — radar", "medium",
+        max_entities = 12 if all_scores else 8
+        if similar_scale and n <= max_entities:
+            return _result("radar", f"Multi-metric profile per '{lc}' — radar",
+                           "high" if all_scores else "medium",
                            lc, nums[:6], _radar(lc, nums[:6], rows))
 
     # ── 6.5 Funnel — workflow progression ──────────────────────────────────────
@@ -912,10 +976,23 @@ def _rules_advise(columns, rows):
             workflow_keywords = {"open", "pending", "progress", "review", "approved", "closed", "resolved", "rejected", "lead", "opportunity", "qualified", "won", "lost"}
             if any(any(kw in val for kw in workflow_keywords) for val in sample_vals):
                 is_workflow = True
-                
+
         if is_workflow:
             return _result("funnel", f"Workflow/Stage progression — funnel", "high",
                            lc, nums, _funnel([str(r.get(lc)) for r in rows], [_coerce(r.get(nc)) for r in rows], nc, sort_order="descending"))
+
+    # ── 5a. Radar pivot — aggregated score dimensions (1 cat, 1 score col) ───────
+    # Fires when: query returns one row per inspection dimension with a score value,
+    # e.g. (category='Safety', avg_score=78), (category='Hygiene', avg_score=90)
+    if cats and len(nums) == 1 and 3 <= n <= 20:
+        lc, nc = cats[0], nums[0]
+        is_score_col = bool(_SCORE_RE.search(nc) or _PCT_RE.search(nc))
+        cat_vals_lower = [str(r.get(lc, '')).lower() for r in rows]
+        cat_looks_like_dims = any(any(kw in v for kw in _RADAR_DIM_KW) for v in cat_vals_lower)
+        cat_col_is_type = bool(re.search(r'(type|categor|section|domain|area|dimension)', lc, re.I))
+        if is_score_col and (cat_looks_like_dims or cat_col_is_type):
+            return _result("radar", f"Score profile across {_lbl(lc)} dimensions — radar", "high",
+                           lc, [nc], _radar_pivot(lc, nc, rows))
 
     # ── 7. Low-cardinality single metric → doughnut or nightingale ─────────────
     if cats and len(nums) == 1 and 3 <= n <= 8:
@@ -938,6 +1015,14 @@ def _rules_advise(columns, rows):
         return _result(ct, f"{'Horizontal bar' if horiz else 'Bar'} — '{lc}' vs '{nc}'", "high",
                        lc, nums, _bar([str(r.get(lc)) for r in rows], nums, rows, horizontal=horiz))
 
+    # ── 9a. Labeled scatter: 1 category + exactly 2 numerics + many rows ────────
+    # When there are ≥ 15 data points, scatter shows correlation better than grouped bar.
+    if len(cats) == 1 and len(nums) == 2 and n >= 15:
+        lc = cats[0]
+        conf = "high" if n >= 5 else "medium"
+        return _result("scatter", f"Correlation — scatter plot labeled by '{lc}'", conf,
+                       None, nums, _scatter(nums[0], nums[1], rows, label_col=lc))
+
     # ── 9. Multiple numerics → grouped bar ────────────────────────────────────
     if cats and 2 <= len(nums) <= 6:
         lc = cats[0]
@@ -947,7 +1032,8 @@ def _rules_advise(columns, rows):
     # ── 10. Two numerics no category → scatter ─────────────────────────────────
     if len(nums) >= 2 and not cats and not dates:
         label_col = next((c for c in columns if c not in nums), None)
-        return _result("scatter", "Correlation — scatter plot", "medium",
+        conf = "high" if n >= 5 else "medium"
+        return _result("scatter", "Correlation — scatter plot", conf,
                        None, nums[:2], _scatter(nums[0], nums[1], rows, label_col=label_col))
 
     # ── 11. Fallback ───────────────────────────────────────────────────────────
@@ -997,14 +1083,23 @@ def _build_config(chart_type, lc, num_cols, labels, rows):
         return _funnel(labels, [r.get(vc) for r in rows], vc, sort_order="descending")
     if chart_type == "scatter" and len(num_cols) >= 2:
         return _scatter(num_cols[0], num_cols[1], rows)
-    if chart_type == "radar" and len(num_cols) >= 3:
-        return _radar(lc, num_cols[:6], rows)
+    if chart_type == "radar":
+        if len(num_cols) == 1:
+            return _radar_pivot(lc, num_cols[0], rows)
+        if len(num_cols) >= 2:
+            return _radar(lc, num_cols[:6], rows)
     if chart_type == "heatmap":
         t = _classify(list({lc} | set(num_cols)) if lc else num_cols, rows)
         all_dims = t["category"] + t["date"]
         if len(all_dims) >= 2 and t["numeric"]:
             return _heatmap(all_dims[0], all_dims[1], t["numeric"][0], rows)
     if chart_type == "waterfall" and num_cols:
+        # Single-row P&L: column names become the X-axis steps, values come from the one row.
+        if len(rows) == 1 and len(num_cols) >= 2:
+            metric_labels = [_lbl(c) for c in num_cols]
+            metric_vals   = [_coerce(rows[0].get(c)) or 0 for c in num_cols]
+            return _waterfall(metric_labels, metric_vals, num_cols[0])
+        # Multi-row: one bar per row using the label column and first numeric column.
         vals = [_coerce(r.get(num_cols[0])) or 0 for r in rows]
         return _waterfall(labels, vals, num_cols[0])
     if chart_type == "calendar_heatmap":
@@ -1077,7 +1172,7 @@ Rules:
 - radar: compare 3+ metrics across ≤8 entities.
 - heatmap: two categorical dimensions × one numeric.
 - waterfall: sequential P&L, or mixed positive/negative values.
-- gauge: ONLY when user explicitly asks for a gauge. Never auto-select.
+- gauge: for a single scalar KPI (score, rate, percentage) with a value in 0-100 range.
 - Default to bar or horizontal_bar when unsure.
 
 Respond ONLY with JSON: {{"chart_type":"line","reason":"monthly trend","confidence":"high"}}"""
@@ -1093,7 +1188,6 @@ Respond ONLY with JSON: {{"chart_type":"line","reason":"monthly trend","confiden
         reason = parsed.get("reason","LLM recommendation")
         conf   = parsed.get("confidence","medium")
 
-        if ct == "gauge": ct = "bar"   # never auto-gauge
         if ct not in _VALID_TYPES: raise ValueError(f"Invalid: {ct}")
         if conf not in ("high","medium","low"): conf = "medium"
 
@@ -1142,14 +1236,19 @@ def force_config(columns, rows, chart_type, lc=None, num_cols=None):
     t  = _classify(columns, rows)
     if not lc:
         if chart_type == "calendar_heatmap":
-            # Prefer date column over category column for calendar charts
             lc = t["date"][0] if t["date"] else (t["category"][0] if t["category"] else columns[0])
+        elif chart_type == "waterfall" and len(rows) == 1 and not t["category"] and not t["date"]:
+            # Single-row all-numeric P&L: _build_config will use column names as steps.
+            # Don't consume a numeric column as the label — just use a placeholder.
+            lc = columns[0]
         else:
             lc = t["category"][0] if t["category"] else (t["date"][0] if t["date"] else columns[0])
     labels   = [str(r.get(lc)) for r in rows]
     if not num_cols:
         if chart_type == "calendar_heatmap":
             num_cols = t["numeric"]  # may be [] — count mode handled inside builder
+        elif chart_type == "waterfall" and len(rows) == 1 and not t["category"] and not t["date"]:
+            num_cols = t["numeric"] or columns  # all numeric columns become waterfall steps
         else:
             num_cols = t["numeric"] or [columns[-1]]
     cfg = _build_config(chart_type, lc, num_cols, labels, rows)

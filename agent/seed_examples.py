@@ -476,13 +476,17 @@ WHERE ica.active = true;
         'limit':  None,
     },
     {
-        'nl':     'what is the total income cost and net profit from corrective actions P&L profit loss',
+        # WATERFALL PATTERN 1: single-row P&L — 3 numeric columns, 1 row.
+        # chart_advisor Rule 1 fires: n==1, len(nums)>=2, has income+cost+profit → waterfall.
+        # Column aliases MUST match: total_income, total_cost, net_profit (triggers _INCOME_RE/_COST_RE/_PROFIT_RE).
+        'nl':     'what is the total income cost and net profit from corrective actions P&L profit loss overall financial summary total revenue expenditure waterfall',
         'sql':    """\
+-- WATERFALL: return exactly 3 columns — total_income, total_cost, net_profit (1 row).
+-- chart_advisor detects income+cost+profit on a single row and auto-selects waterfall.
 -- P&L MODEL: income = po_details.po_amount (client paid Khidmah)
 --            cost   = pr_details.pr_amount (Khidmah paid out)
 --            profit = income - cost
 -- ica.capex is a QUOTE only — NOT income. NEVER use ica.capex as revenue.
--- Pre-aggregate in CTEs to avoid row fan-out from multiple POs/PRs per ICA
 WITH po_agg AS (
     SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_income
     FROM po_details WHERE active = true GROUP BY 1
@@ -499,6 +503,35 @@ FROM inspection_corrective_action ica
 LEFT JOIN po_agg po ON po.ica_id = ica.id
 LEFT JOIN pr_agg pr ON pr.ica_id = ica.id
 WHERE ica.active = true;
+""",
+        'domain': 'financial',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        # WATERFALL PATTERN 2: CAPEX funnel breakdown — 3 rows with pos/neg amounts.
+        # chart_advisor Rule 2 fires: 1 cat col + 1 numeric col + mixed +/- values → waterfall.
+        # Generated = positive (money raised), Converted = negative (money paid out), Lost = negative gap.
+        'nl':     'show capex breakdown generated converted lost waterfall capex funnel capex pipeline capex flow how much capex was generated converted and lost',
+        'sql':    """\
+-- WATERFALL: 3 rows — CAPEX Generated (positive), CAPEX Converted (negative outflow), CAPEX Lost (negative gap).
+-- Mixed positive/negative values on a single numeric column triggers waterfall auto-selection.
+WITH po_agg AS (
+    SELECT ica.id, COALESCE(SUM(pd.po_amount), 0) AS converted
+    FROM inspection_corrective_action ica
+    LEFT JOIN po_details pd ON pd.mitigative_action_uuid = ica.id AND pd.active = true
+    WHERE ica.active = true
+    GROUP BY ica.id
+)
+SELECT category, amount FROM (
+    VALUES
+        ('CAPEX Generated',  (SELECT COALESCE(SUM(capex), 0) FROM inspection_corrective_action WHERE active = true)),
+        ('CAPEX Converted', -(SELECT COALESCE(SUM(converted), 0) FROM po_agg)),
+        ('CAPEX Lost',      -(SELECT COALESCE(SUM(capex), 0) - COALESCE(SUM(converted), 0)
+                               FROM inspection_corrective_action ica
+                               LEFT JOIN po_agg pa ON pa.id = ica.id
+                               WHERE ica.active = true))
+) AS t(category, amount);
 """,
         'domain': 'financial',
         'intent': 'aggregate',
@@ -978,18 +1011,26 @@ LIMIT 100;
         'limit':  100,
     },
     {
-        'nl':     'show average inspection score by inspection type',
+        # RADAR-COMPATIBLE: return only (inspection_type, avg_score) — 2 columns.
+        # chart_advisor Rule 5a fires when: 1 cat col + 1 score col + 3-10 rows.
+        # Adding inspection_count as a 3rd column breaks radar auto-selection.
+        # NEVER add COUNT(*) to this query — the user asked for score profile, not volume.
+        'nl':     'show average inspection score by inspection type inspection scores across inspection types score per type radar chart inspection scores across safety hygiene structure compliance documentation show me scores for each inspection category',
         'sql':    """\
-SELECT it.name AS inspection_type_name,
-       ROUND(AVG(ir.inspection_score)::numeric, 2) AS avg_score,
-       COUNT(*) AS inspection_count
+-- RADAR PATTERN: 2 columns only — inspection_type (cat) + avg_score (num).
+-- NEVER add COUNT(*) — a third column breaks radar auto-selection in the chart advisor.
+-- NEVER filter WHERE it.name IN (...) — use ALL types; user category words are intent labels only.
+SELECT it.name AS inspection_type,
+       ROUND(AVG(ir.inspection_score)::numeric, 1) AS avg_score
 FROM inspection_report ir
 JOIN inspection_type it ON ir.inspection_type_id = it.id
-WHERE ir.status != 'DRAFT' AND ir.inspection_score IS NOT NULL
-GROUP BY it.name ORDER BY avg_score DESC;
+WHERE ir.active = true AND ir.status != 'DRAFT'
+  AND it.active = true AND ir.inspection_score IS NOT NULL
+GROUP BY it.name
+ORDER BY avg_score DESC;
 """,
         'domain': 'inspection',
-        'intent': 'filter',
+        'intent': 'aggregate',
         'limit':  None,
     },
     {
@@ -3706,6 +3747,120 @@ LIMIT 200;
         'domain': 'form_answers',
         'intent': 'single_value',
         'limit':  1,
+    },
+
+    # ── Scatter chart seed examples ──────────────────────────────────────────
+    {
+        # Returns 2 pure numeric columns → scatter: avg_score (x) vs total_inspections (y)
+        # Each point = one inspector. Reveals whether busy inspectors score lower.
+        'nl':     'scatter plot of average inspection score vs number of inspections per inspector correlation between score and workload inspector score vs count',
+        'sql':    """\
+-- Scatter: avg_score (quality) vs total_inspections (workload) per inspector
+-- Returns ONLY two numeric columns so the chart advisor picks scatter automatically.
+-- Do NOT include inspector_name in SELECT — it would trigger grouped bar instead.
+SELECT
+    ROUND(AVG(ir.inspection_score)::numeric, 1) AS avg_score,
+    COUNT(*)                                     AS total_inspections
+FROM inspection_report ir
+JOIN users u ON ir.inspector_user_id = u.id
+WHERE ir.active = true
+  AND ir.status != 'DRAFT'
+  AND ir.inspection_score IS NOT NULL
+GROUP BY u.id
+HAVING COUNT(*) >= 3
+ORDER BY avg_score DESC;
+""",
+        'domain': 'inspection',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        # Returns facility_name + 2 numerics → labeled scatter (name as hover label)
+        # avg_score vs inspection_count per facility, labeled by facility name.
+        'nl':     'scatter chart average score vs inspection count by facility facility score vs count correlation score and inspections per facility relationship between score and number of inspections',
+        'sql':    """\
+-- Labeled scatter: avg_score vs inspection_count with facility_name as hover label.
+-- With facility_name included, Rule 9a fires for n >= 15 facilities → labeled scatter.
+SELECT
+    f.name                                       AS facility_name,
+    ROUND(AVG(ir.inspection_score)::numeric, 1)  AS avg_score,
+    COUNT(*)                                     AS total_inspections
+FROM inspection_report ir
+JOIN facility f ON ir.facility_id = f.id
+WHERE ir.active = true
+  AND ir.status != 'DRAFT'
+  AND ir.inspection_score IS NOT NULL
+GROUP BY f.id, f.name
+HAVING COUNT(*) >= 2
+ORDER BY avg_score DESC;
+""",
+        'domain': 'inspection',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        # CAPEX scatter: generated vs converted per FM manager
+        # Shows which managers raise large capex but convert little (efficiency gap).
+        'nl':     'scatter capex generated vs converted per fm manager capex correlation scatter plot capex efficiency relationship between capex generated and converted',
+        'sql':    """\
+-- Scatter: capex_generated (x) vs capex_converted (y) per FM manager.
+-- Each point = one FM manager. Shows conversion efficiency.
+-- FM Manager = inspectee_user_id (NOT inspector_user_id).
+SELECT
+    COALESCE(SUM(ica.capex), 0)                                              AS capex_generated,
+    COALESCE(SUM(CASE WHEN pd.po_amount IS NOT NULL THEN pd.po_amount END), 0) AS capex_converted
+FROM inspection_report ir
+JOIN users u ON ir.inspectee_user_id = u.id
+LEFT JOIN inspection_corrective_action ica
+       ON ica.inspection_report_id = ir.id AND ica.active = true
+LEFT JOIN po_details pd ON pd.ica_id = ica.id
+WHERE ir.active = true
+  AND ir.status != 'DRAFT'
+GROUP BY u.id
+HAVING COALESCE(SUM(ica.capex), 0) > 0
+ORDER BY capex_generated DESC;
+""",
+        'domain': 'financial',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+
+    # ── Gauge seed examples ──────────────────────────────────────────────────
+    {
+        'nl': 'what is the overall average inspection score',
+        'sql': """
+SELECT ROUND(AVG(i.score), 1) AS avg_score
+FROM inspections i
+WHERE i.score IS NOT NULL;
+""",
+        'domain': 'inspection',
+        'intent': 'single_value',
+        'limit':  None,
+    },
+    {
+        'nl': 'show me the average compliance rate across all inspections as a gauge',
+        'sql': """
+SELECT ROUND(
+    100.0 * COUNT(CASE WHEN i.status = 'completed' THEN 1 END) / NULLIF(COUNT(*), 0)
+, 1) AS compliance_rate
+FROM inspections i;
+""",
+        'domain': 'inspection',
+        'intent': 'single_value',
+        'limit':  None,
+    },
+    {
+        'nl': 'what percentage of inspections passed this month',
+        'sql': """
+SELECT ROUND(
+    100.0 * COUNT(CASE WHEN i.score >= 70 THEN 1 END) / NULLIF(COUNT(*), 0)
+, 1) AS pass_rate
+FROM inspections i
+WHERE DATE_FORMAT(i.inspection_date, '%Y-%m') = DATE_FORMAT(CURDATE(), '%Y-%m');
+""",
+        'domain': 'inspection',
+        'intent': 'single_value',
+        'limit':  None,
     },
 ]
 

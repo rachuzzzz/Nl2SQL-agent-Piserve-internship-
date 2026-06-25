@@ -1784,6 +1784,90 @@ REGISTRY: list[dict] = [
             "  AND due_date < date_trunc('quarter', NOW()) + INTERVAL '3 months';\n"
         ),
     },
+    # Scores across inspection type categories — group ALL types, never filter by name
+    {
+        "id":             "inject_inspection_scores_by_type",
+        "type":           INJECT,
+        "priority":       88,
+        "description":    "Inspection scores across named categories — group all inspection types without name-filter.",
+        "question_pattern": (
+            # "inspection scores across safety, hygiene, ..."
+            r"(?i)\binspection\s+score\w*\b.{0,60}"
+            r"\b(across|by|per|for\s+each|breakdown|compare|versus|vs)\b"
+            # "scores across / by <anything> / breakdown"
+            r"|\bscore\w*\b.{0,30}\b(across|by\s+\w+|breakdown)\b"
+            # two or more inspection-domain keywords in the same sentence with a score word
+            r"|\b(safety|hygiene|structure|compliance|documentation|cleanliness|fire"
+            r"|electrical|mechanical|health)\b.{0,100}"
+            r"\b(safety|hygiene|structure|compliance|documentation|cleanliness|fire"
+            r"|electrical|mechanical|health)\b.{0,60}"
+            r"\b(score\w*|rating\w*|inspection)\b"
+            r"|\b(score\w*|rating\w*)\b.{0,40}"
+            r"\b(safety|hygiene|structure|compliance|documentation|cleanliness|fire"
+            r"|electrical|mechanical|health)\b.{0,80}"
+            r"\b(safety|hygiene|structure|compliance|documentation|cleanliness|fire"
+            r"|electrical|mechanical|health)\b"
+        ),
+        "hint": (
+            "\nINSPECTION SCORES BY TYPE — CRITICAL RULE:\n"
+            "NEVER filter WHERE it.name IN (...) or WHERE it.name ILIKE '%safety%' — "
+            "those names may not match the DB and return ZERO rows.\n"
+            "The user's category words (safety, hygiene, structure, compliance, documentation) "
+            "are INTENT labels, NOT exact strings stored in inspection_type.name.\n"
+            "\nALWAYS group ALL inspection types without a name filter:\n"
+            "SELECT it.name AS inspection_type,\n"
+            "       ROUND(AVG(ir.inspection_score)::numeric, 1) AS avg_score\n"
+            "FROM inspection_report ir\n"
+            "JOIN inspection_type it ON ir.inspection_type_id = it.id\n"
+            "WHERE ir.active = true AND ir.status != 'DRAFT' AND it.active = true\n"
+            "GROUP BY it.name\n"
+            "ORDER BY avg_score DESC;\n"
+            "Return ONLY these 2 columns (inspection_type, avg_score) — no count column.\n"
+            "This gives exactly 1 categorical + 1 score column so the chart advisor auto-selects radar.\n"
+        ),
+    },
+    # P&L summary — single-row waterfall trigger
+    {
+        "id":          "inject_pl_summary_waterfall",
+        "type":        INJECT,
+        "priority":    89,
+        "description": "Overall P&L / income-cost-profit summary — force 3-column single-row pattern for waterfall.",
+        "question_pattern": (
+            r"(?i)\b(total|overall|summary)\b.{0,30}\b(income|revenue)\b"
+            r"|\b(income|revenue).{0,30}\b(cost|expense|expenditure)\b"
+            r"|\b(profit|net\s+profit|p&l|profit\s+and\s+loss|profit\s+loss)\b.{0,40}"
+            r"\b(total|overall|summary|income|revenue|cost)\b"
+            r"|\b(income|revenue).{0,20}\b(cost|expense).{0,20}\b(profit|net)\b"
+            r"|\bfinancial\s+summary\b"
+        ),
+        "hint": (
+            "\nP&L SUMMARY — WATERFALL PATTERN (single row, 3 exact column aliases):\n"
+            "ALWAYS return exactly 1 row with these 3 column names — no other columns:\n"
+            "  total_income  → SUM of po_details.po_amount  (client paid Khidmah)\n"
+            "  total_cost    → SUM of pr_details.pr_amount  (Khidmah paid out)\n"
+            "  net_profit    → total_income - total_cost\n"
+            "NEVER alias as: po_total, pr_total, revenue, expenses, balance — use EXACT names above.\n"
+            "NEVER GROUP BY anything — one global row only.\n"
+            "NEVER add a category/label column — only the 3 numeric columns.\n"
+            "\nCORRECT SQL:\n"
+            "WITH po_agg AS (\n"
+            "    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_income\n"
+            "    FROM po_details WHERE active = true GROUP BY 1\n"
+            "),\n"
+            "pr_agg AS (\n"
+            "    SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_cost\n"
+            "    FROM pr_details WHERE active = true GROUP BY 1\n"
+            ")\n"
+            "SELECT\n"
+            "    COALESCE(SUM(po.total_income), 0)                                   AS total_income,\n"
+            "    COALESCE(SUM(pr.total_cost),  0)                                    AS total_cost,\n"
+            "    COALESCE(SUM(po.total_income), 0) - COALESCE(SUM(pr.total_cost), 0) AS net_profit\n"
+            "FROM inspection_corrective_action ica\n"
+            "LEFT JOIN po_agg po ON po.ica_id = ica.id\n"
+            "LEFT JOIN pr_agg pr ON pr.ica_id = ica.id\n"
+            "WHERE ica.active = true;\n"
+        ),
+    },
 ]
 
 
