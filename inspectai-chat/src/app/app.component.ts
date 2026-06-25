@@ -6,7 +6,8 @@ import { ChatWindowComponent } from './components/chat-window/chat-window.compon
 import { DebugPanelComponent } from './components/debug-panel/debug-panel.component';
 import { HistorySidebarComponent } from './components/history-sidebar/history-sidebar.component';
 
-const TOKEN_KEY = 'inspectai_access_token';
+const TOKEN_KEY    = 'inspectai_access_token';
+const USERNAME_KEY = 'inspectai_username';
 
 @Component({
   selector: 'app-root',
@@ -107,6 +108,18 @@ const TOKEN_KEY = 'inspectai_access_token';
       <div class="splash-fade-bottom"></div>
     </div>
 
+    <!-- ── Welcome toast (appears after splash, fades out) ── -->
+    <div class="welcome-toast" *ngIf="showWelcomeToast" [class.toast-out]="welcomeToastOut">
+      <div class="wt-avatar">{{ userInitials }}</div>
+      <div class="wt-text">
+        <span class="wt-greeting">مرحباً — Welcome back</span>
+        <span class="wt-name">{{ loggedInUser }}</span>
+      </div>
+      <svg class="wt-wave" viewBox="0 0 24 24" fill="none" stroke="#3fbdad" stroke-width="1.5">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"/>
+      </svg>
+    </div>
+
     <div class="app-shell">
       <header class="app-header">
         <!-- Brand block (same width as sidebar) -->
@@ -170,6 +183,10 @@ const TOKEN_KEY = 'inspectai_access_token';
             <span class="bdot" style="background:#34d399"></span>
             Live
           </span>
+          <div class="user-pill" *ngIf="loggedInUser">
+            <div class="user-avatar">{{ userInitials }}</div>
+            <span class="user-name">{{ loggedInUser }}</span>
+          </div>
           <button class="btn-theme" (click)="toggleTheme()" [title]="isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'">
             <svg *ngIf="!isDark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"></path></svg>
             <svg *ngIf="isDark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
@@ -326,6 +343,73 @@ const TOKEN_KEY = 'inspectai_access_token';
       background: linear-gradient(to bottom, transparent, #070d18);
     }
 
+    /* ── Welcome toast ── */
+    .welcome-toast {
+      position: fixed; bottom: 32px; left: 50%; transform: translateX(-50%);
+      z-index: 9998;
+      display: flex; align-items: center; gap: 14px;
+      background: rgba(22, 32, 52, 0.92);
+      border: 1px solid rgba(63,189,173,0.3);
+      border-radius: 16px;
+      padding: 14px 22px 14px 16px;
+      box-shadow: 0 16px 48px rgba(0,0,0,0.45), 0 0 0 1px rgba(63,189,173,0.08);
+      backdrop-filter: blur(20px);
+      animation: toast-in 0.5s cubic-bezier(0.16,1,0.3,1) both;
+      white-space: nowrap;
+    }
+    .welcome-toast.toast-out {
+      animation: toast-out 0.6s cubic-bezier(0.4,0,1,1) forwards;
+    }
+    @keyframes toast-in {
+      from { opacity:0; transform: translateX(-50%) translateY(24px) scale(0.95); }
+      to   { opacity:1; transform: translateX(-50%) translateY(0)    scale(1); }
+    }
+    @keyframes toast-out {
+      from { opacity:1; transform: translateX(-50%) translateY(0)     scale(1); }
+      to   { opacity:0; transform: translateX(-50%) translateY(-16px) scale(0.95); }
+    }
+    .wt-avatar {
+      width: 38px; height: 38px; border-radius: 10px; flex-shrink: 0;
+      background: linear-gradient(145deg, #2fa89a, #3fbdad);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; font-weight: 700; color: #0f1923;
+      box-shadow: 0 4px 12px rgba(63,189,173,0.35);
+    }
+    .wt-text {
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .wt-greeting {
+      font-family: 'Cairo', 'Inter', sans-serif;
+      font-size: 10.5px; color: rgba(63,189,173,0.7); letter-spacing: 0.3px;
+    }
+    .wt-name {
+      font-family: 'Inter', sans-serif;
+      font-size: 14px; font-weight: 600; color: #fff; letter-spacing: -0.2px;
+    }
+    .wt-wave {
+      width: 18px; height: 18px; margin-left: 4px; opacity: 0.6;
+    }
+
+    /* ── User pill in header ── */
+    .user-pill {
+      display: flex; align-items: center; gap: 8px;
+      padding: 4px 10px 4px 4px;
+      background: rgba(63,189,173,0.08);
+      border: 1px solid rgba(63,189,173,0.18);
+      border-radius: 20px;
+      cursor: default;
+    }
+    .user-avatar {
+      width: 24px; height: 24px; border-radius: 6px; flex-shrink: 0;
+      background: linear-gradient(145deg, #2fa89a, #3fbdad);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 9px; font-weight: 700; color: #0f1923;
+    }
+    .user-name {
+      font-size: 11.5px; font-weight: 500; color: rgba(160,174,192,0.9);
+      max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+
     /* ── Login screen ── */
     .login-screen {
       position: fixed; inset: 0; z-index: 10000;
@@ -454,11 +538,14 @@ const TOKEN_KEY = 'inspectai_access_token';
   `]
 })
 export class AppComponent implements OnInit {
-  isDark      = false;
-  modelLabel  = 'Loading…';
-  showSplash  = false;
-  splashOut   = false;
-  showLogin   = true;
+  isDark            = false;
+  modelLabel        = 'Loading…';
+  showSplash        = false;
+  splashOut         = false;
+  showLogin         = true;
+  showWelcomeToast  = false;
+  welcomeToastOut   = false;
+  loggedInUser      = '';
 
   loginUsername = '';
   loginPassword = '';
@@ -467,6 +554,12 @@ export class AppComponent implements OnInit {
   showPass      = false;
   userFocus     = false;
   passFocus     = false;
+
+  get userInitials(): string {
+    return this.loggedInUser
+      .split(/[\s._-]+/).filter(Boolean).slice(0, 2)
+      .map(w => w[0].toUpperCase()).join('') || '?';
+  }
 
   private readonly API = '/api';
 
@@ -483,6 +576,7 @@ export class AppComponent implements OnInit {
         this.isDark = true;
         document.body.setAttribute('data-theme', 'dark');
       }
+      this.loggedInUser = localStorage.getItem(USERNAME_KEY) || '';
       if (localStorage.getItem(TOKEN_KEY)) {
         this.showLogin = false;
         this._startSplash();
@@ -502,7 +596,9 @@ export class AppComponent implements OnInit {
       next: res => {
         if (isPlatformBrowser(this.platformId)) {
           localStorage.setItem(TOKEN_KEY, res.access_token);
+          localStorage.setItem(USERNAME_KEY, this.loginUsername);
         }
+        this.loggedInUser = this.loginUsername;
         this.loginLoading = false;
         this.showLogin    = false;
         this._startSplash();
@@ -524,6 +620,10 @@ export class AppComponent implements OnInit {
     });
     setTimeout(() => { this.splashOut  = true;  this.cdr.detectChanges(); }, 2600);
     setTimeout(() => { this.showSplash = false; this.cdr.detectChanges(); }, 3400);
+    // Welcome toast: appears as splash finishes, stays for 3s then fades out
+    setTimeout(() => { this.showWelcomeToast = true;  this.cdr.detectChanges(); }, 3500);
+    setTimeout(() => { this.welcomeToastOut  = true;  this.cdr.detectChanges(); }, 6200);
+    setTimeout(() => { this.showWelcomeToast = false; this.cdr.detectChanges(); }, 6900);
   }
 
   toggleTheme() {
