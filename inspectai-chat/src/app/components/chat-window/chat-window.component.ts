@@ -42,16 +42,25 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
 
       <div class="chat-messages" #msgs>
 
-        <div class="welcome" *ngIf="messages.length === 0 && !loading">
+        <div class="welcome" *ngIf="messages.length === 0 && !loading && !inputText.trim()">
           <div class="welcome-icon">
-            <svg viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round"
-                d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"/>
+            <!-- Piserve "p" mark -->
+            <svg viewBox="0 0 100 100" fill="none" style="overflow:visible">
+              <defs>
+                <linearGradient id="lg-welcome" x1="20" y1="90" x2="86" y2="10" gradientUnits="userSpaceOnUse">
+                  <stop offset="0" stop-color="var(--blue-700)"/>
+                  <stop offset="0.55" stop-color="var(--blue-600)"/>
+                  <stop offset="1" stop-color="var(--blue-400)"/>
+                </linearGradient>
+              </defs>
+              <path d="M34 36 V87" stroke="url(#lg-welcome)" stroke-width="13" stroke-linecap="round"/>
+              <circle cx="52" cy="42" r="18" stroke="url(#lg-welcome)" stroke-width="13" fill="none"/>
+              <path d="M67 31 L85 12" stroke="url(#lg-welcome)" stroke-width="13" stroke-linecap="round"/>
             </svg>
           </div>
-          <h2>Inspection Intelligence</h2>
-          <p>Query your inspection data in plain English.<br>
-             SQL is generated, executed, and explained automatically.</p>
+          <h2>Ask your data anything</h2>
+          <p>Type a question in plain English — OctaAI generates SQL,<br>
+             executes it, and explains the results automatically.</p>
           <div class="slash-hint">
             Type <kbd>/</kbd> for commands &nbsp;·&nbsp;
             <kbd>/chart</kbd> to visualize &nbsp;·&nbsp;
@@ -70,7 +79,7 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
           <div class="avatar"
             [class.avatar-ai]="msg.role === 'ai'"
             [class.avatar-user]="msg.role === 'user'">
-            {{ msg.role === 'user' ? 'QA' : 'AI' }}
+            {{ msg.role === 'user' ? 'U' : 'AI' }}
           </div>
           <div class="msg-content">
             <div class="bubble"
@@ -142,14 +151,26 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
             </div>
           </div>
         </div>
-        <div class="msg" *ngIf="loading">
-          <div class="avatar avatar-ai">AI</div>
-          <div class="typing-bub">
-            <span style="font-size: 13px; color: var(--gray-600); font-style: italic; margin-right: 8px;">{{ loadingMessage }}</span>
-            <div class="tdot"></div>
-            <div class="tdot"></div>
-            <div class="tdot"></div>
-          </div>
+        <div class="msg inline-thinking" *ngIf="loading">
+          <svg viewBox="0 0 100 100" fill="none" width="20" height="20" style="overflow:visible;flex-shrink:0">
+            <defs>
+              <linearGradient id="lg-think" x1="20" y1="90" x2="86" y2="10" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#1129A8"/>
+                <stop offset="0.55" stop-color="#1B43FF"/>
+                <stop offset="1" stop-color="#5C73FF"/>
+              </linearGradient>
+            </defs>
+            <g style="opacity:.2">
+              <path d="M34 36 V87" stroke="url(#lg-think)" stroke-width="13" stroke-linecap="round"/>
+              <circle cx="52" cy="42" r="18" stroke="url(#lg-think)" stroke-width="13" fill="none"/>
+              <path d="M67 31 L85 12" stroke="url(#lg-think)" stroke-width="13" stroke-linecap="round"/>
+            </g>
+            <path d="M34 87 L34 42 A18 18 0 1 1 70 42 A18 18 0 1 1 34 42 A18 18 0 0 1 67 31 L85 12"
+              fill="none" stroke="url(#lg-think)" stroke-width="13" stroke-linecap="round"
+              stroke-dasharray="26 74"
+              style="animation: om-worm-run 1.3s linear infinite"/>
+          </svg>
+          <span class="inline-think-text">{{ loadingMessage }}</span>
         </div>
 
       </div>
@@ -227,20 +248,20 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
       position: absolute; inset: 0; pointer-events: none; z-index: 0; overflow: hidden;
     }
 
-    /* Orbs — light mode: barely-there teal/coral halos */
+    /* Orbs — light mode: barely-there cobalt blue halos */
     .cb-orb { position: absolute; border-radius: 50%; filter: blur(90px); }
     .cb-orb-1 {
-      width: 560px; height: 560px; background: rgba(63,189,173,0.055);
+      width: 560px; height: 560px; background: rgba(27,67,255,0.055);
       top: -200px; right: -140px;
       animation: cb-drift 12s ease-in-out infinite alternate;
     }
     .cb-orb-2 {
-      width: 420px; height: 420px; background: rgba(224,122,110,0.038);
+      width: 420px; height: 420px; background: rgba(92,115,255,0.038);
       bottom: -140px; left: -100px;
       animation: cb-drift 15s ease-in-out 2.5s infinite alternate-reverse;
     }
     .cb-orb-3 {
-      width: 280px; height: 280px; background: rgba(63,189,173,0.028);
+      width: 280px; height: 280px; background: rgba(27,67,255,0.028);
       top: 45%; left: 35%;
       animation: cb-pulse 9s ease-in-out infinite;
     }
@@ -256,7 +277,7 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
     /* Dot grid */
     .cb-grid {
       position: absolute; inset: 0;
-      background-image: radial-gradient(circle, rgba(63,189,173,0.07) 1px, transparent 1px);
+      background-image: radial-gradient(circle, rgba(27,67,255,0.07) 1px, transparent 1px);
       background-size: 38px 38px;
       mask-image: radial-gradient(ellipse 85% 75% at 65% 25%, rgba(0,0,0,0.6) 0%, transparent 100%);
     }
@@ -265,14 +286,14 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
     .cb-particles { position: absolute; inset: 0; }
     .cbp {
       position: absolute; border-radius: 50%;
-      background: rgba(63,189,173,0.28);
-      box-shadow: 0 0 5px 1px rgba(63,189,173,0.15);
+      background: rgba(27,67,255,0.22);
+      box-shadow: 0 0 5px 1px rgba(27,67,255,0.12);
       animation: cbp-float linear infinite;
     }
     .cbp-1 { width:3px; height:3px; left:82%; top:88%; animation-duration:13s; animation-delay:0s; }
     .cbp-2 { width:2px; height:2px; left:18%; top:65%; animation-duration:17s; animation-delay:4s; }
     .cbp-3 { width:3px; height:3px; left:60%; top:78%; animation-duration:11s; animation-delay:2s;
-              background:rgba(224,122,110,0.3); box-shadow:0 0 5px 1px rgba(224,122,110,0.15); }
+              background:rgba(92,115,255,0.25); box-shadow:0 0 5px 1px rgba(92,115,255,0.12); }
     .cbp-4 { width:2px; height:2px; left:40%; top:90%; animation-duration:20s; animation-delay:7s; }
     .cbp-5 { width:3px; height:3px; left:92%; top:55%; animation-duration:14s; animation-delay:1s; }
     @keyframes cbp-float {
@@ -283,19 +304,19 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
     }
 
     /* Dark mode — same elements, more visible */
-    :host-context([data-theme="dark"]) .cb-orb-1 { background: rgba(63,189,173,0.11); }
-    :host-context([data-theme="dark"]) .cb-orb-2 { background: rgba(224,122,110,0.075); }
-    :host-context([data-theme="dark"]) .cb-orb-3 { background: rgba(63,189,173,0.06); }
+    :host-context([data-theme="dark"]) .cb-orb-1 { background: rgba(27,67,255,0.11); }
+    :host-context([data-theme="dark"]) .cb-orb-2 { background: rgba(92,115,255,0.08); }
+    :host-context([data-theme="dark"]) .cb-orb-3 { background: rgba(27,67,255,0.06); }
     :host-context([data-theme="dark"]) .cb-grid {
-      background-image: radial-gradient(circle, rgba(63,189,173,0.11) 1px, transparent 1px);
+      background-image: radial-gradient(circle, rgba(27,67,255,0.12) 1px, transparent 1px);
     }
     :host-context([data-theme="dark"]) .cbp {
-      background: rgba(63,189,173,0.5);
-      box-shadow: 0 0 7px 2px rgba(63,189,173,0.28);
+      background: rgba(27,67,255,0.5);
+      box-shadow: 0 0 7px 2px rgba(27,67,255,0.28);
     }
     :host-context([data-theme="dark"]) .cbp-3 {
-      background: rgba(224,122,110,0.5);
-      box-shadow: 0 0 7px 2px rgba(224,122,110,0.28);
+      background: rgba(92,115,255,0.5);
+      box-shadow: 0 0 7px 2px rgba(92,115,255,0.28);
     }
 
     /* Push actual content above the bg layer */
@@ -309,26 +330,35 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
     .chat-input-area { position: relative; z-index: 2; }
 
     .slash-hint {
-      font-size: 12px; color: #9aa0ad;
+      font-size: 12px; color: var(--text-3);
       margin: 8px 0 16px;
-      font-family: ui-sans-serif, system-ui, sans-serif;
     }
     kbd {
-      display: inline-block; padding: 1px 6px; border-radius: 4px;
-      background: #f1f3f7; border: 1px solid #e4e7ed;
-      font-family: ui-monospace, monospace; font-size: 11px; color: #374151;
+      display: inline-block; padding: 1px 7px; border-radius: 5px;
+      background: var(--surface-2); border: 1px solid var(--border);
+      font-family: var(--font-mono); font-size: 11px; color: var(--text-2);
     }
     .bubble-command {
-      font-family: ui-monospace, monospace !important;
-      font-size: 13px !important; background: #f1f3f7 !important;
-      color: #374151 !important; border: 1px solid #e4e7ed !important;
+      font-family: var(--font-mono) !important;
+      font-size: 13px !important; background: var(--surface-2) !important;
+      color: var(--text-2) !important; border: 1px solid var(--border) !important;
       border-radius: 8px !important; padding: 6px 12px !important;
+    }
+
+    /* ── Inline thinking ── */
+    .inline-thinking {
+      display: flex; align-items: center; gap: 10px;
+      padding: 4px 0; animation: om-rise .3s var(--ease);
+    }
+    .inline-think-text {
+      font-size: 13.5px; font-weight: 500; color: var(--text-2);
+      animation: om-text-in .35s var(--ease);
     }
 
     /* ── Mic error banner ── */
     .mic-error {
-      font-size: 12px; color: #92400e; background: #fffbeb;
-      border: 1px solid #fde68a; border-radius: 8px;
+      font-size: 12px; color: var(--warn); background: color-mix(in srgb, var(--warn) 8%, transparent);
+      border: 1px solid color-mix(in srgb, var(--warn) 28%, transparent); border-radius: 8px;
       padding: 8px 12px; margin-bottom: 8px; cursor: pointer;
       line-height: 1.5;
     }
@@ -336,24 +366,25 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
     /* ── Mic / ASR button ── */
     .btn-mic {
       width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0;
-      background: transparent; border: 1.5px solid rgba(160,174,192,0.35);
-      color: #9aa0ad; cursor: pointer;
+      background: transparent; border: 1.5px solid rgba(154,163,200,0.35);
+      color: var(--text-3); cursor: pointer;
       display: flex; align-items: center; justify-content: center;
       transition: all 0.18s ease;
       svg { width: 14px; height: 14px; }
     }
     .btn-mic:hover:not(:disabled) {
-      background: rgba(63,189,173,0.07); border-color: rgba(63,189,173,0.4); color: #3fbdad;
+      background: rgba(27,67,255,0.07); border-color: rgba(27,67,255,0.40); color: var(--accent);
     }
     .btn-mic--recording {
-      background: #fef2f2 !important; border-color: #fca5a5 !important;
-      color: #dc2626 !important;
+      background: var(--red-bg) !important;
+      border-color: color-mix(in srgb, var(--err) 35%, transparent) !important;
+      color: var(--err) !important;
       animation: mic-pulse 1.2s ease-in-out infinite;
     }
     .btn-mic--busy { opacity: 0.6; cursor: wait !important; }
     @keyframes mic-pulse {
-      0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0); }
-      50%       { box-shadow: 0 0 0 5px rgba(220,38,38,0.18); }
+      0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--err) 0%, transparent); }
+      50%       { box-shadow: 0 0 0 5px color-mix(in srgb, var(--err) 18%, transparent); }
     }
     .spin { animation: spin 0.9s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
@@ -365,31 +396,20 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
       opacity: 0.35; transition: opacity 0.15s, background 0.15s; line-height: 1;
     }
     .btn-speak:hover { opacity: 1; background: rgba(0,0,0,0.05); }
-    .btn-speak--playing { opacity: 1; color: #3fbdad; }
+    .btn-speak--playing { opacity: 1; color: var(--accent); }
     .btn-speak--loading { opacity: 0.7; cursor: wait; }
 
     /* ── Show as chart button ── */
-    .chart-cta {
-      margin-top: 8px;
-    }
+    .chart-cta { margin-top: 8px; }
     .btn-show-chart {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 6px 14px;
-      border-radius: 8px;
-      font-size: 12px;
-      font-weight: 600;
-      background: #edf9f8;
-      border: 1px solid #c6eeeb;
-      color: #32a89a;
-      cursor: pointer;
-      transition: all 0.15s;
-      font-family: ui-sans-serif, system-ui, sans-serif;
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 6px 14px; border-radius: 8px; font-size: 12px; font-weight: 600;
+      background: var(--blue-50); border: 1px solid var(--blue-100);
+      color: var(--blue-600); cursor: pointer; transition: all 0.15s;
+      font-family: var(--font);
     }
     .btn-show-chart:hover {
-      background: #c6eeeb;
-      border-color: #3fbdad;
+      background: var(--blue-100); border-color: var(--blue-200);
     }
   `],
 })
@@ -402,14 +422,14 @@ export class ChatWindowComponent implements AfterViewChecked {
   sessionId            = '';
   inputText            = '';
   loading              = false;
-  loadingMessage       = 'Thinking...';
+  loadingMessage       = 'Parsing your question…';
   private loadingInterval: any;
   private readonly loadingPhrases = [
-    'Analyzing query...',
-    'Understanding schema...',
-    'Building SQL...',
-    'Executing on database...',
-    'Formatting results...'
+    'Parsing your question…',
+    'Resolving schema…',
+    'Generating SQL…',
+    'Validating & executing…',
+    'Summarizing results…',
   ];
   focused              = false;
 
@@ -467,12 +487,12 @@ export class ChatWindowComponent implements AfterViewChecked {
       if (l === this.loading) return; // Prevent duplicate triggers
       this.loading = l;
       if (l) {
-        this.loadingMessage = 'Thinking...';
+        this.loadingMessage = this.loadingPhrases[0];
         let idx = 0;
         if (this.loadingInterval) clearInterval(this.loadingInterval);
         this.loadingInterval = setInterval(() => {
-          idx++;
-          this.loadingMessage = this.loadingPhrases[idx % this.loadingPhrases.length];
+          idx = Math.min(idx + 1, this.loadingPhrases.length - 1);
+          this.loadingMessage = this.loadingPhrases[idx];
           this.cdr.detectChanges();
         }, 1500);
       } else {

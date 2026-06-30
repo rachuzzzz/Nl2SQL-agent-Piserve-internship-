@@ -204,11 +204,11 @@ import * as echarts from 'echarts';
 
     .suggestion-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding: 12px 18px; background: var(--chart-suggestion-bg); border-bottom: 1px solid var(--chart-border); backdrop-filter: blur(4px); }
     .suggestion-text { font-size: 13px; color: var(--chart-text); font-family: ui-sans-serif,system-ui,sans-serif; }
-    .suggestion-text strong { color: #3fbdad; font-weight: 600; }
+    .suggestion-text strong { color: var(--accent); font-weight: 600; }
     .suggestion-reason { color: var(--chart-text-muted); font-size: 12px; font-style: italic; }
     .suggestion-actions { display: flex; gap: 8px; }
-    .btn-accept { padding: 6px 16px; border-radius: 8px; font-size: 12px; font-weight: 600; background: #3fbdad; border: none; color: #0f1923; cursor: pointer; transition: background 0.2s, transform 0.1s; }
-    .btn-accept:hover { background: #32a89a; transform: translateY(-1px); }
+    .btn-accept { padding: 6px 16px; border-radius: 8px; font-size: 12px; font-weight: 600; background: var(--accent); border: none; color: #fff; cursor: pointer; transition: background 0.2s, transform 0.1s; }
+    .btn-accept:hover { background: var(--blue-700); transform: translateY(-1px); }
     .btn-accept:active { transform: translateY(0); }
     .btn-keep { padding: 6px 16px; border-radius: 8px; font-size: 12px; background: var(--chart-card-bg); border: 1px solid #cbd0da; color: #4b5563; cursor: pointer; transition: all 0.2s; backdrop-filter: blur(2px); }
     .btn-keep:hover { border-color: #9aa0ad; color: #111827; background: var(--surface); }
@@ -216,7 +216,7 @@ import * as echarts from 'echarts';
     .chart-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; gap: 10px; background: var(--chart-header-bg); border-bottom: 1px solid var(--chart-border); backdrop-filter: blur(4px); }
     .chart-header-left { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
     .chart-header-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-    .chart-icon { width: 30px; height: 30px; border-radius: 8px; background: #edf9f8; border: 1px solid #c6eeeb; display: flex; align-items: center; justify-content: center; color: #3fbdad; box-shadow: 0 2px 5px rgba(63,189,173,0.12); }
+    .chart-icon { width: 30px; height: 30px; border-radius: 8px; background: var(--blue-50); border: 1px solid var(--blue-100); display: flex; align-items: center; justify-content: center; color: var(--accent); box-shadow: 0 2px 5px rgba(27,67,255,0.10); }
     .chart-icon svg { width: 15px; height: 15px; }
     .chart-type-label { font-size: 13px; font-weight: 600; color: var(--chart-text); font-family: ui-sans-serif,system-ui,sans-serif; letter-spacing: 0.2px; }
     .chart-confidence { font-size: 10.5px; font-weight: 600; padding: 2px 8px; border-radius: 20px; font-family: ui-sans-serif,system-ui,sans-serif; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -226,17 +226,17 @@ import * as echarts from 'echarts';
     .alt-switcher { display: flex; gap: 4px; background: var(--chart-axis-bg); border: 1px solid rgba(228, 231, 237, 0.8); border-radius: 10px; padding: 4px; backdrop-filter: blur(2px); }
     .btn-alt { display: flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 6px; border: none; background: transparent; color: var(--chart-text-muted); font-size: 11.5px; cursor: pointer; font-family: ui-sans-serif,system-ui,sans-serif; transition: all 0.15s ease; white-space: nowrap; }
     .btn-alt:hover { background: var(--chart-card-bg); color: var(--chart-text); box-shadow: 0 2px 6px rgba(0,0,0,0.04); }
-    .btn-alt.active { background: var(--surface); color: #3fbdad; font-weight: 600; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+    .btn-alt.active { background: var(--surface); color: var(--accent); font-weight: 600; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
 
     .zoom-controls { display: flex; gap: 4px; }
     .btn-ctrl { width: 30px; height: 30px; border-radius: 8px; background: var(--chart-card-bg); border: 1px solid rgba(228, 231, 237, 0.8); color: var(--chart-text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.15s ease; padding: 0; backdrop-filter: blur(2px); }
     .btn-ctrl svg { width: 14px; height: 14px; }
-    .btn-ctrl:hover { background: var(--surface); border-color: #c6eeeb; color: #3fbdad; box-shadow: 0 2px 6px rgba(63,189,173,0.1); transform: translateY(-1px); }
+    .btn-ctrl:hover { background: var(--surface); border-color: var(--blue-100); color: var(--accent); box-shadow: 0 2px 6px rgba(27,67,255,0.08); transform: translateY(-1px); }
 
     /* Axes button — wider to fit label */
-    .btn-axis { width: auto; padding: 0 10px; gap: 5px; font-size: 11.5px; font-family: ui-sans-serif,system-ui,sans-serif; font-weight: 500; }
+    .btn-axis { width: auto; padding: 0 10px; gap: 5px; font-size: 11.5px; font-family: var(--font); font-weight: 500; }
     .btn-axis span { line-height: 1; }
-    .btn-axis.active { background: var(--surface); border-color: #c6eeeb; color: #3fbdad; box-shadow: 0 2px 8px rgba(63,189,173,0.12); }
+    .btn-axis.active { background: var(--surface); border-color: var(--blue-100); color: var(--accent); box-shadow: 0 2px 8px rgba(27,67,255,0.10); }
 
     /* ── Axis panel ── */
     .axis-panel { padding: 12px 16px; background: var(--chart-axis-bg); border-bottom: 1px solid var(--chart-border); backdrop-filter: blur(8px); }
@@ -244,13 +244,13 @@ import * as echarts from 'echarts';
     .axis-group { display: flex; align-items: center; gap: 8px; background: var(--surface); padding: 6px 12px; border-radius: 10px; border: 1px solid #e4e7ed; box-shadow: 0 1px 3px rgba(0,0,0,0.02); }
     .axis-label { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--chart-text-muted); white-space: nowrap; }
     .axis-select { padding: 4px 8px; border-radius: 6px; font-size: 12px; background: transparent; border: none; color: #111827; outline: none; cursor: pointer; font-family: ui-sans-serif,system-ui,sans-serif; font-weight: 500; }
-    .axis-select:focus { color: #3fbdad; }
+    .axis-select:focus { color: var(--accent); }
     .y-options { display: flex; gap: 12px; flex-wrap: wrap; }
-    .y-checkbox { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--chart-text); cursor: pointer; font-family: ui-sans-serif,system-ui,sans-serif; font-weight: 500; }
-    .y-checkbox input { accent-color: #3fbdad; cursor: pointer; width: 14px; height: 14px; }
+    .y-checkbox { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--chart-text); cursor: pointer; font-family: var(--font); font-weight: 500; }
+    .y-checkbox input { accent-color: var(--accent); cursor: pointer; width: 14px; height: 14px; }
     .y-checkbox span { user-select: none; }
-    .btn-apply { display: flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: 8px; font-size: 12px; font-weight: 600; background: #3fbdad; border: none; color: #0f1923; cursor: pointer; margin-left: auto; transition: all 0.2s ease; font-family: ui-sans-serif,system-ui,sans-serif; box-shadow: 0 2px 6px rgba(63,189,173,0.2); }
-    .btn-apply:hover:not(:disabled) { background: #32a89a; box-shadow: 0 4px 12px rgba(63,189,173,0.3); transform: translateY(-1px); }
+    .btn-apply { display: flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: 8px; font-size: 12px; font-weight: 600; background: var(--accent); border: none; color: #fff; cursor: pointer; margin-left: auto; transition: all 0.2s ease; font-family: var(--font); box-shadow: 0 2px 6px rgba(27,67,255,0.22); }
+    .btn-apply:hover:not(:disabled) { background: var(--blue-700); box-shadow: 0 4px 12px rgba(27,67,255,0.32); transform: translateY(-1px); }
     .btn-apply:disabled { opacity: 0.5; cursor: not-allowed; box-shadow: none; transform: none; }
     .axis-error { margin-top: 6px; font-size: 11.5px; color: #dc2626; font-weight: 500; }
     .axis-hint  { font-size: 11.5px; color: var(--chart-text-muted); font-style: italic; }
@@ -631,7 +631,7 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
     const isWaterfall = chartType === 'waterfall';
     const seriesCount = opt.series?.length ?? 0;
     // Vivid, high-contrast professional palette
-    const PALETTE = ['#3fbdad','#e07a6e','#d97706','#7c3aed','#059669','#0891b2','#ea580c','#e11d48'];
+    const PALETTE = ['#1B43FF','#e07a6e','#d97706','#7c3aed','#059669','#0891b2','#5C73FF','#e11d48'];
     opt.color = PALETTE; opt.backgroundColor = 'transparent';
 
     const tTextColor  = isDark ? '#f1f5f9' : '#111827';

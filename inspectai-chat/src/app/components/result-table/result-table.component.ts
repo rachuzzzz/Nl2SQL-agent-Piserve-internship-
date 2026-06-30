@@ -97,34 +97,33 @@ import { ResultData } from '../../models/chat.model';
     .table-card {
       border-radius: 10px; overflow: hidden;
       background: var(--surface);
-      border: 1.5px solid #c6eeeb;
-      box-shadow: 0 2px 12px rgba(63,189,173,0.08);
+      border: 1.5px solid var(--blue-100);
+      box-shadow: 0 2px 12px rgba(27,67,255,0.07);
     }
 
     /* Drilldown hint */
     .drilldown-hint {
       display: flex; align-items: center; gap: 6px;
       padding: 6px 14px;
-      background: #edf9f8; border-bottom: 1px solid #c6eeeb;
-      font-size: 11px; color: #32a89a; font-weight: 500;
-      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: var(--blue-50); border-bottom: 1px solid var(--blue-100);
+      font-size: 11px; color: var(--accent); font-weight: 500;
     }
     .drilldown-hint svg { width: 12px; height: 12px; flex-shrink: 0; }
 
     .table-scroll { overflow-x: auto; max-height: 420px; overflow-y: auto; }
     table {
       width: 100%; border-collapse: collapse;
-      font-size: 13px; font-family: ui-sans-serif, system-ui, sans-serif;
+      font-size: 13px; font-family: var(--font);
     }
     thead { position: sticky; top: 0; z-index: 2; }
-    thead tr { background: var(--surface-2); border-bottom: 2px solid #3fbdad; }
+    thead tr { background: var(--surface-2); border-bottom: 2px solid var(--accent); }
     th {
-      text-align: left; padding: 9px 14px; color: #32a89a;
+      text-align: left; padding: 9px 14px; color: var(--accent);
       font-size: 11px; font-weight: 700; letter-spacing: 0.5px;
       text-transform: uppercase; white-space: nowrap;
     }
     td {
-      padding: 8px 14px; color: var(--gray-800);
+      padding: 8px 14px; color: var(--text-2);
       border-bottom: 1px solid var(--border);
       max-width: 280px; overflow: hidden;
       text-overflow: ellipsis; white-space: nowrap;
@@ -136,55 +135,55 @@ import { ResultData } from '../../models/chat.model';
     /* Drilldown rows */
     .row-drilldown { cursor: pointer; transition: all 0.12s; }
     .row-drilldown:hover {
-      background: #edf9f8 !important;
-      box-shadow: inset 3px 0 0 #3fbdad;
+      background: var(--blue-50) !important;
+      box-shadow: inset 3px 0 0 var(--accent);
     }
-    .row-drilldown td:first-child { color: #32a89a; font-weight: 600; }
+    .row-drilldown td:first-child { color: var(--accent); font-weight: 600; }
 
     .table-footer {
       display: flex; align-items: center; justify-content: space-between;
       padding: 8px 14px; gap: 12px; flex-wrap: wrap;
-      border-top: 1.5px solid #c6eeeb;
+      border-top: 1.5px solid var(--blue-100);
       background: var(--surface);
     }
-    .row-label { font-size: 12px; color: var(--gray-500); }
-    .row-label strong { color: #32a89a; font-weight: 700; }
+    .row-label { font-size: 12px; color: var(--text-3); }
+    .row-label strong { color: var(--accent); font-weight: 700; }
 
     .pager { display: flex; align-items: center; gap: 6px; }
     .pg-arrow {
       display: flex; align-items: center; justify-content: center;
       width: 28px; height: 28px; border-radius: 6px;
-      background: var(--surface); border: 1.5px solid #c6eeeb;
-      color: #3fbdad; cursor: pointer; transition: all 0.15s;
+      background: var(--surface); border: 1.5px solid var(--blue-100);
+      color: var(--accent); cursor: pointer; transition: all 0.15s;
     }
     .pg-arrow svg { width: 14px; height: 14px; }
-    .pg-arrow:hover:not([disabled]) { background: #3fbdad; border-color: #3fbdad; color: #fff; }
+    .pg-arrow:hover:not([disabled]) { background: var(--accent); border-color: var(--accent); color: #fff; }
     .pg-arrow[disabled] { opacity: 0.3; cursor: not-allowed; }
 
     .pg-label { display: flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 600; }
     .pg-current {
-      color: #32a89a; background: #edf9f8;
-      border: 1.5px solid #3fbdad; border-radius: 6px;
+      color: var(--accent); background: var(--blue-50);
+      border: 1.5px solid var(--accent); border-radius: 6px;
       padding: 2px 10px; min-width: 28px; text-align: center; font-weight: 700;
     }
-    .pg-sep   { color: #94a3b8; font-size: 12px; }
-    .pg-total { color: var(--gray-500); font-size: 13px; }
+    .pg-sep   { color: var(--text-3); font-size: 12px; }
+    .pg-total { color: var(--text-2); font-size: 13px; }
 
-    .pg-spin { width: 14px; height: 14px; color: #3fbdad; animation: spin 0.75s linear infinite; }
+    .pg-spin { width: 14px; height: 14px; color: var(--accent); animation: spin 0.75s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
     .page-size-wrap { display: flex; align-items: center; gap: 6px; }
-    .ps-label { font-size: 11px; color: #94a3b8; }
+    .ps-label { font-size: 11px; color: var(--text-3); }
     .ps-select {
-      background: var(--surface); border: 1.5px solid #c6eeeb; border-radius: 6px;
-      color: #32a89a; font-size: 12px; padding: 3px 8px; cursor: pointer; outline: none;
+      background: var(--surface); border: 1.5px solid var(--blue-100); border-radius: 6px;
+      color: var(--accent); font-size: 12px; padding: 3px 8px; cursor: pointer; outline: none;
     }
-    .ps-select:hover { border-color: #3fbdad; }
+    .ps-select:hover { border-color: var(--accent); }
 
     .pg-error {
       display: flex; align-items: center; gap: 7px;
-      padding: 7px 14px; font-size: 12px; color: #dc2626;
-      background: #fef2f2; border-top: 1px solid #fecaca;
+      padding: 7px 14px; font-size: 12px; color: var(--err);
+      background: var(--red-bg); border-top: 1px solid color-mix(in srgb, var(--err) 25%, transparent);
     }
     .pg-error svg { width: 13px; height: 13px; flex-shrink: 0; }
   `],
@@ -309,7 +308,7 @@ export class ResultTableComponent implements OnChanges {
     if (page < 0 || page >= this.totalPages || this.loading) return;
     this.loading = true;
     this.error   = null;
-    this.svc.fetchPage(this.sessionId, page, this.pageSize, this.display.sql).subscribe({
+    this.svc.fetchPage(this.sessionId, page, this.pageSize).subscribe({
       next: res => {
         this.display     = { ...res };
         this.currentPage = page;
@@ -328,7 +327,7 @@ export class ResultTableComponent implements OnChanges {
   changePageSize(): void {
     this.loading = true;
     this.error   = null;
-    this.svc.fetchPage(this.sessionId, 0, this.pageSize, this.display.sql).subscribe({
+    this.svc.fetchPage(this.sessionId, 0, this.pageSize).subscribe({
       next: res => {
         this.display     = { ...res };
         this.currentPage = 0;

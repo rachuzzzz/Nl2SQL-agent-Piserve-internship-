@@ -603,27 +603,44 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
     )
 
 ### CAPEX CONVERSION — CRITICAL DEFINITIONS:
-  CAPEX Converted = SUM(po_details.po_amount) per FM manager — client actually paid via PO
-  CAPEX Generated = SUM(ica.capex) — the estimated/quoted amount on each ICA
-  Conversion Rate = SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100
+  CAPEX Generated  = SUM(ica.capex)              — the FM manager's quoted/estimated amount on each ICA
+  CAPEX Converted  = SUM(po_details.po_amount)   — what the client actually paid via PO (money HAS moved)
+  CAPEX Lost       = SUM(ica.capex) - COALESCE(SUM(po.po_amount), 0)
+                     — the arithmetic gap between quoted and paid. This is NOT capex_status='REJECTED'.
+                     — user phrases that mean CAPEX Lost: "didn't get converted", "not converted",
+                       "unconverted capex", "capex gap", "capex shortfall", "wasted capex",
+                       "how much capex was lost", "capex that wasn't paid"
+  OPEX Incurred    = SUM(pr_details.pr_amount)   — Khidmah's own internal spend via PR (bad: org paying itself)
+  Conversion Rate  = SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100
 
   ica.expenditure is a CATEGORY FLAG ('CAPEX','OPEX','CAPEX_AND_OPEX','NO_EXPENDITURE')
-  NEVER use ica.expenditure to compute conversion rate — it is not a financial amount
+  NEVER use ica.expenditure to compute any financial amount — it is a category string, not a number
   NEVER use capex_status='ACCEPTED' as a proxy for conversion — use po_details
+  NEVER use capex_status='REJECTED' to compute CAPEX Lost — use the arithmetic difference above
+  CAPEX Lost ≠ rejected CAPEX: a user asking about "wasted" or "unconverted" capex means the
+    arithmetic gap, not the subset where capex_status='REJECTED'. Only use capex_status='REJECTED'
+    when the user explicitly says "rejected" and wants to see those specific CA rows.
+
+  FAN-OUT RULE — ALWAYS pre-aggregate po_details and pr_details in CTEs before joining to ica.
+  One ICA can have MULTIPLE POs and MULTIPLE PRs — a direct LEFT JOIN multiplies rows silently.
+  NEVER: LEFT JOIN po_details p ON p.mitigative_action_uuid = ica.id  (causes fan-out)
+  ALWAYS use CTE pre-aggregation (or scalar subqueries for single-row totals):
+    WITH po_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po
+                    FROM po_details WHERE active = true GROUP BY 1)
+    LEFT JOIN po_agg po ON po.ica_id = ica.id
 
 ### P&L (PROFIT & LOSS) MODEL — CRITICAL:
-  INCOME  = SUM(po_details.po_amount)   — client paid Khidmah (PO = Purchase Order received)
-  COST    = SUM(pr_details.pr_amount)   — Khidmah paid out internally (PR = Payment Request)
-  PROFIT  = SUM(po.po_amount) - SUM(pr.pr_amount)
-  LOSS    = when COST > INCOME (negative profit)
+  INCOME / CAPEX Converted = SUM(po_details.po_amount)   — client paid Khidmah (PO = Purchase Order)
+  COST   / OPEX Incurred   = SUM(pr_details.pr_amount)   — Khidmah paid out internally (PR = Payment Request)
+  PROFIT                   = SUM(po.po_amount) - SUM(pr.pr_amount)
+  LOSS                     = when COST > INCOME (negative profit)
+
+  "OPEX" in user language always means SUM(pr_details.pr_amount) — the PR spend.
+  "income" / "revenue" in user language always means SUM(po_details.po_amount).
+  NEVER use ica.capex as income or revenue — it is a QUOTE/ESTIMATE, no money has moved.
 
   These totals are NOT fixed — they change as new POs/PRs are entered.
-  ALWAYS compute Income/Cost/Profit LIVE via SUM(po_details.po_amount) and
-  SUM(pr_details.pr_amount) (the scalar-subquery pattern below). NEVER state
-  a remembered/previous total — always re-query.
-
-  CAPEX Generated (ica.capex) is a QUOTE/ESTIMATE only — no money has moved.
-  NEVER use ica.capex as income or revenue.
+  ALWAYS compute Income/Cost/Profit LIVE via SUM(). NEVER state remembered/previous totals.
 
   P&L JOIN PATTERN — always pre-aggregate in CTEs to avoid row fan-out:
     WITH po_agg AS (
@@ -864,14 +881,35 @@ Turn 1: {"thought": "Filter by isched.schedule_date/due_date within the next 5 d
 """,
     },
     {
-        "title": "Capex lost from rejected corrective actions",
-        # New pattern — distinct from inject_financial_routing's general
-        # capex/opex matching: specifically the "rejected" framing.
-        "question_pattern": r"(?i)capex.{0,30}reject|reject.{0,30}capex",
+        "title": "Capex lost (arithmetic gap) vs capex from rejected CAs — disambiguation",
+        # Fires on "rejected" near "capex" AND on "wasted/unconverted/didn't get converted" capex
+        # so the model always sees the disambiguation rule before deciding which query to run.
+        "question_pattern": (
+            r"(?i)capex.{0,40}reject|reject.{0,40}capex"
+            r"|capex.{0,40}(wasted|waste|not\s+convert|didn.t\s+convert|unconvert|shortfall|gap)"
+            r"|(wasted|waste|not\s+convert|didn.t\s+convert|unconvert|shortfall|gap).{0,40}capex"
+        ),
         "text": """\
-─── Capex lost from rejected corrective actions ───
-User: "show capex lost from rejected corrective actions"
-Turn 1: {"thought": "User wants CAs where capex_status = 'REJECTED' — these are quotes that were rejected by the client. capex_status is a valid column on inspection_corrective_action with values ACCEPTED/REJECTED/DEFERRED. This is different from total capex lost (arithmetic gap) — this is specifically rejected quotes.", "tool": "generate_sql", "args": {"question": "capex from rejected corrective actions", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.capex, ica.capex_status, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.capex_status = 'REJECTED' AND ica.active = true AND ir.active = true ORDER BY ica.capex DESC LIMIT 100;"}}
+─── CAPEX Lost (arithmetic gap) vs CAPEX from rejected CAs — CRITICAL DISAMBIGUATION ───
+CAPEX Lost  = arithmetic gap = SUM(ica.capex) - COALESCE(SUM(po.po_amount),0)
+              — always includes ALL CAs regardless of capex_status
+              — user phrases: "capex lost", "didn't get converted", "not converted",
+                "unconverted capex", "capex gap", "capex shortfall", "wasted capex"
+
+CAPEX from rejected CAs = WHERE capex_status = 'REJECTED'
+              — a SUBSET of the above (only rows the user marked 'REJECTED')
+              — user phrase: explicitly "rejected corrective actions" or "capex_status rejected"
+
+NEVER use capex_status='REJECTED' when the user asks about "wasted" or "lost" capex generally.
+NEVER use the arithmetic gap when the user explicitly says "rejected actions".
+
+─── User asking about total CAPEX Lost (arithmetic gap) ───
+User: "how much capex didn't get converted?" / "what capex was wasted?" / "show capex that wasn't paid"
+Turn 1: {"thought": "User wants the arithmetic CAPEX gap = Generated minus Converted. This is NOT capex_status='REJECTED' — that is only the subset where the user marked the ICA as rejected. Use scalar subqueries for a single-row total.", "tool": "generate_sql", "args": {"question": "total capex lost arithmetic gap generated minus converted", "schema_hint": "SELECT COALESCE((SELECT SUM(capex) FROM inspection_corrective_action WHERE active=true AND capex>0),0) AS capex_generated, COALESCE((SELECT SUM(po_amount) FROM po_details WHERE active=true),0) AS capex_converted, COALESCE((SELECT SUM(capex) FROM inspection_corrective_action WHERE active=true AND capex>0),0) - COALESCE((SELECT SUM(po_amount) FROM po_details WHERE active=true),0) AS capex_lost;"}}
+
+─── User asking specifically about rejected corrective actions ───
+User: "show capex lost from rejected corrective actions" / "list CAs where capex was rejected"
+Turn 1: {"thought": "User explicitly says 'rejected' — they want CA rows where capex_status = 'REJECTED'. This is the subset view, NOT the arithmetic gap. capex_status values: ACCEPTED | REJECTED | DEFERRED | NULL.", "tool": "generate_sql", "args": {"question": "capex from rejected corrective actions", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.capex, ica.capex_status, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.capex_status = 'REJECTED' AND ica.active = true AND ir.active = true ORDER BY ica.capex DESC LIMIT 100;"}}
 """,
     },
     {

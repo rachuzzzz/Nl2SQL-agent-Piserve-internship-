@@ -99,12 +99,19 @@ export class ChatService {
     this.lastDebug$.next(null);
   }
 
-  fetchPage(sessionId: string, page: number, pageSize: number, sql: string | null): Observable<any> {
+  reset(): void {
+    this.conversations$.next([]);
+    this.activeConversation$.next(null);
+    this.lastDebug$.next(null);
+    this.loading$.next(false);
+    this.newConversation();
+  }
+
+  fetchPage(sessionId: string, page: number, pageSize: number): Observable<any> {
     return this.http.post<any>(this.API + '/page', {
       session_id: sessionId,
       page,
       page_size:  pageSize,
-      sql:        sql ?? null,
     });
   }
 
