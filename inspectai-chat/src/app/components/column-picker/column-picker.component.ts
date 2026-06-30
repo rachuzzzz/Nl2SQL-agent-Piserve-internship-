@@ -81,20 +81,20 @@ export interface ColumnSelection {
       background: #f9fafb; color: #4b5563; font-size: 12px; cursor: pointer;
       font-family: ui-sans-serif,system-ui,sans-serif; transition: all 0.12s;
     }
-    .col-pill:hover:not([disabled]) { border-color: #3fbdad; background: #edf9f8; color: #32a89a; }
-    .col-pill.selected { border-color: #3fbdad; background: #edf9f8; color: #32a89a; font-weight: 600; }
+    .col-pill:hover:not([disabled]) { border-color: var(--accent); background: var(--blue-50); color: var(--accent); }
+    .col-pill.selected { border-color: var(--accent); background: var(--blue-50); color: var(--accent); font-weight: 600; }
     .col-pill[disabled] { opacity: 0.4; cursor: not-allowed; }
-    .checkmark { font-size: 11px; color: #3fbdad; margin-left: 2px; }
-    .col-type-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: #d1d5db; }
-    .col-type-dot.numeric  { background: #3fbdad; }
-    .col-type-dot.date     { background: #10b981; }
-    .col-type-dot.category { background: #8b5cf6; }
+    .checkmark { font-size: 11px; color: var(--accent); margin-left: 2px; }
+    .col-type-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: var(--border-2); }
+    .col-type-dot.numeric  { background: var(--accent); }
+    .col-type-dot.date     { background: var(--ok); }
+    .col-type-dot.category { background: var(--viz-violet); }
     .empty-note { font-size: 12px; color: #9aa0ad; font-style: italic; }
     .picker-footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 10px 14px; background: #f8f9fb; }
     .btn-cancel { padding: 6px 14px; border-radius: 7px; font-size: 12px; background: #ffffff; border: 1px solid #e4e7ed; color: #6b7280; cursor: pointer; font-family: ui-sans-serif,system-ui,sans-serif; }
     .btn-cancel:hover { border-color: #9aa0ad; color: #374151; }
-    .btn-draw { padding: 6px 18px; border-radius: 7px; font-size: 12px; font-weight: 600; background: #3fbdad; border: none; color: #fff; cursor: pointer; font-family: ui-sans-serif,system-ui,sans-serif; }
-    .btn-draw:hover:not([disabled]) { background: #32a89a; }
+    .btn-draw { padding: 6px 18px; border-radius: 7px; font-size: 12px; font-weight: 600; background: var(--accent); border: none; color: #fff; cursor: pointer; font-family: var(--font); }
+    .btn-draw:hover:not([disabled]) { background: var(--blue-700); }
     .btn-draw[disabled] { opacity: 0.5; cursor: not-allowed; }
   `],
 })

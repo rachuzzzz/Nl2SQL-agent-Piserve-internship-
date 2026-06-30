@@ -54,18 +54,17 @@ interface Suggestion {
       transition: background 0.1s;
     }
     .suggestion-row:last-child { border-bottom: none; }
-    .suggestion-row.active { background: #edf9f8; }
+    .suggestion-row.active { background: var(--blue-50); }
     .cmd-text {
-      font-family: ui-monospace, monospace;
+      font-family: var(--font-mono);
       font-size: 13px;
       font-weight: 600;
-      color: #3fbdad;
+      color: var(--accent);
       white-space: nowrap;
     }
     .cmd-desc {
       font-size: 12px;
-      color: #9aa0ad;
-      font-family: ui-sans-serif, system-ui, sans-serif;
+      color: var(--text-3);
       text-align: right;
       white-space: nowrap;
       overflow: hidden;

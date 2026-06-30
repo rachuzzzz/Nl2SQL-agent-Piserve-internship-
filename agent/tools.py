@@ -175,13 +175,18 @@ def get_answers(
     inspection_id: Optional[str] = None,
     answer_value: Optional[str] = None,
     limit: int = 50,
+    scope_filter: str = '',
 ) -> dict[str, Any]:
     """
     Query submitted answers from ai_answer.
     Automatically joins ai_question for the question label.
     All filters are optional — combine as needed.
+    scope_filter: SQL predicate from _build_scope_filter(); '' = unrestricted, 'BLOCK' = deny.
     """
     try:
+        if scope_filter == 'BLOCK':
+            return {"success": False, "result": None, "error": "SCOPE_BLOCKED"}
+
         filters = ["1=1"]
         params: dict[str, Any] = {"limit": limit}
 
@@ -215,11 +220,21 @@ def get_answers(
             )
             params["ans_val"] = f"%{answer_value}%"
 
+        # Scope predicate — server-generated SQL fragment, always safe to inline.
+        if scope_filter:
+            filters.append(scope_filter)
+
         where = " AND ".join(filters)
 
-        # answer_text for categorical, answer_numeric for scores/numbers.
-        # COALESCE so we always get one displayable value.
-        # aa.inspection_id is a UUID — join to inspection_report to get readable varchar id.
+        # Use INNER JOIN when scope is active so the predicate cannot be bypassed
+        # by NULL ir rows (a LEFT JOIN with WHERE on the right side acts as inner,
+        # but INNER JOIN makes the intent explicit and avoids NULL propagation risk).
+        _ir_join = (
+            "INNER JOIN inspection_report ir ON aa.inspection_report_id = ir.id"
+            if scope_filter
+            else "LEFT JOIN inspection_report ir ON aa.inspection_report_id = ir.id"
+        )
+
         sql = sql_text(f"""
             SELECT ir.inspection_id,
                    aa.module_name,
@@ -229,7 +244,7 @@ def get_answers(
                    aa.submitted_on
             FROM ai_answers aa
             LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id
-            LEFT JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+            {_ir_join}
             WHERE {where}
             ORDER BY aa.submitted_on DESC
             LIMIT :limit
@@ -249,6 +264,7 @@ def get_answers(
                 count_sql = sql_text(f"""
                     SELECT COUNT(*) FROM ai_answers aa
                     LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id
+                    {_ir_join}
                     WHERE {where}
                 """)
                 with db_engine.connect() as conn:
@@ -785,6 +801,7 @@ class ToolRegistry:
                     inspection_id=_clean(args.get("inspection_id")),
                     answer_value=_clean(args.get("answer_value")),
                     limit=_limit(args.get("limit", 50)),
+                    scope_filter=str(args.get("scope_filter", "")),
                 )
 
             if name == "get_answer_stats":

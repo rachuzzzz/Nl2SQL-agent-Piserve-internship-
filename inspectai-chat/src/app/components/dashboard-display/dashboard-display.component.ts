@@ -136,7 +136,7 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
       content: '';
       position: absolute;
       top: 0; left: 0; right: 0; height: 2.5px;
-      background: linear-gradient(90deg, #3fbdad, #e07a6e);
+      background: linear-gradient(90deg, #1B43FF, #5C73FF);
       opacity: 0;
       transition: opacity 0.25s ease;
       border-radius: 14px 14px 0 0;
@@ -155,8 +155,8 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
     .kpi-card:hover .kpi-icon { transform: scale(1.1); }
     .kpi-icon svg { width: 17px; height: 17px; }
     .kpi-icon--star {
-      background: linear-gradient(135deg, rgba(63,189,173,0.15), rgba(50,168,154,0.12));
-      color: #3fbdad;
+      background: linear-gradient(135deg, rgba(27,67,255,0.14), rgba(92,115,255,0.10));
+      color: var(--accent);
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.5);
     }
     .kpi-icon--list {
@@ -170,7 +170,7 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.5);
     }
     .kpi-icon--hash {
-      background: linear-gradient(135deg, rgba(124,58,237,0.13), rgba(63,189,173,0.1));
+      background: linear-gradient(135deg, rgba(124,58,237,0.13), rgba(27,67,255,0.10));
       color: #7c3aed;
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.5);
     }

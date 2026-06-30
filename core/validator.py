@@ -36,7 +36,7 @@ try:
 except ImportError:
     _HAS_GLOSSARY = False
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("inspectai.sql")
 
 
 # ---------------------------------------------------------------------------
@@ -639,12 +639,12 @@ class SQLValidator:
         passed = len(hard_fails) == 0
 
         if hard_fails:
-            logger.debug("Validation HARD_FAIL: %s",
-                         "; ".join(str(f) for f in hard_fails))
+            logger.info("[VALID] HARD_FAIL (%d): %s",
+                        len(hard_fails), "; ".join(str(f) for f in hard_fails))
         soft = [i for i in issues if i.severity == "SOFT_WARN"]
         if soft:
-            logger.debug("Validation SOFT_WARN (not forwarded to LLM): %s",
-                         "; ".join(str(w) for w in soft))
+            logger.debug("[VALID] SOFT_WARN (%d, not sent to LLM): %s",
+                         len(soft), "; ".join(str(w) for w in soft))
 
         return ValidationResult(passed=passed, issues=issues)
 
@@ -1229,6 +1229,146 @@ class SQLValidator:
             return repaired, mutations
         except Exception:
             return sql, []
+
+    # Tables that need row-level scoping when inspection_report is absent.
+    # Maps table name → FK column on inspection_report that links back to it.
+    # facility is intentionally excluded — it is public reference data visible
+    # to all authenticated users.
+    _SECONDARY_SCOPE_TABLES: dict = {
+        'inspection_cycle': 'cycle_id',
+    }
+
+    def enforce_scope(self, sql: str, scope_filter: str) -> str:
+        """Hard data-visibility guard — AST-level injection, always applied.
+
+        The system prompt is just a hint to the LLM for SQL quality.
+        THIS is the actual security enforcement — it rewrites the SQL via
+        the sqlglot AST unconditionally, independent of what the LLM generated.
+        A filter that exists only in the prompt can be bypassed by prompt
+        injection, model drift, or a SQL comment. This cannot.
+
+        scope_filter == ''       → unrestricted, return SQL unchanged
+        scope_filter == 'BLOCK'  → raise ValueError('SCOPE_BLOCKED')
+        anything else            → inject into every Select that:
+                                   (a) directly FROM/JOINs inspection_report, OR
+                                   (b) directly FROM/JOINs a secondary scoped
+                                       table (facility, inspection_cycle) without
+                                       inspection_report in the query
+
+        Secondary scoping: strips the "ir." alias prefix from scope_filter to
+        build a subquery predicate suitable for raw column names, e.g.:
+          "ir.inspector_user_id = (subq)" → "{alias}.id IN (SELECT DISTINCT
+           facility_id FROM inspection_report WHERE inspector_user_id = (subq)
+           AND active = true)"
+
+        Raises ValueError('SCOPE_BLOCKED') — caller converts to HTTP 403.
+        """
+        if not scope_filter:
+            return sql
+        if scope_filter == 'BLOCK':
+            logger.warning("[SCOPE] enforce_scope called with BLOCK — raising SCOPE_BLOCKED")
+            raise ValueError('SCOPE_BLOCKED')
+
+        sql_lower = sql.lower()
+        has_ir    = 'inspection_report' in sql_lower
+
+        # Strip "ir." alias so the predicate works inside a raw subquery
+        # (e.g., dual-role "(ir.inspector_user_id=X OR ir.inspectee_user_id=X)"
+        #  → "(inspector_user_id=X OR inspectee_user_id=X)")
+        ir_predicate = scope_filter.replace('ir.', '')
+
+        secondary_tables = (
+            [(tbl, fk) for tbl, fk in self._SECONDARY_SCOPE_TABLES.items()
+             if tbl in sql_lower]
+            if not has_ir else []
+        )
+
+        if not has_ir and not secondary_tables:
+            # Pure reference tables (frequency_definition, inspection_type, etc.)
+            # carry no row-level owner — no scope injection required.
+            return sql
+
+        logger.debug("[SCOPE] injecting scope filter: %s", scope_filter[:120])
+
+        # ── Primary path: AST injection via sqlglot ──────────────────────────
+        if _HAS_SQLGLOT:
+            try:
+                tree       = sqlglot.parse_one(sql, dialect="postgres")
+                scope_expr = sqlglot.parse_one(scope_filter, dialect="postgres")
+
+                def _alias_for_table(sel: exp.Select, tbl_name: str):
+                    """Return alias if sel directly FROM/JOINs tbl_name, else None."""
+                    from_clause = sel.args.get("from")
+                    if from_clause and isinstance(from_clause.this, exp.Table):
+                        if from_clause.this.name.lower() == tbl_name:
+                            return from_clause.this.alias or tbl_name
+                    for join in (sel.args.get("joins") or []):
+                        if isinstance(join.this, exp.Table):
+                            if join.this.name.lower() == tbl_name:
+                                return join.this.alias or tbl_name
+                    return None
+
+                if has_ir:
+                    # Inject scope_filter into every SELECT that directly
+                    # FROM/JOINs inspection_report.
+                    def _inject_ir(node):
+                        if isinstance(node, exp.Select) and _alias_for_table(node, 'inspection_report'):
+                            return node.where(scope_expr.copy())
+                        return node
+
+                    rewritten = tree.transform(_inject_ir).sql(dialect="postgres", pretty=False)
+                else:
+                    # Inject a subquery scope for facility / inspection_cycle
+                    # queries that don't join through inspection_report directly.
+                    def _inject_secondary(node):
+                        if not isinstance(node, exp.Select):
+                            return node
+                        for tbl_name, fk_col in secondary_tables:
+                            alias = _alias_for_table(node, tbl_name)
+                            if alias:
+                                subq_where = (
+                                    f"{alias}.id IN ("
+                                    f"SELECT DISTINCT {fk_col} FROM inspection_report "
+                                    f"WHERE {ir_predicate} AND active = true)"
+                                )
+                                node = node.where(
+                                    sqlglot.parse_one(subq_where, dialect="postgres")
+                                )
+                        return node
+
+                    rewritten = tree.transform(_inject_secondary).sql(dialect="postgres", pretty=False)
+
+                if rewritten and not rewritten.rstrip().endswith(";"):
+                    rewritten = rewritten.rstrip() + ";"
+                return rewritten
+
+            except Exception:
+                logging.warning("enforce_scope: AST injection failed, using string fallback",
+                                exc_info=True)
+
+        # ── Fallback: string injection (no sqlglot) ───────────────────────────
+        sql_work  = sql.rstrip().rstrip(";").rstrip()
+        has_where = bool(re.search(r"\bWHERE\b", sql_work, re.IGNORECASE))
+        connector = "AND" if has_where else "WHERE"
+        term      = re.search(
+            r"\b(ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT)\b", sql_work, re.IGNORECASE
+        )
+
+        if has_ir:
+            fragment = scope_filter
+        else:
+            # Build combined secondary predicate without a known alias
+            parts = [
+                f"id IN (SELECT DISTINCT {fk} FROM inspection_report "
+                f"WHERE {ir_predicate} AND active = true)"
+                for _, fk in secondary_tables
+            ]
+            fragment = " AND ".join(parts)
+
+        if term:
+            pos = term.start()
+            return f"{sql_work[:pos].rstrip()}\n  {connector} {fragment}\n{sql_work[pos:]};"
+        return f"{sql_work}\n  {connector} {fragment};"
 
 
 # ---------------------------------------------------------------------------

@@ -164,7 +164,7 @@ export class SlashCommandService {
     return this.http.get<any>('/api/columns/' + sessionId);
   }
 
-  exportCsv(columns: string[], rows: Record<string, any>[], filename = 'inspectai-export.csv'): void {
+  exportCsv(columns: string[], rows: Record<string, any>[], filename = 'octaai-export.csv'): void {
     const escape = (v: any): string => {
       const s = String(v ?? '');
       return s.includes(',') || s.includes('"') || s.includes('\n') ? '"' + s.replace(/"/g, '""') + '"' : s;

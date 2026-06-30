@@ -93,8 +93,8 @@ import { ChartConfig, ColumnMeta } from '../../models/chat.model';
     .suggestion-wrap {
       border-radius: 10px;
       overflow: hidden;
-      border: 1px solid rgba(63,189,173,0.25);
-      background: linear-gradient(135deg, rgba(30,35,55,0.92) 0%, rgba(20,28,50,0.96) 100%);
+      border: 1px solid rgba(27,67,255,0.25);
+      background: linear-gradient(135deg, rgba(12,16,36,0.92) 0%, rgba(20,26,54,0.96) 100%);
     }
 
     /* ── strip ── */
@@ -112,10 +112,10 @@ import { ChartConfig, ColumnMeta } from '../../models/chat.model';
     .strip-icon {
       width: 28px; height: 28px;
       border-radius: 7px;
-      background: rgba(63,189,173,0.18);
-      border: 1px solid rgba(63,189,173,0.3);
+      background: rgba(27,67,255,0.18);
+      border: 1px solid rgba(27,67,255,0.32);
       display: flex; align-items: center; justify-content: center;
-      color: #3fbdad; flex-shrink: 0;
+      color: var(--blue-300); flex-shrink: 0;
     }
     .strip-icon svg { width: 14px; height: 14px; }
 
@@ -148,19 +148,19 @@ import { ChartConfig, ColumnMeta } from '../../models/chat.model';
     .type-pill:disabled { opacity: 0.5; cursor: not-allowed; }
 
     .type-pill-rec {
-      background: rgba(63,189,173,0.14);
-      border-color: rgba(63,189,173,0.35);
-      color: #3fbdad;
+      background: rgba(27,67,255,0.14);
+      border-color: rgba(27,67,255,0.35);
+      color: var(--blue-300);
     }
     .type-pill-rec:hover:not(:disabled) {
-      background: rgba(63,189,173,0.24);
-      border-color: rgba(63,189,173,0.55);
-      color: #7ddbd1;
+      background: rgba(27,67,255,0.24);
+      border-color: rgba(27,67,255,0.55);
+      color: var(--blue-200);
     }
     .type-pill-active {
-      background: rgba(63,189,173,0.28) !important;
-      border-color: rgba(63,189,173,0.6) !important;
-      color: #7ddbd1 !important;
+      background: rgba(27,67,255,0.28) !important;
+      border-color: rgba(27,67,255,0.6) !important;
+      color: var(--blue-200) !important;
       font-weight: 600 !important;
     }
 
@@ -169,8 +169,8 @@ import { ChartConfig, ColumnMeta } from '../../models/chat.model';
     .rec-badge {
       padding: 1px 5px; border-radius: 20px;
       font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px;
-      background: rgba(63,189,173,0.2); color: #3fbdad;
-      border: 1px solid rgba(63,189,173,0.35);
+      background: rgba(27,67,255,0.20); color: var(--blue-300);
+      border: 1px solid rgba(27,67,255,0.35);
     }
 
     /* ── dismiss ── */
@@ -214,7 +214,7 @@ import { ChartConfig, ColumnMeta } from '../../models/chat.model';
       outline: none; cursor: pointer;
       font-family: ui-sans-serif, system-ui, sans-serif;
     }
-    .axis-select:focus { border-color: rgba(63,189,173,0.5); }
+    .axis-select:focus { border-color: rgba(27,67,255,0.50); }
     .axis-select option { background: #1c2135; color: #e2e8f0; }
 
     .y-options { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -224,7 +224,7 @@ import { ChartConfig, ColumnMeta } from '../../models/chat.model';
       cursor: pointer;
       font-family: ui-sans-serif, system-ui, sans-serif;
     }
-    .y-checkbox input { accent-color: #3fbdad; cursor: pointer; }
+    .y-checkbox input { accent-color: var(--accent); cursor: pointer; }
     .y-checkbox span { user-select: none; }
 
     .btn-apply {
@@ -232,14 +232,14 @@ import { ChartConfig, ColumnMeta } from '../../models/chat.model';
       padding: 5px 12px;
       border-radius: 6px;
       font-size: 11.5px; font-weight: 600;
-      background: rgba(63,189,173,0.2);
-      border: 1px solid rgba(63,189,173,0.4);
-      color: #3fbdad; cursor: pointer;
+      background: rgba(27,67,255,0.20);
+      border: 1px solid rgba(27,67,255,0.40);
+      color: var(--blue-300); cursor: pointer;
       transition: all 0.14s;
-      font-family: ui-sans-serif, system-ui, sans-serif;
+      font-family: var(--font);
       margin-left: auto;
     }
-    .btn-apply:hover:not(:disabled) { background: rgba(63,189,173,0.32); color: #7ddbd1; }
+    .btn-apply:hover:not(:disabled) { background: rgba(27,67,255,0.32); color: var(--blue-200); }
     .btn-apply:disabled { opacity: 0.4; cursor: not-allowed; }
 
     /* ── error ── */
