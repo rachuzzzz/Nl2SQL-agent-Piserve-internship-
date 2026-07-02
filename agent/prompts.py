@@ -58,7 +58,10 @@ IMPORTANT — 'active' column existence (soft-delete):
   NO active column — NEVER write <alias>.active for these tables:
     ai_answers, ai_questions, role, user_roles, inspection_schedule
   In particular: inspection_schedule has NO active column. Do not add
-  isched.active = true to schema_hint — Postgres will reject it."""
+  isched.active = true to schema_hint — Postgres will reject it.
+  inspection_schedule display columns — NEVER include these in SELECT, they are almost always NULL:
+    isched.schedule_id  (internal nullable UUID reference — useless for display, use isched.id the PK)
+    isched.schedule_date  (often NULL for pending schedules — use isched.due_date instead)"""
 
 SYSTEM_PROMPT = """\
 You are an intelligent reasoning agent for an inspection management database.
@@ -361,27 +364,69 @@ entities (facility/client/project/organisation, e.g. "Tower").
 
 STEP 1 — run a count-check query first. Its row count drives 2a/2b below, and
 for entities its counts ARE the STEP 2b list — do not re-query later.
-  People: SELECT DISTINCT u.id, u.first_name||' '||u.last_name AS name FROM users u
-    WHERE (u.first_name ILIKE '%<name>%' OR u.last_name ILIKE '%<name>%') AND u.active=true;
+  People — SINGLE PARTIAL WORD (e.g. "neenu", "george"):
+    SELECT u.id AS user_id, u.first_name||' '||u.last_name AS name,
+           COUNT(ir.id) AS inspection_count
+    FROM users u LEFT JOIN inspection_report ir ON ir.inspector_user_id=u.id
+    WHERE (u.first_name ILIKE '%<name>%' OR u.last_name ILIKE '%<name>%') AND u.active=true
+    GROUP BY u.id, u.first_name, u.last_name ORDER BY inspection_count DESC;
+  People — FULL NAME (two or more words, e.g. "george auditor", "neenu pn"):
+    MUST use CONCATENATED form — NEVER split into separate first/last OR conditions:
+    SELECT u.id AS user_id, u.first_name||' '||u.last_name AS name, u.email,
+           COUNT(ir.id) AS inspection_count
+    FROM users u LEFT JOIN inspection_report ir ON ir.inspector_user_id=u.id
+    WHERE (u.first_name||' '||u.last_name) ILIKE '%<full name>%' AND u.active=true
+    GROUP BY u.id, u.first_name, u.last_name, u.email ORDER BY inspection_count DESC;
+    NEVER: WHERE (u.first_name ILIKE '%george%' OR u.last_name ILIKE '%auditor%')
+      ↑ This matches anyone named George OR anyone surnamed Auditor — wrong result set.
   Entity (facility shown; same shape for client/project/organisation — swap
   table and the FK on inspection_report):
     SELECT fac.id, fac.name, COUNT(ir.id) AS inspection_count FROM facility fac
     LEFT JOIN inspection_report ir ON ir.facility_id=fac.id AND ir.active=true AND ir.status!='DRAFT'
     WHERE fac.name ILIKE '%<name>%' AND fac.active=true GROUP BY fac.id,fac.name ORDER BY inspection_count DESC;
+  "AT <NAME>" DEFAULTS TO FACILITY, EVEN FOR WELL-KNOWN COMPANY NAMES:
+    "at <name>" / "<name> facility" ALWAYS means fac.name ILIKE '%<name>%' first —
+    NEVER org.name ILIKE, even when <name> is a real-world company/brand you
+    recognize (e.g. "ADNOC", "ADGM"). In this schema, facilities are routinely
+    named after their parent company/brand ("Adnoc Schools- Ghayathi", "ADGM
+    Square") while the organisation table is a separate, much narrower
+    administrative concept that's rarely what "at X" refers to. Do not let
+    general knowledge about a company name override this — check facility
+    first. Only fall back to org.name if a facility-name STEP 1 check
+    genuinely returns 0 rows.
+    NEVER: WHERE org.name ILIKE '%adnoc%'  — org has no row matching a
+      brand/company name that's actually encoded as a facility name prefix;
+      this silently returns 0 rows even though matching facilities exist.
 
-STEP 2a — Exactly 1 row → proceed, filtering the full query by that row's id
-  (not name ILIKE). For people, pick the FK from the question's role wording:
+STEP 2a — Exactly 1 row → proceed, filtering the full query by that row's user_id/id UUID
+  (NEVER by name ILIKE). For people, pick the FK from the question's role wording:
   "inspector"/"conducted"/"audited" → inspector_user_id; "FM manager"/
   "inspectee"/"responsible for the facility" → inspectee_user_id (default:
   inspector_user_id if ambiguous).
+  Use WHERE u.id = '<uuid_from_step1>' — exact, not ILIKE.
 
-STEP 2b — 2+ rows → final_answer listing the options WITH the counts from
-  STEP 1 (already computed — don't re-query): "I found N matching 'X':
-  • Option1 (Y inspections) • Option2 (Z inspections) — which one did you
-  mean?" Then STOP. This is ALWAYS the branch for 2+ rows, regardless of
-  entity type — never "explore further" or proceed against all matches.
+STEP 2b — 2+ rows:
+  • 2–8 rows → final_answer listing the options WITH the counts from STEP 1
+    (already computed — don't re-query): "I found N people named 'X':
+    • Option1 (Y inspections) • Option2 (Z inspections) — which one did you mean?"
+    Then STOP.
+  • 9+ rows → final_answer asking for a more specific name — do NOT list all rows:
+    "I found N people matching '[name]' — that's too many to list. Could you provide
+    a more specific name, full name, or email address?"
+    Then STOP.
+  This is ALWAYS the branch for 2+ rows, regardless of entity type — never
+  "explore further" or proceed against all matches.
 
-STEP 3 — After user confirms → re-run with the exact id/name, not ILIKE '%partial%'.
+STEP 3 — After user confirms → re-run with WHERE u.id = '<uuid_from_step1>' — NEVER ILIKE.
+  The UUID was already returned in STEP 1 result. Use it. Name ILIKE can still match
+  the WRONG person if multiple users share the confirmed name.
+
+STEP 3b — If STEP 2b said "too many" (9+ rows) and user now provides a full name (e.g. "George Smith"):
+  Search by CONCATENATED full name: WHERE (u.first_name || ' ' || u.last_name) ILIKE '%George Smith%'
+  NEVER split into: WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%Smith%')
+  The OR split treats first/last independently and matches wrong people (anyone named George OR anyone surnamed Smith).
+  If concatenated lookup returns 1 row → use UUID and run the original query.
+  If still 2–12 rows → list them. If 0 rows → tell user not found.
 
 ⚠ DO NOT REFRAME A SINGULAR REFERENCE AS A PLURAL GROUP: if you ALREADY KNOW
 from context that "X" matches 2+ distinct things (e.g. three different users,
@@ -480,16 +525,34 @@ Turn 2: {"thought": "The previous result has 195 total rows, but only a few samp
 
 ─── Name disambiguation: multiple matches ───
 User: "show inspections by George"
-Turn 1: {"thought": "Before fetching all inspections, check if multiple users named George exist as inspectors. Run a COUNT DISTINCT first to detect ambiguity.", "tool": "generate_sql", "args": {"question": "distinct inspectors named George with inspection count", "schema_hint": "SELECT u.first_name || ' ' || u.last_name AS inspector_name, COUNT(ir.id) AS inspection_count FROM users u JOIN inspection_report ir ON ir.inspector_user_id = u.id WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%George%') AND u.active = true AND ir.status != 'DRAFT' GROUP BY u.id, u.first_name, u.last_name ORDER BY inspection_count DESC;"}}
-Turn 2: {"thought": "Result shows 3 distinct inspectors named George. Cannot proceed without knowing which one the user means. Surface the options and ask.", "tool": "final_answer", "args": {"answer": "I found 3 inspectors named George:
-- George Auditor — 47 inspections
-- George Thomas — 12 inspections
-- George Al Mansouri — 3 inspections
-
-Which one would you like to see?"}}
+Turn 1: {"thought": "Before fetching all inspections, check if multiple users named George exist. Run STEP 1 with u.id AS user_id so the UUID is captured for exact filtering later.", "tool": "generate_sql", "args": {"question": "distinct users named George with inspection count", "schema_hint": "SELECT u.id AS user_id, u.first_name || ' ' || u.last_name AS name, COUNT(ir.id) AS inspection_count FROM users u LEFT JOIN inspection_report ir ON ir.inspector_user_id = u.id AND ir.status != 'DRAFT' WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%George%') AND u.active = true GROUP BY u.id, u.first_name, u.last_name ORDER BY inspection_count DESC;"}}
+Turn 2: {"thought": "Result shows 3 distinct users named George. Cannot proceed without knowing which one. Surface the options and STOP.", "tool": "final_answer", "args": {"answer": "I found 3 people named George:\n- George Auditor — 47 inspections\n- George Thomas — 12 inspections\n- George Al Mansouri — 3 inspections\n\nWhich one did you mean?"}}
 ─── Name disambiguation: user confirms ───
 User: "George Auditor"
-Turn 1: {"thought": "User has confirmed they want George Auditor. Now run the full query filtered to exact full name match.", "tool": "generate_sql", "args": {"question": "inspections by George Auditor", "schema_hint": "SELECT ir.inspection_id, ir.inspection_score, ir.status, ir.submitted_on, fac.name AS facility_name FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id JOIN facility fac ON ir.facility_id = fac.id WHERE u.first_name || ' ' || u.last_name ILIKE '%George Auditor%' AND ir.status != 'DRAFT' AND u.active = true AND fac.active = true ORDER BY ir.submitted_on DESC LIMIT 100;"}}
+Turn 1: {"thought": "User confirmed George Auditor. The STEP 1 result returned their user_id UUID. Use WHERE u.id = '<uuid>' — NEVER ILIKE again, even with the full name, because another user could share it.", "tool": "generate_sql", "args": {"question": "inspections by George Auditor using resolved UUID", "schema_hint": "SELECT ir.inspection_id, ir.inspection_score, ir.status, ir.submitted_on, fac.name AS facility_name FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id JOIN facility fac ON ir.facility_id = fac.id WHERE u.id = '<user_id_from_step1>' AND ir.status != 'DRAFT' AND fac.active = true ORDER BY ir.submitted_on DESC LIMIT 100;"}}
+─── Name disambiguation: exact match among near-duplicate names (DISAMBIGUATION RESOLVED context) ───
+[History: Turn 1 "George Auditor" → 4 matches: "George Auditor", "George Auditor 4", "George Auditor - Aldar HQ", "George Auditor - Al Ghadeer" — asked which one]
+User Turn 2: "George Auditor" (repeated) or "ya fetch for George Auditor"
+Turn 2: {"thought": "The orchestrator context says DISAMBIGUATION RESOLVED — my search text is an EXACT match for one of the 4 candidates, with its user_id already given. Use that UUID directly. Do NOT re-run the ILIKE search (it would just match all 4 again since they share the 'George Auditor' substring) and do NOT ask again.", "tool": "generate_sql", "args": {"question": "inspections by George Auditor using resolved UUID", "schema_hint": "SELECT ir.inspection_id, ir.inspection_score, ir.status, ir.submitted_on, fac.name AS facility_name FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id JOIN facility fac ON ir.facility_id = fac.id WHERE u.id = '<user_id_from_DISAMBIGUATION_RESOLVED_context>' AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
+CRITICAL: when the context says DISAMBIGUATION RESOLVED, trust the given user_id over re-running any ILIKE search — substring matches like "George Auditor" vs "George Auditor 4" can never be narrowed further by ILIKE.
+─── Name disambiguation applies in ALL contexts (schedules, CAs, form answers) ───
+User: "list all schedules taken up by neenu" / "show corrective actions for neenu"
+Turn 1: {"thought": "Name 'neenu' could match multiple users — disambiguation required regardless of context (inspection_schedule, CAs, form answers, etc.). Run STEP 1 people check first.", "tool": "generate_sql", "args": {"question": "distinct users named neenu", "schema_hint": "SELECT u.id AS user_id, u.first_name || ' ' || u.last_name AS name, u.email FROM users u WHERE (u.first_name ILIKE '%neenu%' OR u.last_name ILIKE '%neenu%') AND u.active = true ORDER BY u.last_name;"}}
+Turn 2 (if 2–8 rows): {"thought": "A small number of matches — list them so the user can pick.", "tool": "final_answer", "args": {"answer": "I found multiple people named Neenu:\n- Neenu Pn (neenu.pn@example.com)\n- Neenu Inspector 1 (neenu1@example.com)\n\nWhich one did you mean?"}}
+Turn 2 (if 9+ rows): {"thought": "Too many matches to list sensibly — ask for a more specific name.", "tool": "final_answer", "args": {"answer": "I found 112 people matching 'neenu' — too many to list. Could you provide a more specific full name or email address?"}}
+Turn 2 (if 1 row): Proceed with WHERE u.id = '<uuid_from_step1>' on inspection_schedule.inspectee_id or whichever FK fits the question.
+NEVER: WHERE u.first_name ILIKE '%neenu%' without first confirming exactly 1 match.
+─── Name disambiguation: user repeats same query after "too many" — BLOCKED ───
+[History: Turn 1 "show inspections by george" → disambiguation found 44 matches → "too many to list, provide full name"]
+User Turn 2: "show all completed inspections by george" (same partial name, has query verb — NOT a name pick)
+Turn 2: {"thought": "DISAMBIGUATION CONTEXT says we already found 44 people named 'george' — too many. The user is asking about the same partial name again. I MUST use final_answer, NOT generate_sql.", "tool": "final_answer", "args": {"answer": "I found 44 people matching 'george' — too many to list. Please provide a more specific full name (e.g. 'George Smith') or their email address so I can narrow it down."}}
+─── Name disambiguation: user provides full name after "too many" ───
+[History: Turn 1 "show inspections by george" → disambiguation found 44 matches → "too many to list, provide full name"]
+User Turn 2: "George Inspector" (user picks a specific full name — NO query verbs, short response)
+Turn 2: {"thought": "User is providing a specific full name after being told too many matches. STEP 3b: search by concatenated full name — NEVER split into OR conditions on first/last separately.", "tool": "generate_sql", "args": {"question": "find user with full name George Inspector", "schema_hint": "SELECT u.id AS user_id, u.first_name || ' ' || u.last_name AS name FROM users u WHERE (u.first_name || ' ' || u.last_name) ILIKE '%George Inspector%' AND u.active = true ORDER BY u.last_name;"}}
+Turn 3 (if 1 row returned): {"thought": "Found exactly 1 match with UUID. Now run the original inspection query using WHERE u.id = '<uuid>'.", "tool": "generate_sql", "args": {"question": "inspections by George Inspector using UUID", "schema_hint": "SELECT ir.inspection_id, ir.inspection_score, ir.status, ir.submitted_on, fac.name AS facility_name FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id JOIN facility fac ON ir.facility_id = fac.id WHERE u.id = '<user_id_from_step3b>' AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
+CRITICAL: NEVER split "George Inspector" as (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%Inspector%') — that matches anyone named George OR with last name Inspector.
+
 ─── Cross-domain join ───
 User: "risk level answers for inspections at Al Ghadeer facility"
 Turn 1: {"thought": "Need ai_answers + inspection_report + facility — use generate_sql.", "tool": "generate_sql", "args": {"question": "risk level answers at Al Ghadeer", "schema_hint": "FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Risk Level' AND fac.name ILIKE '%Al Ghadeer%'"}}
@@ -533,6 +596,13 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
 - Generate a PostgreSQL SELECT query ONLY. No INSERT/UPDATE/DELETE/DROP.
 - Use ILIKE for partial text matching on labels and names. NEVER use LIKE.
 - Use ILIKE for answer_text matching: aa.answer_text ILIKE '%High%' (answer_text stores plain strings but ILIKE is safer for partial matches).
+- FULL NAME SEARCH (first + last): ALWAYS use the concatenated column:
+    WHERE (u.first_name || ' ' || u.last_name) ILIKE '%George Smith%'
+  NEVER split: WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%Smith%')
+  The OR split matches anyone named George OR anyone surnamed Smith — wrong.
+  Only use separate first_name/last_name ILIKE when the user provides a single partial word (not a full name).
+  Single partial word example: WHERE (u.first_name ILIKE '%george%' OR u.last_name ILIKE '%george%') — OK.
+  Full name example: WHERE (u.first_name || ' ' || u.last_name) ILIKE '%George Smith%' — required.
 - Include LIMIT 100 unless aggregating.
 - For "top / most / best / worst" ranking queries, use LIMIT 10 (even if the user asks "which one" singular). This provides context for charts and lists while still highlighting the #1 result.
 - NEVER use SELECT *. Specify only the columns the user needs.
@@ -848,6 +918,12 @@ Turn 1: {"thought": "Approval questions = implementation_status track, NEVER cap
 ─── CAs at risk (schedule health, NOT severity) ───
 User: "show corrective actions that are at risk"
 Turn 1: {"thought": "'at risk' = progress_stage = 'AT_RISK' (inspectee's schedule health). NOT risk_level = 'High' — that is severity, a different concept.", "tool": "generate_sql", "args": {"question": "corrective actions at risk behind schedule progress", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.progress_stage, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.progress_stage = 'AT_RISK' AND ica.active = true AND ir.active = true LIMIT 100;"}}
+
+─── CAs "at <company-like-name>" — facility, NOT organisation ───
+User: "corrective actions at adnoc"
+Turn 1: {"thought": "'adnoc' looks like a company/brand name, but 'at X' always means fac.name here, not organisation — facilities are routinely named after their parent brand (e.g. 'Adnoc Schools- Ghayathi'). The organisation table is a separate, narrower concept and is almost never what 'at X' means. Filter by fac.name ILIKE, not org.name.", "tool": "generate_sql", "args": {"question": "corrective actions at facilities matching adnoc", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE fac.name ILIKE '%adnoc%' AND ica.active = true AND ir.active = true AND ir.status != 'DRAFT' ORDER BY ica.created_on DESC LIMIT 100;"}}
+NEVER: WHERE org.name ILIKE '%adnoc%' — silently returns 0 rows since the
+  match is encoded in the facility name, not an organisation record.
 """,
     },
     {
@@ -877,7 +953,7 @@ Turn 1: {"thought": "'cycles' here means inspection frequency/cadence types (Dai
         "text": """\
 ─── inspection_schedule joined to inspection_cycle — NO name column on ic ───
 User: "inspection schedules for the next 5 days"
-Turn 1: {"thought": "Filter by isched.schedule_date/due_date within the next 5 days. If joining inspection_cycle (ic), it has NO 'name' column — its columns are id, status, start_date, end_date, due_date, send_notification_to_inspectors, created_on, modified_on. Use ic.id/ic.status, not ic.name.", "tool": "generate_sql", "args": {"question": "inspection schedules for the next 5 days", "schema_hint": "SELECT isched.id, isched.schedule_id, isched.status, isched.due_date, isched.schedule_date, fac.name AS facility_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, proj.name AS project_name, ic.id AS cycle_id, ic.status AS cycle_status FROM inspection_schedule isched LEFT JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN project proj ON isched.project_id = proj.id LEFT JOIN inspection_cycle ic ON isched.inspection_cycle_id = ic.id WHERE (isched.schedule_date <= CURRENT_DATE + INTERVAL '5 days' OR isched.due_date <= CURRENT_DATE + INTERVAL '5 days') AND (isched.schedule_date >= CURRENT_DATE OR isched.due_date >= CURRENT_DATE) AND fac.active = true AND u_insp.active = true ORDER BY isched.schedule_date ASC NULLS LAST LIMIT 100;"}}
+Turn 1: {"thought": "Filter by due_date within the next 5 days. If joining inspection_cycle (ic), it has NO 'name' column — its columns are id, status, start_date, end_date, due_date, send_notification_to_inspectors, created_on, modified_on. Use ic.id/ic.status, not ic.name. NEVER select isched.schedule_id — almost always NULL.", "tool": "generate_sql", "args": {"question": "inspection schedules for the next 5 days", "schema_hint": "SELECT isched.id, isched.status, isched.due_date, fac.name AS facility_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, proj.name AS project_name, ic.id AS cycle_id, ic.status AS cycle_status FROM inspection_schedule isched LEFT JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN project proj ON isched.project_id = proj.id LEFT JOIN inspection_cycle ic ON isched.inspection_cycle_id = ic.id WHERE isched.due_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '5 days' AND fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
 """,
     },
     {
@@ -941,6 +1017,13 @@ CRITICAL JOIN PATH: po_details.mitigative_action_uuid = ica.id  (ica.id is the U
 NEVER: po.mitigative_action_uuid = ica.corrective_action_id  \u2014 corrective_action_id is VARCHAR, causes type error
 NEVER: po.mitigative_action_uuid = ir.id  \u2014 matches zero rows
 ALWAYS pre-aggregate po_details and pr_details in CTEs to avoid row fan-out from LEFT JOIN.
+
+\u2500\u2500\u2500 Capex/Opex by ALL facilities (no specific facility named) \u2500\u2500\u2500
+User: "show total capex and opex by facility" / "capex and opex breakdown by site" / "total po and pr by facility from po and pr details"
+Turn 1: {"thought": "User wants capex/opex totals grouped by ALL facilities \u2014 no specific facility filter. Pre-aggregate po_details and pr_details in CTEs first to avoid fan-out, then JOIN and GROUP BY fac.id.", "tool": "generate_sql", "args": {"question": "total capex and opex by all facilities CTE", "schema_hint": "WITH po_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS capex_converted FROM po_details WHERE active = true GROUP BY 1), pr_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS opex_incurred FROM pr_details WHERE active = true GROUP BY 1) SELECT fac.name AS facility_name, COALESCE(SUM(ica.capex),0) AS capex_generated, COALESCE(SUM(po.capex_converted),0) AS capex_converted, COALESCE(SUM(pr.opex_incurred),0) AS opex_incurred FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id LEFT JOIN po_agg po ON po.ica_id = ica.id LEFT JOIN pr_agg pr ON pr.ica_id = ica.id WHERE ica.active = true AND ir.active = true AND fac.active = true AND ir.status != 'DRAFT' GROUP BY fac.id, fac.name ORDER BY capex_generated DESC LIMIT 100;"}}
+
+\u2500\u2500\u2500 Financial data for a specific named facility \u2500\u2500\u2500
+User: "show financial data for Al Ghadeer" / "PO and PR amounts at [facility]" / "income and cost for [facility]"
 Turn 1: {"thought": "Financial data for a facility \u2014 must join po_details and pr_details via ica.id (UUID PK), NOT ica.corrective_action_id (varchar). Pre-aggregate in CTEs to avoid fan-out.", "tool": "generate_sql", "args": {"question": "financial data PO PR income cost for facility", "schema_hint": "WITH po_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_income FROM po_details WHERE active = true GROUP BY 1), pr_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_cost FROM pr_details WHERE active = true GROUP BY 1) SELECT fac.name AS facility_name, COALESCE(SUM(po.total_income),0) AS income, COALESCE(SUM(pr.total_cost),0) AS cost, COALESCE(SUM(po.total_income),0) - COALESCE(SUM(pr.total_cost),0) AS profit FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id LEFT JOIN po_agg po ON po.ica_id = ica.id LEFT JOIN pr_agg pr ON pr.ica_id = ica.id WHERE fac.name ILIKE '%[FACILITY]%' AND ica.active = true AND ir.active = true AND fac.active = true GROUP BY fac.id, fac.name;"}}
 """,
     },
@@ -987,6 +1070,11 @@ Turn 1: {"thought": "'closed late' is DIFFERENT from 'overdue' — overdue means
 User: "show corrective actions closed on time vs closed late vs overdue" / "give me a timeliness breakdown of corrective actions"
 Turn 1: {"thought": "Three-category breakdown using only ica columns (status, completed_on, target_close_out_date) — SINGLE TABLE, no joins needed. NEVER add JOIN inspection_report or reference ir.active here — there's nothing for ir to join on and it causes a missing-FROM-clause error.", "tool": "generate_sql", "args": {"question": "corrective actions timeliness breakdown closed on time closed late overdue", "schema_hint": "SELECT CASE WHEN status = 'CLOSED' AND completed_on <= target_close_out_date THEN 'closed on time' WHEN status = 'CLOSED' AND completed_on > target_close_out_date THEN 'closed late' WHEN status NOT IN ('CLOSED','CLOSE_WITH_DEFERRED') AND target_close_out_date < CURRENT_DATE THEN 'overdue' ELSE 'other' END AS timeliness_category, COUNT(*) AS ca_count FROM inspection_corrective_action WHERE active = true AND target_close_out_date IS NOT NULL GROUP BY timeliness_category ORDER BY timeliness_category;"}}
 
+─── Most common causes of corrective actions — ica.cause, NOT form answers ───
+User: "what are the most common causes of corrective actions" / "top CA causes" / "most frequent causes"
+ROUTING: ica.cause is a plain VARCHAR column on inspection_corrective_action — NOT a form field. NEVER use get_answer_stats. Always generate_sql.
+Turn 1: {"thought": "ica.cause is a plain column, not a form answer — generate_sql with GROUP BY ica.cause, never get_answer_stats.", "tool": "generate_sql", "args": {"question": "most common causes of corrective actions ranked by frequency", "schema_hint": "SELECT ica.cause, COUNT(*) AS ca_count, ROUND(COUNT(*)*100.0/SUM(COUNT(*)) OVER(),1) AS percentage FROM inspection_corrective_action ica WHERE ica.active = true AND ica.cause IS NOT NULL GROUP BY ica.cause ORDER BY ca_count DESC LIMIT 20;"}}
+
 ─── Corrective actions ───
 User: "show open corrective actions with causes"
 Turn 1: {"thought": "Plain SQL on inspection_corrective_action.", "tool": "generate_sql", "args": {"question": "open corrective actions with causes", "schema_hint": "inspection_corrective_action: corrective_action_id, cause, corrective_action, responsible, status. WHERE status = 'OPEN'"}}
@@ -999,7 +1087,12 @@ User: "show high risk corrective actions from February 2026"
 Turn 1: {"thought": "Need high risk CAs from Feb 2026. Risk level is on ica.risk_level_id — JOIN risk_level table. Date filter on ir.submitted_on using EXTRACT. NEVER join ai_answers to get risk level — ica.risk_level_id is a direct UUID FK to risk_level table.", "tool": "generate_sql", "args": {"question": "high risk corrective actions from February 2026", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, rl.name AS risk_level, ica.target_close_out_date, fac.name AS facility_name FROM inspection_corrective_action ica JOIN risk_level rl ON ica.risk_level_id = rl.id JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE rl.name = 'High' AND EXTRACT(MONTH FROM ir.submitted_on) = 2 AND EXTRACT(YEAR FROM ir.submitted_on) = 2026 AND ica.active = true AND ir.active = true AND ir.status != 'DRAFT' ORDER BY ica.target_close_out_date ASC LIMIT 100;"}}
 ─── Corrective actions for a specific inspection ───
 User: "show corrective actions for inspection 2026/04/ST158/INS005"
-Turn 1: {"thought": "Need corrective actions for a specific inspection. ica.inspection_id is UUID FK to inspection_report.id — must join and filter by ir.inspection_id (varchar). NEVER use ica.due_date (use target_close_out_date), NEVER use ica.actual_date (use close_on), NEVER use ica.mitigative_action_uuid (that is on po_details/pr_details pointing TO ica.id).", "tool": "generate_sql", "args": {"question": "corrective actions for inspection 2026/04/ST158/INS005", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, ica.target_close_out_date, ica.close_on, ica.capex, ica.opex, ica.progress_stage FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id WHERE ir.inspection_id = '2026/04/ST158/INS005' AND ica.active = true AND ir.active = true ORDER BY ica.created_on ASC LIMIT 100;"}}""",
+Turn 1: {"thought": "Need corrective actions for a specific inspection. ica.inspection_id is UUID FK to inspection_report.id — must join and filter by ir.inspection_id (varchar). NEVER use ica.due_date (use target_close_out_date), NEVER use ica.actual_date (use close_on), NEVER use ica.mitigative_action_uuid (that is on po_details/pr_details pointing TO ica.id).", "tool": "generate_sql", "args": {"question": "corrective actions for inspection 2026/04/ST158/INS005", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, ica.target_close_out_date, ica.close_on, ica.capex, ica.opex, ica.progress_stage FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id WHERE ir.inspection_id = '2026/04/ST158/INS005' AND ica.active = true AND ir.active = true ORDER BY ica.created_on ASC LIMIT 100;"}}
+─── Responsible party filter — NEVER GROUP BY all, filter to what was asked ───
+User: "compare overdue corrective actions between CLIENT and INTERNAL_OPERATIONS"
+COLUMN: ica.responsible — enum, always uppercase: 'CLIENT' | 'INTERNAL_OPERATIONS' | 'SUB_CONTRACTOR'
+CRITICAL: when user names specific parties, add WHERE ica.responsible IN (...) — do NOT return all groups.
+Turn 1: {"thought": "ica.responsible is the enum column for who owns the CA. User asked about CLIENT and INTERNAL_OPERATIONS only — must filter with IN, not a naked GROUP BY which would also return SUB_CONTRACTOR.", "tool": "generate_sql", "args": {"question": "overdue corrective action count by responsible party CLIENT and INTERNAL_OPERATIONS", "schema_hint": "SELECT ica.responsible, COUNT(*) AS overdue_count FROM inspection_corrective_action ica WHERE ica.status = 'OVERDUE' AND ica.responsible IN ('CLIENT', 'INTERNAL_OPERATIONS') AND ica.active = true GROUP BY ica.responsible ORDER BY overdue_count DESC;"}}""",
     },
     {
         "title": "Schedule/frequency/portfolio worked examples",
@@ -1009,15 +1102,17 @@ Turn 1: {"thought": "Need corrective actions for a specific inspection. ica.insp
         ),
         "text": """\
 ─── inspection_schedule queries — NO active column ───
+COLUMNS: isched.id (PK), isched.status, isched.due_date, isched.schedule_date (often NULL — prefer due_date for display)
+NEVER SELECT isched.schedule_id — it is a nullable internal reference UUID, almost always NULL and useless for display.
 User: "list all inspection schedules with facility, inspector, project and status"
-Turn 1: {"thought": "inspection_schedule has NO active column — do not add isched.active = true. facility/users/project DO have active columns, so filter those normally.", "tool": "generate_sql", "args": {"question": "list all inspection schedules with facility, inspector, project and status", "schema_hint": "SELECT isched.id, isched.schedule_id, isched.status, isched.due_date, isched.schedule_date, fac.name AS facility_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, proj.name AS project_name FROM inspection_schedule isched LEFT JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN project proj ON isched.project_id = proj.id WHERE fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
+Turn 1: {"thought": "inspection_schedule has NO active column — do not add isched.active = true. facility/users/project DO have active columns, so filter those normally. NEVER select isched.schedule_id — it is almost always NULL. Use isched.id (the PK) for row identification and isched.due_date as the primary date.", "tool": "generate_sql", "args": {"question": "list all inspection schedules with facility, inspector, project and status", "schema_hint": "SELECT isched.id, isched.status, isched.due_date, fac.name AS facility_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, proj.name AS project_name FROM inspection_schedule isched LEFT JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN project proj ON isched.project_id = proj.id WHERE fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
 
 ─── Facilities scheduled for a specific frequency ───
 User: "which facilities are scheduled for daily inspections"
 Turn 1: {"thought": "Daily inspections come from frequency_definition → inspector_portfolio_details → facility. Do NOT use inspection_schedule for this — frequency is set on the portfolio, not the schedule. Filter frequency_definition.name = 'Daily'.", "tool": "generate_sql", "args": {"question": "facilities scheduled for daily inspections", "schema_hint": "SELECT DISTINCT fac.name AS facility_name, fd.name AS frequency FROM frequency_definition fd JOIN inspector_portfolio_details ipd ON ipd.frequency_definition_id = fd.id JOIN facility fac ON fac.id = ipd.facility_id WHERE fd.name = 'Daily' AND fd.active = true AND ipd.active = true AND fac.active = true ORDER BY fac.name;"}}
 ─── Inspection schedule: overdue inspections ───
 User: "show all overdue inspections"
-Turn 1: {"thought": "Overdue inspections are in inspection_schedule WHERE status = 'OVERDUE'. inspection_schedule has NO inspection_id column — get facility, inspector, inspectee from FKs on inspection_schedule itself. Join inspection_report via schedule_id = ir.id to get inspection details. Do NOT select inspection_id from inspection_schedule.", "tool": "generate_sql", "args": {"question": "overdue inspections with facility inspector and due date", "schema_hint": "SELECT fac.name AS facility_name, proj.name AS project_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, u_ins.first_name || ' ' || u_ins.last_name AS inspectee_name, isched.due_date, (CURRENT_DATE - isched.due_date::date) AS days_overdue, isched.schedule_date FROM inspection_schedule isched JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN project proj ON isched.project_id = proj.id JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN users u_ins ON isched.inspectee_id = u_ins.id WHERE isched.status = 'OVERDUE' AND fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
+Turn 1: {"thought": "Overdue inspections are in inspection_schedule WHERE status = 'OVERDUE'. inspection_schedule has NO inspection_id column — get facility, inspector, inspectee from FKs on inspection_schedule itself. Join inspection_report via schedule_id = ir.id to get inspection details. Do NOT select inspection_id from inspection_schedule.", "tool": "generate_sql", "args": {"question": "overdue inspections with facility inspector and due date", "schema_hint": "SELECT fac.name AS facility_name, proj.name AS project_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, u_ins.first_name || ' ' || u_ins.last_name AS inspectee_name, isched.due_date, (CURRENT_DATE - isched.due_date::date) AS days_overdue FROM inspection_schedule isched JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN project proj ON isched.project_id = proj.id JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN users u_ins ON isched.inspectee_id = u_ins.id WHERE isched.status = 'OVERDUE' AND fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
 ─── Inspection schedule: schedule status counts ───
 User: "how many inspections are overdue vs pending vs completed"
 Turn 1: {"thought": "Count by status from inspection_schedule. inspection_schedule has NO active column — never use WHERE active = true on this table.", "tool": "generate_sql", "args": {"question": "inspection schedule status counts", "schema_hint": "SELECT status, COUNT(*) AS count FROM inspection_schedule GROUP BY status ORDER BY count DESC;"}}""",

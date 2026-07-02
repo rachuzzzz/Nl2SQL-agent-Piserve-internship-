@@ -167,10 +167,10 @@ const SAVED_CARDS: SavedCard[] = [
     }
     .s-card {
       background: var(--surface); border: 1px solid var(--border);
-      border-radius: 16px; overflow: hidden; display: flex; flex-direction: column;
-      box-shadow: var(--shadow-sm); transition: box-shadow 0.18s, transform 0.18s;
+      border-radius: 22px; overflow: hidden; display: flex; flex-direction: column;
+      box-shadow: var(--shadow-sm); transition: box-shadow 0.22s, transform 0.22s, border-color 0.22s;
     }
-    .s-card:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
+    .s-card:hover { box-shadow: var(--shadow-md), 0 0 0 1px rgba(27,67,255,0.08); transform: translateY(-3px); border-color: var(--blue-100); }
 
     .s-card-top { padding: 15px 16px 6px; }
     .s-tag-row {

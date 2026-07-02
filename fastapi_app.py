@@ -16,9 +16,8 @@ import tempfile
 import subprocess
 import numpy as np
 import httpx
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer as _HTTPBearer, HTTPAuthorizationCredentials as _HTTPCreds
 from pydantic import BaseModel, Field
 
 import re
@@ -27,6 +26,9 @@ import logging
 from contextlib import asynccontextmanager
 
 from core.logging_config import setup_logging
+from core.rbac import DATA_VISIBILITY_PERMS, build_scope_filter
+from core.disambiguation import is_disambiguation_result, is_entity_disambiguation_result
+from app_state import get_orch, get_orch_optional
 
 # ── TTS — lazy-loaded on first /api/tts call ──────────────────────────────────
 _tts_model = None
@@ -128,20 +130,19 @@ log_query = logging.getLogger("inspectai.query")
 
 # ── Eager startup ──────────────────────────────────────────────────────────────
 
-_orch = None
 _sessions: dict = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Warm up the orchestrator at server start so the first request is instant."""
-    global _orch
+    app.state.orch = None
     from dotenv import load_dotenv
     load_dotenv()
     setup_logging(log_level="INFO")
     log.info("[SERVER] Starting InspectAI — loading orchestrator (LLM + embeddings + schema)…")
     t0 = time.time()
     from agent.orchestrator import AgentOrchestrator
-    _orch = AgentOrchestrator.from_env()
+    app.state.orch = AgentOrchestrator.from_env()
     log.info("[SERVER] Orchestrator ready in %.1fs", time.time() - t0)
     yield
     log.info("[SERVER] Shutting down")
@@ -159,78 +160,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Token store ────────────────────────────────────────────────────────────────
-# Maps access_token → {expiry, sub, permissions[]}. Populated on /api/login
-# (sub + expiry only) and hydrated by /api/me/permissions. Cleared on restart.
-_valid_tokens: dict[str, dict] = {}
-_bearer_scheme = _HTTPBearer(auto_error=False)
+from core.auth import require_auth
+from auth_routes import auth_router
 
-# Inspection data-visibility permissions — the only ones the orchestrator is
-# allowed to know about. All other permissions are stripped before the
-# visibility_scope dict reaches the SQL layer. This is the boundary wall.
-DATA_VISIBILITY_PERMS: frozenset = frozenset({
-    'view list of all inspections',
-    'view list of own inspections',
-    'view own inspection dashboard',
-    'view own inspection portfolio list',
-    'view list of own inspection schedules',
-    'view list of own inspection mitigative actions',
-    'view list of all inspection mitigative actions',
-    'conduct an inspection',
-    'can be an inspectee',
-    # Grants scoped access to PO details linked to the user's own CAs
-    'view po details in any mitigative action',
-    # Scoped cycle and project dashboard access via the inspection chain
-    'view inspection cycle list',
-    'view project inspection dashboard',
-})
-
-
-def _decode_jwt_payload(token: str) -> dict:
-    """Decode the JWT payload segment (base64url) without signature verification."""
-    import base64, json as _json
-    try:
-        parts = token.split('.')
-        if len(parts) != 3:
-            return {}
-        payload = parts[1]
-        payload += '=' * (4 - len(payload) % 4)
-        return _json.loads(base64.urlsafe_b64decode(payload))
-    except Exception:
-        return {}
-
-
-def _register_token(token: str, sub: str, permissions: list, expires_in: int = 3600) -> None:
-    _valid_tokens[token] = {
-        'expiry': _time.time() + expires_in,
-        'sub': sub,
-        'permissions': permissions,
-    }
-    now = _time.time()
-    expired = [t for t, data in list(_valid_tokens.items()) if data['expiry'] < now]
-    for t in expired:
-        _valid_tokens.pop(t, None)
-
-
-async def require_auth(
-    credentials: _HTTPCreds | None = Depends(_bearer_scheme),
-) -> dict:
-    token = credentials.credentials if credentials else None
-    if not token:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    data = _valid_tokens.get(token)
-    if not data or data['expiry'] < _time.time():
-        raise HTTPException(status_code=401, detail="Authentication required")
-    return data
-
-
-def require_scope(*scopes: str):
-    """Dependency factory — raises 403 if the token holds none of the given scopes."""
-    async def _dep(token_data: dict = Depends(require_auth)) -> dict:
-        if scopes and not any(s in token_data['permissions'] for s in scopes):
-            raise HTTPException(status_code=403, detail="Insufficient permissions")
-        return token_data
-    return _dep
+app.include_router(auth_router)
 
 
 class ChatRequest(BaseModel):
@@ -425,27 +358,35 @@ def _generate_summary(question: str, columns: list, rows: list) -> str:
             """Return a human-readable label, formatting datetimes nicely."""
             import re
             from datetime import datetime, date
+
+            def _fmt_dt(dt: datetime) -> str:
+                # day==1 at midnight → DATE_TRUNC('month', ...) pattern → show month only
+                if dt.hour == 0 and dt.minute == 0 and dt.second == 0 and dt.day == 1:
+                    return dt.strftime("%b %Y")
+                if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+                    return dt.strftime("%b %d, %Y").replace(" 0", " ")
+                return dt.strftime("%b %d, %Y %H:%M").replace(" 0", " ")
+
             s = str(v).strip()
             # Already a date/datetime object
             if isinstance(v, datetime):
-                return v.strftime("%b %-d, %Y")
+                return _fmt_dt(v)
             if isinstance(v, date):
-                return v.strftime("%b %-d, %Y")
+                if v.day == 1:
+                    return v.strftime("%b %Y")
+                return v.strftime("%b %d, %Y").replace(" 0", " ")
             # ISO timestamp strings: 2026-01-01 00:00:00+00:00 or 2026-01-01T00:00:00Z
             if re.match(r'^\d{4}-\d{2}-\d{2}[ T]', s):
                 try:
                     dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-                    # If time is midnight, show date only
-                    if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
-                        return dt.strftime("%b %-d, %Y")
-                    return dt.strftime("%b %-d, %Y %H:%M")
+                    return _fmt_dt(dt)
                 except Exception:
                     pass
             # Plain date string: 2026-01-01
             if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
                 try:
                     dt = datetime.strptime(s, "%Y-%m-%d")
-                    return dt.strftime("%b %-d, %Y")
+                    return _fmt_dt(dt)
                 except Exception:
                     pass
             return s
@@ -528,11 +469,10 @@ def _chart_suggestion_sentence(columns: list, rows: list) -> str:
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, token_data: dict = Depends(require_auth)):
+async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=Depends(get_orch)):
     qid = uuid.uuid4().hex[:8]
     sub = token_data['sub']
     try:
-        orch = _orch
         sess_key = f"{req.session_id}:{sub}"
         sess_data = get_or_create_session(sess_key)
 
@@ -654,8 +594,14 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth)):
                     _result_cols = list(rows[0].keys())
                     _row_count = inner.get("row_count", len(rows))
 
-                    # Cache SQL for pagination — if it's a new or auto-paginated query
-                    exec_sql = sql or (step.args or {}).get("sql")
+                    # Cache SQL for pagination — prefer this execute_sql step's own
+                    # args, which is the ACTUALLY EXECUTED SQL (agent/orchestrator.py
+                    # rewrites it via enforce_scope() before execution). Falling back
+                    # to `sql` (the raw, pre-scope-enforcement generate_sql result)
+                    # would cache unscoped SQL, which /api/page and the calendar
+                    # refetch then re-run with no scope re-application — a bypass for
+                    # a scoped user paging through results or opening a calendar chart.
+                    exec_sql = (step.args or {}).get("sql") or sql
                     if exec_sql:
                         sess_data["last_sql"]        = exec_sql
                         sess_data["last_sql_params"] = {}
@@ -704,12 +650,24 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth)):
                         _ga_clauses.append("aa.answer_text ILIKE :ga_ans_text")
                         _ga_params["ga_ans_text"] = f"%{_ga_args['answer_text']}%"
                     # Inline the same scope predicate the tool applied at query time.
-                    # Uses _build_scope_filter (server-trusted SQL, int(sub) cast).
+                    # Uses build_scope_filter (server-trusted SQL, int(sub) cast).
                     # Added to clauses before SQL string is built to preserve :params.
-                    _ga_scope = _orch._build_scope_filter(visibility_scope) if visibility_scope else 'BLOCK'
+                    _ga_scope = build_scope_filter(visibility_scope) if visibility_scope else 'BLOCK'
                     if _ga_scope and _ga_scope != 'BLOCK':
                         _ga_clauses.append(_ga_scope)
                     _ga_where = " AND ".join(_ga_clauses)
+                    # Match agent/tools.py's get_answers(): INNER JOIN when scope is
+                    # active so the RBAC predicate can't be bypassed by NULL ir rows
+                    # (a LEFT JOIN with a WHERE-side scope predicate still behaves
+                    # like an inner join for matched rows, but INNER JOIN makes the
+                    # intent explicit and avoids relying on that NULL-propagation
+                    # behavior — the two code paths for the same logical query must
+                    # share this enforcement, not diverge).
+                    _ga_ir_join = (
+                        "INNER JOIN inspection_report ir ON aa.inspection_report_id = ir.id"
+                        if _ga_scope and _ga_scope != 'BLOCK'
+                        else "LEFT JOIN inspection_report ir ON aa.inspection_report_id = ir.id"
+                    )
                     _ga_sql = (
                         "SELECT ir.inspection_id, aa.module_name,"
                         " aq.label AS question_label,"
@@ -717,7 +675,7 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth)):
                         " aa.score, aa.submitted_on"
                         " FROM ai_answers aa"
                         " LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id"
-                        " LEFT JOIN inspection_report ir ON aa.inspection_report_id = ir.id"
+                        f" {_ga_ir_join}"
                         f" WHERE {_ga_where} ORDER BY aa.submitted_on DESC"
                     )
                     sess_data["last_sql"]        = _ga_sql if _ga_scope != 'BLOCK' else None
@@ -762,6 +720,25 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth)):
             _has_more = _total_count > _row_count
         else:
             _has_more = _row_count >= 50
+
+        # Name-disambiguation count-check queries exist purely so the model can
+        # ask "which person/facility did you mean?" — showing them as a full
+        # animated heatmap/KPI dashboard is misleading (looks like an analytics
+        # result, not a pick-one list). Uses the same shared shape-checks
+        # (core.disambiguation) that agent/orchestrator.py's _synthesize() and
+        # _extract_disambiguation()/_extract_entity_disambiguation() use, so the
+        # chat text and the dashboard/chart shown for the same result never
+        # disagree. Based on the FINAL result shape only, so an earlier
+        # disambiguation step in the same turn doesn't suppress the dashboard
+        # for a later, legitimate analytical result. Covers both the people
+        # shape (user_id+name) and the entity shape (facility/project/client/
+        # organisation — id+name+inspection_count).
+        _last_sql = sess_data.get("last_sql") or ""
+        if _result_cols and (
+            is_disambiguation_result(_result_cols, _last_sql)
+            or is_entity_disambiguation_result(_result_cols, _last_sql)
+        ):
+            _skip_dashboard = True
 
         # Generate answer text; decide whether to show dashboard or plain chart suggestion
         if _result_rows and len(_result_rows) > 1 and not _chart_config and not _skip_dashboard:
@@ -934,7 +911,7 @@ def _paginate_sql(sql: str, page: int, page_size: int) -> str:
 
 
 @app.post("/api/page")
-async def get_page(req: PageRequest, token_data: dict = Depends(require_auth)):
+async def get_page(req: PageRequest, token_data: dict = Depends(require_auth), orch=Depends(get_orch)):
     """
     Paginate the last server-generated SQL for this session.
     Client-supplied SQL is never accepted — pagination always re-runs the
@@ -957,7 +934,7 @@ async def get_page(req: PageRequest, token_data: dict = Depends(require_auth)):
 
         from sqlalchemy import text as sql_text
         _page_params = sess_data.get("last_sql_params", {})
-        with _orch.db_engine.connect() as conn:
+        with orch.db_engine.connect() as conn:
             result  = conn.execute(sql_text(paged_sql), _page_params)
             columns = list(result.keys())
             rows    = [{k: str(v) for k, v in dict(row._mapping).items()} for row in result.fetchall()]
@@ -998,7 +975,7 @@ async def clear_session(session_id: str, token_data: dict = Depends(require_auth
 
 
 @app.post("/api/chart")
-async def get_chart(req: ChartRequest, token_data: dict = Depends(require_auth)):
+async def get_chart(req: ChartRequest, request: Request, token_data: dict = Depends(require_auth)):
     """
     Slash-command chart endpoint — /chart [type?]
     Generates or regenerates a chart from the session's last result.
@@ -1020,8 +997,9 @@ async def get_chart(req: ChartRequest, token_data: dict = Depends(require_auth))
 
     # Calendar heatmap needs the full date range, not just the cached 50 rows.
     _cal_needed = (req.chart_type == "calendar_heatmap") or (not req.chart_type and advise(cols, rows).get("chart_type") == "calendar_heatmap")
-    if _cal_needed and sess_data.get("last_sql") and _orch:
-        _full = _refetch_for_calendar(sess_data["last_sql"], _orch, params=sess_data.get("last_sql_params", {}))
+    _chart_orch = get_orch_optional(request)
+    if _cal_needed and sess_data.get("last_sql") and _chart_orch:
+        _full = _refetch_for_calendar(sess_data["last_sql"], _chart_orch, params=sess_data.get("last_sql_params", {}))
         if _full:
             rows = _full
             cols = list(_full[0].keys())
@@ -1133,196 +1111,11 @@ async def get_last_columns(session_id: str, token_data: dict = Depends(require_a
     }
 
 
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-
-@app.post("/api/login")
-async def login(req: LoginRequest):
-    """Proxy OAuth password-grant to the identity server.
-    Client credentials never leave the backend. Returns the OAuth response
-    plus the decoded Drupal sub so Angular can display user info."""
-    oauth_url     = os.getenv("OAUTH_URL", "https://10.77.20.51/oauth/token?_format=json")
-    client_id     = os.getenv("CLIENT_ID", "").strip()
-    client_secret = os.getenv("CLIENT_SECRET", "").strip()
-    ca_cert = os.getenv("OAUTH_CA_CERT", "").strip()
-    skip_tls = os.getenv("OAUTH_SKIP_TLS_VERIFY", "").strip().lower() in ("1", "true", "yes")
-    verify: str | bool = False if skip_tls else (ca_cert if ca_cert else True)
-
-    payload = {
-        "grant_type":    "password",
-        "client_id":     client_id,
-        "client_secret": client_secret,
-        "username":      req.username,
-        "password":      req.password,
-    }
-    log_auth.info("[AUTH] Login attempt user=%r", req.username)
-    try:
-        async with httpx.AsyncClient(verify=verify, timeout=15) as client:
-            resp = await client.post(oauth_url, data=payload)
-        if resp.status_code == 200:
-            data = resp.json()
-            access_token = data["access_token"]
-            token_hint = access_token[:8] + "…"
-
-            # Decode JWT to extract Drupal UID (sub claim).
-            # Validate at decode time — a malformed sub must never enter the token store.
-            claims = _decode_jwt_payload(access_token)
-            sub = str(claims.get("sub", "")).strip()
-            log_auth.debug("[AUTH] JWT decoded sub=%r claims_keys=%s", sub, list(claims.keys()))
-            if not re.match(r'^\d+$', sub) or sub == "0":
-                log_auth.warning("[AUTH] Login FAIL user=%r — invalid sub=%r", req.username, sub)
-                raise HTTPException(
-                    status_code=401,
-                    detail="Invalid token: sub must be a positive integer"
-                )
-
-            # Verify user is synced in the local DB (OAuth already validated credentials)
-            if _orch is None:
-                raise HTTPException(status_code=503, detail="Service not ready")
-            from sqlalchemy import text as _sql_text
-            try:
-                with _orch.db_engine.connect() as conn:
-                    row = conn.execute(
-                        _sql_text(
-                            "SELECT id_fk FROM users WHERE id_fk = :sub LIMIT 1"
-                        ),
-                        {"sub": int(sub)},
-                    ).fetchone()
-                    log_auth.debug("[AUTH] DB lookup id_fk=%r → found=%s", sub, row is not None)
-            except (ValueError, TypeError):
-                log_auth.exception("[AUTH] sub=%r could not be cast to int", sub)
-                raise HTTPException(status_code=401, detail="Invalid token: sub is not a valid user ID")
-            except Exception:
-                log_auth.exception("[AUTH] DB user sync check failed for sub=%r", sub)
-                raise HTTPException(status_code=502, detail="Database lookup failed")
-
-            if not row:
-                log_auth.warning("[AUTH] Login FAIL user=%r sub=%r — not in local DB", req.username, sub)
-                raise HTTPException(status_code=403, detail="User not found in system")
-            if row.id_fk == -1:
-                log_auth.warning("[AUTH] Login FAIL user=%r sub=%r — account not synced", req.username, sub)
-                raise HTTPException(status_code=403, detail="User account not synchronized")
-
-            # Register token with empty permissions — client fetches via /api/me/permissions
-            _register_token(access_token, sub, [], int(data.get("expires_in", 3600)))
-            log_auth.info("[AUTH] Login OK user=%r sub=%s token=%s expires_in=%ss",
-                          req.username, sub, token_hint, data.get("expires_in", 3600))
-            return {**data, "sub": sub}
-
-        try:
-            detail = resp.json().get("error_description") or resp.json().get("message") or "Invalid credentials"
-        except Exception:
-            detail = "Invalid credentials"
-        log_auth.warning("[AUTH] Login FAIL user=%r — OAuth status=%d detail=%r",
-                         req.username, resp.status_code, detail)
-        # Never forward a 5xx from the OAuth server — it looks like our fault.
-        fwd_status = resp.status_code if resp.status_code < 500 else 502
-        raise HTTPException(status_code=fwd_status, detail=detail)
-    except HTTPException:
-        raise
-    except Exception as _exc:
-        import traceback
-        _tb = traceback.format_exc()
-        log_auth.error("[AUTH] Login ERROR user=%r exc=%s\n%s", req.username, _exc, _tb)
-        raise HTTPException(status_code=502, detail=f"Authentication service unavailable: {_exc}")
-
-
-@app.post("/api/logout")
-async def logout(
-    credentials: _HTTPCreds | None = Depends(_bearer_scheme),
-    token_data: dict = Depends(require_auth),
-):
-    """Invalidate the caller's access token server-side."""
-    token = credentials.credentials  # type: ignore[union-attr]
-    _valid_tokens.pop(token, None)
-    log_auth.info("[AUTH] Logout sub=%s", token_data.get("sub"))
-    return {"status": "logged_out"}
-
-
-@app.get("/api/me/permissions")
-async def get_my_permissions(
-    credentials: _HTTPCreds | None = Depends(_bearer_scheme),
-    token_data: dict = Depends(require_auth),
-):
-    """Fetch (and cache) the permission list for the authenticated user.
-    The full list is stored in the token store but only DATA_VISIBILITY_PERMS
-    is ever forwarded to the orchestrator — nothing else reaches the SQL layer."""
-    sub = token_data["sub"]  # Drupal integer UID from JWT
-
-    # Return cached list if already populated (avoids hammering the Java API)
-    if token_data.get("permissions"):
-        return {"sub": sub, "permissions": token_data["permissions"]}
-
-    # The permissions API expects the internal UUID, not the Drupal integer.
-    # Resolve: JWT sub (int) → users.id_fk → users.id (UUID)
-    if _orch is None:
-        raise HTTPException(status_code=503, detail="Service not ready")
-    from sqlalchemy import text as _sql_text
-    try:
-        with _orch.db_engine.connect() as conn:
-            row = conn.execute(
-                _sql_text("SELECT id FROM users WHERE id_fk = :sub LIMIT 1"),
-                {"sub": int(sub)},
-            ).fetchone()
-    except Exception:
-        logging.exception("UUID lookup failed for sub=%s", sub)
-        raise HTTPException(status_code=502, detail="User UUID lookup failed")
-
-    if not row:
-        raise HTTPException(status_code=404, detail="User not found")
-    user_uuid = str(row.id)
-
-    perms_base = os.getenv("PERMISSIONS_API_URL", "http://10.77.20.54:8083")
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{perms_base}/api/users/{user_uuid}/permissions")
-        if resp.status_code == 404:
-            log_auth.warning("[AUTH] Permissions API 404 sub=%s uuid=%s — no permissions assigned", sub, user_uuid)
-            raise HTTPException(status_code=403, detail="You have no permission to access this feature")
-        if resp.status_code != 200:
-            log_auth.warning("[AUTH] Permissions API returned %s for sub=%s uuid=%s",
-                             resp.status_code, sub, user_uuid)
-            raise HTTPException(status_code=502, detail="Permissions service unavailable")
-        result = resp.json()
-        raw = result.get("result", [])
-        # Deduplicate while preserving order (API sometimes repeats entries)
-        permissions = list(dict.fromkeys(raw))
-
-        if not permissions:
-            log_auth.warning("[AUTH] No permissions assigned sub=%s uuid=%s", sub, user_uuid)
-            raise HTTPException(status_code=403, detail="You have no permission to access this feature")
-
-        data_vis = [p for p in permissions if p in DATA_VISIBILITY_PERMS]
-
-        if not data_vis:
-            log_auth.warning(
-                "[AUTH] Access DENIED sub=%s uuid=%s — total=%d permissions but 0 data-visibility grants",
-                sub, user_uuid, len(permissions),
-            )
-            raise HTTPException(status_code=403, detail="You have no permission to access this feature")
-
-        # Hydrate the token store so future require_auth calls carry permissions
-        token_str = credentials.credentials if credentials else None
-        if token_str and token_str in _valid_tokens:
-            _valid_tokens[token_str]["permissions"] = permissions
-
-        log_auth.info("[AUTH] Permissions loaded sub=%s uuid=%s total=%d data_visibility=%d: %s",
-                      sub, user_uuid, len(permissions), len(data_vis), data_vis or "(none)")
-        return {"sub": sub, "permissions": permissions}
-    except HTTPException:
-        raise
-    except Exception:
-        log_auth.exception("[AUTH] Permissions fetch error for sub=%s uuid=%s", sub, user_uuid)
-        raise HTTPException(status_code=502, detail="Permissions service unavailable")
-
-
 @app.get("/api/health")
-async def health():
-    if _orch is not None:
-        model_label = f"{_orch.chat_model_name} + {_orch.sql_model_name}"
+async def health(request: Request):
+    _health_orch = get_orch_optional(request)
+    if _health_orch is not None:
+        model_label = f"{_health_orch.chat_model_name} + {_health_orch.sql_model_name}"
     else:
         import os
         chat = os.getenv("OLLAMA_CHAT_MODEL", "—")
@@ -1331,10 +1124,10 @@ async def health():
     return {"status": "ok", "model": model_label}
 
 @app.get("/api/ready")
-async def ready():
+async def ready(request: Request):
     """Used by start.sh to wait until the orchestrator is fully loaded."""
     from fastapi.responses import JSONResponse
-    if _orch is None:
+    if get_orch_optional(request) is None:
         return JSONResponse(status_code=503, content={"status": "loading"})
     return {"status": "ready"}
 

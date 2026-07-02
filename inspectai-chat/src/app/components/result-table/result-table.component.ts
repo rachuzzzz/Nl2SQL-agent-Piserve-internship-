@@ -33,7 +33,7 @@ import { ResultData } from '../../models/chat.model';
                 [class.row-even]="even"
                 [class.row-drilldown]="isDrilldown"
                 (click)="isDrilldown ? onRowClick(row) : null">
-              <td *ngFor="let col of display.columns">{{ row[col] ?? '—' }}</td>
+              <td *ngFor="let col of display.columns">{{ formatCell(row[col]) }}</td>
             </tr>
           </tbody>
         </table>
@@ -95,10 +95,10 @@ import { ResultData } from '../../models/chat.model';
     :host { display: block; margin-top: 10px; }
 
     .table-card {
-      border-radius: 10px; overflow: hidden;
+      border-radius: 16px; overflow: hidden;
       background: var(--surface);
-      border: 1.5px solid var(--blue-100);
-      box-shadow: 0 2px 12px rgba(27,67,255,0.07);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow-sm);
     }
 
     /* Drilldown hint */
@@ -116,10 +116,10 @@ import { ResultData } from '../../models/chat.model';
       font-size: 13px; font-family: var(--font);
     }
     thead { position: sticky; top: 0; z-index: 2; }
-    thead tr { background: var(--surface-2); border-bottom: 2px solid var(--accent); }
+    thead tr { background: var(--surface-2); border-bottom: 1.5px solid var(--border-2); }
     th {
       text-align: left; padding: 9px 14px; color: var(--accent);
-      font-size: 11px; font-weight: 700; letter-spacing: 0.5px;
+      font-size: 10.5px; font-weight: 700; letter-spacing: 0.6px;
       text-transform: uppercase; white-space: nowrap;
     }
     td {
@@ -143,8 +143,8 @@ import { ResultData } from '../../models/chat.model';
     .table-footer {
       display: flex; align-items: center; justify-content: space-between;
       padding: 8px 14px; gap: 12px; flex-wrap: wrap;
-      border-top: 1.5px solid var(--blue-100);
-      background: var(--surface);
+      border-top: 1px solid var(--border);
+      background: var(--surface-2);
     }
     .row-label { font-size: 12px; color: var(--text-3); }
     .row-label strong { color: var(--accent); font-weight: 700; }
@@ -302,6 +302,32 @@ export class ResultTableComponent implements OnChanges {
 
   formatHeader(col: string): string {
     return col.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  }
+
+  formatCell(value: any): string {
+    if (value === null || value === undefined) return '—';
+    const s = String(value).trim();
+    if (!s || s === 'null' || s === 'None') return '—';
+
+    // ISO timestamp: 2026-01-01 00:00:00+00:00 or 2026-01-01T00:00:00Z
+    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(s)) {
+      try {
+        const d = new Date(s.replace(' ', 'T'));
+        if (!isNaN(d.getTime())) {
+          const isMonthStart = d.getUTCDate() === 1 && d.getUTCHours() === 0 && d.getUTCMinutes() === 0 && d.getUTCSeconds() === 0;
+          if (isMonthStart) {
+            return d.toLocaleDateString('en-US', { month: 'short', year: 'numeric', timeZone: 'UTC' });
+          }
+          const hasTime = d.getUTCHours() !== 0 || d.getUTCMinutes() !== 0;
+          const opts: Intl.DateTimeFormatOptions = hasTime
+            ? { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }
+            : { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' };
+          return d.toLocaleDateString('en-US', opts);
+        }
+      } catch { /* fall through */ }
+    }
+
+    return s;
   }
 
   goToPage(page: number): void {

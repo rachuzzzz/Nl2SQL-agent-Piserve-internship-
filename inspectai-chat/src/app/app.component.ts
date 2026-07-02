@@ -293,7 +293,7 @@ const USERNAME_KEY = 'octaai_username';
       position: relative; z-index: 2;
       background: rgba(255,255,255,0.035);
       border: 1px solid rgba(27,67,255,0.22);
-      border-radius: 22px; padding: 40px 36px 36px;
+      border-radius: 28px; padding: 40px 36px 36px;
       width: 100%; max-width: 380px;
       box-shadow: 0 24px 64px rgba(0,0,0,0.55), 0 0 0 1px rgba(27,67,255,0.10), inset 0 1px 0 rgba(255,255,255,0.05);
       backdrop-filter: blur(20px);
@@ -305,7 +305,7 @@ const USERNAME_KEY = 'octaai_username';
       to   { opacity:1; transform: translateY(0) scale(1); }
     }
     .login-logo-ring {
-      width: 64px; height: 64px; border-radius: 18px;
+      width: 64px; height: 64px; border-radius: 50%;
       background: rgba(27,67,255,0.10);
       border: 1px solid rgba(27,67,255,0.30);
       box-shadow: 0 0 36px rgba(27,67,255,0.20), inset 0 1px 0 rgba(255,255,255,0.06);
@@ -335,7 +335,7 @@ const USERNAME_KEY = 'octaai_username';
     .field-inner {
       display: flex; align-items: center; gap: 10px;
       background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.09);
-      border-radius: 11px; padding: 0 14px;
+      border-radius: 14px; padding: 0 14px;
       transition: border-color 0.18s, box-shadow 0.18s;
     }
     .field-inner.field-focus {
@@ -356,14 +356,14 @@ const USERNAME_KEY = 'octaai_username';
     .login-error {
       display: flex; align-items: center; gap: 8px;
       background: rgba(220,38,38,0.09); border: 1px solid rgba(220,38,38,0.22);
-      border-radius: 8px; padding: 9px 12px;
+      border-radius: 12px; padding: 9px 12px;
       font-size: 12px; color: #f87171; line-height: 1.4;
     }
     .login-error svg { width: 15px; height: 15px; flex-shrink: 0; }
     .login-btn {
       margin-top: 4px; width: 100%; padding: 13px;
       background: linear-gradient(145deg, #1B43FF, #1535D6);
-      border: none; border-radius: 11px;
+      border: none; border-radius: 999px;
       font-size: 14px; font-weight: 700; color: #fff; cursor: pointer;
       box-shadow: 0 4px 18px rgba(27,67,255,0.38);
       transition: all 0.18s;
@@ -428,13 +428,13 @@ const USERNAME_KEY = 'octaai_username';
     }
 
     .oa-progress-track {
-      width: 200px; height: 2px; background: rgba(27,67,255,0.18);
-      border-radius: 2px; overflow: hidden;
+      width: 200px; height: 3px; background: rgba(27,67,255,0.18);
+      border-radius: 999px; overflow: hidden;
       animation: text-up 0.5s ease 1.2s both;
     }
     .oa-progress-bar {
       height: 100%; background: linear-gradient(90deg, #1B43FF, #94A5FF);
-      border-radius: 2px; transition: width 0.4s ease;
+      border-radius: 999px; transition: width 0.4s ease;
       box-shadow: 0 0 8px rgba(27,67,255,0.6);
     }
 
@@ -453,7 +453,7 @@ const USERNAME_KEY = 'octaai_username';
       border-radius: 20px; cursor: default;
     }
     .user-avatar {
-      width: 24px; height: 24px; border-radius: 6px; flex-shrink: 0;
+      width: 24px; height: 24px; border-radius: 50%; flex-shrink: 0;
       background: linear-gradient(145deg, #1535D6, #1B43FF);
       display: flex; align-items: center; justify-content: center;
       font-size: 9px; font-weight: 700; color: #fff;
@@ -466,7 +466,7 @@ const USERNAME_KEY = 'octaai_username';
       display: flex; align-items: center; justify-content: center;
       width: 20px; height: 20px; padding: 0; margin-left: 2px;
       background: none; border: none; cursor: pointer;
-      color: rgba(154,163,200,0.45); border-radius: 4px;
+      color: rgba(154,163,200,0.45); border-radius: 8px;
       transition: color 0.15s, background 0.15s;
     }
     .btn-logout:hover { color: #f87171; background: rgba(248,113,113,0.10); }
@@ -475,7 +475,7 @@ const USERNAME_KEY = 'octaai_username';
     /* ── Theme toggle ── */
     .btn-theme {
       background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 7px; padding: 5px 9px; cursor: pointer;
+      border-radius: 10px; padding: 5px 9px; cursor: pointer;
       color: rgba(154,163,200,0.75);
       display: flex; align-items: center; justify-content: center; transition: all 0.18s;
     }
@@ -561,7 +561,7 @@ export class AppComponent implements OnInit {
         this.showLogin = false;
         this.authService.fetchPermissions().subscribe({
           next: res => {
-            this.authService.setAuth(existingToken, res.sub, res.permissions);
+            this.authService.setAuth(existingToken, res.sub, res.permissions, res.first_name || '');
             this._startSplash();
             this.cdr.detectChanges();
           },
@@ -585,7 +585,7 @@ export class AppComponent implements OnInit {
         document.addEventListener('visibilitychange', () => {
           if (document.visibilityState === 'visible' && this.authService.token) {
             this.authService.fetchPermissions().subscribe({
-              next: res => this.authService.setAuth(this.authService.token!, res.sub, res.permissions),
+              next: res => this.authService.setAuth(this.authService.token!, res.sub, res.permissions, res.first_name || ''),
               error: () => {},
             });
           }
@@ -612,7 +612,7 @@ export class AppComponent implements OnInit {
 
         this.authService.fetchPermissions().subscribe({
           next: permsRes => {
-            this.authService.setAuth(res.access_token, res.sub, permsRes.permissions);
+            this.authService.setAuth(res.access_token, res.sub, permsRes.permissions, permsRes.first_name || '');
             this.loginLoading = false;
             this.showLogin    = false;
             this._startSplash();

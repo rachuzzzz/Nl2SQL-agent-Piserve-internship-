@@ -588,12 +588,122 @@ def generate_sql(
                         )
                     response2 = sql_llm.complete(forced_prompt)
                     raw_sql = str(response2).strip()
+
+                    # Re-check: did the retry actually fix what triggered it?
+                    # Without this, a small model ignoring the forced instruction
+                    # a second time silently passes the still-broken SQL through
+                    # to validation/execution as if the guard had succeeded.
+                    _still_missing = [t for t in required if t.lower() not in raw_sql.lower()]
+                    _still_violated = [
+                        fpat for fpat in violated_forbidden
+                        if re.search(fpat, raw_sql, re.IGNORECASE)
+                    ]
+                    if _still_missing or _still_violated:
+                        _logging.getLogger("inspectai").warning(
+                            f"[table-guard] retry did NOT fix it — still missing="
+                            f"{_still_missing} still_violated={_still_violated}"
+                        )
+                        if _debug_logger:
+                            _debug_logger.debug(
+                                f"  [table-guard] retry unsuccessful — still_missing="
+                                f"{_still_missing} still_violated={_still_violated}"
+                            )
             except Exception as _guard_exc:
                 if _debug_logger:
                     _debug_logger.debug(f"  [table-guard] skipped: {_guard_exc}")
         # ── end table guard ──────────────────────────────────────────────────
 
+        # ── UUID-filter guard: schema_hint sometimes carries an already-resolved
+        # identity filter, e.g. "WHERE u.id = '<uuid>'" after a name has been
+        # disambiguated to a single user. DeepSeek can silently discard this and
+        # invent its own ILIKE/name-based filter (or wrong FK column) instead —
+        # same failure mode as the table-guard above, but for exact-identity
+        # filters. Force one retry pinning the UUID if it's missing from the
+        # generated SQL. ─────────────────────────────────────────────────────
+        try:
+            _hint_uuid_filters = re.findall(
+                r"([a-zA-Z_]\w*\.\w+)\s*=\s*'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'",
+                schema_hint,
+            )
+            _missing_uuid = [
+                (col, uid) for col, uid in _hint_uuid_filters
+                if uid.lower() not in raw_sql.lower()
+            ]
+            if _missing_uuid:
+                # Multiple FK columns can resolve to the SAME uuid (e.g. "assigned
+                # to X" meaning X could be the inspector OR the inspectee) — those
+                # must be OR'd, not AND'd, or the filter demands a row where X is
+                # simultaneously both roles and the query returns 0 rows. Different
+                # uuids (genuinely separate resolved entities) still combine with AND.
+                _cols_by_uuid: dict[str, list[str]] = {}
+                for col, uid in _missing_uuid:
+                    _cols_by_uuid.setdefault(uid, []).append(col)
+                _clause_parts = [
+                    f"{cols[0]} = '{uid}'" if len(cols) == 1
+                    else "(" + " OR ".join(f"{c} = '{uid}'" for c in cols) + ")"
+                    for uid, cols in _cols_by_uuid.items()
+                ]
+                _filter_clause = " AND ".join(_clause_parts)
+                # Strip the base template's trailing "[SQL]" completion marker before
+                # appending our own instructions — otherwise the prompt ends up with
+                # two "[SQL]" markers (one mid-prompt, one at the true end), which can
+                # confuse a small completion-style model about where to actually start
+                # writing SQL.
+                _base_prompt = re.sub(r"\[SQL\]\s*$", "", prompt).rstrip()
+                forced_prompt = (
+                    _base_prompt
+                    + f"\n\n### MANDATORY FILTER (do not deviate)\n"
+                    f"Your query MUST include this exact filter, verbatim: {_filter_clause}\n"
+                    f"This identity has already been resolved to a UUID — do NOT substitute "
+                    f"an ILIKE/name search, and do NOT change the column/table it's joined on.\n"
+                    f"[SQL]\n"
+                )
+                import logging as _logging
+                _logging.getLogger("inspectai").warning(
+                    f"[uuid-guard] retry fired — missing={_missing_uuid}"
+                )
+                if _debug_logger:
+                    _debug_logger.debug(f"  [uuid-guard] firing retry — missing={_missing_uuid}")
+                response3 = sql_llm.complete(forced_prompt)
+                raw_sql = str(response3).strip()
+                if _debug_logger:
+                    _debug_logger.debug(
+                        f"\n{'='*70}\n>>> DEEPSEEK RAW OUTPUT (uuid-guard retry)\n{'='*70}\n{raw_sql}\n"
+                    )
+
+                # Re-check: did the retry actually pin the required UUID filter(s)?
+                # Without this, a still-broken retry (e.g. the model substitutes
+                # an ILIKE name search again) silently proceeds to validation and
+                # execution as if the guard had succeeded — potentially returning
+                # a different person's data than the one already resolved.
+                _still_missing_uuid = [
+                    (col, uid) for col, uid in _missing_uuid
+                    if uid.lower() not in raw_sql.lower()
+                ]
+                if _still_missing_uuid:
+                    _logging.getLogger("inspectai").warning(
+                        f"[uuid-guard] retry did NOT fix it — still missing={_still_missing_uuid}"
+                    )
+                    if _debug_logger:
+                        _debug_logger.debug(
+                            f"  [uuid-guard] retry unsuccessful — still missing={_still_missing_uuid}"
+                        )
+        except Exception as _uuid_guard_exc:
+            if _debug_logger:
+                _debug_logger.debug(f"  [uuid-guard] skipped: {_uuid_guard_exc}")
+        # ── end UUID-filter guard ────────────────────────────────────────────
+
         sql = validator.clean_sql(raw_sql)
+
+        # AST-level deterministic repairs (sqlglot): drops hallucinated
+        # {alias}.active on no-active tables, injects missing soft-delete
+        # filters, fixes date_trunc(literal) ambiguity, and renames
+        # sched.scheduled_date -> sched.schedule_date. Falls back to the
+        # unmodified SQL on parse failure or if sqlglot isn't installed.
+        sql, _ast_mutations = validator.ast_repair(sql)
+        if _ast_mutations and _debug_logger:
+            _debug_logger.debug(f"  [ast-repair] {'; '.join(_ast_mutations)}")
 
         # validate() returns ValidationResult — hard fails block, soft warns are advisory only.
         vresult = validator.validate(sql)
@@ -787,6 +897,11 @@ class ToolRegistry:
                     return v
                 # Accept both 'label' and 'question_label' — LLM uses both names
                 q_label = args.get("question_label") or args.get("label")
+                # Accept both 'answer_text' (the key the tool schema in
+                # agent/prompts.py actually documents) and 'answer_value' (the
+                # function parameter's own name) — without this the documented
+                # key silently drops the filter, since get_answers() never sees it.
+                ans_filter = args.get("answer_text") or args.get("answer_value")
                 def _limit(v, default=50):
                     try:
                         n = int(v)
@@ -799,7 +914,7 @@ class ToolRegistry:
                     module_name=_clean(args.get("module_name")),
                     question_label=_clean(q_label),
                     inspection_id=_clean(args.get("inspection_id")),
-                    answer_value=_clean(args.get("answer_value")),
+                    answer_value=_clean(ans_filter),
                     limit=_limit(args.get("limit", 50)),
                     scope_filter=str(args.get("scope_filter", "")),
                 )

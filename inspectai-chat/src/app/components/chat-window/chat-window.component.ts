@@ -5,7 +5,9 @@ import {
 import { CommonModule, DatePipe, DecimalPipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
+import { Subscription } from 'rxjs';
 import { ChatService } from '../../services/chat.service';
+import { AuthService } from '../../services/auth.service';
 import { Message, ResultData, ChartConfig } from '../../models/chat.model';
 import { ChartDisplayComponent } from '../chart-display/chart-display.component';
 import { ResultTableComponent } from '../result-table/result-table.component';
@@ -58,7 +60,7 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
               <path d="M67 31 L85 12" stroke="url(#lg-welcome)" stroke-width="13" stroke-linecap="round"/>
             </svg>
           </div>
-          <h2>Ask your data anything</h2>
+          <div class="greet-line">{{ greeting }}, <span class="greet-name">{{ displayName }}</span></div>
           <p>Type a question in plain English — OctaAI generates SQL,<br>
              executes it, and explains the results automatically.</p>
           <div class="slash-hint">
@@ -79,13 +81,19 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
           <div class="avatar"
             [class.avatar-ai]="msg.role === 'ai'"
             [class.avatar-user]="msg.role === 'user'">
-            {{ msg.role === 'user' ? 'U' : 'AI' }}
+            <svg *ngIf="msg.role === 'ai'" viewBox="0 0 100 100" fill="none" width="15" height="15" style="overflow:visible;flex-shrink:0">
+              <path d="M34 36 V87" stroke="rgba(255,255,255,0.92)" stroke-width="13" stroke-linecap="round"/>
+              <circle cx="52" cy="42" r="18" stroke="rgba(255,255,255,0.92)" stroke-width="13" fill="none"/>
+              <path d="M67 31 L85 12" stroke="rgba(255,255,255,0.92)" stroke-width="13" stroke-linecap="round"/>
+            </svg>
+            <span *ngIf="msg.role === 'user'">{{ userInitial }}</span>
           </div>
           <div class="msg-content">
             <div class="bubble"
-              [class.bubble-ai]="msg.role === 'ai'"
+              [class.bubble-ai]="msg.role === 'ai' && !msg.dashboard?.show"
               [class.bubble-user]="msg.role === 'user'"
               [class.bubble-command]="isCommand(msg.text)"
+              [class.ai-summary]="msg.role === 'ai' && !!msg.dashboard?.show"
               [innerHTML]="msg.text | formatMsg">
             </div>
 
@@ -99,29 +107,75 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
               [messageId]="msg.id">
             </app-dashboard-display>
 
-            <!-- Non-dashboard path: existing "Show as chart" + table + chart -->
+            <!-- Non-dashboard path: table/chart, side-by-side when both present -->
             <ng-container *ngIf="!(msg.role === 'ai' && msg.dashboard?.show)">
 
-              <!-- "Show as chart" button — appears when backend signals a chart is available -->
-              <div class="chart-cta" *ngIf="msg.role === 'ai' && msg.chartSignal && !msg.chartConfig">
-                <button class="btn-show-chart" (click)="showChart(msg)">
-                  <svg viewBox="0 0 16 16" fill="currentColor" width="13" height="13">
-                    <path d="M2 11a1 1 0 011-1h2a1 1 0 011 1v3a1 1 0 01-1 1H3a1 1 0 01-1-1v-3zM6 6a1 1 0 011-1h2a1 1 0 011 1v8a1 1 0 01-1 1H7a1 1 0 01-1-1V6zm6-4a1 1 0 00-1 1v11a1 1 0 102 0V3a1 1 0 00-1-1z"/>
-                  </svg>
-                  Show as chart
-                </button>
+              <!-- Both chart + table: side-by-side panels with per-panel zoom -->
+              <div *ngIf="msg.role === 'ai' && msg.resultData?.rows?.length && msg.chartConfig"
+                   class="dual-panel"
+                   [class.dual-focus-chart]="(msgPanelFocus.get(msg.id) ?? null) === 'chart'"
+                   [class.dual-focus-table]="(msgPanelFocus.get(msg.id) ?? null) === 'table'">
+
+                <div class="dual-cell dual-chart">
+                  <div class="panel-zoom-bar">
+                    <button class="btn-zoom"
+                            [class.btn-zoom--active]="(msgPanelFocus.get(msg.id) ?? null) === 'chart'"
+                            (click)="toggleMsgPanel(msg.id, 'chart')"
+                            [title]="(msgPanelFocus.get(msg.id) ?? null) === 'chart' ? 'Restore split view' : 'Expand chart'">
+                      <svg *ngIf="(msgPanelFocus.get(msg.id) ?? null) !== 'chart'" viewBox="0 0 16 16" fill="currentColor" width="11" height="11">
+                        <path d="M1.5 1.5v4h1.5v-2.5h2.5v-1.5h-4zm4 13h-2.5v-2.5h-1.5v4h4v-1.5zm9-9h-1.5v2.5h-2.5v1.5h4v-4zm-4 7h2.5v-2.5h1.5v4h-4v-1.5z"/>
+                      </svg>
+                      <svg *ngIf="(msgPanelFocus.get(msg.id) ?? null) === 'chart'" viewBox="0 0 16 16" fill="currentColor" width="11" height="11">
+                        <path d="M5.5 5.5v-4h-1.5v2.5h-2.5v1.5h4zm-4 5h2.5v2.5h1.5v-4h-4v1.5zm9-5h1.5v-2.5h2.5v-1.5h-4v4zm4 5h-2.5v2.5h-1.5v-4h4v1.5z"/>
+                      </svg>
+                    </button>
+                  </div>
+                  <app-chart-display
+                    [cfg]="msg.chartConfig!"
+                    [sessionId]="sessionId"
+                    [mode]="msg.chartMode ?? 'quick'"
+                    [noOverlay]="true"
+                    [resizeTrigger]="chartResizeTriggers.get(msg.id) ?? 0"
+                    (fullscreenChange)="onMsgChartFullscreen(msg.id, $event)">
+                  </app-chart-display>
+                </div>
+
+                <div class="dual-cell dual-table">
+                  <div class="panel-zoom-bar">
+                    <button class="btn-zoom"
+                            [class.btn-zoom--active]="(msgPanelFocus.get(msg.id) ?? null) === 'table'"
+                            (click)="toggleMsgPanel(msg.id, 'table')"
+                            [title]="(msgPanelFocus.get(msg.id) ?? null) === 'table' ? 'Restore split view' : 'Expand table'">
+                      <svg *ngIf="(msgPanelFocus.get(msg.id) ?? null) !== 'table'" viewBox="0 0 16 16" fill="currentColor" width="11" height="11">
+                        <path d="M1.5 1.5v4h1.5v-2.5h2.5v-1.5h-4zm4 13h-2.5v-2.5h-1.5v4h4v-1.5zm9-9h-1.5v2.5h-2.5v1.5h4v-4zm-4 7h2.5v-2.5h1.5v4h-4v-1.5z"/>
+                      </svg>
+                      <svg *ngIf="(msgPanelFocus.get(msg.id) ?? null) === 'table'" viewBox="0 0 16 16" fill="currentColor" width="11" height="11">
+                        <path d="M5.5 5.5v-4h-1.5v2.5h-2.5v1.5h4zm-4 5h2.5v2.5h1.5v-4h-4v1.5zm9-5h1.5v-2.5h2.5v-1.5h-4v4zm4 5h-2.5v2.5h-1.5v-4h4v1.5z"/>
+                      </svg>
+                    </button>
+                  </div>
+                  <app-result-table
+                    [data]="msg.resultData!"
+                    [sessionId]="sessionId"
+                    [messageId]="msg.id"
+                    (drilldown)="send($event)">
+                  </app-result-table>
+                </div>
+
               </div>
 
+              <!-- Table only (no chart yet) -->
               <app-result-table
-                *ngIf="msg.role === 'ai' && msg.resultData && msg.resultData.rows.length > 0"
-                [data]="msg.resultData"
+                *ngIf="msg.role === 'ai' && msg.resultData?.rows?.length && !msg.chartConfig"
+                [data]="msg.resultData!"
                 [sessionId]="sessionId"
                 [messageId]="msg.id"
                 (drilldown)="send($event)">
               </app-result-table>
 
+              <!-- Chart only (no table rows) -->
               <app-chart-display
-                *ngIf="msg.role === 'ai' && msg.chartConfig"
+                *ngIf="msg.role === 'ai' && msg.chartConfig && !msg.resultData?.rows?.length"
                 [cfg]="msg.chartConfig!"
                 [sessionId]="sessionId"
                 [mode]="msg.chartMode ?? 'quick'"
@@ -399,18 +453,32 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
     .btn-speak--playing { opacity: 1; color: var(--accent); }
     .btn-speak--loading { opacity: 0.7; cursor: wait; }
 
-    /* ── Show as chart button ── */
-    .chart-cta { margin-top: 8px; }
-    .btn-show-chart {
-      display: inline-flex; align-items: center; gap: 6px;
-      padding: 6px 14px; border-radius: 8px; font-size: 12px; font-weight: 600;
-      background: var(--blue-50); border: 1px solid var(--blue-100);
-      color: var(--blue-600); cursor: pointer; transition: all 0.15s;
-      font-family: var(--font);
+    /* ── Dual panel: side-by-side chart + table ── */
+    .dual-panel {
+      display: flex; gap: 14px; flex-wrap: wrap; align-items: start; margin-top: 10px;
     }
-    .btn-show-chart:hover {
-      background: var(--blue-100); border-color: var(--blue-200);
+    .dual-cell {
+      flex: 1 1 calc(50% - 7px); min-width: 280px; display: flex; flex-direction: column;
     }
+    .dual-panel.dual-focus-chart .dual-chart,
+    .dual-panel.dual-focus-table .dual-table { flex-basis: 100%; order: 0; }
+    .dual-panel.dual-focus-chart .dual-table,
+    .dual-panel.dual-focus-table .dual-chart { flex-basis: 100%; order: 1; }
+
+    .panel-zoom-bar {
+      display: flex; align-items: center; justify-content: flex-end; padding: 0 0 5px;
+    }
+    .btn-zoom {
+      width: 28px; height: 28px; border-radius: 8px;
+      border: 1px solid var(--border); background: var(--surface);
+      display: grid; place-items: center; cursor: pointer; padding: 0; flex-shrink: 0;
+      color: var(--text-3); transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .btn-zoom:hover { background: var(--surface-2); color: var(--accent); border-color: var(--accent-soft-border); }
+    .btn-zoom.btn-zoom--active {
+      background: var(--accent-soft); border-color: var(--accent-soft-border); color: var(--accent);
+    }
+
   `],
 })
 export class ChatWindowComponent implements AfterViewChecked {
@@ -439,6 +507,7 @@ export class ChatWindowComponent implements AfterViewChecked {
 
   expandedChartMsgs   = new Set<string>();
   chartResizeTriggers = new Map<string, number>();
+  msgPanelFocus       = new Map<string, 'chart' | 'table' | null>();
 
   isRecording    = false;
   isTranscribing = false;
@@ -454,6 +523,25 @@ export class ChatWindowComponent implements AfterViewChecked {
   private lastResultData: ResultData | null = null;
   private lastMsgCount     = 0;
   private lastLoadingState = false;
+  private authSub          = Subscription.EMPTY;
+
+  get greeting(): string {
+    const h = new Date().getHours();
+    if (h < 12) return 'Good morning';
+    if (h < 17) return 'Good afternoon';
+    return 'Good evening';
+  }
+
+  get userInitial(): string {
+    return this.displayName.charAt(0).toUpperCase();
+  }
+
+  get displayName(): string {
+    const first = localStorage.getItem('octaai_firstname') || '';
+    if (first) return first;
+    const username = localStorage.getItem('octaai_username') || '';
+    return username ? username.charAt(0).toUpperCase() + username.slice(1) : 'there';
+  }
 
   quickQueries = [
     'What is the average inspection score?',
@@ -474,8 +562,10 @@ export class ChatWindowComponent implements AfterViewChecked {
     private cdr: ChangeDetectorRef,
     private slashSvc: SlashCommandService,
     private http: HttpClient,
-    private zone: NgZone
+    private zone: NgZone,
+    private authSvc: AuthService,
   ) {
+    this.authSub = authSvc.sub$.subscribe(() => this.cdr.markForCheck());
     svc.activeConversation$.subscribe(c => {
       this.messages  = c?.messages ?? [];
       this.sessionId = c?.id ?? '';
@@ -506,6 +596,7 @@ export class ChatWindowComponent implements AfterViewChecked {
   }
   
   ngOnDestroy() {
+    this.authSub.unsubscribe();
     if (this.loadingInterval) clearInterval(this.loadingInterval);
     if (this._ttsAudio) { this._ttsAudio.pause(); this._ttsAudio = null; }
   }
@@ -671,11 +762,23 @@ export class ChatWindowComponent implements AfterViewChecked {
     });
   }
 
+  toggleMsgPanel(msgId: string, panel: 'chart' | 'table'): void {
+    const current = this.msgPanelFocus.get(msgId) ?? null;
+    const next = current === panel ? null : panel;
+    this.msgPanelFocus.set(msgId, next);
+    if (next) this.expandedChartMsgs.add(msgId);
+    else this.expandedChartMsgs.delete(msgId);
+    this.chartResizeTriggers.set(msgId, (this.chartResizeTriggers.get(msgId) ?? 0) + 1);
+    this.cdr.markForCheck();
+  }
+
   onMsgChartFullscreen(msgId: string, isFullscreen: boolean): void {
     if (isFullscreen) {
       this.expandedChartMsgs.add(msgId);
+      this.msgPanelFocus.set(msgId, 'chart');
     } else {
       this.expandedChartMsgs.delete(msgId);
+      this.msgPanelFocus.set(msgId, null);
     }
     this.chartResizeTriggers.set(msgId, (this.chartResizeTriggers.get(msgId) ?? 0) + 1);
     this.cdr.markForCheck();

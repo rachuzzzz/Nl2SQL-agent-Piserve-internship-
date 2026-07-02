@@ -90,8 +90,8 @@ import * as echarts from 'echarts';
             <button class="btn-ctrl" title="Zoom out"   (click)="zoomOut()"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6.5 1a5.5 5.5 0 104.396 8.803l3.85 3.85a.75.75 0 001.061-1.06l-3.85-3.85A5.5 5.5 0 006.5 1zm0 1.5a4 4 0 110 8 4 4 0 010-8zm-2 3.75a.75.75 0 01.75-.75h2.5a.75.75 0 010 1.5h-2.5a.75.75 0 01-.75-.75z"/></svg></button>
             <button class="btn-ctrl" title="Reset zoom" (click)="resetZoom()"><svg viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M2.5 7.5a5 5 0 119.316 2.537.75.75 0 001.376.588A6.5 6.5 0 102.25 8.37V7a.75.75 0 00-1.5 0v2.5a.75.75 0 00.75.75H4a.75.75 0 000-1.5H2.5V7.5z" clip-rule="evenodd"/></svg></button>
           </div>
-          <!-- Fullscreen control -->
-          <button class="btn-ctrl" title="Toggle Fullscreen" (click)="toggleFullscreen()">
+          <!-- Fullscreen control — hidden when parent handles expand (noOverlay mode) -->
+          <button *ngIf="!noOverlay" class="btn-ctrl" title="Toggle Fullscreen" (click)="toggleFullscreen()">
             <svg *ngIf="!isFullscreen" viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.5v4h1.5v-2.5h2.5v-1.5h-4zm4 13h-2.5v-2.5h-1.5v4h4v-1.5zm9-9h-1.5v2.5h-2.5v1.5h4v-4zm-4 7h2.5v-2.5h1.5v4h-4v-1.5z"/></svg>
             <svg *ngIf="isFullscreen" viewBox="0 0 16 16" fill="currentColor"><path d="M5.5 5.5v-4h-1.5v2.5h-2.5v1.5h4zm-4 5h2.5v2.5h1.5v-4h-4v1.5zm9-5h1.5v-2.5h2.5v-1.5h-4v4zm4 5h-2.5v2.5h-1.5v-4h4v1.5z"/></svg>
           </button>

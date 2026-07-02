@@ -236,15 +236,15 @@ const RECENT: RecentItem[] = [
     }
     .kpi-card {
       background: var(--surface); border: 1px solid var(--border);
-      border-radius: 16px; padding: 18px 20px;
-      box-shadow: var(--shadow-sm); transition: box-shadow 0.18s, transform 0.18s;
+      border-radius: 22px; padding: 18px 20px;
+      box-shadow: var(--shadow-sm); transition: box-shadow 0.22s, transform 0.22s, border-color 0.22s;
     }
-    .kpi-card:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
+    .kpi-card:hover { box-shadow: var(--shadow-md), 0 0 0 1px rgba(27,67,255,0.08); transform: translateY(-3px); border-color: var(--blue-100); }
     .kpi-top {
       display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
     }
     .kpi-icon {
-      width: 34px; height: 34px; border-radius: 10px;
+      width: 34px; height: 34px; border-radius: 12px;
       background: var(--accent-soft); display: grid; place-items: center;
       flex-shrink: 0; color: var(--accent);
     }
@@ -270,8 +270,10 @@ const RECENT: RecentItem[] = [
     }
     .chart-card {
       background: var(--surface); border: 1px solid var(--border);
-      border-radius: 16px; padding: 18px 20px; box-shadow: var(--shadow-sm);
+      border-radius: 22px; padding: 18px 20px; box-shadow: var(--shadow-sm);
+      transition: box-shadow 0.22s, transform 0.22s;
     }
+    .chart-card:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
     .chart-card-head {
       display: flex; align-items: center; margin-bottom: 14px;
     }
@@ -291,7 +293,7 @@ const RECENT: RecentItem[] = [
     /* Recent queries */
     .recent-card {
       background: var(--surface); border: 1px solid var(--border);
-      border-radius: 16px; overflow: hidden; box-shadow: var(--shadow-sm);
+      border-radius: 22px; overflow: hidden; box-shadow: var(--shadow-sm);
     }
     .recent-head {
       padding: 15px 20px; border-bottom: 1px solid var(--border);
@@ -304,7 +306,7 @@ const RECENT: RecentItem[] = [
     .recent-row.not-first { border-top: 1px solid var(--border); }
     .recent-row:hover { background: var(--surface-2); }
     .recent-icon {
-      width: 32px; height: 32px; border-radius: 9px;
+      width: 32px; height: 32px; border-radius: 50%;
       background: var(--accent-soft); display: grid; place-items: center;
       flex-shrink: 0; color: var(--accent);
     }

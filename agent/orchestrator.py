@@ -29,6 +29,8 @@ from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PR
 from agent.tools import ToolRegistry
 from agent.tool_dispatcher import parse_tool_call, dispatch
 from core.business_rules import get_engine as get_rules_engine
+from core.rbac import build_scope_filter
+from core.disambiguation import is_disambiguation_result, is_entity_disambiguation_result
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +125,21 @@ class ConversationTurn:
     facility_names: list = field(default_factory=list)   # e.g. ["Golf Gardens"]
     inspector_names: list = field(default_factory=list)  # e.g. ["neenu extinsp1"]
     cycle_ids: list = field(default_factory=list)        # UUIDs from cycle_id column
+    user_ids: list = field(default_factory=list)         # resolved user UUIDs after disambiguation
+    disambiguation_name: str = ""   # name that was disambiguated (e.g. "george"), total_count stored in total_count
+    disambiguation_candidates: list = field(default_factory=list)  # [{"name": ..., "user_id": ...}] from disambiguation rows
+    disambiguation_origin_question: str = ""  # the ORIGINAL question that started this disambiguation chain (e.g. "which schedules is assigned to neenu") — carried forward across narrowing turns so the agent doesn't lose the actual goal while resolving a name
+    entity_disambiguation_candidates: list = field(default_factory=list)  # [{"name": ..., "inspection_count": ...}] from a STEP 1 entity (facility/project/client/organisation) count-check — lets a later turn that names one entity from this list resolve active_subject_type even though that turn ran no new SQL of its own
+    entity_disambiguation_table: str = ""  # e.g. "facility", "project" — which table the candidates above came from
+    entity_disambiguation_alias: str = ""  # e.g. "fac", "proj" — the SQL alias used, for building a correct {alias}.name ILIKE filter
     single_row_values: dict = field(default_factory=dict) # col→val when result is 1 row
     # Active focal entity — what the user is currently drilling into
-    # type: "inspection"|"facility"|"inspector"|"cycle"|"corrective_action"|None
+    # type: "inspection"|"facility"|"inspector"|"cycle"|"corrective_action"|"entity"|None
     active_subject_type: str = ""
     active_subject_value: str = ""   # exact value (UUID or name)
     active_subject_label: str = ""   # human-readable label for context message
+    active_subject_table: str = ""   # only for active_subject_type=="entity" — e.g. "project"
+    active_subject_alias: str = ""   # only for active_subject_type=="entity" — e.g. "proj"
 
 
 
@@ -228,6 +239,14 @@ _CONSTRAINT_NOTE_MAP = {
     "UUID_IN_SELECT": (
         "-- ir.id is the UUID primary key — never SELECT it for display.\n"
         "--   Use ir.inspection_id (VARCHAR) for human-readable inspection IDs."
+    ),
+    "SPLIT_NAME_MISMATCH": (
+        "-- (x.first_name ILIKE '%A%' OR x.last_name ILIKE '%B%') with A != B matches\n"
+        "--   anyone named A OR anyone surnamed B — NOT people named 'A B'.\n"
+        "-- For a two-word full name, use the CONCATENATED form instead:\n"
+        "--   WHERE (x.first_name || ' ' || x.last_name) ILIKE '%A B%'\n"
+        "-- Only use the OR form when both literals are IDENTICAL (single-word partial name):\n"
+        "--   WHERE (x.first_name ILIKE '%george%' OR x.last_name ILIKE '%george%')  -- OK"
     ),
     "TOCHAR_WHERE_FILTER": (
         "-- TO_CHAR(col, 'Month YYYY') = 'January 2026' ALWAYS RETURNS 0 ROWS in WHERE.\n"
@@ -365,6 +384,8 @@ class ConversationSession:
         active_type = ""
         active_value = ""
         active_label = ""
+        active_table = ""
+        active_alias = ""
 
         # "go back" or "back to" signals: re-anchor to the earliest matching subject
         _BACK_RE = re.compile(r"\b(go\s+back|back\s+to|return\s+to)\b", re.IGNORECASE)
@@ -375,6 +396,8 @@ class ConversationSession:
                     active_type = t.active_subject_type
                     active_value = t.active_subject_value
                     active_label = t.active_subject_label
+                    active_table = t.active_subject_table
+                    active_alias = t.active_subject_alias
                     break
         else:
             # Normal: use the most recent active subject
@@ -383,7 +406,14 @@ class ConversationSession:
                     active_type = t.active_subject_type
                     active_value = t.active_subject_value
                     active_label = t.active_subject_label
+                    active_table = t.active_subject_table
+                    active_alias = t.active_subject_alias
                     break
+
+        # self.turns is guaranteed non-empty (early-return above), so `last` is
+        # always defined for both the fallback block and the disambiguation
+        # STOP-guard below.
+        last = self.turns[-1]
 
         # ── Emit the scoped context block ────────────────────────────────────
         if not is_clearly_fresh and active_type and active_value:
@@ -397,13 +427,28 @@ class ConversationSession:
                     f" — this is the scope."
                 )
             elif active_type == "inspector":
-                lines.append(
-                    f"ACTIVE CONTEXT — The conversation is about inspector '{active_label}'."
-                    f" When user says 'they', 'that inspector', 'their inspections'"
-                    f" — filter by inspector name ILIKE '%{active_label.split()[0]}%'"
-                    f" on the users table joined via ir.inspector_user_id."
-                    f" Do NOT broaden to all inspectors."
+                # Prefer exact UUID filter if we captured it from a disambiguation query
+                _last_with_uid = next(
+                    (t for t in reversed(self.turns) if t.user_ids),
+                    None
                 )
+                if _last_with_uid and len(_last_with_uid.user_ids) == 1:
+                    _uid = _last_with_uid.user_ids[0]
+                    lines.append(
+                        f"ACTIVE CONTEXT — The conversation is about user '{active_label}' (resolved user_id='{_uid}')."
+                        f" When user says 'they', 'that inspector', 'that person', 'their schedules/actions'"
+                        f" — filter EXACTLY by WHERE u.id = '{_uid}'"
+                        f" (join users u on the appropriate FK). NEVER use ILIKE on a name — use this UUID."
+                        f" Do NOT broaden to all users."
+                    )
+                else:
+                    lines.append(
+                        f"ACTIVE CONTEXT — The conversation is about inspector '{active_label}'."
+                        f" When user says 'they', 'that inspector', 'their inspections'"
+                        f" — filter by u.first_name || ' ' || u.last_name ILIKE '%{active_label}%'"
+                        f" on the users table joined via the appropriate FK."
+                        f" Do NOT broaden to all inspectors."
+                    )
             elif active_type == "inspection":
                 lines.append(
                     f"ACTIVE CONTEXT — The conversation is about inspection '{active_value}'."
@@ -420,13 +465,26 @@ class ConversationSession:
                     f" for a global/all-facilities view."
                     f" Do NOT query globally when the context is scoped to this facility."
                 )
+            elif active_type == "entity":
+                # Generic scope for project/client/organisation — same idea as
+                # facility above, parameterized by whichever table/alias the
+                # STEP 1 disambiguation actually searched.
+                _tbl = active_table or "entity"
+                _als = active_alias or "e"
+                lines.append(
+                    f"ACTIVE CONTEXT — The conversation is scoped to {_tbl} '{active_label}'."
+                    f" ALL follow-up questions about corrective actions, inspections, scores,"
+                    f" or form answers should include a filter"
+                    f" ({_als}.name ILIKE '%{active_label}%') unless the user explicitly asks"
+                    f" for a global view."
+                    f" Do NOT query globally when the context is scoped to this {_tbl}."
+                )
             elif active_type == "corrective_action":
                 lines.append(
                     f"ACTIVE CONTEXT — The conversation is about corrective action '{active_value}'."
                 )
         elif not is_clearly_fresh:
             # Fallback: legacy single-entity context
-            last = self.turns[-1]
             if last.inspection_ids and len(last.inspection_ids) == 1:
                 lines.append(
                     f"CONTEXT — The conversation is about inspection '{last.inspection_ids[0]}'."
@@ -472,6 +530,157 @@ class ConversationSession:
                 )
             elif last.single_row_values:
                 lines.append(f"CONTEXT — Last query returned a single result: {last.single_row_values}")
+
+        # Disambiguation context — stop the model re-running the same check
+        if not is_clearly_fresh and last.disambiguation_name:
+            _dn = last.disambiguation_name
+            _dc = last.total_count
+            _q_lower = current_question.lower().strip()
+            _q_has_same_name = _dn.lower() in _q_lower
+            # "name pick": short response with no query verbs = user picking from the list
+            _QUERY_VERB_RE = re.compile(
+                r"\b(show|list|find|what|who|which|how|count|display|get|fetch|"
+                r"give|tell|check|search|view|see|compare|rank|sort|filter)\b",
+                re.IGNORECASE,
+            )
+            _specific = current_question.strip().rstrip("\t").strip()
+            # Strip trailing sentence punctuation ("George Auditor?", "george auditor.")
+            # so it doesn't break the exact-match comparison against candidate names below.
+            _specific = re.sub(r"[?.!,;:]+$", "", _specific).strip()
+            _is_name_pick = (
+                not bool(_QUERY_VERB_RE.search(current_question))
+                and len(_q_lower.split()) <= 6
+                and _specific.lower() != _dn.lower()  # must be more specific than the original term
+            )
+
+            # Exact-match short-circuit: if the user's text — once filler/verb
+            # words like "ya fetch for" are stripped — is an EXACT match for
+            # one of the candidate names from the previous disambiguation,
+            # resolve it directly. Without this, repeating an exact name (or
+            # wrapping it in "ya fetch for ...") just re-triggers the same
+            # ILIKE search / STOP branch forever whenever that name is a
+            # substring of other candidates.
+            _FILLER_WORDS = {
+                "ya", "yeah", "yep", "please", "pls", "me", "for", "the",
+                "that", "data", "info", "information", "details", "on",
+                "about", "of", "person", "user",
+            }
+
+            def _strip_filler(text: str) -> str:
+                words = text.strip().split()
+                while words and (
+                    words[0].lower() in _FILLER_WORDS
+                    or _QUERY_VERB_RE.fullmatch(words[0])
+                ):
+                    words.pop(0)
+                while words and words[-1].lower() in _FILLER_WORDS:
+                    words.pop()
+                return " ".join(words)
+
+            _cleaned_specific = _strip_filler(_specific)
+            _name_matches = [
+                _cand for _cand in last.disambiguation_candidates
+                if _cand.get("name", "").strip().lower() == _cleaned_specific.lower()
+            ]
+            # Only auto-resolve when the name uniquely identifies one candidate.
+            # Several distinct accounts can share an identical display name
+            # (e.g. 8 different "George Joseph" users seen in this dataset) —
+            # picking the first one silently would bind the wrong identity.
+            _exact_match = _name_matches[0] if len(_name_matches) == 1 else None
+            _ambiguous_duplicate_names = len(_name_matches) > 1
+
+            # Remind the model what it was ACTUALLY asked for before the name
+            # went ambiguous. Without this, a multi-turn narrowing sequence
+            # ("list schedules for neenu" → too many → "neenu qa inspector")
+            # loses track of "schedules" and settles for just resolving/describing
+            # the person instead of running the original request against them.
+            _origin_q = last.disambiguation_origin_question
+            _origin_note = (
+                f" Once resolved, you MUST go on to actually answer the ORIGINAL"
+                f" request — '{_origin_q}' — not just return the person's info/role."
+                if _origin_q and _origin_q.strip().lower() != _dn.lower() else ""
+            )
+
+            if _exact_match:
+                lines.append(
+                    f"DISAMBIGUATION RESOLVED — '{_cleaned_specific}' is an EXACT match for one of"
+                    f" the {_dc} candidates found previously (user_id="
+                    f"'{_exact_match['user_id']}').\n"
+                    f"  Use WHERE u.id = '{_exact_match['user_id']}' directly to run the"
+                    f" original query now. Do NOT re-run the disambiguation search and"
+                    f" do NOT ask the user to pick again — this name is unambiguous."
+                    f"{_origin_note}"
+                )
+            elif _ambiguous_duplicate_names:
+                _dup_uids = ", ".join(f"'{c['user_id']}'" for c in _name_matches)
+                lines.append(
+                    f"⚠️ STOP — '{_cleaned_specific}' matches {len(_name_matches)} DIFFERENT"
+                    f" people from the previous list (same display name, different accounts:"
+                    f" user_id IN ({_dup_uids})).\n"
+                    f"  YOU MUST call final_answer NOW asking the user to disambiguate further"
+                    f" by email address — do NOT pick one of these UUIDs arbitrarily and do NOT"
+                    f" call generate_sql."
+                )
+            elif _dc > 12:
+                if _q_has_same_name and not _is_name_pick:
+                    # User re-asked the same partial-name query — hard block, no SQL
+                    lines.append(
+                        f"⚠️ STOP — DISAMBIGUATION ALREADY DONE (MANDATORY RULE):\n"
+                        f"  Turn {len(self.turns)} already searched '{_dn}' → {_dc} matches (threshold=12).\n"
+                        f"  The current question still uses '{_dn}' as a partial name.\n"
+                        f"  YOU MUST call final_answer NOW with:\n"
+                        f'  "I found {_dc} people matching \'{_dn}\' — too many to list. '
+                        f'Please provide a more specific full name (e.g. \'George Smith\') '
+                        f'or their email address so I can narrow it down."\n'
+                        f"  DO NOT call generate_sql. DO NOT run any SQL."
+                    )
+                elif _is_name_pick:
+                    # User is providing a more specific name — allow a targeted full-name lookup
+                    lines.append(
+                        f"DISAMBIGUATION CONTEXT — Previous turn found {_dc} people matching"
+                        f" '{_dn}' (too many to list). The user now appears to be providing"
+                        f" a specific full name: '{_specific}'.\n"
+                        f"  STEP A: Run a targeted lookup using the concatenated full name:\n"
+                        f"    WHERE (u.first_name || ' ' || u.last_name) ILIKE '%{_specific}%'"
+                        f"  — NOT separate first_name OR last_name conditions. If '{_specific}'"
+                        f"  includes a role/descriptor rather than a real name (e.g. 'neenu qa"
+                        f"  inspector'), instead search by the name part alone and use the role"
+                        f"  words to pick among the results via a JOIN to user_roles/role.\n"
+                        f"  STEP B: If exactly 1 match, use WHERE u.id = '<uuid>' to run the"
+                        f"  original query. If still 2–12, list them. If 0, tell user not found."
+                        f"{_origin_note}"
+                    )
+                else:
+                    lines.append(
+                        f"DISAMBIGUATION CONTEXT — Previous turn found {_dc} people"
+                        f" matching '{_dn}' (too many). If the user is providing a specific"
+                        f" full name, use concatenated full-name search:"
+                        f" (u.first_name || ' ' || u.last_name) ILIKE '%<full name>%'."
+                    )
+            elif _dc > 1:
+                if _q_has_same_name and not _is_name_pick:
+                    lines.append(
+                        f"⚠️ STOP — DISAMBIGUATION ALREADY DONE (MANDATORY RULE):\n"
+                        f"  Turn {len(self.turns)} already found {_dc} people matching '{_dn}'.\n"
+                        f"  YOU MUST call final_answer NOW to list those {_dc} options\n"
+                        f"  and ask the user which one they meant.\n"
+                        f"  DO NOT call generate_sql again."
+                    )
+                elif _is_name_pick:
+                    lines.append(
+                        f"DISAMBIGUATION CONTEXT — Previous turn found {_dc} people matching"
+                        f" '{_dn}'. The user now appears to be selecting a specific person:"
+                        f" '{_specific}'. Use the UUID already returned in the previous result"
+                        f" (WHERE u.id = '<uuid>') to run the original query."
+                        f" If UUID is not in history, look up by full name:"
+                        f" WHERE (u.first_name || ' ' || u.last_name) ILIKE '%{_specific}%'."
+                        f"{_origin_note}"
+                    )
+                else:
+                    lines.append(
+                        f"DISAMBIGUATION CONTEXT — Previous turn found {_dc} people"
+                        f" matching '{_dn}'. Use UUID from previous result for exact lookup."
+                    )
 
         lines.append("")
         lines.append(
@@ -632,72 +841,6 @@ class AgentOrchestrator:
         "execute_sql",
     }
 
-    # Permissions that exclusively identify the inspector role (drive scope to
-    # ir.inspector_user_id).  Shared permissions — view list of own inspections,
-    # view own inspection dashboard, view list of own inspection mitigative
-    # actions, view inspection cycle list, view project inspection dashboard —
-    # are intentionally excluded because FM roles (AD FM, FM Manager, FM
-    # Supervisor, etc.) also hold them despite being inspectee-only roles.
-    # Including shared perms here would give FM users ir.inspector_user_id scope
-    # instead of the correct ir.inspectee_user_id scope.
-    _INSPECTOR_PERMS: frozenset = frozenset({
-        'conduct an inspection',
-        'view own inspection portfolio list',
-        'view list of own inspection schedules',
-    })
-
-    def _build_scope_filter(self, visibility_scope: dict) -> str:
-        """Return a SQL WHERE fragment that enforces data-visibility scope.
-
-        Returns '' for unrestricted access, 'BLOCK' when the user has no
-        inspection permissions at all, or a concrete SQL predicate otherwise.
-        Role names must never appear here — only permission strings drive this.
-
-        Dual-role users (both inspector and inspectee) get a union predicate so
-        they can see rows where they appear in either column.
-        """
-        if not visibility_scope:
-            return ''
-        perms = set(visibility_scope.get('permissions', []))
-        sub   = str(visibility_scope.get('sub', '')).strip()
-
-        # Empty perms inside a non-None visibility_scope means the Java API
-        # returned a list with zero data-visibility entries — deny access.
-        # (None visibility_scope is already converted to 'BLOCK' before this
-        # method is called, so we never reach here with an unfetched state.)
-        if not perms:
-            return 'BLOCK'
-        if not sub:
-            return 'BLOCK'
-
-        # Unrestricted — can see every inspection / every MA (and thus every PO)
-        if 'view list of all inspections' in perms:
-            return ''
-        if 'view list of all inspection mitigative actions' in perms:
-            return ''
-
-        # Sub-query to map Drupal UID → internal UUID
-        user_subq = (
-            f"(SELECT id FROM users WHERE id_fk = {int(sub)} "
-            f"AND active = true AND is_synced = true)"
-        )
-
-        is_inspector = bool(perms & self._INSPECTOR_PERMS)
-        is_inspectee = 'can be an inspectee' in perms
-
-        # Dual-role: union both columns so neither view is suppressed
-        if is_inspector and is_inspectee:
-            return (
-                f"(ir.inspector_user_id = {user_subq}"
-                f" OR ir.inspectee_user_id = {user_subq})"
-            )
-        if is_inspector:
-            return f"ir.inspector_user_id = {user_subq}"
-        if is_inspectee:
-            return f"ir.inspectee_user_id = {user_subq}"
-
-        return 'BLOCK'
-
     def query(self, question, max_iterations=8, on_step=None, session=None,
               visibility_scope: dict | None = None, query_id: str = ""):
         qid = query_id or ""
@@ -714,7 +857,7 @@ class AgentOrchestrator:
         if visibility_scope is None:
             scope_filter = 'BLOCK'
         else:
-            scope_filter = self._build_scope_filter(visibility_scope)
+            scope_filter = build_scope_filter(visibility_scope)
 
         if scope_filter == 'BLOCK':
             _log_query.warning("[SCOPE] %sBLOCKED sub=%s — no data-visibility permissions", _pfx, _sub)
@@ -755,6 +898,7 @@ class AgentOrchestrator:
         _last_sql = ""
         _last_total_count = 0
         _last_columns = []
+        _last_rows = []
 
         # ---- Pagination fast-path ----
         # Only fires when the question is PURELY about seeing more of the last result —
@@ -807,15 +951,33 @@ class AgentOrchestrator:
                                   {"sql": prev.sql}, er, 0)
                     steps.append(s); _emit(s)
                     if er.get("success"):
-                        ans = self._synthesize(question, "execute_sql", er, max_display_rows=100)
+                        ans = self._synthesize(question, "execute_sql", er, max_display_rows=100, sql=prev.sql)
                         stats.total_wall_ms = int((time.time() - query_start) * 1000)
                         exec_data = er.get("result", {})
                         if session is not None:
+                            _pg_name, _pg_candidates = self._extract_disambiguation(
+                                prev.sql, exec_data.get("rows", []), exec_data.get("columns", [])
+                            )
+                            _pg_origin = (
+                                (prev.disambiguation_origin_question or prev.question)
+                                if _pg_name else ""
+                            )
+                            _, _pg_ent_candidates, _pg_ent_table, _pg_ent_alias = (
+                                self._extract_entity_disambiguation(
+                                    prev.sql, exec_data.get("rows", []), exec_data.get("columns", [])
+                                )
+                            )
                             session.add_turn(ConversationTurn(
                                 question=question, answer=ans[:300],
                                 tool_used="execute_sql", sql=prev.sql,
                                 total_count=exec_data.get("total_count", exec_data.get("row_count", 0)),
                                 columns=exec_data.get("columns", []),
+                                disambiguation_name=_pg_name,
+                                disambiguation_candidates=_pg_candidates,
+                                disambiguation_origin_question=_pg_origin,
+                                entity_disambiguation_candidates=_pg_ent_candidates,
+                                entity_disambiguation_table=_pg_ent_table,
+                                entity_disambiguation_alias=_pg_ent_alias,
                             ))
                         return AgentResult(question, ans, steps, 1, True, stats)
 
@@ -912,11 +1074,37 @@ class AgentOrchestrator:
                 steps.append(s); _emit(s)
                 stats.total_wall_ms = int((time.time() - query_start) * 1000)
                 if session is not None:
+                    _fa_name, _fa_candidates = self._extract_disambiguation(
+                        _last_sql, _last_rows, _last_columns
+                    )
+                    _fa_origin = ""
+                    if _fa_name:
+                        _fa_prev = session.turns[-1] if session.turns else None
+                        _fa_origin = (
+                            (_fa_prev.disambiguation_origin_question or _fa_prev.question)
+                            if _fa_prev and _fa_prev.disambiguation_name else question
+                        )
+                    # Entity (facility/project/client/organisation) disambiguation
+                    # STEP 2b (2+ matches) always terminates HERE, via final_answer —
+                    # not via _finish() — so this is the critical site for capturing
+                    # entity_disambiguation_candidates. Without this, a later turn
+                    # naming one entity from the list can never resolve active_subject_type.
+                    _fa_ent_name, _fa_ent_candidates, _fa_ent_table, _fa_ent_alias = (
+                        self._extract_entity_disambiguation(
+                            _last_sql, _last_rows, _last_columns
+                        )
+                    )
                     session.add_turn(ConversationTurn(
                         question=question, answer=ans[:300],
                         tool_used="final_answer", sql=_last_sql,
                         total_count=_last_total_count, columns=_last_columns,
-                    ))  # Entity extraction happens in _finish for SQL-path turns
+                        disambiguation_name=_fa_name,
+                        disambiguation_candidates=_fa_candidates,
+                        disambiguation_origin_question=_fa_origin,
+                        entity_disambiguation_candidates=_fa_ent_candidates,
+                        entity_disambiguation_table=_fa_ent_table,
+                        entity_disambiguation_alias=_fa_ent_alias,
+                    ))
                 return AgentResult(question, ans, steps, iteration, True, stats)
 
             # Enforce scope for any direct execute_sql call the LLM emits
@@ -1002,10 +1190,12 @@ class AgentOrchestrator:
                     _last_sql = sql
                     _last_total_count = _total_cnt
                     _last_columns = exec_data.get("columns", [])
+                    _last_rows = exec_data.get("rows", [])
 
                     if self._is_preparatory_result(question, er, sql):
                         messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
-                        if self._is_disambiguation_check(exec_data.get("columns", []), sql):
+                        _dcols = exec_data.get("columns", [])
+                        if is_disambiguation_result(_dcols, sql) or is_entity_disambiguation_result(_dcols, sql):
                             followup = self._disambiguation_followup_message(question, sql, exec_data)
                         else:
                             rows_preview = json.dumps(exec_data.get("rows", [])[:10], default=str)
@@ -1019,7 +1209,7 @@ class AgentOrchestrator:
                         messages.append(ChatMessage(role=MessageRole.USER, content=followup))
                         continue
 
-                    ans = self._synthesize(question, "execute_sql", er)
+                    ans = self._synthesize(question, "execute_sql", er, sql=sql)
                     return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
                 else:
@@ -1058,7 +1248,7 @@ class AgentOrchestrator:
                                              "execute_sql", {"sql": sql}, er, 0)
                             steps.append(auto); _emit(auto)
                             if er.get("success"):
-                                ans = self._synthesize(question, "execute_sql", er)
+                                ans = self._synthesize(question, "execute_sql", er, sql=sql)
                                 return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
                     # Build a focused, actionable retry note.
@@ -1071,7 +1261,8 @@ class AgentOrchestrator:
 
             # Path B: terminal tools → synthesize and return
             if tool in self._TERMINAL_TOOLS and result.get("success"):
-                ans = self._synthesize(question, tool, result)
+                ans = self._synthesize(question, tool, result,
+                                        sql=args.get("sql", "") if tool == "execute_sql" else "")
                 return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
             # Path C: non-terminal → continue reasoning
@@ -1092,10 +1283,31 @@ class AgentOrchestrator:
         steps.append(s); _emit(s)
         stats.total_wall_ms = int((time.time() - query_start) * 1000)
         if session is not None:
+            _fs_name, _fs_candidates = self._extract_disambiguation(
+                _last_sql, _last_rows, _last_columns
+            )
+            _fs_origin = ""
+            if _fs_name:
+                _fs_prev = session.turns[-1] if session.turns else None
+                _fs_origin = (
+                    (_fs_prev.disambiguation_origin_question or _fs_prev.question)
+                    if _fs_prev and _fs_prev.disambiguation_name else question
+                )
+            _fs_ent_name, _fs_ent_candidates, _fs_ent_table, _fs_ent_alias = (
+                self._extract_entity_disambiguation(
+                    _last_sql, _last_rows, _last_columns
+                )
+            )
             session.add_turn(ConversationTurn(
                 question=question, answer=ans[:300], tool_used="forced_summary",
                 sql=_last_sql, total_count=_last_total_count, columns=_last_columns,
-            ))  # Note: entity extraction not available in forced-summary path
+                disambiguation_name=_fs_name,
+                disambiguation_candidates=_fs_candidates,
+                disambiguation_origin_question=_fs_origin,
+                entity_disambiguation_candidates=_fs_ent_candidates,
+                entity_disambiguation_table=_fs_ent_table,
+                entity_disambiguation_alias=_fs_ent_alias,
+            ))
         return AgentResult(question, ans, steps, max_iterations, False, stats)
 
     def test_connection(self):
@@ -1164,7 +1376,7 @@ class AgentOrchestrator:
                     break
 
         # Extract key entities from result rows for follow-up context
-        insp_ids, fac_names, insp_names, cycle_ids = [], [], [], []
+        insp_ids, fac_names, insp_names, cycle_ids, user_ids = [], [], [], [], []
         single_row_vals = {}
         _UUID_PAT = re.compile(
             r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
@@ -1190,6 +1402,20 @@ class AgentOrchestrator:
                 v = row.get(col)
                 if v and str(v) not in cycle_ids and _UUID_PAT.match(str(v).strip()):
                     cycle_ids.append(str(v).strip())
+            # Capture resolved user UUID from disambiguation queries (SELECT u.id AS user_id)
+            for col in ("user_id",):
+                v = row.get(col)
+                if v and str(v) not in user_ids and _UUID_PAT.match(str(v).strip()):
+                    user_ids.append(str(v).strip())
+
+        # get_answers result rows don't have inspection_id as a column — pull it from the tool args
+        if not insp_ids:
+            for step in reversed(steps):
+                if step.tool == "get_answers" and step.args:
+                    _ga_insp = step.args.get("inspection_id")
+                    if _ga_insp and str(_ga_insp) not in insp_ids:
+                        insp_ids.append(str(_ga_insp))
+                    break
 
         # If only 1 row, store all values for maximum context
         if len(last_rows) == 1 and last_rows[0]:
@@ -1208,6 +1434,8 @@ class AgentOrchestrator:
         active_subject_type = ""
         active_subject_value = ""
         active_subject_label = ""
+        active_subject_table = ""
+        active_subject_alias = ""
 
         if len(cycle_ids) == 1:
             active_subject_type = "cycle"
@@ -1229,12 +1457,39 @@ class AgentOrchestrator:
         # has no conflicting subject (e.g. a COUNT query with no facility_name column),
         # inherit the scope so it persists across multi-turn drilldowns.
         elif session and session.turns:
-            for prev_turn in reversed(session.turns):
-                if prev_turn.active_subject_type and prev_turn.active_subject_value:
-                    active_subject_type = prev_turn.active_subject_type
-                    active_subject_value = prev_turn.active_subject_value
-                    active_subject_label = prev_turn.active_subject_label
-                    break
+            _prev_turn = session.turns[-1]
+            # This turn ran no new SQL that names a single entity (e.g. it's
+            # just "Adnoc Schools- Ghayathi" answering "which one did you
+            # mean?"). If it's an exact pick from the PREVIOUS turn's entity
+            # disambiguation list, resolve the scope directly instead of
+            # falling through to "no active subject". Facility keeps the
+            # dedicated "facility" type (tested wording); project/client/
+            # organisation use the generic "entity" type, carrying their
+            # table/alias so build_context_block can build a correct filter.
+            if _prev_turn.entity_disambiguation_candidates:
+                _ed_q = re.sub(r"[?.!,;:]+$", "", question.strip()).strip().lower()
+                _ed_matches = [
+                    c for c in _prev_turn.entity_disambiguation_candidates
+                    if c.get("name", "").strip().lower() == _ed_q
+                ]
+                if len(_ed_matches) == 1:
+                    if _prev_turn.entity_disambiguation_table == "facility":
+                        active_subject_type = "facility"
+                    else:
+                        active_subject_type = "entity"
+                        active_subject_table = _prev_turn.entity_disambiguation_table
+                        active_subject_alias = _prev_turn.entity_disambiguation_alias
+                    active_subject_value = _ed_matches[0]["name"]
+                    active_subject_label = _ed_matches[0]["name"]
+            if not active_subject_type:
+                for prev_turn in reversed(session.turns):
+                    if prev_turn.active_subject_type and prev_turn.active_subject_value:
+                        active_subject_type = prev_turn.active_subject_type
+                        active_subject_value = prev_turn.active_subject_value
+                        active_subject_label = prev_turn.active_subject_label
+                        active_subject_table = prev_turn.active_subject_table
+                        active_subject_alias = prev_turn.active_subject_alias
+                        break
 
         if session is not None:
             # MT-03 fix: if we have a facility name but no inspection_id (e.g. MT-01
@@ -1260,6 +1515,35 @@ class AgentOrchestrator:
                 except Exception:
                     pass  # Silently skip — follow-up will have less context
 
+            # Detect if this turn was a disambiguation query (user_id + name cols)
+            _disambig_name, _disambig_candidates = self._extract_disambiguation(
+                last_sql, last_rows, last_cols
+            )
+            _is_disambig = bool(_disambig_name)
+
+            # Detect if this turn was an entity disambiguation query (id + name
+            # + inspection_count cols) so a later exact pick from this list can
+            # resolve active_subject_type (see the elif branch above).
+            _, _ent_disambig_candidates, _ent_disambig_table, _ent_disambig_alias = (
+                self._extract_entity_disambiguation(last_sql, last_rows, last_cols)
+            )
+
+            # Carry forward the ORIGINAL question that started this disambiguation
+            # chain. Without this, a multi-turn narrowing sequence ("list schedules
+            # for neenu" → too many → "neenu qa inspector") loses track of the real
+            # goal (schedules) once the model is a couple of turns deep into just
+            # resolving the name, and answers "here's the person" instead of
+            # actually running the original request.
+            _disambig_origin_question = ""
+            if _is_disambig:
+                _prev_last = session.turns[-1] if session.turns else None
+                if _prev_last and _prev_last.disambiguation_name:
+                    _disambig_origin_question = (
+                        _prev_last.disambiguation_origin_question or _prev_last.question
+                    )
+                else:
+                    _disambig_origin_question = question
+
             session.add_turn(ConversationTurn(
                 question=question,
                 answer=answer[:300],
@@ -1271,10 +1555,19 @@ class AgentOrchestrator:
                 facility_names=fac_names[:5],
                 inspector_names=insp_names[:5],
                 cycle_ids=cycle_ids[:3],
+                user_ids=user_ids[:5],
+                disambiguation_name=_disambig_name,
+                disambiguation_candidates=_disambig_candidates,
+                disambiguation_origin_question=_disambig_origin_question,
+                entity_disambiguation_candidates=_ent_disambig_candidates,
+                entity_disambiguation_table=_ent_disambig_table,
+                entity_disambiguation_alias=_ent_disambig_alias,
                 single_row_values=single_row_vals,
                 active_subject_type=active_subject_type,
                 active_subject_value=active_subject_value,
                 active_subject_label=active_subject_label,
+                active_subject_table=active_subject_table,
+                active_subject_alias=active_subject_alias,
             ))
 
         _final_stats = stats or QueryStats()
@@ -1298,7 +1591,7 @@ class AgentOrchestrator:
     _LIST_ALL_RE = re.compile(
         r'\b(show\s+all|list\s+all|all\s+forms|every\s+form)\b', re.IGNORECASE)
 
-    def _synthesize(self, question, tool_name, tool_result, max_display_rows=20):
+    def _synthesize(self, question, tool_name, tool_result, max_display_rows=20, sql=""):
         data = tool_result.get("result", {})
         q_lower = question.lower()
 
@@ -1428,6 +1721,40 @@ class AgentOrchestrator:
             truncated = data.get("truncated", False)
             total_count = data.get("total_count", len(rows))
 
+            # Disambiguation result — user_id + name columns, searched by ILIKE
+            # on first_name/last_name → format as choice list. Shared check
+            # (core.disambiguation) so this agrees with fastapi_app.py's
+            # dashboard-suppression logic for the same result.
+            if is_disambiguation_result(cols, sql):
+                if not rows:
+                    return "No users found matching that name."
+                name_col = next((c for c in cols if c.lower() == "name"), "name")
+                count_col = next((c for c in cols if c.lower() in
+                                  {"inspection_count", "count", "total"}), None)
+                if total_count > 12:
+                    return (
+                        f"I found {total_count} people matching that name — too many to list. "
+                        f"Could you provide a more specific full name or email address?"
+                    )
+                if total_count == 1:
+                    row = rows[0]
+                    name = row.get(name_col, "")
+                    uid = row.get("user_id", "")
+                    return f"Found exactly 1 match: **{name}** (user_id: `{uid}`). Proceeding with your request."
+                # 2–12: list them as choices
+                email_col = next((c for c in cols if c.lower() == "email"), None)
+                lines = [f"I found {total_count} people matching that name:"]
+                for r in rows[:12]:
+                    name = r.get(name_col, "?")
+                    parts = [f"  • {name}"]
+                    if count_col and r.get(count_col) is not None:
+                        parts.append(f"({r[count_col]} inspections)")
+                    if email_col and r.get(email_col):
+                        parts.append(f"— {r[email_col]}")
+                    lines.append(" ".join(parts))
+                lines.append("\nWhich one did you mean?")
+                return "\n".join(lines)
+
             # Single-row aggregate
             if len(rows) == 1 and len(cols) <= 3:
                 agg_names = {
@@ -1503,7 +1830,8 @@ class AgentOrchestrator:
                               "client_id", "inspector_user_id", "inspectee_user_id",
                               "inspection_report_id", "question_id",
                               "inspection_type_id", "inspection_sub_type_id",
-                              "cycle_id", "schedule_id", "entity_id"}
+                              "cycle_id", "schedule_id", "entity_id",
+                              "user_id"}
                 displayable_cols = [c for c in rows[0].keys() if c not in _HIDE_COLS]
                 if len(rows) > 1:
                     for col in displayable_cols:
@@ -1699,19 +2027,77 @@ class AgentOrchestrator:
         return content
 
     @staticmethod
-    def _is_disambiguation_check(columns: list[str], sql: str) -> bool:
+    def _extract_disambiguation(sql: str, rows: list, columns: list[str]) -> tuple[str, list[dict]]:
         """
-        True if this result is an AMBIGUOUS REFERENCE RULE STEP 1 existence/count
-        check — both templates (people: id+name; entity: id+name+inspection_count)
-        produce this exact column shape combined with a partial-match ILIKE filter.
-        Shared by _is_preparatory_result (decides whether to loop back to Llama)
-        and the follow-up-message builder (decides which instructions to send).
+        If `columns` matches the people-disambiguation shape (user_id + name),
+        extract the searched name from `sql` and the (name, user_id) candidate
+        pairs from `rows`. Returns ("", []) otherwise.
+
+        Shared by every ConversationTurn construction site so the STOP-guard /
+        exact-match / origin-question context (see build_context_block) works
+        regardless of which code path produced the disambiguation result —
+        previously only the main _finish() path populated these fields, so a
+        disambiguation result reaching the user via the final_answer branch or
+        a pagination replay silently dropped this context on the next turn.
         """
-        col_set = {c.lower() for c in columns}
-        return (
-            col_set in ({"id", "name"}, {"id", "name", "inspection_count"})
-            and "ilike '%" in sql.lower()
-        )
+        if not is_disambiguation_result(columns, sql):
+            return "", []
+
+        # Anchor to the first_name/last_name reference, then take the NEXT ILIKE
+        # after it — a plain "first ILIKE anywhere in the SQL" search can grab an
+        # unrelated earlier filter (e.g. a facility-name ILIKE) when the query
+        # combines a name check with other conditions.
+        name_col_pos = re.search(r"first_name|last_name", sql, re.IGNORECASE)
+        search_from = sql[name_col_pos.start():] if name_col_pos else sql
+        m = re.search(r"ILIKE\s+'%([^%]+)%'", search_from, re.IGNORECASE)
+        name = m.group(1).strip() if m else "?"
+
+        candidates = []
+        for row in rows[:20]:
+            if not isinstance(row, dict):
+                continue
+            nm, uid = row.get("name"), row.get("user_id")
+            if nm and uid and _UUID_RE.match(str(uid).strip()):
+                candidates.append({"name": str(nm).strip(), "user_id": str(uid).strip()})
+        return name, candidates
+
+    @staticmethod
+    def _extract_entity_disambiguation(sql: str, rows: list, columns: list[str]) -> tuple[str, list[dict], str, str]:
+        """
+        If `columns`/`sql` match the STEP 1 entity count-check shape (id +
+        name + inspection_count, ILIKE on a known entity table — see
+        is_entity_disambiguation_result) produced by the AMBIGUOUS REFERENCE
+        RULE for "at <facility/project/client/organisation>"-style queries,
+        extract the searched name, the (name, inspection_count) candidate
+        rows, and the table/alias that was searched.
+
+        Without this, an entity disambiguation list ("4 facilities match
+        'adnoc'") is never remembered: the generic facility_names extraction
+        in _finish() only looks for a "facility_name"/"facility" column, which
+        this template doesn't produce (it selects bare "name"). So when the
+        user later names one entity from that list, that turn runs no new
+        SQL of its own and active_subject_type is never set — the scope
+        silently vanishes on the very next follow-up question.
+        """
+        entity = is_entity_disambiguation_result(columns, sql)
+        if entity is None:
+            return "", [], "", ""
+        table, alias = entity
+
+        m = re.search(rf"{re.escape(alias)}\.name\s+ilike\s+'%([^%]+)%'", sql, re.IGNORECASE)
+        name = m.group(1).strip() if m else "?"
+
+        candidates = []
+        for row in rows[:20]:
+            if not isinstance(row, dict):
+                continue
+            nm = row.get("name")
+            if nm:
+                candidates.append({
+                    "name": str(nm).strip(),
+                    "inspection_count": row.get("inspection_count") or 0,
+                })
+        return name, candidates, table, alias
 
     def _disambiguation_followup_message(self, question: str, sql: str, exec_data: dict) -> str:
         """
@@ -1720,35 +2106,46 @@ class AgentOrchestrator:
         message — which previously caused Llama to statistically summarize the
         disambiguation table (MAX/SUM of inspection_count) instead of recognizing
         2+ rows as the STEP 2b "which one did you mean?" trigger.
+
+        Branches on `is_disambiguation_result` (people: user_id+name), not on
+        "inspection_count" presence — both real people templates can include
+        inspection_count too, so that heuristic would misroute a people result
+        into the entity/facility wording below. Callers gate on
+        `is_disambiguation_result(...) or is_entity_disambiguation_result(...)`
+        before calling this, so exactly one of the two branches applies.
         """
         rows = exec_data.get("rows", [])
-        columns = [c.lower() for c in exec_data.get("columns", [])]
+        columns = exec_data.get("columns", [])
         m = re.search(r"ilike '%(.+?)%'", sql, re.IGNORECASE)
         name_filter = m.group(1) if m else "?"
 
-        if "inspection_count" in columns:
-            # Entity template — only candidates with inspections > 0 are useful
-            # answers to "show inspections at X"; zero-inspection facilities are
-            # real matches but not relevant choices.
+        if not is_disambiguation_result(columns, sql):
+            # Entity template (facility/project/client/organisation) — only
+            # candidates with inspections > 0 are useful answers to "show
+            # inspections at X"; zero-inspection entities are real matches
+            # but not relevant choices.
+            _entity = is_entity_disambiguation_result(columns, sql)
+            table, alias = _entity if _entity else ("facility", "fac")
+            table_plural = table[:-1] + "ies" if table.endswith("y") else table + "s"
             nonzero = [r for r in rows if (r.get("inspection_count") or 0) > 0]
             if len(nonzero) == 0:
                 return (
-                    f"STEP 1 disambiguation check found {len(rows)} facilities matching "
+                    f"STEP 1 disambiguation check found {len(rows)} {table_plural} matching "
                     f"'{name_filter}', but NONE have any inspections.\n"
                     f"Original question: \"{question}\"\n"
-                    f"Call final_answer stating no inspections were found at any facility "
+                    f"Call final_answer stating no inspections were found at any {table} "
                     f"matching '{name_filter}'."
                 )
             elif len(nonzero) == 1:
                 r = nonzero[0]
                 return (
-                    f"STEP 1 disambiguation check: exactly ONE facility matching "
+                    f"STEP 1 disambiguation check: exactly ONE {table} matching "
                     f"'{name_filter}' has inspections — '{r.get('name')}' "
                     f"({r.get('inspection_count')} inspections).\n"
                     f"Original question: \"{question}\"\n"
                     f"This is STEP 2a — call generate_sql again using "
-                    f"fac.name ILIKE '%{r.get('name')}%' to filter by this facility. "
-                    f"Do NOT use fac.id UUID — the SQL model ignores UUID filters "
+                    f"{alias}.name ILIKE '%{r.get('name')}%' to filter by this {table}. "
+                    f"Do NOT use {alias}.id UUID — the SQL model ignores UUID filters "
                     f"and will generate ILIKE anyway. Use the exact name directly."
                 )
             else:
@@ -1757,18 +2154,18 @@ class AgentOrchestrator:
                     for r in nonzero
                 )
                 return (
-                    f"STEP 1 disambiguation check: {len(nonzero)} facilities matching "
+                    f"STEP 1 disambiguation check: {len(nonzero)} {table_plural} matching "
                     f"'{name_filter}' have inspections (out of {len(rows)} total matches).\n"
                     f"Original question: \"{question}\"\n"
                     f"This is STEP 2b — call final_answer NOW with EXACTLY this format "
                     f"(do not compute totals, leaders, sums, or any other statistic; do "
                     f"not call generate_sql again):\n"
-                    f"\"I found {len(nonzero)} facilities matching '{name_filter}':\n"
+                    f"\"I found {len(nonzero)} {table_plural} matching '{name_filter}':\n"
                     f"{options}\n"
                     f"Which one did you mean?\""
                 )
         else:
-            # People template — no count column, list all matched names
+            # People template — list all matched names
             if len(rows) == 0:
                 return (
                     f"STEP 1 disambiguation check found NO users matching "
@@ -1811,11 +2208,11 @@ class AgentOrchestrator:
         columns = [c.lower() for c in data.get("columns", [])]
         row_count = data.get("row_count", 0)
 
-        # AMBIGUOUS REFERENCE RULE STEP 1 check — see _is_disambiguation_check.
+        # AMBIGUOUS REFERENCE RULE STEP 1 check (people OR entity shape).
         # Without this, STEP 1 results render directly as a table and Llama
         # never gets to branch into STEP 2a/2b — the disambiguation flow
         # silently becomes a dead-end table dump.
-        if self._is_disambiguation_check(columns, sql):
+        if is_disambiguation_result(columns, sql) or is_entity_disambiguation_result(columns, sql):
             return True
 
         wants_content = bool(re.search(
