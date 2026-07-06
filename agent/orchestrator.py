@@ -1047,6 +1047,13 @@ class AgentOrchestrator:
         ]
         steps = []
         gen_sql_failures = 0
+        # Separate from gen_sql_failures (which gates the "force-execute after
+        # 3 validation failures" safety valve) — this only signals generate_sql
+        # to drop the seed example it's fixating on. Incremented on BOTH
+        # validation failures and execution failures (the latter includes bugs
+        # invisible to the static validator, e.g. an ORDER BY/GROUP BY term
+        # referencing a SELECT alias the model dropped).
+        _sql_retry_signal = 0
         _last_sql = ""
         _last_total_count = 0
         _last_columns = []
@@ -1233,6 +1240,11 @@ class AgentOrchestrator:
                 except Exception:
                     args["_inject_rule_ids"] = []
 
+                # Tells generate_sql this is a post-failure retry so it can
+                # drop the seed example the SQL-gen model is fixating on
+                # (see SeedExampleIndex.retrieve's skip_top_match).
+                args["_retry_attempt"] = _sql_retry_signal
+
                 # Preserve explicit LIMIT from user question
                 limit_match = re.search(
                     r'\b(?:last|top|first|recent|latest)\s+(\d+)\b', question, re.IGNORECASE
@@ -1360,6 +1372,7 @@ class AgentOrchestrator:
                     if not er.get("success"):
                         _log_sql.warning("[SQL ] %siter=%d execution FAIL in %dms — %s",
                                          _pfx, iteration, _exec_ms, er.get("error", "?")[:200])
+                        _sql_retry_signal += 1
                         messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
                         hint = self._schema_hint_for_error(er.get("error", ""))
                         err_msg = er.get("error", "")
@@ -1402,6 +1415,7 @@ class AgentOrchestrator:
 
                 else:
                     gen_sql_failures += 1
+                    _sql_retry_signal += 1
                     val_data = sql_data.get("validation", {})
                     errs = val_data.get("errors", ["unknown"])
 

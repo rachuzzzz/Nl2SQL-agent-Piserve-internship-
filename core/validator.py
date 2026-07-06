@@ -1425,6 +1425,71 @@ class SQLValidator:
                 if len(new_joins) < len(joins):
                     sel.set("joins", new_joins)
 
+        # ── 6. Drop ORDER BY / GROUP BY terms referencing an undefined alias ──
+        # Weak SQL-gen models (e.g. small local models) frequently copy a seed
+        # example's ORDER BY/GROUP BY clause referencing a SELECT alias they
+        # themselves dropped from the SELECT list one line earlier — e.g.
+        # `SELECT ... FROM ... ORDER BY last_inspection_date` where
+        # `last_inspection_date` was never actually selected. Postgres would
+        # reject this with "column ... does not exist" / the validator's
+        # UNDEFINED_ALIAS check. Removing the dangling sort/group term is
+        # always safe: it loses only ordering/grouping, never row content.
+        # Deliberately conservative — UNSAFE to touch SELECT columns, WHERE,
+        # HAVING, or JOIN ON referencing an undefined alias (those change
+        # which rows/values come back), so those are left for the validator
+        # to hard-fail and trigger a real LLM retry instead.
+        _introduced_all: set = set()
+        for t in tree.find_all(exp.Table):
+            if t.alias:
+                _introduced_all.add(t.alias.lower())
+            if t.name:
+                _introduced_all.add(t.name.lower())
+        for cte in tree.find_all(exp.CTE):
+            if cte.alias:
+                _introduced_all.add(cte.alias.lower())
+        for sq in tree.find_all(exp.Subquery):
+            if sq.alias:
+                _introduced_all.add(sq.alias.lower())
+
+        if _introduced_all:
+            _undefined_all: set = set()
+            for col in tree.find_all(exp.Column):
+                if col.table and col.table.lower() not in _introduced_all:
+                    _undefined_all.add(col.table.lower())
+
+            if _undefined_all:
+                def _refs_undefined(node) -> bool:
+                    return any(
+                        isinstance(c, exp.Column)
+                        and c.table and c.table.lower() in _undefined_all
+                        for c in node.find_all(exp.Column)
+                    )
+
+                for sel in tree.find_all(exp.Select):
+                    order = sel.args.get("order")
+                    if order is not None:
+                        kept = [o for o in order.expressions if not _refs_undefined(o)]
+                        if len(kept) < len(order.expressions):
+                            for o in order.expressions:
+                                if _refs_undefined(o):
+                                    mutations.append(
+                                        f"Removed ORDER BY term referencing "
+                                        f"undefined alias: {o.sql(dialect='postgres')}"
+                                    )
+                            sel.set("order", exp.Order(expressions=kept) if kept else None)
+
+                    group = sel.args.get("group")
+                    if group is not None:
+                        kept_g = [g for g in group.expressions if not _refs_undefined(g)]
+                        if len(kept_g) < len(group.expressions):
+                            for g in group.expressions:
+                                if _refs_undefined(g):
+                                    mutations.append(
+                                        f"Removed GROUP BY term referencing "
+                                        f"undefined alias: {g.sql(dialect='postgres')}"
+                                    )
+                            sel.set("group", exp.Group(expressions=kept_g) if kept_g else None)
+
         if not mutations:
             return sql, []
 

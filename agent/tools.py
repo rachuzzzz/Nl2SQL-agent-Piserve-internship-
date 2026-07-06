@@ -469,6 +469,7 @@ def generate_sql(
     _seed_index=None,
     _db_schema=None,
     _active_cycle_uuid: str = "",
+    _retry_attempt: int = 0,
 ) -> dict[str, Any]:
     try:
         # Schema block — use the slim version to keep context under ~600 tokens.
@@ -501,7 +502,16 @@ def generate_sql(
             )
         if _seed_index is not None:
             try:
-                retrieved = _seed_index.format_for_prompt(question, top_k=4)
+                # On a retry, a weak SQL-gen model tends to reproduce its single
+                # closest seed example almost verbatim — including whatever
+                # fragment triggered the validator failure — ignoring the
+                # planner's corrected schema_hint entirely. Dropping that one
+                # example forces the model to actually use schema_hint instead
+                # of re-copying the same broken pattern (see validator retry
+                # loop in orchestrator.py which increments gen_sql_failures).
+                retrieved = _seed_index.format_for_prompt(
+                    question, top_k=4, skip_top_match=bool(_retry_attempt)
+                )
             except Exception:
                 retrieved = ""
         else:
@@ -943,6 +953,10 @@ class ToolRegistry:
                 )
 
             if name == "generate_sql":
+                try:
+                    _retry_attempt = int(args.get("_retry_attempt", 0))
+                except (TypeError, ValueError):
+                    _retry_attempt = 0
                 return generate_sql(
                     self._sql_llm, self._validator,
                     question=str(args["question"]),
@@ -954,6 +968,7 @@ class ToolRegistry:
                     _seed_index=self._seed_index,
                     _db_schema=self._db_schema,
                     _active_cycle_uuid=str(args.get("_active_cycle_uuid", "")),
+                    _retry_attempt=_retry_attempt,
                 )
 
             if name == "execute_sql":

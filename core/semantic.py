@@ -468,7 +468,7 @@ class SeedExampleIndex:
         content = [w for w in words if w not in stop]
         return ' '.join(content[:4])
 
-    def retrieve(self, query: str, top_k: int = 4) -> list:
+    def retrieve(self, query: str, top_k: int = 4, skip_top_match: bool = False) -> list:
         """
         Three-stage retrieval + reranking with intent pre-filtering:
           Stage 0: intent pre-filter — 'which single X' queries only see
@@ -477,6 +477,13 @@ class SeedExampleIndex:
           Stage 1: domain-tagged cosine similarity → top_k * RERANK_FACTOR candidates
           Stage 2: rerank — CrossEncoder if available, else augmented embedding fallback
           Stage 3: deduplicate by 4-word NL fingerprint → return top_k
+
+        skip_top_match: drop the single best-scoring example before returning.
+          Use on a SQL-gen retry — a weak model tends to reproduce its single
+          closest seed example almost verbatim (including the fragment that
+          triggered the validator failure) regardless of an updated
+          schema_hint. Removing that one example forces it to lean on the
+          corrected schema_hint instead of re-copying the same broken pattern.
         """
         if self.embeddings is None or not self.examples:
             return []
@@ -557,6 +564,8 @@ class SeedExampleIndex:
             reranked.sort(key=lambda x: x[1], reverse=True)
 
         # ── Stage 3: NL-prefix deduplication ─────────────────────────────────
+        # Fetch one extra when skip_top_match will drop the best hit below.
+        _fetch_k = top_k + 1 if skip_top_match else top_k
         seen: set = set()
         deduped   = []
         for i, score in reranked:
@@ -566,8 +575,10 @@ class SeedExampleIndex:
             if fp not in seen:
                 seen.add(fp)
                 deduped.append(ex)
-            if len(deduped) >= top_k:
+            if len(deduped) >= _fetch_k:
                 break
+        if skip_top_match and deduped:
+            deduped = deduped[1:]
         return deduped
 
     @classmethod
@@ -592,13 +603,13 @@ class SeedExampleIndex:
             return 'trend'
         return 'general'
 
-    def format_for_prompt(self, query: str, top_k: int = 4) -> str:
+    def format_for_prompt(self, query: str, top_k: int = 4, skip_top_match: bool = False) -> str:
         """
         Retrieve top examples and format them as a SQL comment block
         suitable for injection into the SQL generation prompt.
         Handles both legacy tuple format and new dict format.
         """
-        examples = self.retrieve(query, top_k=top_k)
+        examples = self.retrieve(query, top_k=top_k, skip_top_match=skip_top_match)
         if not examples:
             return "-- No specific examples matched this query."
         parts = []
