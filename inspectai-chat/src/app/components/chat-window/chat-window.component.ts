@@ -158,6 +158,7 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
                     [data]="msg.resultData!"
                     [sessionId]="sessionId"
                     [messageId]="msg.id"
+                    [sourceQuestion]="msg.sourceQuestion"
                     (drilldown)="send($event)">
                   </app-result-table>
                 </div>
@@ -170,6 +171,7 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
                 [data]="msg.resultData!"
                 [sessionId]="sessionId"
                 [messageId]="msg.id"
+                [sourceQuestion]="msg.sourceQuestion"
                 (drilldown)="send($event)">
               </app-result-table>
 

@@ -10,15 +10,21 @@ export interface StepInfo {
 
 // ── Result data (table pagination) ───────────────────────────────────────────
 
+export interface DisambiguationMeta {
+  kind:        string;  // "person" | "facility" | "project" | "client" | "organisation"
+  search_term: string;  // literal text from the STEP 1 ILIKE clause, e.g. "adnoc"
+}
+
 export interface ResultData {
-  rows:         Record<string, any>[];
-  columns:      string[];
-  row_count:    number;
-  total_count?: number | null;
-  page?:        number;
-  page_size?:   number;
-  has_more?:    boolean;
-  sql:          string | null;
+  rows:            Record<string, any>[];
+  columns:         string[];
+  row_count:       number;
+  total_count?:    number | null;
+  page?:           number;
+  page_size?:      number;
+  has_more?:       boolean;
+  sql:             string | null;
+  disambiguation?: DisambiguationMeta | null;
 }
 
 // ── Chart types ───────────────────────────────────────────────────────────────
@@ -100,16 +106,20 @@ export interface ChatResponse {
 // ── Message ───────────────────────────────────────────────────────────────────
 
 export interface Message {
-  id:           string;
-  role:         'user' | 'ai';
-  text:         string;
-  timestamp:    Date;
-  debug?:       ChatResponse | null;
-  resultData?:  ResultData | null;
-  chartConfig?: ChartConfig | null;
-  chartSignal?: ChartSignal | null;   // parsed from __CHART_AVAILABLE__ signal
-  chartMode?:   'quick' | 'control';  // 'quick' = plain render, 'control' = switcher+axis
-  dashboard?:   DashboardData | null;
+  id:              string;
+  role:            'user' | 'ai';
+  text:            string;
+  timestamp:       Date;
+  debug?:          ChatResponse | null;
+  resultData?:     ResultData | null;
+  chartConfig?:    ChartConfig | null;
+  chartSignal?:    ChartSignal | null;   // parsed from __CHART_AVAILABLE__ signal
+  chartMode?:      'quick' | 'control';  // 'quick' = plain render, 'control' = switcher+axis
+  dashboard?:      DashboardData | null;
+  sourceQuestion?: string;  // the user question that produced this AI message's resultData —
+                             // lets a drilldown click on the resulting table build a follow-up
+                             // that preserves what the user actually asked about (e.g. "corrective
+                             // actions") instead of always assuming "inspections"
 }
 
 // ── Conversation ──────────────────────────────────────────────────────────────

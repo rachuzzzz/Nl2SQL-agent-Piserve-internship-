@@ -18,7 +18,7 @@ import { ResultData } from '../../models/chat.model';
       <!-- Drilldown hint bar -->
       <div class="drilldown-hint" *ngIf="isDrilldown">
         <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zm.75 4.75a.75.75 0 00-1.5 0v3.5H5.5a.75.75 0 000 1.5h3.25V5.75z"/></svg>
-        Click a row to drill down
+        {{ display.disambiguation ? 'Click a row to select' : 'Click a row to drill down' }}
       </div>
 
       <div class="table-scroll">
@@ -190,9 +190,11 @@ import { ResultData } from '../../models/chat.model';
 })
 export class ResultTableComponent implements OnChanges {
 
-  @Input()  data!:      ResultData;
-  @Input()  sessionId!: string;
-  @Input()  messageId!: string;
+  @Input()  data!:           ResultData;
+  @Input()  sessionId!:      string;
+  @Input()  messageId!:      string;
+  @Input()  sourceQuestion?: string;  // the question that produced `data` — used to infer
+                                       // drilldown intent (see resolveSubject())
   @Output() drilldown = new EventEmitter<string>();  // emits message text to send
 
   display!:    ResultData;
@@ -226,7 +228,16 @@ export class ResultTableComponent implements OnChanges {
    * 'conducted' and 'completed' are summary labels, not entity names.
    */
   get isDrilldown(): boolean {
-    if (!this.display?.columns || this.display.columns.length !== 2) return false;
+    if (!this.display?.columns) return false;
+
+    // Backend-confirmed disambiguation pick-list (core.disambiguation's
+    // is_disambiguation_result / is_entity_disambiguation_result) — always
+    // drillable regardless of row count. These can legitimately run into the
+    // hundreds (a broad name search), paginated at 50/page, so the generic
+    // heuristic's 20-row cap below must not apply here.
+    if (this.display.disambiguation && this.display.rows.length >= 1) return true;
+
+    if (this.display.columns.length !== 2) return false;
     if (this.display.rows.length > 20 || this.display.rows.length < 2) return false;
 
     const cols   = this.display.columns;
@@ -255,31 +266,75 @@ export class ResultTableComponent implements OnChanges {
     return typeof second === 'number' || !isNaN(Number(second));
   }
 
+  // Subject phrases to look for in the question that produced this table,
+  // ordered by specificity. The FIRST one found in `sourceQuestion` wins.
+  // Falls back to 'inspections' when nothing matches (the original behaviour) —
+  // most drilldown tables (by inspector, by facility, ...) really are inspection
+  // counts, but "corrective actions at X" / "schedules for X" etc. must not be
+  // silently rewritten to an inspections query on click.
+  private static readonly SUBJECT_PATTERNS: Array<[RegExp, string]> = [
+    [/corrective\s*actions?/i,          'corrective actions'],
+    [/mitigative\s*actions?/i,          'mitigative actions'],
+    [/inspection\s*cycles?|\bcycles?\b/i, 'inspection cycles'],
+    [/inspection\s*schedules?|\bschedules?\b/i, 'inspection schedules'],
+    [/form\s*answers?|question\s*answers?/i, 'form answers'],
+    [/findings?/i,                      'findings'],
+    [/observations?/i,                  'observations'],
+  ];
+
+  /** Infer what the user actually asked about from `sourceQuestion`. */
+  private resolveSubject(): string {
+    const q = this.sourceQuestion ?? '';
+    for (const [re, label] of ResultTableComponent.SUBJECT_PATTERNS) {
+      if (re.test(q)) return label;
+    }
+    return 'inspections';
+  }
+
   /**
    * When a drilldown row is clicked, emit a message requesting the DETAIL LIST
-   * for that entity — not a recount. Phrasing "list of X inspections" signals
-   * Llama to return inspection rows (inspection_id, facility, status, submitted_on)
-   * rather than a COUNT(*).
+   * for that entity — not a recount. Preferred path: the backend already told
+   * us (via `display.disambiguation`, computed from the same SQL that
+   * produced this table — see core.disambiguation.extract_search_term)
+   * exactly what search term was ambiguous. Substituting the resolved entity
+   * name for just that term inside `sourceQuestion` preserves everything else
+   * the user actually asked for — subject, verb, even typos — e.g.
+   * "list corrective actions at adnoc" → "list corrective actions at Adnoc
+   * Schools- Ruwais". Works uniformly for any kind (person, facility,
+   * project, client, organisation) with no per-kind branching needed here.
+   * Falls back to a generic "list of <subject> by/at/for <value>" phrasing
+   * (subject guessed from keywords) when there's no disambiguation metadata —
+   * e.g. clicking a plain "inspections per inspector" summary row.
    */
   onRowClick(row: Record<string, any>): void {
     const labelCol = this.display.columns[0];
-    const countCol = this.display.columns[1];
     const value    = row[labelCol];
-    const count    = row[countCol];
     if (!value) return;
 
-    // Build a natural-language detail request based on the column name
+    const origin = this.sourceQuestion?.trim();
+    const term   = this.display.disambiguation?.search_term;
+    if (origin && term) {
+      const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(escaped, 'i');
+      if (re.test(origin)) {
+        this.drilldown.emit(origin.replace(re, value));
+        return;
+      }
+    }
+
+    // Fallback — build a generic detail request based on the column name
     // so Llama understands to return rows, not an aggregate
-    const colName = labelCol.toLowerCase();
+    const subject = this.resolveSubject();
+    const colName  = labelCol.toLowerCase();
     if (colName.includes('inspector') || colName.includes('name')) {
-      this.drilldown.emit(`show me the list of inspections by ${value}`);
+      this.drilldown.emit(`show me the list of ${subject} by ${value}`);
     } else if (colName.includes('facility')) {
-      this.drilldown.emit(`show me the list of inspections at ${value}`);
+      this.drilldown.emit(`show me the list of ${subject} at ${value}`);
     } else if (colName.includes('region') || colName.includes('country') || colName.includes('project')) {
-      this.drilldown.emit(`show me the list of inspections for ${value}`);
+      this.drilldown.emit(`show me the list of ${subject} for ${value}`);
     } else {
-      // Generic fallback — "show inspections where <col> is <value>"
-      this.drilldown.emit(`show me inspections where ${labelCol.replace(/_/g, ' ')} is ${value}`);
+      // Generic fallback — "show <subject> where <col> is <value>"
+      this.drilldown.emit(`show me ${subject} where ${labelCol.replace(/_/g, ' ')} is ${value}`);
     }
   }
 
