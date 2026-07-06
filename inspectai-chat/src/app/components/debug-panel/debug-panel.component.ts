@@ -288,11 +288,10 @@ function fmtTok(n: number): string {
     .dh-toggle {
       width: 28px; height: 28px; display: grid; place-items: center;
       background: var(--surface-2); border: 1px solid var(--border);
-      border-radius: 7px; cursor: pointer; color: var(--text-2);
-      flex-shrink: 0; transition: background 0.14s, color 0.14s;
+      border-radius: 10px; cursor: pointer; color: var(--text-2);
+      flex-shrink: 0; transition: background 0.14s, color 0.14s, box-shadow 0.14s;
     }
-    .dh-toggle:hover { background: var(--surface-3); color: var(--text); }
-
+    .dh-toggle:hover { background: var(--surface-3); color: var(--text); box-shadow: var(--shadow-sm); }
     .status-ring { position: relative; display: inline-flex; flex-shrink: 0; }
     .status-dot {
       width: 9px; height: 9px; border-radius: 50%; background: var(--ok);
@@ -326,8 +325,10 @@ function fmtTok(n: number): string {
       padding: 40px 20px; gap: 12px; text-align: center;
     }
     .empty-icon {
-      width: 48px; height: 48px; border-radius: 13px;
-      background: var(--blue-50); border: 1px solid var(--blue-100);
+      width: 52px; height: 52px; border-radius: 50%;
+      background: linear-gradient(145deg, var(--blue-50), var(--blue-100));
+      border: 1px solid var(--blue-200);
+      box-shadow: 0 0 0 6px rgba(27,67,255,0.06);
       display: grid; place-items: center; color: var(--accent);
     }
     .empty-text {
@@ -338,7 +339,7 @@ function fmtTok(n: number): string {
     /* Banner */
     .banner {
       display: flex; align-items: center; gap: 8px;
-      margin: 12px 14px 4px; padding: 9px 12px; border-radius: 10px;
+      margin: 12px 14px 4px; padding: 9px 14px; border-radius: 14px;
       font-size: 11.5px; font-weight: 600; font-family: var(--font-mono);
     }
     .banner-ok {
@@ -353,13 +354,18 @@ function fmtTok(n: number): string {
     }
 
     /* Section */
-    .section { border-top: 1px solid var(--border); }
+    .section {
+      margin: 6px 10px 0;
+      background: var(--surface-2); border: 1px solid var(--border);
+      border-radius: 14px; overflow: hidden;
+    }
+    .section:last-child { margin-bottom: 10px; }
     .sec-hdr {
       width: 100%; display: flex; align-items: center; gap: 8px;
-      background: none; border: none; padding: 12px 14px;
-      cursor: pointer; transition: background 0.13s;
+      background: none; border: none; padding: 11px 14px;
+      cursor: pointer; transition: background 0.13s; border-radius: 14px;
     }
-    .sec-hdr:hover { background: var(--surface-2); }
+    .sec-hdr:hover { background: var(--surface-3); }
     .sdot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
     .sec-title {
       font-size: 10.5px; font-weight: 700; letter-spacing: 0.11em;
@@ -413,15 +419,16 @@ function fmtTok(n: number): string {
 
     /* SQL block */
     .sql-block {
-      position: relative; border-radius: 11px; overflow: hidden;
+      position: relative; border-radius: 16px; overflow: hidden;
       background: var(--code-bg); border: 1px solid var(--rail-border, #232a4d);
+      box-shadow: var(--shadow-sm);
     }
     .copy-btn {
       position: absolute; top: 8px; right: 8px; z-index: 2;
       display: inline-flex; align-items: center; gap: 4px;
       background: rgba(255,255,255,0.08); color: #fff;
       border: 1px solid rgba(255,255,255,0.14);
-      border-radius: 7px; padding: 4px 8px;
+      border-radius: 10px; padding: 4px 9px;
       font-size: 10.5px; font-weight: 600; cursor: pointer;
       transition: background 0.15s;
     }
@@ -438,7 +445,7 @@ function fmtTok(n: number): string {
       font-size: 12.5px; line-height: 1.62; font-style: italic;
       color: var(--text-2);
       border-left: 2.5px solid var(--accent-soft-border, rgba(27,67,255,0.25));
-      padding-left: 11px;
+      padding-left: 11px; border-radius: 0 8px 8px 0;
     }
 
     /* Metrics */
@@ -446,9 +453,11 @@ function fmtTok(n: number): string {
       display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
     }
     .metric {
-      background: var(--surface-2); border: 1px solid var(--border);
-      border-radius: 10px; padding: 10px 12px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 14px; padding: 10px 12px;
+      transition: box-shadow 0.18s, transform 0.18s;
     }
+    .metric:hover { box-shadow: var(--shadow-sm); transform: translateY(-1px); }
     .metric-lbl {
       font-size: 9.5px; font-weight: 700; letter-spacing: 0.09em;
       color: var(--text-3); text-transform: uppercase;
@@ -463,7 +472,7 @@ function fmtTok(n: number): string {
 
     /* Session KV table */
     .kv-table {
-      border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+      border: 1px solid var(--border); border-radius: 14px; overflow: hidden;
       margin-bottom: 10px;
     }
     .kv-row {

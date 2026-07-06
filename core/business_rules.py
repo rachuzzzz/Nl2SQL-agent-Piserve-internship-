@@ -2073,7 +2073,7 @@ class RulesEngine:
     def required_tables_for(self, rule_ids: list) -> list:
         """Return all required_tables for a set of fired INJECT rule IDs."""
         tables = []
-        for rule in REGISTRY:
+        for rule in self._rules:
             if rule.get("id") in rule_ids and rule.get("type") == INJECT:
                 tables.extend(rule.get("required_tables", []))
         return list(set(tables))
@@ -2081,7 +2081,7 @@ class RulesEngine:
     def forbidden_patterns_for(self, rule_ids: list) -> list:
         """Return all forbidden_patterns for a set of fired INJECT rule IDs."""
         patterns = []
-        for rule in REGISTRY:
+        for rule in self._rules:
             if rule.get("id") in rule_ids and rule.get("type") == INJECT:
                 patterns.extend(rule.get("forbidden_patterns", []))
         return patterns

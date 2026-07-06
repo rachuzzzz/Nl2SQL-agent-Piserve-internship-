@@ -88,8 +88,10 @@ CORE_CONTEXT = """\
 --
 """ + _CAST_BLOCK + """
 --
--- inspection_schedule columns: schedule_date (NOT scheduled_date), due_date, schedule_id, status
---   NEVER: sched.scheduled_date — column is schedule_date
+-- inspection_schedule useful columns: id (PK), status, due_date, facility_id, inspector_id, inspectee_id
+--   NEVER SELECT isched.schedule_id — nullable internal UUID, almost always NULL in data
+--   NEVER SELECT isched.schedule_date — almost always NULL for pending schedules; use due_date instead
+--   NEVER: sched.scheduled_date — column is schedule_date (but prefer due_date anyway)
 --   NEVER: sched.active — inspection_schedule has no active column
 --
 -- UNION / UNION ALL TYPE SAFETY:

@@ -626,6 +626,35 @@ class SQLValidator:
                 detail="Use the full inspection_id string as provided by the user",
             ))
             ValidatorStats.record("TRUNCATED_INSPECTION_ID", is_retry_trigger=True)
+        # ── 10d. Mismatched first/last name OR-split — HARD_FAIL ──────────
+        # WHERE (x.first_name ILIKE '%George%' OR x.last_name ILIKE '%Auditor%')
+        # matches anyone named George OR anyone surnamed Auditor — not people
+        # named "George Auditor". A same-literal OR split (both '%george%') is
+        # the correct single-word check and is NOT flagged. Two-word full names
+        # must use the concatenated form instead:
+        #   (x.first_name || ' ' || x.last_name) ILIKE '%George Auditor%'
+        _name_or_pat = re.compile(
+            r"(\w+)\.first_name\s+ILIKE\s+'%([^%']+)%'\s+OR\s+\1\.last_name\s+ILIKE\s+'%([^%']+)%'"
+            r"|(\w+)\.last_name\s+ILIKE\s+'%([^%']+)%'\s+OR\s+\4\.first_name\s+ILIKE\s+'%([^%']+)%'",
+            re.IGNORECASE,
+        )
+        _name_or_match = _name_or_pat.search(sql)
+        if _name_or_match:
+            g = _name_or_match.groups()
+            first_val, last_val = (g[1], g[2]) if g[0] else (g[5], g[4])
+            if first_val.strip().lower() != last_val.strip().lower():
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "SPLIT_NAME_MISMATCH",
+                    f"first_name/last_name OR-split uses different literals "
+                    f"('{first_val}' vs '{last_val}') — matches wrong people",
+                    detail=(
+                        "Use the concatenated form for a full name: "
+                        f"(alias.first_name || ' ' || alias.last_name) ILIKE "
+                        f"'%{first_val} {last_val}%'"
+                    ),
+                ))
+                ValidatorStats.record("SPLIT_NAME_MISMATCH", is_retry_trigger=True)
+
         has_agg = bool(self._AGG_RE.search(sql))
         if not has_agg and not self._LIMIT_RE.search(sql):
             issues.append(ValidationIssue(
@@ -1064,17 +1093,41 @@ class SQLValidator:
 
         # ── 2. Inject active = true for soft-delete tables ────────────────
         def _direct_tables(sel: exp.Select) -> dict:
-            """alias → table_name for tables directly in this SELECT's FROM/JOIN."""
+            """
+            alias -> table_name for tables that are NEVER NULL for a matched
+            row in this SELECT (FROM + INNER-joined tables) — safe to filter
+            via WHERE without changing which rows the query returns.
+
+            A LEFT-joined table's own alias is always excluded (it can be
+            NULL). A RIGHT/FULL join makes every table accumulated BEFORE it
+            nullable too (that's the side RIGHT/FULL JOIN pads with NULLs),
+            so those are dropped from the safe set at that point; a RIGHT
+            join's own right-hand table is NOT nullable (all its rows are
+            kept) and stays in the safe set, while a FULL join's own table
+            is nullable like the LEFT-joined case.
+            """
+            def _alias(t):
+                return (t.alias or t.name).lower() if isinstance(t, exp.Table) and t.name else None
+            def _tname(t):
+                return t.name.lower() if isinstance(t, exp.Table) and t.name else None
+
             result = {}
-            def _add(t):
-                if isinstance(t, exp.Table) and t.name:
-                    result[(t.alias or t.name).lower()] = t.name.lower()
             # sqlglot v20+ uses 'from_' key; older versions use 'from'
             from_clause = sel.args.get("from_") or sel.args.get("from")
-            if from_clause:
-                _add(from_clause.this)
+            if from_clause and _alias(from_clause.this):
+                result[_alias(from_clause.this)] = _tname(from_clause.this)
+
             for j in (sel.args.get("joins") or []):
-                _add(j.this)
+                _side = (j.args.get("side") or "").upper()
+                if _side == "LEFT":
+                    continue  # this join's table is nullable — never mark safe
+                if _side in ("RIGHT", "FULL"):
+                    result.clear()  # everything accumulated so far is now nullable
+                    if _side == "FULL":
+                        continue  # this join's own table is nullable too
+                _alias_ = _alias(j.this)
+                if _alias_:
+                    result[_alias_] = _tname(j.this)
             return result
 
         def _active_aliases(where) -> set:
@@ -1118,6 +1171,95 @@ class SQLValidator:
                     )
                     sel = sel.where(cond)
                     mutations.append(f"Injected {alias}.active = true ({tname})")
+
+            # For LEFT/FULL-joined soft-delete tables (excluded from `direct`
+            # above because they're nullable), the active filter belongs in
+            # the JOIN's own ON clause, not WHERE. This still hides
+            # soft-deleted matches but — unlike a WHERE-clause filter — doesn't
+            # turn the outer join into an inner join, so rows with no match at
+            # all (genuinely NULL on that side) are still kept.
+            #
+            # The LLM sometimes writes `alias.active = true` in WHERE itself
+            # for one of these tables (it dutifully adds the filter it was
+            # told to, without realizing that placement breaks outer-join
+            # semantics — e.g. `LEFT JOIN organisation org ON ... WHERE
+            # org.active = true` silently drops every row whose org is
+            # genuinely NULL). `_relocate_aliases` collects those so they can
+            # be stripped from WHERE and re-added to the correct ON clause
+            # below, instead of just being left in place as "already handled".
+            _relocate_aliases: set = set()
+            for j in (sel.args.get("joins") or []):
+                _join_side = (j.args.get("side") or "").upper()
+                # LEFT: the joined table is nullable. FULL: the joined table is
+                # also nullable, and ON-clause injection is equally safe there —
+                # a false match (soft-deleted row) just falls back to NULL on
+                # that side, same as a genuine non-match. (The FROM-side of a
+                # FULL JOIN is nullable too, but that side isn't reachable from
+                # this loop — FULL JOIN doesn't appear anywhere in this
+                # codebase's generated SQL patterns, so it's not worth the
+                # extra complexity to handle here.)
+                if _join_side not in ("LEFT", "FULL"):
+                    continue
+                t = j.this
+                if not (isinstance(t, exp.Table) and t.name):
+                    continue
+                alias = (t.alias or t.name).lower()
+                tname = t.name.lower()
+                if tname not in self._SOFT_DELETE_TABLES:
+                    continue
+                on_cond = j.args.get("on")
+                already_filtered = on_cond is not None and any(
+                    isinstance(eq.left, exp.Column)
+                    and eq.left.name.lower() == "active"
+                    and eq.left.table and eq.left.table.lower() == alias
+                    for eq in on_cond.find_all(exp.EQ)
+                )
+                if already_filtered:
+                    continue
+                cond = exp.EQ(
+                    this=exp.Column(
+                        this=exp.Identifier(this="active"),
+                        table=exp.Identifier(this=alias),
+                    ),
+                    expression=exp.true(),
+                )
+                j.set("on", exp.And(this=on_cond, expression=cond) if on_cond else cond)
+                if alias in existing:
+                    _relocate_aliases.add(alias)
+                    mutations.append(
+                        f"Relocated {alias}.active = true from WHERE into {_join_side} "
+                        f"JOIN ON clause ({tname}) — WHERE placement silently drops "
+                        f"legitimate no-match rows on an outer join"
+                    )
+                else:
+                    mutations.append(
+                        f"Injected {alias}.active = true into {_join_side} JOIN ON clause ({tname})"
+                    )
+
+            if _relocate_aliases:
+                def _strip_relocated(node):
+                    if (isinstance(node, exp.EQ)
+                            and isinstance(node.left, exp.Column)
+                            and node.left.name.lower() == "active"
+                            and node.left.table
+                            and node.left.table.lower() in _relocate_aliases):
+                        return exp.true()
+                    return node
+                where = sel.args.get("where")
+                if where is not None:
+                    new_where = where.this.transform(_strip_relocated)
+                    def _simplify(n):
+                        if isinstance(n, exp.And):
+                            if isinstance(n.left, exp.Boolean) and n.left.this:
+                                return n.right
+                            if isinstance(n.right, exp.Boolean) and n.right.this:
+                                return n.left
+                        return n
+                    new_where = new_where.transform(_simplify)
+                    if isinstance(new_where, exp.Boolean) and new_where.this:
+                        sel.set("where", None)
+                    else:
+                        where.set("this", new_where)
             return sel
 
         # ── 4. Strip date_trunc wrapping bare string literals in comparisons ─
@@ -1298,7 +1440,11 @@ class SQLValidator:
 
                 def _alias_for_table(sel: exp.Select, tbl_name: str):
                     """Return alias if sel directly FROM/JOINs tbl_name, else None."""
-                    from_clause = sel.args.get("from")
+                    # sqlglot v20+ uses 'from_' key; older versions use 'from'.
+                    # Matches the fallback already used by _direct_tables() above —
+                    # without it this always returns None on the installed
+                    # sqlglot version, silently disabling scope injection.
+                    from_clause = sel.args.get("from_") or sel.args.get("from")
                     if from_clause and isinstance(from_clause.this, exp.Table):
                         if from_clause.this.name.lower() == tbl_name:
                             return from_clause.this.alias or tbl_name

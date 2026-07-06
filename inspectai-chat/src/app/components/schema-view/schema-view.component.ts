@@ -124,9 +124,10 @@ const EHS_SCHEMA = [
     .acc-list { display: flex; flex-direction: column; gap: 10px; }
     .acc-item {
       background: var(--surface); border: 1px solid var(--border);
-      border-radius: 14px; overflow: hidden; box-shadow: var(--shadow-sm);
-      transition: border-color 0.18s;
+      border-radius: 18px; overflow: hidden; box-shadow: var(--shadow-sm);
+      transition: border-color 0.2s, box-shadow 0.2s;
     }
+    .acc-item:hover { box-shadow: var(--shadow); }
     .acc-item.acc-open { border-color: var(--accent-soft-border); }
     .acc-hdr {
       width: 100%; display: flex; align-items: center; gap: 12px;
@@ -135,7 +136,7 @@ const EHS_SCHEMA = [
     }
     .acc-hdr:hover { background: var(--surface-2); }
     .acc-icon {
-      width: 38px; height: 38px; border-radius: 10px;
+      width: 38px; height: 38px; border-radius: 12px;
       background: var(--accent-soft); display: grid; place-items: center;
       flex-shrink: 0; color: var(--accent);
     }
@@ -166,8 +167,10 @@ const EHS_SCHEMA = [
     .col-chip {
       display: flex; align-items: center; justify-content: space-between;
       gap: 6px; padding: 7px 12px; background: var(--surface-2);
-      border-radius: 9px; border: 1px solid var(--border);
+      border-radius: 12px; border: 1px solid var(--border);
+      transition: background 0.14s, box-shadow 0.14s;
     }
+    .col-chip:hover { background: var(--surface); box-shadow: var(--shadow-sm); }
     .col-n {
       font-size: 12.5px; font-weight: 600; color: var(--text);
       font-family: var(--font-mono);
@@ -175,7 +178,7 @@ const EHS_SCHEMA = [
     .col-t {
       font-size: 11px; font-family: var(--font-mono);
       color: var(--accent); background: var(--accent-soft);
-      padding: 2px 7px; border-radius: 6px; white-space: nowrap;
+      padding: 2px 8px; border-radius: 999px; white-space: nowrap;
     }
     .empty-state {
       text-align: center; padding: 48px 24px;

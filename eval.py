@@ -875,7 +875,8 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
         print(f"[{i+1:02d}/{len(tests)}] {qid} ({cat})  Q: {q[:65]}")
         t0 = time.time()
         try:
-            result = orch.query(q, session=session if cat == "Multi-turn" else None)
+            result = orch.query(q, session=session if cat == "Multi-turn" else None,
+                                visibility_scope={})
             wall   = time.time() - t0
             al     = result.answer.lower()
 

@@ -69,6 +69,18 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
 
         <!-- Chart panel -->
         <div class="panel panel-chart">
+          <div class="panel-toolbar">
+            <button class="btn-panel-expand"
+                    (click)="toggleChartStack()"
+                    [title]="stackedMode === 'chart-first' ? 'Restore side-by-side' : 'Expand chart'">
+              <svg *ngIf="stackedMode !== 'chart-first'" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                <path d="M1.5 1.5v4h1.5v-2.5h2.5v-1.5h-4zm4 13h-2.5v-2.5h-1.5v4h4v-1.5zm9-9h-1.5v2.5h-2.5v1.5h4v-4zm-4 7h2.5v-2.5h1.5v4h-4v-1.5z"/>
+              </svg>
+              <svg *ngIf="stackedMode === 'chart-first'" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                <path d="M5.5 5.5v-4h-1.5v2.5h-2.5v1.5h4zm-4 5h2.5v2.5h1.5v-4h-4v1.5zm9-5h1.5v-2.5h2.5v-1.5h-4v4zm4 5h-2.5v2.5h-1.5v-4h4v1.5z"/>
+              </svg>
+            </button>
+          </div>
           <app-chart-display
             [cfg]="chartConfig"
             [sessionId]="sessionId"
@@ -152,7 +164,7 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
       flex-shrink: 0;
       transition: transform 0.22s ease;
     }
-    .kpi-card:hover .kpi-icon { transform: scale(1.1); }
+    .kpi-card:hover .kpi-icon { transform: scale(1.1) rotate(-4deg); }
     .kpi-icon svg { width: 17px; height: 17px; }
     .kpi-icon--star {
       background: linear-gradient(135deg, rgba(27,67,255,0.14), rgba(92,115,255,0.10));
@@ -308,6 +320,12 @@ export class DashboardDisplayComponent implements OnChanges, AfterViewInit, OnDe
     this.destroyed = true;
     this.timers.forEach(t => clearTimeout(t));
     this.timers = [];
+  }
+
+  toggleChartStack(): void {
+    this.stackedMode = this.stackedMode === 'chart-first' ? 'none' : 'chart-first';
+    this.chartResizeTrigger++;
+    this.cdr.markForCheck();
   }
 
   toggleTableStack(): void {
