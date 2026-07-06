@@ -22,7 +22,7 @@ from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-from core.semantic import SemanticQuestionIndex, SeedExampleIndex
+from core.semantic import SemanticQuestionIndex, SeedExampleIndex, text_similarity
 from core.validator import SQLValidator
 from core.schema_introspector import introspect_schema
 from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT, build_dynamic_prompt_additions
@@ -416,6 +416,25 @@ class ConversationSession:
         last = self.turns[-1]
 
         # ── Emit the scoped context block ────────────────────────────────────
+        def _lookup_entity_id(label: str) -> str:
+            """
+            Find the id captured for `label` in the most recent turn whose
+            entity_disambiguation_candidates contains an exact (case-insensitive)
+            name match — mirrors the `_last_with_uid` lookup the `inspector`
+            branch below already uses for people, so facility/project/client/
+            organisation follow-ups can filter by exact id too instead of
+            re-searching by ILIKE name every time.
+            """
+            for t in reversed(self.turns):
+                match = next(
+                    (c for c in t.entity_disambiguation_candidates
+                     if c.get("name", "").strip().lower() == label.lower() and c.get("id")),
+                    None
+                )
+                if match:
+                    return match["id"]
+            return ""
+
         if not is_clearly_fresh and active_type and active_value:
             if active_type == "cycle":
                 lines.append(
@@ -457,28 +476,52 @@ class ConversationSession:
                     f" (or aa.inspection_id = '{active_value}' for form answers)."
                 )
             elif active_type == "facility":
-                lines.append(
-                    f"ACTIVE CONTEXT — The conversation is scoped to facility '{active_label}'."
-                    f" ALL follow-up questions about corrective actions, inspections, scores,"
-                    f" or form answers should include a facility filter"
-                    f" (fac.name ILIKE '%{active_label}%') unless the user explicitly asks"
-                    f" for a global/all-facilities view."
-                    f" Do NOT query globally when the context is scoped to this facility."
-                )
+                # Prefer exact id filter if we captured one from a disambiguation
+                # query — same pattern as the inspector branch above.
+                _fid = _lookup_entity_id(active_label)
+                if _fid:
+                    lines.append(
+                        f"ACTIVE CONTEXT — The conversation is scoped to facility '{active_label}'"
+                        f" (resolved facility_id='{_fid}')."
+                        f" ALL follow-up questions about corrective actions, inspections, scores,"
+                        f" or form answers should filter EXACTLY by WHERE fac.id = '{_fid}'"
+                        f" — NOT ILIKE — unless the user explicitly asks for a global/all-facilities view."
+                        f" Do NOT query globally when the context is scoped to this facility."
+                    )
+                else:
+                    lines.append(
+                        f"ACTIVE CONTEXT — The conversation is scoped to facility '{active_label}'."
+                        f" ALL follow-up questions about corrective actions, inspections, scores,"
+                        f" or form answers should include a facility filter"
+                        f" (fac.name ILIKE '%{active_label}%') unless the user explicitly asks"
+                        f" for a global/all-facilities view."
+                        f" Do NOT query globally when the context is scoped to this facility."
+                    )
             elif active_type == "entity":
                 # Generic scope for project/client/organisation — same idea as
                 # facility above, parameterized by whichever table/alias the
                 # STEP 1 disambiguation actually searched.
                 _tbl = active_table or "entity"
                 _als = active_alias or "e"
-                lines.append(
-                    f"ACTIVE CONTEXT — The conversation is scoped to {_tbl} '{active_label}'."
-                    f" ALL follow-up questions about corrective actions, inspections, scores,"
-                    f" or form answers should include a filter"
-                    f" ({_als}.name ILIKE '%{active_label}%') unless the user explicitly asks"
-                    f" for a global view."
-                    f" Do NOT query globally when the context is scoped to this {_tbl}."
-                )
+                _eid = _lookup_entity_id(active_label)
+                if _eid:
+                    lines.append(
+                        f"ACTIVE CONTEXT — The conversation is scoped to {_tbl} '{active_label}'"
+                        f" (resolved {_tbl}_id='{_eid}')."
+                        f" ALL follow-up questions about corrective actions, inspections, scores,"
+                        f" or form answers should filter EXACTLY by WHERE {_als}.id = '{_eid}'"
+                        f" — NOT ILIKE — unless the user explicitly asks for a global view."
+                        f" Do NOT query globally when the context is scoped to this {_tbl}."
+                    )
+                else:
+                    lines.append(
+                        f"ACTIVE CONTEXT — The conversation is scoped to {_tbl} '{active_label}'."
+                        f" ALL follow-up questions about corrective actions, inspections, scores,"
+                        f" or form answers should include a filter"
+                        f" ({_als}.name ILIKE '%{active_label}%') unless the user explicitly asks"
+                        f" for a global view."
+                        f" Do NOT query globally when the context is scoped to this {_tbl}."
+                    )
             elif active_type == "corrective_action":
                 lines.append(
                     f"ACTIVE CONTEXT — The conversation is about corrective action '{active_value}'."
@@ -582,12 +625,72 @@ class ConversationSession:
                 _cand for _cand in last.disambiguation_candidates
                 if _cand.get("name", "").strip().lower() == _cleaned_specific.lower()
             ]
+            if not _name_matches:
+                # Full-sentence follow-up (e.g. a drilldown-click "list all
+                # schedules assigned to kavya insp") embeds the resolved
+                # candidate name inside a longer question instead of replying
+                # with just the bare name — the whole-message equality check
+                # above can never match that shape. Fall back to substring
+                # containment against the raw question, preferring the LONGEST
+                # candidate name so a more specific match ("kavya insp") wins
+                # over a shorter coincidental one ("kavya"). Without this, the
+                # question still contains the ORIGINAL search term as a
+                # substring, so it gets misclassified by the _q_has_same_name
+                # STOP-guard below as "same vague query repeated" instead of
+                # "already resolved" — the model then re-runs the broad search
+                # and never reaches the user's actual request.
+                _q_full_lower = current_question.lower()
+                _substr_hits = [
+                    _cand for _cand in last.disambiguation_candidates
+                    if _cand.get("name") and _cand["name"].strip().lower() in _q_full_lower
+                ]
+                if _substr_hits:
+                    _max_len = max(len(_c["name"]) for _c in _substr_hits)
+                    _name_matches = [_c for _c in _substr_hits if len(_c["name"]) == _max_len]
             # Only auto-resolve when the name uniquely identifies one candidate.
             # Several distinct accounts can share an identical display name
             # (e.g. 8 different "George Joseph" users seen in this dataset) —
             # picking the first one silently would bind the wrong identity.
             _exact_match = _name_matches[0] if len(_name_matches) == 1 else None
             _ambiguous_duplicate_names = len(_name_matches) > 1
+
+            # Ordinal short-circuit: "the first one", "option 2", "#3", "the 2nd"
+            # — resolve directly to that position in the previously-shown list.
+            # Without this, an ordinal pick falls through to the generic
+            # _is_name_pick branch below, which can only tell the model to
+            # "use the UUID from previous result" with no way to say WHICH
+            # uuid that is — the model then re-runs the disambiguation SQL
+            # over and over trying to re-derive it from conversation text and
+            # never converges within the iteration budget (observed: 8 wasted
+            # generate_sql calls / ~70s / final_answer giving up).
+            # Gated on _is_name_pick (same short/no-verb/not-the-original-term
+            # shape used for exact-name picks) so it can't misfire on a
+            # legitimate analytical question that happens to contain an
+            # ordinal word (e.g. "what's the second highest score" has a
+            # query verb and fails _is_name_pick).
+            _ordinal_n = None
+            if _is_name_pick:
+                _ORDINAL_WORD_TO_N = {
+                    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+                    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+                }
+                _q_for_ordinal = _cleaned_specific.lower()
+                for _word, _n in _ORDINAL_WORD_TO_N.items():
+                    if re.search(rf"\b{_word}\b", _q_for_ordinal):
+                        _ordinal_n = _n
+                        break
+                if _ordinal_n is None:
+                    _om = re.search(
+                        r"\b(?:option|choice|number|#)\s*0*(\d{1,2})\b|\b(\d{1,2})(?:st|nd|rd|th)\b",
+                        _q_for_ordinal,
+                    )
+                    if _om:
+                        _ordinal_n = int(_om.group(1) or _om.group(2))
+            _ordinal_match = (
+                last.disambiguation_candidates[_ordinal_n - 1]
+                if _ordinal_n and 1 <= _ordinal_n <= len(last.disambiguation_candidates)
+                else None
+            )
 
             # Remind the model what it was ACTUALLY asked for before the name
             # went ambiguous. Without this, a multi-turn narrowing sequence
@@ -609,6 +712,16 @@ class ConversationSession:
                     f"  Use WHERE u.id = '{_exact_match['user_id']}' directly to run the"
                     f" original query now. Do NOT re-run the disambiguation search and"
                     f" do NOT ask the user to pick again — this name is unambiguous."
+                    f"{_origin_note}"
+                )
+            elif _ordinal_match:
+                lines.append(
+                    f"DISAMBIGUATION RESOLVED — user picked option #{_ordinal_n}"
+                    f" ('{_ordinal_match['name']}') from the {_dc} candidates found"
+                    f" previously (user_id='{_ordinal_match['user_id']}').\n"
+                    f"  Use WHERE u.id = '{_ordinal_match['user_id']}' directly to run the"
+                    f" original query now. Do NOT re-run the disambiguation search and"
+                    f" do NOT ask the user to pick again."
                     f"{_origin_note}"
                 )
             elif _ambiguous_duplicate_names:
@@ -681,6 +794,36 @@ class ConversationSession:
                         f"DISAMBIGUATION CONTEXT — Previous turn found {_dc} people"
                         f" matching '{_dn}'. Use UUID from previous result for exact lookup."
                     )
+
+        # Entity disambiguation context (facility/project/client/organisation) —
+        # the entity-equivalent of the people exact-match block above. Gated on
+        # the IMMEDIATELY PRECEDING turn's entity_disambiguation_candidates
+        # directly (not on active_subject_type — the STEP 2b final_answer
+        # termination path, which is how every 2+-match entity disambiguation
+        # list actually ends, never sets active_subject_type, so the ACTIVE
+        # CONTEXT facility/entity branches above never fire for a same-turn
+        # drilldown-click follow-up). Unlike the people block, the typical
+        # follow-up here is a full sentence with the resolved name embedded
+        # (e.g. drilldown-click text "show corrective actions at Adnoc
+        # Schools- Ghayathi"), not a bare name reply — so this matches by
+        # substring containment against the whole question, not equality.
+        if not is_clearly_fresh and last.entity_disambiguation_candidates:
+            _ent_match = next(
+                (c for c in last.entity_disambiguation_candidates
+                 if c.get("id") and c.get("name")
+                 and c["name"].strip().lower() in current_question.lower()),
+                None
+            )
+            if _ent_match:
+                _ent_tbl = last.entity_disambiguation_table or "entity"
+                _ent_als = last.entity_disambiguation_alias or "e"
+                lines.append(
+                    f"DISAMBIGUATION RESOLVED — '{_ent_match['name']}' is an EXACT match for one"
+                    f" of the {_ent_tbl} candidates found previously"
+                    f" ({_ent_tbl}_id='{_ent_match['id']}').\n"
+                    f"  Use WHERE {_ent_als}.id = '{_ent_match['id']}' directly to run the"
+                    f" original query now — do NOT use ILIKE on the name."
+                )
 
         lines.append("")
         lines.append(
@@ -762,6 +905,7 @@ class AgentOrchestrator:
         print(f"  Loading embedding model: {embedding_model}...")
         embed_model = HuggingFaceEmbedding(model_name=embedding_model)
         Settings.embed_model = embed_model
+        self.embed_model = embed_model  # reused to rank/budget-cap Tier-2 prompt blocks
         print("  ✓ Embedding model loaded")
 
         self.semantic_index = SemanticQuestionIndex(
@@ -871,7 +1015,15 @@ class AgentOrchestrator:
         _log_query.info("[SCOPE] %ssub=%s filter=%r",
                         _pfx, _sub, scope_filter[:120] if scope_filter else "(unrestricted)")
 
-        system_content = self._system_prompt + build_dynamic_prompt_additions(question)
+        # Rank/budget-cap Tier-2 worked-examples and conditional blocks when
+        # 2+ match the same question, instead of concatenating every match
+        # unconditionally — see agent/prompts.py's _select_within_budget.
+        # Reuses the same embed_model already loaded for seed-example
+        # retrieval, via the shared core.semantic.text_similarity scorer.
+        _tier2_score_fn = lambda q, title: text_similarity(self.embed_model, q, title)
+        system_content = self._system_prompt + build_dynamic_prompt_additions(
+            question, score_fn=_tier2_score_fn
+        )
         if visibility_scope and visibility_scope.get('sub'):
             system_content += (
                 f"\n\nCURRENT USER: Drupal UID {visibility_scope['sub']} "
@@ -1000,6 +1152,7 @@ class AgentOrchestrator:
                             ))
                         return AgentResult(question, ans, steps, 1, True, stats)
 
+        _consecutive_empty = 0
         for iteration in range(1, max_iterations + 1):
             t0 = time.time()
             _emit({"_event": "thinking", "iteration": iteration})
@@ -1011,12 +1164,47 @@ class AgentOrchestrator:
             except ValueError as exc:
                 _dbg(self._debug, "PARSE ERROR — could not recover", str(exc), iteration)
                 _log_llm.warning("[LLM ] %siter=%d parse error — %s", _pfx, iteration, exc)
+
+                if not raw or not raw.strip():
+                    _consecutive_empty += 1
+                else:
+                    _consecutive_empty = 0
+
+                # Two consecutive EMPTY (not just malformed) completions in a
+                # row means the reasoning LLM burned its full num_predict
+                # budget without emitting a single visible token — the classic
+                # sign that the accumulated `messages` history (every prior
+                # round-trip is appended verbatim below with no cap) has
+                # crowded out the num_ctx window, not a one-off formatting
+                # slip. Retrying against the SAME oversized history just
+                # repeats the failure (observed: 8/8 iterations empty on one
+                # query, ~125s wasted, before max_iterations gave up). Trim
+                # back to the original question plus only the most recent
+                # round-trip — frees real headroom so the retry has an actual
+                # chance to make progress instead of failing identically for
+                # the rest of the iteration budget.
+                if _consecutive_empty >= 2 and len(messages) > 4:
+                    _dropped = len(messages) - 4
+                    messages = messages[:2] + messages[-2:]
+                    _consecutive_empty = 0
+                    _log_llm.warning(
+                        "[LLM ] %siter=%d context-trim — dropped %d older "
+                        "messages after 2 consecutive empty completions",
+                        _pfx, iteration, _dropped
+                    )
+                    _dbg(self._debug, "CONTEXT TRIM",
+                         f"Dropped {_dropped} older messages after 2 consecutive "
+                         f"empty completions (accumulated context likely crowded "
+                         f"out num_ctx)", iteration)
+
                 messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
                 messages.append(ChatMessage(role=MessageRole.USER, content=
                     f"Not valid JSON: {exc}\nRespond with ONLY a JSON tool call."))
                 s = AgentStep(iteration, "[parse error]", "[parse_error]",
                               {}, {"error": str(exc)}, int((time.time()-t0)*1000))
                 steps.append(s); _emit(s); continue
+
+            _consecutive_empty = 0
 
             # Log recovered tool call
             _dbg(self._debug, "PARSED TOOL CALL",
@@ -2096,6 +2284,7 @@ class AgentOrchestrator:
                 candidates.append({
                     "name": str(nm).strip(),
                     "inspection_count": row.get("inspection_count") or 0,
+                    "id": str(row.get("id")).strip() if row.get("id") else "",
                 })
         return name, candidates, table, alias
 

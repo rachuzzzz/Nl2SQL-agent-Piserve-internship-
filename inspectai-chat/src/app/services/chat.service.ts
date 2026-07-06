@@ -55,15 +55,16 @@ export class ChatService {
           const { cleanText, chartSignal } = parseChartSignal(res.answer);
 
           const aiMsg: Message = {
-            id:          uuid(),
-            role:        'ai',
-            text:        cleanText,
-            timestamp:   new Date(),
-            debug:       res,
-            resultData:  res.result_data ?? null,
-            chartConfig: res.chart_config ?? null,
-            chartSignal: chartSignal,
-            dashboard:   res.dashboard ?? null,
+            id:             uuid(),
+            role:           'ai',
+            text:           cleanText,
+            timestamp:      new Date(),
+            debug:          res,
+            resultData:     res.result_data ?? null,
+            chartConfig:    res.chart_config ?? null,
+            chartSignal:    chartSignal,
+            dashboard:      res.dashboard ?? null,
+            sourceQuestion: text,
           };
           conv.messages.push(aiMsg);
           this.activeConversation$.next({ ...conv });

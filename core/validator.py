@@ -1057,14 +1057,76 @@ class SQLValidator:
         except Exception:
             return sql, []
 
-        # ── 1. Drop hallucinated active columns on no-active tables ─────────
-        # ALL tables in _NO_ACTIVE_TABLES have no soft-delete column.
-        # Covers ai_answers, ai_questions, role, user_roles, inspection_schedule.
-        # deepseek writes `aa.active`, `sched.active` etc from training bias.
-        _no_active_aliases: set = set()
+        # ── 1. Drop hallucinated active columns on aliases that can't have one ──
+        # Three cases, unioned into one alias->reason map. deepseek reflexively
+        # appends `<alias>.active = true` to every table/CTE it references,
+        # regardless of whether that alias actually has (or even IS) a
+        # soft-delete-tracked table:
+        #  (a) alias's table is in _NO_ACTIVE_TABLES — known real tables with
+        #      no soft-delete column (ai_answers, ai_questions, role, etc.)
+        #  (b) alias is a CTE whose own SELECT never outputs an "active"
+        #      column — pre-aggregated derived tables were never soft-delete
+        #      tracked in the first place, so `<cte_alias>.active` can never
+        #      resolve to a real column no matter what the CTE's base table is
+        #  (c) alias isn't introduced anywhere in the statement at all — same
+        #      conservative whole-statement alias union as
+        #      _check_undefined_table_aliases() below (see its docstring for
+        #      why: false negatives are OK, false positives would block valid
+        #      SQL). This is typically leftover from copying a WHERE fragment
+        #      out of an unrelated few-shot example without its JOIN.
+        _bogus_active_aliases: dict = {}
+
         for node in tree.find_all(exp.Table):
             if node.name and node.name.lower() in self._NO_ACTIVE_TABLES:
-                _no_active_aliases.add((node.alias or node.name).lower())
+                _bogus_active_aliases[(node.alias or node.name).lower()] = (
+                    "table has no active column"
+                )
+
+        _introduced: set = set()
+        for t in tree.find_all(exp.Table):
+            if t.alias:
+                _introduced.add(t.alias.lower())
+            if t.name:
+                _introduced.add(t.name.lower())
+        for cte in tree.find_all(exp.CTE):
+            if cte.alias:
+                _introduced.add(cte.alias.lower())
+        for sq in tree.find_all(exp.Subquery):
+            if sq.alias:
+                _introduced.add(sq.alias.lower())
+
+        # cte.alias is the CTE's OWN declared name (e.g. "po_by_ica" in
+        # `WITH po_by_ica AS (...)`) — NOT the alias used to reference it in a
+        # JOIN (e.g. the "p" in `LEFT JOIN po_by_ica p ON ...`, which is a
+        # separate exp.Table node). Column qualifiers use the JOIN alias, so
+        # this must resolve CTE-name -> JOIN-alias(es) via exp.Table, exactly
+        # like the _NO_ACTIVE_TABLES loop above does for real tables.
+        _cte_names_without_active: set = set()
+        for cte in tree.find_all(exp.CTE):
+            if cte.alias and isinstance(cte.this, exp.Select):
+                has_active = any(
+                    e.output_name and e.output_name.lower() == "active"
+                    for e in cte.this.expressions
+                )
+                if not has_active:
+                    _cte_names_without_active.add(cte.alias.lower())
+        for node in tree.find_all(exp.Table):
+            if node.name and node.name.lower() in _cte_names_without_active:
+                _bogus_active_aliases.setdefault(
+                    (node.alias or node.name).lower(), "CTE has no active column"
+                )
+
+        for eq in tree.find_all(exp.EQ):
+            if (isinstance(eq.left, exp.Column)
+                    and eq.left.name.lower() == "active"
+                    and eq.left.table
+                    and eq.left.table.lower() not in _introduced):
+                _bogus_active_aliases.setdefault(
+                    eq.left.table.lower(),
+                    "alias not joined/defined anywhere in this query",
+                )
+
+        _no_active_aliases: set = set(_bogus_active_aliases)
 
         if _no_active_aliases:
             def _drop_ai_active(node):
@@ -1073,9 +1135,11 @@ class SQLValidator:
                         and node.left.name.lower() == "active"
                         and node.left.table
                         and node.left.table.lower() in _no_active_aliases):
+                    reason = _bogus_active_aliases.get(
+                        node.left.table.lower(), "table has no active column"
+                    )
                     mutations.append(
-                        f"Removed {node.left.table}.active "
-                        f"(table has no active column)"
+                        f"Removed {node.left.table}.active ({reason})"
                     )
                     return exp.true()
                 return node

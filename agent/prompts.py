@@ -1117,58 +1117,166 @@ Turn 1: {"thought": "Overdue inspections are in inspection_schedule WHERE status
 User: "how many inspections are overdue vs pending vs completed"
 Turn 1: {"thought": "Count by status from inspection_schedule. inspection_schedule has NO active column — never use WHERE active = true on this table.", "tool": "generate_sql", "args": {"question": "inspection schedule status counts", "schema_hint": "SELECT status, COUNT(*) AS count FROM inspection_schedule GROUP BY status ORDER BY count DESC;"}}""",
     },
+    # Form answers / observations / risk level / form-scores worked examples —
+    # split into one entry per scenario (was a single ~12.9K-char block shared
+    # by one broad question_pattern matching any of "forms/answer/questions/
+    # observations/risk level/deviations/good practice/total score/ai_answers"
+    # — meaning EVERY one of these 19 scenarios fired together on nearly any
+    # form-related question, e.g. "which facilities have high risk
+    # observations but no corrective actions" pulled in the full block even
+    # though only 1-2 of the 19 examples are actually relevant. Combined with
+    # the baseline SYSTEM_PROMPT this pushed the reasoning-LLM prompt close
+    # enough to its 20K-token num_ctx to produce empty completions (see
+    # _select_within_budget above — it can only ration BETWEEN blocks that
+    # match, it can't shrink a single block that matches alone). Splitting
+    # into per-scenario patterns lets the budget/scoring mechanism actually
+    # do its job: a question now pulls in only the 1-3 truly relevant
+    # examples (a few hundred chars each) instead of the whole ~12.9K.
     {
-        "title": "Form answers / observations / risk level / form-scores worked examples",
+        "title": "Form answers: specific question",
         "question_pattern": (
-            r"(?i)\b(forms?|answer\w*|questions?|observations?|risk\s*levels?"
-            r"|deviations?|good\s+practice|total\s+score|ai_answers)\b"
+            r"(?i)\bwhat\s+did\b.{0,25}\banswer\w*\s+for\b"
+            r"|\bwhat\s+(is|was)\s+the\s+answer\s+(for|to)\b"
         ),
         "text": """\
 ─── Form answers: specific question ───
 User: "what did inspectors answer for 'risk level'?"
 Turn 1: {"thought": "Form answers are in ai_answers — use get_answers.", "tool": "get_answers", "args": {"label": "risk level", "limit": 50}}
-
+""",
+    },
+    {
+        "title": "Form answers: distribution",
+        "question_pattern": (
+            r"(?i)\bmost\s+common\s+answer\b|\banswer\s+distribution\b"
+            r"|\bbreakdown\s+of\s+answers?\b"
+        ),
+        "text": """\
 ─── Form answers: distribution ───
 User: "most common answer to 'condition of PPE'?"
 Turn 1: {"thought": "Need distribution — get_answer_stats.", "tool": "get_answer_stats", "args": {"label": "condition of PPE"}}
-
+""",
+    },
+    {
+        "title": "Form answers: average score for a scored question",
+        "question_pattern": (
+            r"(?i)\baverage\s+score\s+for\s+the\b|\bavg\s+score\s+for\s+the\b"
+        ),
+        "text": """\
 ─── Form answers: average score for a scored question ───
 User: "what is the average score for the risk level question?"
 Turn 1: {"thought": "Risk Level is a scored dropdown question. get_answer_stats returns score stats from ai_answers.score — not answer_numeric which is NULL for dropdowns.", "tool": "get_answer_stats", "args": {"label": "risk level"}}
-
+""",
+    },
+    {
+        "title": "Scores: which inspection had highest total score",
+        "question_pattern": (
+            r"(?i)\b(highest|lowest|top)\s+total\s+score\b"
+            r"|\btotal\s+score\b.{0,30}\binspection\b"
+        ),
+        "text": """\
 ─── Scores: which inspection had highest total score ───
 User: "which inspection had the highest total score?"
 Turn 1: {"thought": "Total score = SUM of ai_answers.score per inspection. NOT inspection_report.inspection_score which is the overall report score. Use ir.inspection_id (varchar) not ir.id (UUID).", "tool": "generate_sql", "args": {"question": "inspection with highest total score from ai_answers", "schema_hint": "SELECT ir.inspection_id, SUM(aa.score) AS total_score FROM ai_answers aa JOIN inspection_report ir ON aa.inspection_report_id = ir.id WHERE aa.score IS NOT NULL AND ir.status != 'DRAFT' GROUP BY ir.inspection_id ORDER BY total_score DESC LIMIT 1;"}}
-
+""",
+    },
+    {
+        "title": "Form answers: observation text at a specific facility",
+        "question_pattern": (
+            r"(?i)\bwrote\s+in\s+the\s+observation\b"
+            r"|\bobservation\s+(text|field)\s+(at|for)\b"
+        ),
+        "text": """\
 ─── Form answers: observation text at a specific facility ───
 User: "what did inspectors write in the observation field for Al Ghadeer?"
 Turn 1: {"thought": "Need ai_answers filtered by question label='Observation' AND facility='Al Ghadeer'. Must join: ai_answers → ai_questions (label) → inspection_report → facility. Exclude 'Observation Type' and 'Unique Identifier' — only the free-text Observation field.", "tool": "generate_sql", "args": {"question": "observation text at Al Ghadeer facility", "schema_hint": "SELECT aa.answer_text AS observation, ir.inspection_id, ir.submitted_on FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Observation' AND fac.name ILIKE '%Al Ghadeer%' AND aa.answer_text IS NOT NULL AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
-
+""",
+    },
+    {
+        "title": "Form answers: filter by answer value (high risk observations)",
+        "question_pattern": (
+            r"(?i)\bhigh\s*[- ]?risk\s+observations?\b"
+            r"|\bobservations?\b.{0,20}\brisk\s+(level\s+)?is\s+high\b"
+        ),
+        "text": """\
 ─── Form answers: filter by answer value ───
 User: "show all high risk observations"
 Turn 1: {"thought": "User wants observation TEXT for inspections where Risk Level answer = High. Must use TWO arms: subquery gets inspection_report_ids where Risk Level=High, outer query gets Observation answer_text for those inspections. NEVER return risk level rows themselves — return the observation text.", "tool": "generate_sql", "args": {"question": "observation text for inspections where risk level is high", "schema_hint": "SELECT obs.answer_text AS observation, ir.inspection_id, ir.submitted_on FROM ai_answers obs JOIN ai_questions obs_q ON obs.element_id = obs_q.element_id JOIN inspection_report ir ON obs.inspection_report_id = ir.id WHERE obs_q.label = 'Observation' AND obs.inspection_report_id IN (SELECT aa2.inspection_report_id FROM ai_answers aa2 JOIN ai_questions aq2 ON aa2.element_id = aq2.element_id WHERE aq2.label = 'Risk Level' AND aa2.answer_text ILIKE '%High%') AND ir.status != 'DRAFT' AND ir.active = true ORDER BY ir.submitted_on DESC LIMIT 100;"}}
-
+""",
+    },
+    {
+        "title": "Form answers: by inspection",
+        "question_pattern": (
+            r"(?i)\banswers?\s+in\s+inspection\b|\ball\s+answers?\s+for\s+inspection\b"
+        ),
+        "text": """\
 ─── Form answers: by inspection ───
 User: "all answers in inspection INS-2024-001"
 Turn 1: {"thought": "Filter by inspection_id.", "tool": "get_answers", "args": {"inspection_id": "INS-2024-001", "limit": 100}}
-
+""",
+    },
+    {
+        "title": "Form answers: most recently filled form",
+        "question_pattern": (
+            # Covers both "most recently filled/answered" phrasing (MT-01:
+            # "show me the most recently answered inspection") and "questions
+            # and answers {in,from} the most recent(ly) [inspection] form"
+            # (ANS-02: "...from the most recent inspection form" — note the
+            # "inspection" infix and "from" instead of "in", both of which a
+            # too-literal first-draft pattern missed, silently dropping the
+            # "use an aa subquery, NOT inspection_report" guidance these two
+            # eval cases depend on).
+            r"(?i)\bmost\s+recently\s+(filled|answered)\b"
+            r"|\bquestions?\s+and\s+answers?\s+(in|from)\s+the\s+most\s+recent\w*"
+            r"\s+(inspection\s+)?form\b"
+        ),
+        "text": """\
 ─── Form answers: most recently filled form ───
 User: "show all questions and answers in the most recently filled form"
 Turn 1: {"thought": "Need most recent inspection that has Inspection Form answers — using aa subquery, NOT inspection_report subquery (newest ir row may have no answers yet). CRITICAL: module_name filter goes on OUTER query only — NEVER inside the subquery or it returns NULL.", "tool": "generate_sql", "args": {"question": "questions and answers from most recent inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT aa2.inspection_report_id FROM ai_answers aa2                    ORDER BY aa2.submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' ORDER BY aq.label LIMIT 100;"}}
-
+""",
+    },
+    {
+        "title": "Scores for a named inspector's last inspection",
+        "question_pattern": (
+            r"(?i)\bscores?\s+for\s+the\s+last\s+inspection\b"
+            r"|\bquestions\s+and\s+scores\s+for\b"
+        ),
+        "text": """\
 ─── Scores for a named inspector's last inspection ───
 User: "show questions and scores for the last inspection by George"
 ROUTING RULE: ALWAYS use generate_sql here. NEVER use get_answers — it cannot filter by inspector name.
 Turn 1: {"thought": "Need ai_answers.score filtered to George's last inspection. Must use generate_sql with subquery to find the inspection_report_id first.", "tool": "generate_sql", "args": {"question": "questions and scores for last inspection by George", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer, aa.score FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT ir.id FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%George%') AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' AND aa.score IS NOT NULL ORDER BY aa.score DESC LIMIT 100;"}}
-
+""",
+    },
+    {
+        "title": "Form discovery",
+        "question_pattern": (
+            r"(?i)\bwhich\s+forms?\s+ask\b|\bforms?\s+that\s+ask\s+about\b"
+        ),
+        "text": """\
 ─── Form discovery ───
 User: "which forms ask about emergency contact?"
 Turn 1: {"thought": "Semantic search over question labels.", "tool": "semantic_search", "args": {"query": "emergency contact"}}
-
+""",
+    },
+    {
+        "title": "What questions are in a form",
+        "question_pattern": (
+            r"(?i)\bwhat\s+questions?\s+are\s+in\b|\bquestions?\s+in\s+the\s+\w+\s+form\b"
+        ),
+        "text": """\
 ─── What questions are in a form ───
 User: "what questions are in the vehicle inspection form?"
 Turn 1: {"thought": "Search ai_questions by form name.", "tool": "search_questions", "args": {"query": "", "form_name": "vehicle inspection", "limit": 50}}
-
+""",
+    },
+    {
+        "title": "Which observation appears most as high risk",
+        "question_pattern": (
+            r"(?i)\bobservation\b.{0,20}\bappears?\s+most\b"
+            r"|\bmost\s+frequent\w*\s+high\s*[- ]?risk\s+observation"
+        ),
+        "text": """\
 ─── Which observation appears most as high risk ───
 User: "which observation appears most frequently as high risk"
 ROUTING RULE: This asks for OBSERVATION TEXT where risk level = High.
@@ -1176,7 +1284,14 @@ Do NOT call get_answer_stats(label="Risk Level") — that returns the risk level
 Do NOT call get_answer_stats(label="Observation") — that ignores the high-risk filter.
 MUST use generate_sql with a subquery joining risk level answers to observation answers.
 Turn 1: {"thought": "Need observations filtered to inspections where Risk Level = High. Must use SQL subquery — get_answer_stats cannot cross-filter between two questions.", "tool": "generate_sql", "args": {"question": "observation text most frequent in high risk inspections", "schema_hint": "SELECT obs.answer_text AS observation, COUNT(*) AS frequency FROM ai_answers risk_aa JOIN ai_questions risk_aq ON risk_aa.element_id = risk_aq.element_id JOIN inspection_report ir ON risk_aa.inspection_report_id = ir.id JOIN ai_answers obs ON obs.inspection_report_id = ir.id JOIN ai_questions obs_q ON obs.element_id = obs_q.element_id WHERE risk_aq.label = 'Risk Level' AND risk_aa.answer_text ILIKE '%High%' AND obs_q.label = 'Observation' AND obs.answer_text IS NOT NULL AND ir.status != 'DRAFT' GROUP BY obs.answer_text ORDER BY frequency DESC LIMIT 1;"}}
-
+""",
+    },
+    {
+        "title": "Q&A for most recently answered inspection",
+        "question_pattern": (
+            r"(?i)\bquestions?\s+and\s+answers?\s+for\s+the\s+most\s+recently\s+answered\b"
+        ),
+        "text": """\
 ─── Q&A for most recently answered inspection ───
 User: "show me the questions and answers for the most recently answered inspection"
 ROUTING RULE: ONLY use this when the question explicitly asks for both QUESTIONS AND ANSWERS
@@ -1184,7 +1299,14 @@ ROUTING RULE: ONLY use this when the question explicitly asks for both QUESTIONS
 inspection" — that only needs inspection metadata (inspection_id, score, facility) and
 should use generate_sql on inspection_report directly.
 Turn 1: {"thought": "User wants Q&A content — questions + answers from the form. Must use single SQL with ai_answers + ai_questions JOIN and aa.submitted_on subquery. Do NOT first look up inspection_id separately.", "tool": "generate_sql", "args": {"question": "list all questions and answers from the most recently answered inspection form", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer, aa.module_name AS form_section\nFROM ai_answers aa\nJOIN ai_questions aq ON aa.element_id = aq.element_id\nWHERE aa.inspection_report_id = (\n    SELECT aa2.inspection_report_id FROM ai_answers aa2\n    ORDER BY aa2.submitted_on DESC LIMIT 1\n)\nORDER BY aa.module_name, aq.label LIMIT 200;"}}
-
+""",
+    },
+    {
+        "title": "Inspector with most high-impact observations",
+        "question_pattern": (
+            r"(?i)\bhigh\s*[- ]?impact\s+observations?\b|\bmost\s+impact\w*\s+observations?\b"
+        ),
+        "text": """\
 ─── Inspector with most high-impact observations ───
 User: "which inspector raises the most high impact observations?"
 ROUTING RULE: Impact is a MULTI-SELECT CATEGORY field. There is NO answer_text value called 'High' for Impact.
@@ -1193,24 +1315,54 @@ Categories are: 'Client Relationship', 'Health & Safety (HS)', 'Financial', 'Env
 NEVER generate: aq.label ILIKE '%Impact%' OR aa.answer_text ILIKE '%High%'
 ALWAYS use: aq.label = 'Impact' (exact match) and ORDER BY aa.score DESC or COUNT(*) DESC
 Turn 1: {"thought": "Impact is multi-select category, not severity. 'High impact' = high aa.score. Count Impact answers per inspector ordered by avg score.", "tool": "generate_sql", "args": {"question": "inspector with most high impact score observations", "schema_hint": "SELECT u.first_name || ' ' || u.last_name AS inspector_name, COUNT(*) AS impact_count, ROUND(AVG(aa.score)::numeric, 2) AS avg_impact_score FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN users u ON ir.inspector_user_id = u.id WHERE aq.label = 'Impact' AND aa.score IS NOT NULL AND aa.module_name = 'Inspection Form' AND ir.active = true AND ir.status != 'DRAFT' AND u.active = true GROUP BY u.id, u.first_name, u.last_name ORDER BY avg_impact_score DESC LIMIT 10;"}}
-
+""",
+    },
+    {
+        "title": "Count deviations at a facility",
+        "question_pattern": r"(?i)\bdeviations?\b",
+        "text": """\
 ─── Count deviations at a facility ───
 User: "how many deviations were raised at Al Ghadeer this year?"
 ROUTING RULE: 'Deviation' is a KNOWN answer value for 'Observation Type'. Route directly to generate_sql — do NOT call search_questions or semantic_search first.
 Turn 1: {"thought": "'Deviation' is the known answer value for aq.label='Observation Type'. Route directly to generate_sql — no question lookup needed.", "tool": "generate_sql", "args": {"question": "count deviations at Al Ghadeer this year", "schema_hint": "SELECT COUNT(*) AS deviation_count FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Observation Type' AND aa.answer_text ILIKE '%Deviation%' AND aa.module_name = 'Inspection Form' AND fac.name ILIKE '%Al Ghadeer%' AND ir.active = true AND ir.status != 'DRAFT' AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE);"}}
-
+""",
+    },
+    {
+        "title": "Facilities that never had a good practice",
+        "question_pattern": (
+            r"(?i)\bnever\s+had\s+a?\s*good\s+practice\b|\bgood\s+practice\b.{0,20}\bnever\b"
+        ),
+        "text": """\
 ─── Facilities that never had a good practice ───
 User: "which facilities have never had a good practice observation?"
 ROUTING RULE: This is a facility-level negation query. Route directly to generate_sql — do NOT call search_questions, semantic_search, or get_answers first.
 Turn 1: {"thought": "Facility-level negation — needs NOT IN subquery. 'Good Practice' is a known value of 'Observation Type'. Route directly to generate_sql.", "tool": "generate_sql", "args": {"question": "facilities that have never had a good practice observation", "schema_hint": "SELECT fac.name FROM facility fac WHERE fac.active = true AND fac.id IN (SELECT DISTINCT ir.facility_id FROM inspection_report ir WHERE ir.active = true AND ir.status != 'DRAFT') AND fac.id NOT IN (SELECT DISTINCT ir.facility_id FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id WHERE aq.label = 'Observation Type' AND aa.answer_text ILIKE '%Good Practice%' AND aa.module_name = 'Inspection Form' AND ir.active = true AND ir.status != 'DRAFT') ORDER BY fac.name;"}}
+""",
+    },
+    {
+        "title": "Count of questions in a form",
+        "question_pattern": (
+            r"(?i)\bhow\s+many\s+questions?\s+(are\s+)?in\b|\bcount\s+of\s+questions?\s+in\b"
+        ),
+        "text": """\
 User: "how many questions are in the inspection form?"
 ROUTING RULE: Do NOT use search_questions or list_forms — those return rows not a count. Use generate_sql.
 Turn 1: {"thought": "Count distinct questions from ai_questions filtered by module_name.", "tool": "generate_sql", "args": {"question": "count questions in inspection form", "schema_hint": "SELECT COUNT(DISTINCT element_id) AS question_count FROM ai_questions WHERE module_name ILIKE '%Inspection Form%';"}}
-
+""",
+    },
+    {
+        "title": "List forms",
+        "question_pattern": r"(?i)\bhow\s+many\s+forms?\s+are\s+there\b|\blist\s+(all\s+)?forms?\b",
+        "text": """\
 ─── List forms ───
 User: "how many forms are there?"
 Turn 1: {"thought": "list_forms gives distinct form names.", "tool": "list_forms", "args": {}}
-
+""",
+    },
+    {
+        "title": "Average form answer score",
+        "question_pattern": r"(?i)\baverage\s+score\s+in\s+the\b|\bavg\s+score\s+in\s+the\b",
+        "text": """\
 ─── Average form answer score ───
 User: "average score in the fire safety form"
 Turn 1: {"thought": "Aggregate over ai_answer.answer_text for fire safety.", "tool": "get_answer_stats", "args": {"form_name": "fire safety", "label": "score"}}
@@ -1285,7 +1437,52 @@ Turn 1: {"thought": "User answered metric. Entity already confirmed (FM managers
 ]
 
 
-def build_worked_examples(question: str) -> str:
+# Default combined-size cap applied ONLY when 2+ Tier-2/conditional blocks
+# match the same question (see _select_within_budget) — single-match questions
+# are never capped, so the common case is untouched. EXAMPLES_TIER2 blocks
+# range from ~700 to ~12,900 chars; this budget is sized so a multi-match
+# question costs roughly what ONE large block already costs alone, rather
+# than letting matches stack unbounded (observed: 2 blocks = 8,764 chars for
+# a single "capex" query, contributing to a reasoning-LLM prompt that nearly
+# filled its 20K-token context window and produced an empty completion).
+_DEFAULT_BLOCK_BUDGET_CHARS = 6000
+
+
+def _select_within_budget(
+    candidates: list[tuple[str, str]],
+    question: str,
+    score_fn,
+    budget_chars: int,
+) -> list[str]:
+    """
+    candidates: [(title, text), ...] — already topic-gated by regex match.
+
+    Without score_fn (the default everywhere this is called unless the
+    caller opts in), or when there's only one candidate, returns every text
+    unchanged — today's behavior, zero cost, zero risk.
+
+    With score_fn(question, title) -> float supplied, ranks candidates by
+    score descending and greedily keeps them within budget_chars, ALWAYS
+    keeping at least the single best-scored block regardless of its size
+    (so one large, highly-relevant block is never dropped) — additional
+    blocks are included only while they still fit.
+    """
+    if score_fn is None or len(candidates) <= 1:
+        return [text for _, text in candidates]
+    scored = sorted(candidates, key=lambda c: score_fn(question, c[0]), reverse=True)
+    kept: list[str] = []
+    total = 0
+    for _, text in scored:
+        if kept and total + len(text) > budget_chars:
+            break
+        kept.append(text)
+        total += len(text)
+    return kept
+
+
+def build_worked_examples(
+    question: str, score_fn=None, budget_chars: int = _DEFAULT_BLOCK_BUDGET_CHARS
+) -> str:
     """
     Return additional WORKED EXAMPLES text for narrow topics whose
     question_pattern matches the current question. Append the result to
@@ -1295,6 +1492,9 @@ def build_worked_examples(question: str) -> str:
 
     Returns "" if no Tier-2 example matches — i.e. no size penalty for
     questions outside these narrow topics.
+
+    `score_fn`, if supplied, ranks and budget-caps matches when 2+ fire
+    together — see _select_within_budget.
     """
     if not question:
         return ""
@@ -1302,16 +1502,17 @@ def build_worked_examples(question: str) -> str:
     for ex in EXAMPLES_TIER2:
         try:
             if re.search(ex["question_pattern"], question):
-                matched.append(ex["text"])
+                matched.append((ex["title"], ex["text"]))
         except re.error:
             continue
     if not matched:
         return ""
+    kept = _select_within_budget(matched, question, score_fn, budget_chars)
     return (
         "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "ADDITIONAL WORKED EXAMPLES (topic-matched for this question)\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        + "\n".join(matched)
+        + "\n".join(kept)
     )
 
 
@@ -1337,13 +1538,19 @@ CONDITIONAL_BLOCKS = [
 ]
 
 
-def build_conditional_blocks(question: str) -> str:
+def build_conditional_blocks(
+    question: str, score_fn=None, budget_chars: int = _DEFAULT_BLOCK_BUDGET_CHARS
+) -> str:
     """
     Return additional registry-derived semantic blocks whose question_pattern
     matches the current question. Companion to build_worked_examples — call
     both at per-call prompt-assembly time (see orchestrator.py query()).
 
     Returns "" if nothing matches — no size penalty for unrelated questions.
+
+    `score_fn`, if supplied, ranks and budget-caps matches when 2+ fire
+    together — see _select_within_budget. Only one entry exists today, so
+    this is a no-op in practice until CONDITIONAL_BLOCKS grows.
     """
     if not question:
         return ""
@@ -1351,27 +1558,36 @@ def build_conditional_blocks(question: str) -> str:
     for blk in CONDITIONAL_BLOCKS:
         try:
             if re.search(blk["question_pattern"], question):
-                matched.append(blk["get_text"]())
+                matched.append((blk["title"], blk["get_text"]()))
         except re.error:
             continue
     if not matched:
         return ""
+    kept = _select_within_budget(matched, question, score_fn, budget_chars)
     return (
         "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "ADDITIONAL CONTEXT (topic-matched for this question)\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        + "\n\n".join(matched)
+        + "\n\n".join(kept)
     )
 
 
-def build_dynamic_prompt_additions(question: str) -> str:
+def build_dynamic_prompt_additions(question: str, score_fn=None) -> str:
     """
     Single integration point: combines build_worked_examples (Tier-2 few-shots)
     and build_conditional_blocks (registry semantic facts) into one string to
     append to SYSTEM_PROMPT. Call this from orchestrator.py instead of either
     function individually, so future conditional-injection categories only
     need to be added here.
+
+    `score_fn(question, title) -> float`, if supplied, ranks and budget-caps
+    same-question multi-block matches (see _select_within_budget) instead of
+    concatenating every regex match unconditionally — without it, behavior is
+    unchanged from before this parameter existed.
     """
-    return build_conditional_blocks(question) + build_worked_examples(question)
+    return (
+        build_conditional_blocks(question, score_fn=score_fn)
+        + build_worked_examples(question, score_fn=score_fn)
+    )
 
     #123

@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 
 from core.logging_config import setup_logging
 from core.rbac import DATA_VISIBILITY_PERMS, build_scope_filter
-from core.disambiguation import is_disambiguation_result, is_entity_disambiguation_result
+from core.disambiguation import is_disambiguation_result, is_entity_disambiguation_result, extract_search_term
 from app_state import get_orch, get_orch_optional
 
 # ── TTS — lazy-loaded on first /api/tts call ──────────────────────────────────
@@ -188,6 +188,10 @@ class StepInfo(BaseModel):
     result_preview: str | None = None
     success: bool = True
 
+class DisambiguationMeta(BaseModel):
+    kind: str          # "person" | "facility" | "project" | "client" | "organisation"
+    search_term: str   # literal text from the STEP 1 ILIKE clause, e.g. "adnoc"
+
 class ResultData(BaseModel):
     rows: list[dict]
     columns: list[str]
@@ -197,6 +201,7 @@ class ResultData(BaseModel):
     page_size: int = 50
     has_more: bool = False
     sql: str | None = None   # base SQL — sent back with every /api/page call
+    disambiguation: DisambiguationMeta | None = None
 
 class ChartConfig(BaseModel):
     chart_type: str | None
@@ -250,6 +255,34 @@ def get_or_create_session(session_id: str) -> dict:
             "last_total": None,
         }
     return _sessions[session_id]
+
+
+# ── UUID column scrubber ──────────────────────────────────────────────────────
+
+_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE
+)
+
+
+def _strip_uuid_columns(columns: list, rows: list) -> tuple[list, list]:
+    """
+    Drop any column whose values are raw UUIDs before the result table reaches
+    the frontend. UUIDs (user_id, facility_id, etc.) are needed server-side to
+    resolve/join entities but are meaningless — and look like a bug — to a
+    person reading the chat table, so they're scrubbed here regardless of
+    which tool/path produced the rows.
+    """
+    if not columns or not rows:
+        return columns, rows
+    uuid_cols = {
+        col for col in columns
+        if any(_UUID_RE.match(str(row.get(col, "")).strip()) for row in rows if row.get(col))
+    }
+    if not uuid_cols:
+        return columns, rows
+    kept_cols = [c for c in columns if c not in uuid_cols]
+    kept_rows = [{k: v for k, v in row.items() if k not in uuid_cols} for row in rows]
+    return kept_cols, kept_rows
 
 
 # ── Answer cleaner ────────────────────────────────────────────────────────────
@@ -734,11 +767,20 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=
         # shape (user_id+name) and the entity shape (facility/project/client/
         # organisation — id+name+inspection_count).
         _last_sql = sess_data.get("last_sql") or ""
-        if _result_cols and (
-            is_disambiguation_result(_result_cols, _last_sql)
-            or is_entity_disambiguation_result(_result_cols, _last_sql)
-        ):
-            _skip_dashboard = True
+        _disambiguation_meta: DisambiguationMeta | None = None
+        if _result_cols:
+            if is_disambiguation_result(_result_cols, _last_sql):
+                _skip_dashboard = True
+                _term = extract_search_term(_last_sql)
+                if _term:
+                    _disambiguation_meta = DisambiguationMeta(kind="person", search_term=_term)
+            else:
+                _entity = is_entity_disambiguation_result(_result_cols, _last_sql)
+                if _entity:
+                    _skip_dashboard = True
+                    _term = extract_search_term(_last_sql)
+                    if _term:
+                        _disambiguation_meta = DisambiguationMeta(kind=_entity[0], search_term=_term)
 
         # Generate answer text; decide whether to show dashboard or plain chart suggestion
         if _result_rows and len(_result_rows) > 1 and not _chart_config and not _skip_dashboard:
@@ -805,6 +847,11 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=
                 )
                 _dashboard = _dashboard or DashboardData(show=False, cards=[])
 
+        # Scrub raw UUID columns (user_id, facility_id, ...) right before the
+        # table reaches the frontend — done last so it never affects chart/KPI
+        # column selection or summary generation upstream, only the payload.
+        _result_cols, _result_rows = _strip_uuid_columns(_result_cols, _result_rows)
+
         log_query.info(
             "[QUERY] END   qid=%s sub=%s elapsed=%dms llm_calls=%d "
             "sql_errors=%d rows=%d tokens=%d/%d success=%s",
@@ -838,6 +885,7 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=
                 page_size=50,
                 has_more=_has_more,
                 sql=sql,
+                disambiguation=_disambiguation_meta,
             ) if _result_rows else None,
             chart_config=_chart_config,
             dashboard=_dashboard,
@@ -944,14 +992,33 @@ async def get_page(req: PageRequest, token_data: dict = Depends(require_auth), o
             or len(rows) >= req.page_size
         )
 
+        # Recompute the same disambiguation metadata /api/chat attaches, so
+        # paging into a large pick-list (e.g. 112 name matches, 50/page)
+        # doesn't silently lose click-to-resolve on page 2+ — goToPage()
+        # replaces the whole result object with this response.
+        _page_disambiguation = None
+        if is_disambiguation_result(columns, sql):
+            _term = extract_search_term(sql)
+            if _term:
+                _page_disambiguation = {"kind": "person", "search_term": _term}
+        else:
+            _page_entity = is_entity_disambiguation_result(columns, sql)
+            if _page_entity:
+                _term = extract_search_term(sql)
+                if _term:
+                    _page_disambiguation = {"kind": _page_entity[0], "search_term": _term}
+
+        columns, rows = _strip_uuid_columns(columns, rows)
+
         return {
-            "rows":        rows,
-            "columns":     columns,
-            "row_count":   len(rows),
-            "total_count": total,
-            "page":        req.page,
-            "page_size":   req.page_size,
-            "has_more":    has_more,
+            "rows":           rows,
+            "columns":        columns,
+            "row_count":      len(rows),
+            "total_count":    total,
+            "page":           req.page,
+            "page_size":      req.page_size,
+            "has_more":       has_more,
+            "disambiguation": _page_disambiguation,
         }
 
     except HTTPException:

@@ -83,3 +83,22 @@ def is_entity_disambiguation_result(columns: list, sql: str = "") -> tuple[str, 
     if table not in _ENTITY_DISAMBIGUATION_TABLES:
         return None
     return table, alias
+
+
+_SEARCH_TERM_RE = re.compile(r"ILIKE\s+'%([^%]+)%'", re.IGNORECASE)
+
+
+def extract_search_term(sql: str) -> str | None:
+    """
+    Pull the literal search text out of a disambiguation STEP 1 query's ILIKE
+    clause (e.g. `fac.name ILIKE '%ADNOc%'` -> "ADNOc"). Callers must only
+    invoke this once `is_disambiguation_result`/`is_entity_disambiguation_result`
+    has already confirmed the SQL is a STEP 1 count-check — which by
+    construction has exactly one name/entity ILIKE filter — so taking the
+    first match unqualified (unlike the more carefully-anchored extraction in
+    agent/orchestrator.py) is safe here.
+    """
+    if not sql:
+        return None
+    m = _SEARCH_TERM_RE.search(sql)
+    return m.group(1).strip() if m and m.group(1).strip() else None

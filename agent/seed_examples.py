@@ -2511,6 +2511,60 @@ LIMIT 5;
         'limit':  5,
     },
     {
+        # "Top N X BY/ACROSS MONTH" = rank X by TOTAL first, take top N, THEN
+        # break down by month for just those N — a two-step CTE (rank, then
+        # join back for detail). Do NOT do this as one GROUP BY (month, X)
+        # with a single ORDER BY month, metric DESC LIMIT N — sorting by
+        # month first means LIMIT N is satisfied entirely from the EARLIEST
+        # month if it alone has >= N distinct X, silently dropping every
+        # later month from the result (observed bug: "top 5 capex generators
+        # by month" returned only January rows).
+        'nl':     'top 5 capex generators by month top 5 capex generators across months '
+                  'monthly breakdown for top capex generating fm managers capex trend '
+                  'by month for the top 5 fm managers top capex generators month by month',
+        'sql':    """\
+-- Rank FM managers by TOTAL capex first (top_managers CTE), THEN break down
+-- by month for just those 5 — NOT grouped by (month, manager) with a single
+-- ORDER BY month LIMIT 5, which only returns the earliest month's rows.
+WITH po_by_ica AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po
+    FROM po_details WHERE active = true GROUP BY 1
+),
+top_managers AS (
+    SELECT u.id AS user_id, u.first_name || ' ' || u.last_name AS fm_manager,
+           SUM(ica.capex) AS total_capex_generated
+    FROM inspection_corrective_action ica
+    JOIN inspection_report ir ON ica.inspection_id = ir.id
+    JOIN users u ON ir.inspectee_user_id = u.id
+    WHERE ir.active = true AND ica.active = true AND u.active = true AND ica.capex > 0
+    GROUP BY u.id, u.first_name, u.last_name
+    ORDER BY total_capex_generated DESC
+    LIMIT 5
+)
+SELECT
+    tm.fm_manager,
+    TO_CHAR(DATE_TRUNC('month', ir.submitted_on), 'Month YYYY') AS month_label,
+    COALESCE(SUM(ica.capex), 0)      AS capex_generated,
+    COALESCE(SUM(p.total_po), 0)     AS capex_converted
+FROM top_managers tm
+JOIN inspection_report ir ON ir.inspectee_user_id = tm.user_id
+JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id
+LEFT JOIN po_by_ica p ON p.ica_id = ica.id
+WHERE ir.active = true AND ica.active = true AND ica.capex > 0
+GROUP BY tm.fm_manager, tm.total_capex_generated, DATE_TRUNC('month', ir.submitted_on)
+ORDER BY tm.total_capex_generated DESC, DATE_TRUNC('month', ir.submitted_on);
+""",
+        'domain': 'financial',
+        # 'ranked_list', not 'per_row_breakdown' — the Stage 0 intent
+        # pre-filter (core/semantic.py's SeedExampleIndex.retrieve) only
+        # allows ('ranked_list', 'aggregate', 'filter', 'general') seeds
+        # through for a "top N ..." query (classified 'ranked_list'), so a
+        # different intent value here would silently exclude this example
+        # from ever being retrieved for the exact question it's meant to fix.
+        'intent': 'ranked_list',
+        'limit':  5,
+    },
+    {
         'nl':     'which corrective actions are awaiting capex approval',
         'sql':    """\
 -- capex_status IS NULL = awaiting approval (not yet actioned by approver)
