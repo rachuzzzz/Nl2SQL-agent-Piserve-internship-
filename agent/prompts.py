@@ -54,11 +54,12 @@ IMPORTANT — 'active' column existence (soft-delete):
   HAS active column — include WHERE <alias>.active = true:
     inspection_report, inspection_corrective_action, facility, users,
     inspection_type, inspector_portfolio, inspector_portfolio_details, frequency_definition,
-    po_details, pr_details, risk_level
+    po_details, pr_details, risk_level, inspection_schedule
   NO active column — NEVER write <alias>.active for these tables:
-    ai_answers, ai_questions, role, user_roles, inspection_schedule
-  In particular: inspection_schedule has NO active column. Do not add
-  isched.active = true to schema_hint — Postgres will reject it.
+    ai_answers, ai_questions, role, user_roles
+  In particular: inspection_schedule DOES have an active column (confirmed 2026-07-08:
+  21/2209 rows are active=false) — include WHERE isched.active = true unless the
+  question is specifically about cancelled/removed schedules.
   inspection_schedule display columns — NEVER include these in SELECT, they are almost always NULL:
     isched.schedule_id  (internal nullable UUID reference — useless for display, use isched.id the PK)
     isched.schedule_date  (often NULL for pending schedules — use isched.due_date instead)"""
@@ -159,13 +160,15 @@ ROUTING — INSPECTION QUERIES:
   "by project" / "by country" / "by org"   → generate_sql — JOIN lookup table via inspection_report FK
 
 LOOKUP TABLES (all have active column — filter WHERE active = true):
-  country:       id, name  — inspection_report.country_id (DIRECT) or facility.country_id
+  country:       id, name  — facility.country_id ONLY (inspection_report has NO country_id)
   entity:        id, name  — inspection_report.entity_id (DIRECT) — standalone business entity
   region:        id, name, country_id  — facility.region_id → region.id → country
   organisation:  id, name  — NO direct FK on inspection_report
-                             Join path: inspection_report → facility → organisation
-                             facility.organization_id → organisation.id
-                             (American spelling on FK column; British spelling on table name)
+                             ⚠ facility.organization_id → organisation.id is CONFIRMED DEAD
+                             (all rows NULL, join always empty) — use
+                             inspection_communication_group_organisations.organisation_id
+                             or organisation_countries.organisation_id instead
+                             (American spelling on the dead FK column; British spelling on table name)
   project:       id, name, organisation_id  — inspection_report.project_id
   client:        id, name  — inspection_report.client_id / facility.client_id
 
@@ -613,19 +616,20 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
 - SOFT-DELETE — ALWAYS add WHERE active = true (or AND active = true) when querying:
   inspection_report, inspection_corrective_action, facility, users,
   inspection_type, inspector_portfolio, inspector_portfolio_details,
-  frequency_definition, po_details, pr_details, risk_level,
+  frequency_definition, po_details, pr_details, risk_level, inspection_schedule,
   country, region, organisation, project, client, entity.
   NEVER return rows where active = false — those are deleted/archived records.
 - LOOKUP TABLE JOINS (inspection_report FK columns):
-  inspection_report.country_id      → country.id       (country.name)
   inspection_report.project_id      → project.id       (project.name)
   inspection_report.client_id       → client.id        (client.name)
   inspection_report.entity_id       → entity.id        (DIRECT FK)
-  inspection_report.country_id      → country.id       (DIRECT FK — use this for country queries)
+  # inspection_report has NO country_id — country is ONLY reachable via facility.country_id below
   NOTE: inspection_report has NO organisation_id or region_id — join via facility
-  facility.organization_id          → organisation.id  ← American spelling on column, British on table
+  facility.organization_id          → organisation.id  ⚠ CONFIRMED DEAD (all 175 rows NULL) —
+                                        reach organisation via inspection_communication_group_organisations
+                                        or organisation_countries instead
   facility.region_id                → region.id
-  facility.country_id               → country.id
+  facility.country_id               → country.id       (country.name — use this for country queries)
   # facility.client_id does NOT exist — reach client via inspection_report.client_id
   region.country_id                 → country.id       (region belongs to country)
   project.organisation_id           → organisation.id
@@ -1064,11 +1068,11 @@ Turn 1: {"thought": "Need FM manager ranked by capex conversion rate = SUM(po.po
         "text": """\
 ─── CAs not closed on time / closed late ───
 User: "how many corrective actions were not closed on time?" / "show closed-late corrective actions"
-Turn 1: {"thought": "'closed late' is DIFFERENT from 'overdue' — overdue means still OPEN and past due; closed late means it DID close (status='CLOSED') but completed_on was after target_close_out_date. These are mutually exclusive — NEVER OR them into one count. close_on is a dead column (all NULL); use completed_on.", "tool": "generate_sql", "args": {"question": "corrective actions not closed on time closed late vs overdue", "schema_hint": "SELECT COUNT(*) FILTER (WHERE status NOT IN ('CLOSED','CLOSE_WITH_DEFERRED') AND target_close_out_date < CURRENT_DATE) AS overdue_count, COUNT(*) FILTER (WHERE status = 'CLOSED' AND completed_on > target_close_out_date) AS closed_late_count FROM inspection_corrective_action WHERE active = true AND target_close_out_date IS NOT NULL;"}}
+Turn 1: {"thought": "'closed late' is DIFFERENT from 'overdue' — overdue means still OPEN and past due (status='OVERDUE', the authoritative field); closed late means it DID close (status='CLOSED') but completed_on was after target_close_out_date. These are mutually exclusive — NEVER OR them into one count. close_on is a dead column (all NULL); use completed_on.", "tool": "generate_sql", "args": {"question": "corrective actions not closed on time closed late vs overdue", "schema_hint": "SELECT COUNT(*) FILTER (WHERE status = 'OVERDUE') AS overdue_count, COUNT(*) FILTER (WHERE status = 'CLOSED' AND completed_on > target_close_out_date) AS closed_late_count FROM inspection_corrective_action WHERE active = true AND target_close_out_date IS NOT NULL;"}}
 
 ─── CAs timeliness breakdown (closed on time / closed late / overdue) ───
 User: "show corrective actions closed on time vs closed late vs overdue" / "give me a timeliness breakdown of corrective actions"
-Turn 1: {"thought": "Three-category breakdown using only ica columns (status, completed_on, target_close_out_date) — SINGLE TABLE, no joins needed. NEVER add JOIN inspection_report or reference ir.active here — there's nothing for ir to join on and it causes a missing-FROM-clause error.", "tool": "generate_sql", "args": {"question": "corrective actions timeliness breakdown closed on time closed late overdue", "schema_hint": "SELECT CASE WHEN status = 'CLOSED' AND completed_on <= target_close_out_date THEN 'closed on time' WHEN status = 'CLOSED' AND completed_on > target_close_out_date THEN 'closed late' WHEN status NOT IN ('CLOSED','CLOSE_WITH_DEFERRED') AND target_close_out_date < CURRENT_DATE THEN 'overdue' ELSE 'other' END AS timeliness_category, COUNT(*) AS ca_count FROM inspection_corrective_action WHERE active = true AND target_close_out_date IS NOT NULL GROUP BY timeliness_category ORDER BY timeliness_category;"}}
+Turn 1: {"thought": "Three-category breakdown using only ica columns (status, completed_on, target_close_out_date) — SINGLE TABLE, no joins needed. NEVER add JOIN inspection_report or reference ir.active here — there's nothing for ir to join on and it causes a missing-FROM-clause error. 'overdue' = status = 'OVERDUE', the authoritative field, not date arithmetic.", "tool": "generate_sql", "args": {"question": "corrective actions timeliness breakdown closed on time closed late overdue", "schema_hint": "SELECT CASE WHEN status = 'CLOSED' AND completed_on <= target_close_out_date THEN 'closed on time' WHEN status = 'CLOSED' AND completed_on > target_close_out_date THEN 'closed late' WHEN status = 'OVERDUE' THEN 'overdue' ELSE 'other' END AS timeliness_category, COUNT(*) AS ca_count FROM inspection_corrective_action WHERE active = true AND target_close_out_date IS NOT NULL GROUP BY timeliness_category ORDER BY timeliness_category;"}}
 
 ─── Most common causes of corrective actions — ica.cause, NOT form answers ───
 User: "what are the most common causes of corrective actions" / "top CA causes" / "most frequent causes"
@@ -1101,21 +1105,21 @@ Turn 1: {"thought": "ica.responsible is the enum column for who owns the CA. Use
             r"|\boverdue\b.{0,30}\binspections?\b|\binspections?\b.{0,30}\boverdue\b"
         ),
         "text": """\
-─── inspection_schedule queries — NO active column ───
-COLUMNS: isched.id (PK), isched.status, isched.due_date, isched.schedule_date (often NULL — prefer due_date for display)
+─── inspection_schedule queries — DOES have an active column ───
+COLUMNS: isched.id (PK), isched.active, isched.status, isched.due_date, isched.schedule_date (often NULL — prefer due_date for display)
 NEVER SELECT isched.schedule_id — it is a nullable internal reference UUID, almost always NULL and useless for display.
 User: "list all inspection schedules with facility, inspector, project and status"
-Turn 1: {"thought": "inspection_schedule has NO active column — do not add isched.active = true. facility/users/project DO have active columns, so filter those normally. NEVER select isched.schedule_id — it is almost always NULL. Use isched.id (the PK) for row identification and isched.due_date as the primary date.", "tool": "generate_sql", "args": {"question": "list all inspection schedules with facility, inspector, project and status", "schema_hint": "SELECT isched.id, isched.status, isched.due_date, fac.name AS facility_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, proj.name AS project_name FROM inspection_schedule isched LEFT JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN project proj ON isched.project_id = proj.id WHERE fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
+Turn 1: {"thought": "inspection_schedule DOES have an active column — add isched.active = true. facility/users/project also have active columns, filter those too. NEVER select isched.schedule_id — it is almost always NULL. Use isched.id (the PK) for row identification and isched.due_date as the primary date.", "tool": "generate_sql", "args": {"question": "list all inspection schedules with facility, inspector, project and status", "schema_hint": "SELECT isched.id, isched.status, isched.due_date, fac.name AS facility_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, proj.name AS project_name FROM inspection_schedule isched LEFT JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN project proj ON isched.project_id = proj.id WHERE isched.active = true AND fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
 
 ─── Facilities scheduled for a specific frequency ───
 User: "which facilities are scheduled for daily inspections"
 Turn 1: {"thought": "Daily inspections come from frequency_definition → inspector_portfolio_details → facility. Do NOT use inspection_schedule for this — frequency is set on the portfolio, not the schedule. Filter frequency_definition.name = 'Daily'.", "tool": "generate_sql", "args": {"question": "facilities scheduled for daily inspections", "schema_hint": "SELECT DISTINCT fac.name AS facility_name, fd.name AS frequency FROM frequency_definition fd JOIN inspector_portfolio_details ipd ON ipd.frequency_definition_id = fd.id JOIN facility fac ON fac.id = ipd.facility_id WHERE fd.name = 'Daily' AND fd.active = true AND ipd.active = true AND fac.active = true ORDER BY fac.name;"}}
 ─── Inspection schedule: overdue inspections ───
 User: "show all overdue inspections"
-Turn 1: {"thought": "Overdue inspections are in inspection_schedule WHERE status = 'OVERDUE'. inspection_schedule has NO inspection_id column — get facility, inspector, inspectee from FKs on inspection_schedule itself. Join inspection_report via schedule_id = ir.id to get inspection details. Do NOT select inspection_id from inspection_schedule.", "tool": "generate_sql", "args": {"question": "overdue inspections with facility inspector and due date", "schema_hint": "SELECT fac.name AS facility_name, proj.name AS project_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, u_ins.first_name || ' ' || u_ins.last_name AS inspectee_name, isched.due_date, (CURRENT_DATE - isched.due_date::date) AS days_overdue FROM inspection_schedule isched JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN project proj ON isched.project_id = proj.id JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN users u_ins ON isched.inspectee_id = u_ins.id WHERE isched.status = 'OVERDUE' AND fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
+Turn 1: {"thought": "Overdue inspections are in inspection_schedule WHERE status = 'OVERDUE'. inspection_schedule has NO inspection_id or inspection_report_id column — get facility, inspector, inspectee from FKs on inspection_schedule itself. To reach inspection_report instead, the FK is on the report: inspection_report.schedule_id = isched.id (not the other way round). Do NOT select inspection_id from inspection_schedule.", "tool": "generate_sql", "args": {"question": "overdue inspections with facility inspector and due date", "schema_hint": "SELECT fac.name AS facility_name, proj.name AS project_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, u_ins.first_name || ' ' || u_ins.last_name AS inspectee_name, isched.due_date, (CURRENT_DATE - isched.due_date::date) AS days_overdue FROM inspection_schedule isched JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN project proj ON isched.project_id = proj.id JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN users u_ins ON isched.inspectee_id = u_ins.id WHERE isched.status = 'OVERDUE' AND isched.active = true AND fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
 ─── Inspection schedule: schedule status counts ───
 User: "how many inspections are overdue vs pending vs completed"
-Turn 1: {"thought": "Count by status from inspection_schedule. inspection_schedule has NO active column — never use WHERE active = true on this table.", "tool": "generate_sql", "args": {"question": "inspection schedule status counts", "schema_hint": "SELECT status, COUNT(*) AS count FROM inspection_schedule GROUP BY status ORDER BY count DESC;"}}""",
+Turn 1: {"thought": "Count by status from inspection_schedule. inspection_schedule DOES have an active column — filter WHERE active = true to exclude cancelled/removed schedules.", "tool": "generate_sql", "args": {"question": "inspection schedule status counts", "schema_hint": "SELECT status, COUNT(*) AS count FROM inspection_schedule WHERE active = true GROUP BY status ORDER BY count DESC;"}}""",
     },
     # Form answers / observations / risk level / form-scores worked examples —
     # split into one entry per scenario (was a single ~12.9K-char block shared

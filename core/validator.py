@@ -205,10 +205,12 @@ class SQLValidator:
         "inspection_schedule": {
             # deepseek training bias: uses scheduled_date (past participle) instead of schedule_date
             "scheduled_date": "column is 'schedule_date' not 'scheduled_date' on inspection_schedule",
-            # inspection_schedule has no active column
-            "active":         "inspection_schedule has no active column — no soft-delete on this table",
-            # inspection_id does not exist — use inspection_report_id
-            "inspection_id":  "inspection_schedule has no inspection_id — use inspection_report_id FK",
+            # inspection_id/inspection_report_id do not exist on inspection_schedule — the FK lives
+            # on the report instead: inspection_report.schedule_id = isched.id
+            "inspection_id":         "inspection_schedule has no inspection_id — reach the report via "
+                                      "inspection_report.schedule_id = isched.id",
+            "inspection_report_id":  "inspection_schedule has no inspection_report_id — reach the report via "
+                                      "inspection_report.schedule_id = isched.id",
         },
     }
 
@@ -256,6 +258,23 @@ class SQLValidator:
     # If we check unqualified, we'd false-positive on "JOIN risk_level rl" clauses.
     _ICA_QUALIFIED_ONLY_COLS: frozenset = frozenset({"risk_level", "impact"})
 
+    # Columns that do not exist on inspection_cycle. It has NO human-readable
+    # name column — confirmed 2026-06-12 after a real DB error (see
+    # core/business_rules.py block_inspection_cycle_name, which documents the
+    # same fact but is never invoked at runtime — this is the live check).
+    # inspection_cycle columns: id, status, start_date, end_date, due_date,
+    # send_notification_to_inspectors, created_on, modified_on.
+    HALLUCINATED_IC_COLUMNS: dict[str, str] = {
+        "name":       "does not exist on inspection_cycle — cycles have no name, identify them by "
+                       "ic.start_date / ic.end_date / ic.status instead (e.g. 'Jan 2026 cycle')",
+        "cycle_name": "does not exist on inspection_cycle — cycles have no name, identify them by "
+                       "ic.start_date / ic.end_date / ic.status instead (e.g. 'Jan 2026 cycle')",
+        "title":      "does not exist on inspection_cycle — cycles have no name, identify them by "
+                       "ic.start_date / ic.end_date / ic.status instead (e.g. 'Jan 2026 cycle')",
+        "code":       "does not exist on inspection_cycle — cycles have no name, identify them by "
+                       "ic.start_date / ic.end_date / ic.status instead (e.g. 'Jan 2026 cycle')",
+    }
+
     # Impossible JOIN conditions derived from join_graph — these columns
     # do not exist so the join can never be correct. Keyed by the bad pattern
     # (regex), value is the correct path.
@@ -271,9 +290,11 @@ class SQLValidator:
         (r'\bipd\.id\s*=\s*ic\.id\b',
          'inspector_portfolio_details does not join directly to inspection_cycle. '
          'Use: ip.cycle_id = ic.id, then ipd.portfolio_id = ip.id'),
-        # inspection_schedule.inspection_id — does not exist
-        (r'\bisched\.inspection_id\b|\binspection_schedule\.inspection_id\b',
-         'inspection_schedule has no inspection_id — use inspection_report_id FK'),
+        # inspection_schedule.inspection_id / inspection_report_id — neither exists
+        (r'\bisched\.inspection_id\b|\binspection_schedule\.inspection_id\b'
+         r'|\bisched\.inspection_report_id\b|\binspection_schedule\.inspection_report_id\b',
+         'inspection_schedule has no inspection_id or inspection_report_id column. '
+         'The FK lives on the report instead: inspection_report.schedule_id = isched.id'),
         # ── observation → ai_answers cast direction ───────────────────────────
         # CORRECT cast: aa.submission_id = ica.observation_id::varchar
         #   (ica.observation_id is uuid, aa.submission_id is varchar — cast uuid to varchar)
@@ -294,6 +315,10 @@ class SQLValidator:
         "inspection_type_id":     ("inspection_type",    "it",   "it.name AS inspection_type_name"),
         "inspection_sub_type_id": ("inspection_sub_type","ist",  "ist.name AS subtype_name"),
         "module_id":              ("fb_modules",         "mod",  "mod.name AS module_name"),
+        # inspection_cycle has no human-readable name — its "identity" for display
+        # purposes is its date span + status, not a derived label from an unrelated
+        # date column (e.g. TO_CHAR of an individual inspection's submitted_on).
+        "cycle_id":               ("inspection_cycle",   "ic",   "ic.start_date, ic.end_date, ic.status AS cycle_status"),
     }
 
     # Precompiled patterns — class-level, built once
@@ -322,7 +347,7 @@ class SQLValidator:
     # Primary validation — HARD_FAIL vs SOFT_WARN separation
     # ------------------------------------------------------------------ #
 
-    def validate(self, sql: str) -> ValidationResult:
+    def validate(self, sql: str, question: str = "") -> ValidationResult:
         """
         Validate SQL. Returns ValidationResult.
 
@@ -463,6 +488,30 @@ class SQLValidator:
                     ))
                     ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
 
+        # ── 5b2. Hallucinated columns on inspection_cycle ─────────────────
+        # deepseek/llama repeatedly confabulate a display-name column on
+        # inspection_cycle (ic.name, ic.cycle_name, ...) even after get_schema
+        # returns the real column list — seen looping for 5 straight retries
+        # in production traces (2026-07-08). Only flag when inspection_cycle
+        # is actually joined, using its real alias(es) from FROM/JOIN, so we
+        # don't false-positive on unrelated tables that legitimately have a
+        # "name" column (facility.name, project.name, etc.).
+        _ic_table_used = bool(re.search(r'\binspection_cycle\b', sql_lower))
+        if _ic_table_used:
+            _ic_aliases: set[str] = {"inspection_cycle"}
+            for _m in re.finditer(r'\binspection_cycle\s+(?:as\s+)?(\w+)', sql_lower):
+                _ic_aliases.add(_m.group(1))
+            for col, hint in self.HALLUCINATED_IC_COLUMNS.items():
+                for alias in _ic_aliases:
+                    if re.search(rf"\b{re.escape(alias)}\.{re.escape(col)}\b", sql_lower):
+                        issues.append(ValidationIssue(
+                            "HARD_FAIL", "WRONG_COLUMN",
+                            f"Column '{alias}.{col}' does not exist on inspection_cycle — {hint}",
+                            detail=f"Hallucinated IC column: {col}",
+                        ))
+                        ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+                        break
+
         # ── 5c. Impossible JOIN conditions (from join graph) ─────────────
         for _pattern, _correct in self.IMPOSSIBLE_JOIN_PATTERNS:
             if re.search(_pattern, sql_lower):
@@ -570,14 +619,15 @@ class SQLValidator:
             break  # one report is enough
 
         # ── 10. close_on arithmetic — HARD_FAIL (dead column, all NULL) ──────
-        # close_on does not exist — any reference to it fails at the DB level.
-        
+        # close_on exists as a real column but is confirmed always NULL
+        # (0/398 populated, 2026-07-08) — arithmetic on it silently produces NULL.
+
         # business_rules.py block_close_on_arithmetic also blocks this at the
         # INJECT layer; this validator check catches it at execution-time too.
         if self._CLOSE_ON_ARITH_RE.search(sql):
             issues.append(ValidationIssue(
                 "HARD_FAIL", "DEAD_COLUMN",
-                "BLOCKED: close_on does not exist — use completed_on "
+                "BLOCKED: close_on is always NULL in production (dead column) — use completed_on "
                 "for closure timing (populated for status='CLOSED' rows)",
                 detail="For closed-late: status='CLOSED' AND completed_on > target_close_out_date",
                 retryable=True,
@@ -654,6 +704,85 @@ class SQLValidator:
                     ),
                 ))
                 ValidatorStats.record("SPLIT_NAME_MISMATCH", is_retry_trigger=True)
+
+        # ── 10e. "overdue" corrective actions via date arithmetic — HARD_FAIL ──
+        # status='OVERDUE' is the authoritative, maintained field. Reconstructing
+        # it via `NOT status IN (...) AND target_close_out_date < CURRENT_DATE`
+        # silently diverges from that field's business rule (grace periods,
+        # deferrals, etc. are baked into the maintained status, not the raw date
+        # comparison) — both 3B and 7B were observed doing this identically in
+        # eval, always without error, so it was invisible until the SQL was
+        # read by hand. Scoped tightly to "overdue" + corrective/action to avoid
+        # over-firing on unrelated "active"/"status" questions.
+        _overdue_ca_q = re.compile(
+            r"\boverdue\b.{0,25}\b(?:corrective|actions?)\b"
+            r"|\b(?:corrective|actions?)\b.{0,25}\boverdue\b",
+            re.IGNORECASE,
+        )
+        if question and _overdue_ca_q.search(question):
+            uses_overdue_status = "'OVERDUE'" in sql.upper()
+            uses_date_compare = bool(re.search(
+                r"target_close_out_date\s*<\s*(?:now|current_date)", sql_lower, re.IGNORECASE))
+            if not uses_overdue_status and uses_date_compare:
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "OVERDUE_DATE_ARITHMETIC",
+                    "Overdue corrective actions must use status='OVERDUE', not date arithmetic",
+                    detail="status='OVERDUE' is the authoritative field — do not recompute "
+                           "overdue from target_close_out_date/CLOSED/CLOSE_WITH_DEFERRED",
+                ))
+                ValidatorStats.record("OVERDUE_DATE_ARITHMETIC", is_retry_trigger=True)
+
+        # ── 10f. "which cycle" returning a bare cycle_id — HARD_FAIL ────────────
+        # inspection_cycle has no human-readable name — its only identity is
+        # start_date/end_date/status. A query that answers "which cycle ..." by
+        # selecting/grouping on the raw cycle_id UUID without joining
+        # inspection_cycle is unusable in the UI and easily read as duplicate
+        # rows when unrelated derived labels (e.g. month of an individual
+        # inspection's submitted_on) coincide across several distinct cycles.
+        # Reuses the precise AST-based SELECT/GROUP BY leak detector (not a
+        # blind substring match) so a legitimate `WHERE cycle_id = '<uuid>'`
+        # scoping filter is never flagged.
+        if question and re.search(r"\bcycle\b", question, re.IGNORECASE):
+            _cycle_leak: list[ValidationIssue] = []
+            _cycle_fk = {"cycle_id": self.UUID_FK_COLUMNS["cycle_id"]}
+            if _HAS_SQLGLOT:
+                _check_uuid_leaks_ast(sql, _cycle_fk, _cycle_leak)
+            else:
+                _check_uuid_leaks_regex(sql_lower, _cycle_fk, _cycle_leak)
+            if _cycle_leak:
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "CYCLE_UUID_NO_JOIN",
+                    "Question asks about a cycle but SQL exposes cycle_id without "
+                    "joining inspection_cycle for its date span/status",
+                    detail=_cycle_leak[0].detail,
+                ))
+                ValidatorStats.record("CYCLE_UUID_NO_JOIN", is_retry_trigger=True)
+
+        # ── 10g. "opex incurred/converted" answered via po_details — HARD_FAIL ──
+        # po_details (Purchase Orders) is the CAPEX conversion table; pr_details
+        # (Purchase Requisitions) is the OPEX one. Both share the same
+        # mitigative_action_uuid join shape, so joining the wrong one produces
+        # a plausible, non-erroring result that is actually measuring CAPEX
+        # data under an "opex" label — observed live 2026-07-07: a query asking
+        # for "opex generated and converted" joined po_details for the
+        # "converted" figure instead of pr_details.
+        _opex_convert_q = re.compile(
+            r"\bopex\b.{0,25}\b(?:converted|incurred|spend|spent)\b"
+            r"|\b(?:converted|incurred|spend|spent)\b.{0,25}\bopex\b",
+            re.IGNORECASE,
+        )
+        if question and _opex_convert_q.search(question):
+            uses_po = bool(re.search(r"\bpo_details\b|\bpo\.po_amount\b", sql_lower))
+            uses_pr = bool(re.search(r"\bpr_details\b|\bpr\.pr_amount\b", sql_lower))
+            if uses_po and not uses_pr:
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "OPEX_WRONG_TABLE",
+                    "OPEX incurred/converted must come from pr_details (Purchase "
+                    "Requisitions), not po_details (that's the CAPEX conversion table)",
+                    detail="JOIN pr_details pr ON pr.mitigative_action_uuid = ica.id, "
+                           "SELECT SUM(pr.pr_amount)",
+                ))
+                ValidatorStats.record("OPEX_WRONG_TABLE", is_retry_trigger=True)
 
         has_agg = bool(self._AGG_RE.search(sql))
         if not has_agg and not self._LIMIT_RE.search(sql):
@@ -876,23 +1005,10 @@ class SQLValidator:
                 ))
                 ValidatorStats.record("MISSING_COMPLETED_STATUS", is_retry_trigger=False)
 
-        # "overdue" corrective actions should use status='OVERDUE' not date arithmetic
-        _OVERDUE_CA_Q = re.compile(
-            r"\boverdue\s+(corrective|action)\b|\b(corrective|action).{0,15}overdue\b",
-            re.IGNORECASE,
-        )
-        if _OVERDUE_CA_Q.search(question):
-            uses_overdue_status = "'OVERDUE'" in sql.upper()
-            uses_date_compare = bool(re.search(
-                r"target_close_out_date\s*<\s*(?:NOW|CURRENT_DATE)", sql_lower))
-            if not uses_overdue_status and uses_date_compare:
-                warns.append(ValidationIssue(
-                    "SOFT_WARN", "SEMANTIC_DATE_VS_STATUS",
-                    "Overdue corrective actions: prefer status='OVERDUE' over date arithmetic",
-                    detail="status='OVERDUE' is the authoritative field — do not recompute from target_close_out_date",
-                    retryable=False,
-                ))
-                ValidatorStats.record("SEMANTIC_DATE_VS_STATUS", is_retry_trigger=False)
+        # NOTE: "overdue corrective actions" via date arithmetic is now a HARD_FAIL,
+        # enforced in validate() (see OVERDUE_DATE_ARITHMETIC) — promoted out of this
+        # advisory-only method because it was firing consistently (both 3B and 7B,
+        # in eval) with no retry and no user-visible signal.
 
         # ── Business glossary term checks ─────────────────────────────────────
         if _HAS_GLOSSARY:
@@ -1029,12 +1145,12 @@ class SQLValidator:
         "inspector_portfolio", "inspector_portfolio_details",
         "frequency_definition", "po_details", "pr_details", "risk_level",
         "client", "project", "country", "region", "entity", "organisation",
+        "inspection_schedule", "impact",
     })
 
     # Tables that NEVER have an active column — never inject for these.
     _NO_ACTIVE_TABLES: frozenset = frozenset({
         "ai_answers", "ai_questions", "role", "user_roles",
-        "inspection_schedule",
     })
 
     def ast_repair(self, sql: str) -> tuple:
@@ -1376,55 +1492,6 @@ class SQLValidator:
                     )
                 return node
             tree = tree.transform(_fix_scheduled_date)
-        # deepseek hallucinates a standalone 'impact' table every time it generates
-        # CA detail queries. ast_repair removes both the JOIN and any SELECT columns
-        # referencing the impact alias, so the BLOCK rule never fires.
-        _impact_aliases: set = set()
-        for node in tree.find_all(exp.Table):
-            if node.name and node.name.lower() == "impact":
-                _impact_aliases.add((node.alias or node.name).lower())
-
-        if _impact_aliases:
-            # Remove impact columns from SELECT expressions
-            def _drop_impact_cols(node):
-                if isinstance(node, exp.Select):
-                    new_exprs = []
-                    for expr in node.expressions:
-                        col = expr.this if isinstance(expr, exp.Alias) else expr
-                        if (isinstance(col, exp.Column)
-                                and col.table
-                                and col.table.lower() in _impact_aliases):
-                            mutations.append(
-                                f"Removed {col.table}.{col.name} "
-                                f"(table 'impact' does not exist — use ai_answers WHERE aq.label='Impact')"
-                            )
-                            continue
-                        new_exprs.append(expr)
-                    if len(new_exprs) < len(node.expressions):
-                        node = node.copy()
-                        node.set("expressions", new_exprs)
-                return node
-
-            tree = tree.transform(_drop_impact_cols)
-
-            # Remove the JOIN to impact from every Select node's joins list
-            # (transform can't delete JOIN nodes — must mutate the joins list directly)
-            for sel in tree.find_all(exp.Select):
-                joins = sel.args.get("joins")
-                if not joins:
-                    continue
-                new_joins = []
-                for j in joins:
-                    tbl = j.this
-                    if (isinstance(tbl, exp.Table)
-                            and tbl.name
-                            and tbl.name.lower() == "impact"):
-                        mutations.append("Removed JOIN impact (table does not exist)")
-                    else:
-                        new_joins.append(j)
-                if len(new_joins) < len(joins):
-                    sel.set("joins", new_joins)
-
         # ── 6. Drop ORDER BY / GROUP BY terms referencing an undefined alias ──
         # Weak SQL-gen models (e.g. small local models) frequently copy a seed
         # example's ORDER BY/GROUP BY clause referencing a SELECT alias they

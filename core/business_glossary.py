@@ -352,8 +352,27 @@ _RAW: list[dict] = [
         "severity": "SOFT_WARN",
     },
     {
+        "id": "opex_generated",
+        "terms": ["opex generated", "generated opex", "total opex generated"],
+        "required_pattern": r"SUM\s*\(\s*(?:ica\.)?opex\s*\)|inspection_corrective_action",
+        "forbidden_patterns": [],
+        "correct_sql": "SUM(ica.opex) AS opex_generated FROM inspection_corrective_action",
+        "message": "OPEX Generated = SUM(ica.opex) from inspection_corrective_action — "
+                   "the inspectee's estimate, parallel to CAPEX Generated. Distinct from "
+                   "OPEX Incurred/Converted (SUM(pr_details.pr_amount), the actual realized spend).",
+        "severity": "SOFT_WARN",
+    },
+    {
         "id": "opex_incurred",
-        "terms": ["opex incurred", "opex spend", "purchase requisition amount", "pr amount"],
+        # Plain phrases PLUS proximity patterns — bare "opex converted" as a
+        # contiguous literal misses realistic phrasing like "opex generated
+        # AND converted" (the word "converted" isn't adjacent to "opex").
+        # Same class of miss that let 'overdue' slip through in seed_examples.py.
+        "terms": [
+            "opex incurred", "opex spend", "purchase requisition amount", "pr amount",
+            r"opex\b.{0,25}\b(?:converted|incurred|spend|spent)",
+            r"(?:converted|incurred|spend|spent)\b.{0,25}\bopex",
+        ],
         "required_pattern": r"pr_details|pr\.pr_amount|pr_by_ica",
         "forbidden_patterns": [
             r"SUM\s*\(\s*ica\.opex\s*\)",

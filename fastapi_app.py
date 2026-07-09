@@ -144,6 +144,24 @@ async def lifespan(app: FastAPI):
     from agent.orchestrator import AgentOrchestrator
     app.state.orch = AgentOrchestrator.from_env()
     log.info("[SERVER] Orchestrator ready in %.1fs", time.time() - t0)
+
+    # Catch definition desyncs between core/semantics_registry.py (the declared
+    # single source of truth) and the prompt/example files that actually feed
+    # the SQL-generating LLM. This previously existed as a CLI-only tool nobody
+    # ran automatically — the "overdue" bug (fixed 2026-07-07) sat undetected
+    # for an unknown period because of exactly that gap.
+    from core.semantics_registry import verify_consistency
+    _desyncs = verify_consistency([
+        "agent/prompts.py", "agent/seed_examples.py",
+        "core/business_rules.py", "agent/orchestrator.py",
+    ])
+    if _desyncs:
+        log.warning("[SERVER] %d semantics desync(s) detected — see core.semantics_registry:", len(_desyncs))
+        for _d in _desyncs:
+            log.warning("[SERVER]   %s", _d)
+    else:
+        log.info("[SERVER] semantics_registry consistency check passed")
+
     yield
     log.info("[SERVER] Shutting down")
 
@@ -1197,6 +1215,16 @@ async def ready(request: Request):
     if get_orch_optional(request) is None:
         return JSONResponse(status_code=503, content={"status": "loading"})
     return {"status": "ready"}
+
+@app.get("/api/validator-stats")
+async def validator_stats():
+    """
+    Read-only diagnostic: how often each validator rule has fired since process
+    start. In-memory only (resets on restart, same as _sessions) — enough to
+    notice a SOFT_WARN firing constantly without needing to grep debug logs.
+    """
+    from core.validator import ValidatorStats
+    return ValidatorStats.snapshot()
 
 
 # ── ASR ───────────────────────────────────────────────────────────────────────

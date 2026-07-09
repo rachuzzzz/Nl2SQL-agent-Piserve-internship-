@@ -325,12 +325,18 @@ class ConversationSession:
         if not self.turns:
             return ""
 
+        # NOTE: bare "that"/"this" are deliberately excluded — they double as
+        # relative pronouns/determiners in ordinary questions ("corrective actions
+        # THAT are overdue", "show me THIS month's data") and caused the sticky
+        # active-context gate below to false-positive-match plain global questions.
+        # Demonstrative reference to a specific entity is still caught via the
+        # explicit "that/this <entity>" phrases.
         _FOLLOWUP_RE = re.compile(
-            r"\b(it|that|this|she|he|they|them|her|his|their|"
-            r"that\s+inspection|that\s+site|that\s+facility|that\s+form|"
+            r"\b(it|its|them|they|she|he|her|his|their|"
+            r"(?:that|this)\s+(?:inspection|site|facility|form|inspector|cycle|"
+            r"person|project|client|action|schedule)|"
             r"the\s+same|the\s+above|from\s+there|more|rest|remaining|"
-            r"continue|next|previous|last\s+one|back\s+to|go\s+back|"
-            r"that\s+inspector|that\s+cycle|that\s+person)\b",
+            r"continue|next|previous|last\s+one|back\s+to|go\s+back)\b",
             re.IGNORECASE,
         )
         # A question is "clearly fresh" only when it introduces a wholly new subject.
@@ -435,7 +441,14 @@ class ConversationSession:
                     return match["id"]
             return ""
 
-        if not is_clearly_fresh and active_type and active_value:
+        # Scope only carries forward when the question is an actual detected
+        # follow-up (pronoun, "that <entity>", "back to", etc.) — NOT merely
+        # whenever the question fails to match a narrow "fresh subject" allowlist.
+        # The previous default (carry forward unless clearly fresh) let stale
+        # entity scope silently leak into unrelated global questions that happened
+        # not to contain "most recent"/"most common"/"latest" (e.g. "which cycle
+        # is currently active" inheriting a facility resolved 2 turns earlier).
+        if is_followup and not is_clearly_fresh and active_type and active_value:
             if active_type == "cycle":
                 lines.append(
                     f"ACTIVE CONTEXT — The conversation is scoped to cycle "
@@ -526,8 +539,10 @@ class ConversationSession:
                 lines.append(
                     f"ACTIVE CONTEXT — The conversation is about corrective action '{active_value}'."
                 )
-        elif not is_clearly_fresh:
-            # Fallback: legacy single-entity context
+        elif is_followup and not is_clearly_fresh:
+            # Fallback: legacy single-entity context. Same fix as the primary
+            # gate above — only carry this forward on an actual detected
+            # follow-up, not merely whenever the question isn't "clearly fresh".
             if last.inspection_ids and len(last.inspection_ids) == 1:
                 lines.append(
                     f"CONTEXT — The conversation is about inspection '{last.inspection_ids[0]}'."
@@ -1105,7 +1120,7 @@ class AgentOrchestrator:
 
                 # Path A: last turn used execute_sql — re-run the SQL
                 if prev.sql:
-                    er = self.registry.call("execute_sql", {"sql": prev.sql})
+                    er = self.registry.call("execute_sql", {"sql": prev.sql, "question": question})
                     s = AgentStep(1, "[auto] pagination", "execute_sql",
                                   {"sql": prev.sql}, er, 0)
                     steps.append(s); _emit(s)
@@ -1206,7 +1221,9 @@ class AgentOrchestrator:
 
                 messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
                 messages.append(ChatMessage(role=MessageRole.USER, content=
-                    f"Not valid JSON: {exc}\nRespond with ONLY a JSON tool call."))
+                    f"Not valid JSON: {exc}\n"
+                    f"Original question: \"{question}\"\n"
+                    f"Respond with ONLY a JSON tool call for THIS question."))
                 s = AgentStep(iteration, "[parse error]", "[parse_error]",
                               {}, {"error": str(exc)}, int((time.time()-t0)*1000))
                 steps.append(s); _emit(s); continue
@@ -1363,7 +1380,7 @@ class AgentOrchestrator:
                                 steps, iteration, False, stats,
                             )
                     et0 = time.time()
-                    er = self.registry.call("execute_sql", {"sql": sql})
+                    er = self.registry.call("execute_sql", {"sql": sql, "question": question})
                     _exec_ms = int((time.time() - et0) * 1000)
                     auto = AgentStep(iteration, "[auto] execute after generate_sql",
                                      "execute_sql", {"sql": sql}, er, _exec_ms)
@@ -1378,7 +1395,8 @@ class AgentOrchestrator:
                         err_msg = er.get("error", "")
                         messages.append(ChatMessage(role=MessageRole.USER, content=
                             f"SQL execution failed: {err_msg}\n{hint}"
-                            f"Rewrite the query. Do NOT pass the failed SQL as schema_hint again. "
+                            f"Original question: \"{question}\"\n"
+                            f"Rewrite the query for THIS question. Do NOT pass the failed SQL as schema_hint again. "
                             f"Use get_schema if you need to verify column names."))
                         continue
 
@@ -1445,7 +1463,7 @@ class AgentOrchestrator:
                         if sql:
                             _log_sql.warning("[SQL ] %sforced execution after %d validation failures",
                                              _pfx, gen_sql_failures)
-                            er = self.registry.call("execute_sql", {"sql": sql})
+                            er = self.registry.call("execute_sql", {"sql": sql, "question": question})
                             auto = AgentStep(iteration, "[auto] forced exec after 3 failures",
                                              "execute_sql", {"sql": sql}, er, 0)
                             steps.append(auto); _emit(auto)
@@ -1458,7 +1476,8 @@ class AgentOrchestrator:
                     messages.append(ChatMessage(role=MessageRole.USER, content=
                         f"generate_sql failed ({gen_sql_failures}x). Fix required: {retry_reason}\n"
                         f"{_constraint_notes}"
-                        f"Rewrite the SQL from scratch. Do NOT put corrected SQL in schema_hint."))
+                        f"Original question: \"{question}\"\n"
+                        f"Rewrite the SQL from scratch for THIS question. Do NOT put corrected SQL in schema_hint."))
                     continue
 
             # Path B: terminal tools → synthesize and return

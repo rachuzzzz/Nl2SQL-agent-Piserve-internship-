@@ -123,9 +123,13 @@ SEMANTICS: dict = {
                 "meaning": "arithmetic difference — generated minus converted",
                 "never": "capex_status='REJECTED'/'DEFERRED' is NOT the loss calculation",
             },
+            "opex_generated": {
+                "expr": "SUM(ica.opex)",
+                "meaning": "inspectee's original estimate on ICA — parallel to capex_generated",
+            },
             "opex_incurred": {
                 "expr": "SUM(pr.pr_amount)",
-                "meaning": "actual PR spend (via pr_details)",
+                "meaning": "actual PR spend (via pr_details) — a.k.a. 'opex converted', parallel to capex_converted",
             },
         },
         "tables": {
@@ -165,6 +169,15 @@ SEMANTICS: dict = {
             "Inspectors only raise observations — they have NO role in CAPEX/OPEX",
             "FM Manager (inspectee_user_id) raises the ICA and assigns the CAPEX value",
             "Client raises PO to cover it (CAPEX Converted) or org raises PR (OPEX Incurred)",
+            # VERIFIED against live data 2026-07-07: 26/26 distinct inspectee_user_id
+            # values in inspection_report hold at least one FM-side role (FM Manager,
+            # FM Engineer, AD FM, Asst FM Manager, FM Admin, FM Supervisor — see
+            # schema_introspector.py's USER ROLES section for the full EXISTS pattern).
+            # 0 exceptions found. This is a data snapshot, not a DB-enforced constraint
+            # — if it ever needs re-checking, run the same EXISTS query again; it is
+            # NOT currently applied to fm_manager queries (33 locations checked
+            # 2026-07-07) since it changes zero results today and the role table
+            # itself carries its own caveats (see schema_introspector.py).
         ],
     },
 
@@ -221,14 +234,15 @@ SEMANTICS: dict = {
         "unreliable_columns": {
             "pending_with":    "observed NULL across rows — derive 'who must act' from implementation_status",
             "adequacy_status": "currently NULL, future use",
-            "close_on":        "column does not exist — NEVER use. Use completed_on for closure timing.",
+            "close_on":        "dead column — confirmed always NULL (0/398, 2026-07-08). Use completed_on for closure timing.",
         },
         "timeliness": {
-            # confirmed 2026-06-11: completed_on populated for CLOSED rows, close_on does not exist
+            # confirmed 2026-06-11: completed_on populated for CLOSED rows
+            # confirmed 2026-07-08: close_on exists but is always NULL (0/398 rows) — dead, not missing
             "completed_on": "the actual closure timestamp — populated for status='CLOSED' rows",
             "overdue": {
                 "meaning": "still OPEN and past deadline — has NOT closed yet",
-                "expr": "status NOT IN ('CLOSED','CLOSE_WITH_DEFERRED') AND target_close_out_date < CURRENT_DATE",
+                "expr": "status = 'OVERDUE'",
             },
             "closed_late": {
                 "meaning": "DID close, but after the deadline — mutually exclusive with overdue",
@@ -246,7 +260,7 @@ SEMANTICS: dict = {
             "sent back / returned":               "implementation_status = 'RETURN_FOR_MODIFICATION'",
             "at risk / behind / on track":        "progress_stage (schedule health)",
             "not started":                        "progress_stage = 'NOT_STARTED' OR progress_stage IS NULL",
-            "overdue":                            "status NOT IN ('CLOSED','CLOSE_WITH_DEFERRED') AND target_close_out_date < CURRENT_DATE",
+            "overdue":                            "status = 'OVERDUE'",
             "closed late / not closed on time":   "status = 'CLOSED' AND completed_on > target_close_out_date",
         },
     },
@@ -254,12 +268,14 @@ SEMANTICS: dict = {
     # ── Column existence facts (validator-relevant) ──────────────────────────
     "columns": {
         "no_active_column": [
-            "ai_answers", "ai_questions", "role", "user_roles", "inspection_schedule",
+            "ai_answers", "ai_questions", "role", "user_roles",
         ],
         "has_active_column": [
             "inspection_report", "inspection_corrective_action", "facility", "users",
             "inspection_type", "inspector_portfolio", "inspector_portfolio_details",
             "frequency_definition", "po_details", "pr_details", "risk_level",
+            "inspection_schedule",
+            # confirmed 2026-07-08: 21/2209 rows are active=false — a real, used soft-delete flag
         ],
     },
 }
@@ -487,8 +503,9 @@ def llama_columns_block() -> str:
 {has_wrapped}
   NO active column — NEVER write <alias>.active for these tables:
     {", ".join(no)}
-  In particular: inspection_schedule has NO active column. Do not add
-  isched.active = true to schema_hint — Postgres will reject it."""
+  In particular: inspection_schedule DOES have an active column (confirmed 2026-07-08,
+  21/2209 rows are active=false) — include WHERE isched.active = true unless the
+  question is specifically about cancelled/removed schedules."""
 
 
 def core_context_ca_workflow_block() -> str:
@@ -517,7 +534,7 @@ def core_context_ca_workflow_block() -> str:
 --                              ({t['overdue']['meaning']})
 --   'not closed on time' / 'closed late' = {t['closed_late']['expr']}
 --                              ({t['closed_late']['meaning']})
---   close_on does not exist — use completed_on for closure timing
+--   close_on is a dead column (always NULL) — use completed_on for closure timing
 --   {t['invariant']}"""
 
 
@@ -546,7 +563,8 @@ def inject_hint_financial() -> str:
         f"\n  CAPEX Loss Detail (from form answers — module: '{loss['module']}'):\n"
         f"{loss_labels}\n"
         f"    JOIN via: {loss['join']}\n"
-        f"\n  OPEX Incurred    = {m['opex_incurred']['expr']}    — {m['opex_incurred']['meaning']}\n"
+        f"\n  OPEX Generated   = {m['opex_generated']['expr']}       — {m['opex_generated']['meaning']}\n"
+        f"  OPEX Incurred    = {m['opex_incurred']['expr']}    — {m['opex_incurred']['meaning']}\n"
         f"    '{prf['labels'][0]}' / '{prf['labels'][1]}' / '{prf['labels'][2]}' also in form: '{prf['module']}'\n"
         f"    JOIN via: {prf['join']}\n"
         f"\npo_details: {', '.join(po['columns'])}\n"
@@ -586,7 +604,7 @@ def llama_ca_workflow_block() -> str:
   TIMELINESS — 'overdue' and 'closed late' are MUTUALLY EXCLUSIVE, NEVER OR them:
     'overdue' (still open, past due)     → {t['overdue']['expr']}
     'closed late' / 'not closed on time' → {t['closed_late']['expr']}
-    close_on does not exist — use completed_on for closure timing."""
+    close_on is a dead column (always NULL) — use completed_on for closure timing."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -617,11 +635,17 @@ _STALE_PATTERNS: list[tuple[str, str]] = [
     (r"mitigative_action_uuid\s*=\s*ir\.",
      "wrong join target: mitigative_action_uuid → ica.id, never ir.id (silent all-zero results)"),
     (r"\bclose_on\s*[<>]=?\s*\w",
-     "close_on does not exist — use completed_on for closure timing"),
+     "close_on is a dead column (always NULL) — use completed_on for closure timing"),
     (r"implementation_status\s*=\s*'APPROVED'",
      "wrong enum string: it is 'APPROVE' not 'APPROVED'"),
     (r"implementation_status\s*=\s*'PENDING'(?!_)",
      "wrong enum string: it is 'PENDING_FOR_REVIEW' not 'PENDING'"),
+    (r"status\s*NOT\s*IN\s*\(\s*'CLOSED'\s*,\s*'CLOSE_WITH_DEFERRED'\s*\)\s*AND\s*"
+     r"[\w.]*target_close_out_date\s*<\s*(?:CURRENT_DATE|NOW\(\))",
+     "old definition: overdue reconstructed via date arithmetic — must be status = 'OVERDUE' "
+     "(found live in agent/seed_examples.py, agent/prompts.py, core/business_rules.py, "
+     "and core/semantics_registry.py itself on 2026-07-07; cost every 'overdue' query an "
+     "extra retry before the model self-corrected)"),
 ]
 
 
