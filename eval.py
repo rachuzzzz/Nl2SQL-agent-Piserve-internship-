@@ -333,7 +333,7 @@ TEST_SET = [
         "expected_contains": ["quarter", "closed"],
         "expected_nonempty": False,
         "expected_llm_calls": 1,
-        "notes": "close_on does not exist — answer must use completed_on for status-based closure rate",
+        "notes": "close_on is a dead column (always NULL) — answer must use completed_on for status-based closure rate",
     },
     {
         "id": "TRD-03", "category": "Trends",

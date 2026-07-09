@@ -716,7 +716,7 @@ def generate_sql(
             _debug_logger.debug(f"  [ast-repair] {'; '.join(_ast_mutations)}")
 
         # validate() returns ValidationResult — hard fails block, soft warns are advisory only.
-        vresult = validator.validate(sql)
+        vresult = validator.validate(sql, question)
 
         # validate_semantic() returns SOFT_WARN issues only.
         # These are logged for observability but NEVER injected into the retry prompt.
@@ -773,11 +773,15 @@ def generate_sql(
         }
 
 
-def execute_sql(db_engine: Engine, validator: SQLValidator, sql: str) -> dict[str, Any]:
+def execute_sql(db_engine: Engine, validator: SQLValidator, sql: str, question: str = "") -> dict[str, Any]:
     try:
         # validate() returns ValidationResult.
         # Only hard fails block execution — soft warns are advisory and ignored here.
-        vresult = validator.validate(sql)
+        # question is threaded through so question-scoped HARD_FAILs (e.g.
+        # OVERDUE_DATE_ARITHMETIC, CYCLE_UUID_NO_JOIN) still apply here — this is
+        # also the re-validation gate used by the "forced execution after 3
+        # failures" fallback in the orchestrator, which must not silently bypass them.
+        vresult = validator.validate(sql, question)
         if not vresult.passed:
             return {
                 "success": False,
@@ -973,7 +977,8 @@ class ToolRegistry:
 
             if name == "execute_sql":
                 return execute_sql(self._db_engine, self._validator,
-                                   sql=str(args["sql"]))
+                                   sql=str(args["sql"]),
+                                   question=str(args.get("question", "")))
 
             if name == "get_schema":
                 return get_schema(self._db_engine,

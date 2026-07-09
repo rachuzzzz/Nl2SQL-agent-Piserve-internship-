@@ -43,6 +43,9 @@ ENUM_COLUMNS = {
         "PENDING", "ONGOING", "COMPLETED", "OVERDUE", "CANCELLED",
     ],
     "inspection_cycle.status": [],
+    "inspector_portfolio.status": [
+        "APPROVED", "PENDING", "DRAFT", "MODIFICATION",
+    ],  # DRAFT = not yet submitted; PENDING = awaiting review; MODIFICATION = sent back
 }
 
 BUSINESS_RULES = [
@@ -81,11 +84,11 @@ BUSINESS_RULES = [
     "WHERE EXISTS (SELECT 1 FROM user_roles ur JOIN role r ON ur.role_id = r.id "
     "WHERE ur.user_id = u.id AND r.name = 'FM Manager'). "
     "FM Manager role names: fm_manager, fm_engineer, ad_fm, asst_fm_manager, fm_admin, fm_supervisor. "
-    "⚠ UNVERIFIED — these inspector role names have NEVER been confirmed against the live role table "
-    "and returned 0 rows in production (2026-06-15). Run `SELECT name FROM role` to get exact casing "
-    "before filtering: internal_inspector, internal_auditor, external_inspector, external_auditor. "
-    "FM-side roles ARE confirmed correct (Title Case with spaces, e.g. 'FM Manager') — inspector-side "
-    "roles likely follow the same convention, e.g. 'Internal Inspector' not 'internal_inspector'.",
+    "Inspector role names (verified 2026-07-08 via SELECT name, COUNT(*) FROM role JOIN user_roles): "
+    "'Internal Inspector' (101 users) and 'External Inspector' (2 users) — Title Case with spaces, "
+    "matching the FM-side convention. 'Internal Auditor' (122) and 'External Auditor' (14) also exist "
+    "but belong to the separate Audit domain, not this app — do NOT match them for inspection-domain "
+    "role filters (e.g. avoid ILIKE '%inspector%' or '%audit%'; use an explicit IN list instead).",
 ]
 
 TABLE_RELATIONSHIPS = """\
@@ -95,10 +98,11 @@ WHERE CONCEPTS LIVE:
   - Facility names → facility.name (JOIN via facility_id)
   - Project names → project.name (JOIN via project_id)
   - Client names → client.name (JOIN via client_id)
-  - Country names → country.name (JOIN via country_id)
   - Entity names       → entity.name        (JOIN via inspection_report.entity_id — DIRECT)
-  - Organisation names → organisation.name (JOIN via facility.organization_id)
-  - Country names      → country.name      (JOIN via ir.country_id OR facility.country_id)
+  - Organisation names → organisation.name (JOIN via facility.organization_id — ⚠ confirmed always
+                          0 rows live; use the communication-group junction tables instead, see below)
+  - Country names      → country.name      (JOIN via facility.country_id — inspection_report has
+                          NO country_id column, despite what older comments in this file used to say)
   - Region names       → region.name       (JOIN via facility.region_id → region)
   - Scores, status, dates → inspection_report
   - Causes, costs, overdue → inspection_corrective_action
@@ -112,13 +116,16 @@ HOW TABLES CONNECT (inspection_report is the hub):
   inspection_report.facility_id         → facility.id
   inspection_report.project_id          → project.id
   inspection_report.client_id           → client.id
-  inspection_report.country_id          → country.id
   inspection_report.entity_id   → entity.id    (DIRECT)
-  inspection_report.country_id  → country.id   (DIRECT)
-  inspection_report → facility (facility_id) → organisation (organization_id)
+  inspection_report → facility (facility_id) → organisation (organization_id)  ⚠ DEAD — see below
   inspection_report → facility (facility_id) → region (region_id) → country (country_id)
-  NOTE: inspection_report has NO direct organisation_id or region_id — join via facility
-  facility.organization_id → organisation.id   ← American spelling on FK; British on table name
+  NOTE: inspection_report has NO direct organisation_id, region_id, OR country_id — join via facility
+  facility.organization_id → organisation.id   ← American spelling on FK; British on table name.
+    ⚠ CONFIRMED DEAD 2026-07-08: facility.organization_id is NULL on all 175 rows in production;
+    this join always returns 0 rows. organisation IS reachable, just not from facility — use
+    inspection_communication_group_organisations.organisation_id or organisation_countries.organisation_id
+    instead (see COMMUNICATION GROUPS below). In current data both of those paths also only ever
+    point at a single organisation, so "break down by organisation" queries won't be meaningful yet.
   facility.region_id       → region.id
   region.country_id        → country.id        ← region belongs to a country
   inspection_report.inspector_user_id   → users.id
@@ -129,9 +136,9 @@ HOW TABLES CONNECT (inspection_report is the hub):
   ai_answers.inspection_report_id       → inspection_report.id
   ai_answers.element_id                 → ai_questions.element_id
 
-  facility.client_id       → client.id
   facility.country_id      → country.id
-  facility.organization_id → organisation.id   ← American spelling on FK column
+  # facility.client_id does NOT exist — reach client via inspection_report.client_id
+  # facility.organization_id → organisation.id — DEAD, see the ⚠ note above (always NULL)
 
   project.organisation_id  → organisation.id
 
@@ -180,11 +187,11 @@ USER ROLES:
   role.name values relevant to inspections:
     FM-side (inspectee):  FM Manager, FM Engineer, AD FM, Asst FM Manager,
                           FM Admin, FM Supervisor, hse_officer
-    Inspector-side (⚠ UNVERIFIED, returned 0 rows 2026-06-15 — confirm exact
-                    casing with `SELECT name FROM role` before use; likely
-                    Title Case like FM-side, NOT snake_case):
-                          internal_inspector, internal_auditor, external_inspector,
-                          external_auditor, hse_officer
+    Inspector-side (verified 2026-07-08, Title Case with spaces like FM-side):
+                          Internal Inspector (101 users), External Inspector (2 users).
+                          NOTE: 'Internal Auditor' (122) and 'External Auditor' (14) also exist
+                          in the role table but belong to the separate, unwired Audit domain —
+                          NEVER match them for "inspector" questions in this app.
   CRITICAL — use EXISTS subquery (not JOIN) to avoid row fan-out:
     WHERE EXISTS (
         SELECT 1 FROM user_roles ur JOIN role r ON ur.role_id = r.id
@@ -223,6 +230,8 @@ LOOKUP_TABLES = {
     "client":              {"name_expr": None, "name_col": "name"},
     "entity":              {"name_expr": None, "name_col": "name"},
     "organisation":        {"name_expr": None, "name_col": "name"},
+    "country":             {"name_expr": None, "name_col": "name"},
+    "region":              {"name_expr": None, "name_col": "name"},
     "inspection_type":     {"name_expr": None, "name_col": "name"},
     "inspection_sub_type": {"name_expr": None, "name_col": "name"},
     # Frequency/cadence lookup — defines how often inspections happen in a portfolio
@@ -308,6 +317,10 @@ USEFUL_COLUMNS = {
         "capex_status", "opex_status", "expenditure",
         "target_close_out_date", "age", "deferred_on",
         "risk_level_id", "impact_id", "inspection_id",
+        "external_stakeholder_email", "external_stakeholder_name", "external_stakeholder_phone",
+        "internal_stakeholder_id",
+        # internal_stakeholder_id → users.id. Both stakeholder groups are real and in active use
+        # (confirmed 2026-07-08: external_* populated on ~23% of rows, internal_stakeholder_id on 58%)
         # capex_status: NULL=awaiting approval, ACCEPTED, REJECTED, DEFERRED
         # expenditure: STRING ENUM — NO_EXPENDITURE | CAPEX | OPEX | CAPEX_AND_OPEX
         #   (NOT a numeric amount — it is a category flag)
@@ -327,10 +340,13 @@ USEFUL_COLUMNS = {
         #   JOIN via: ica.completion_submission_id = ai_answers.inspection_report_id
     ],
     "inspection_schedule": [
-        "id", "status", "due_date", "scheduled_date",
+        "id", "active", "status", "due_date", "schedule_date",
         "facility_id", "inspector_id", "inspection_cycle_id", "portfolio_details_id",
-        # ⚠ NO 'active' column — inspection_schedule is NOT soft-deleted.
+        # 'active' IS a real soft-delete column (confirmed 2026-07-08: 21/2209 rows are false) —
+        #   ALWAYS filter WHERE active = true unless the question is specifically about
+        #   cancelled/removed schedules.
         # ⚠ NO 'frequency_definition_id' column — frequency via portfolio_details_id → ipd.frequency_definition_id
+        # ⚠ NO 'inspection_report_id' column — reach the report via inspection_report.schedule_id = isched.id
     ],
     "inspector_portfolio_details": [
         "id", "portfolio_id", "facility_id",

@@ -207,24 +207,9 @@ REGISTRY: list[dict] = [
         "message": (
             "WRONG COLUMN: inspection_cycle has no 'name' column. Its columns are: "
             "id, status, start_date, end_date, due_date, send_notification_to_inspectors, "
-            "created_on, modified_on. For a display label, use ic.id / ic.status, or "
-            "join to frequency_definition for a human-readable cadence name "
-            "(fd.name via ip/ipd, see cycle-frequency seeds)."
-        ),
-    },
-
-    # ── inspection_schedule has NO active column ──────────────────────────────
-    {
-        "id":          "block_isched_active",
-        "type":        BLOCK,
-        "description": "inspection_schedule has no 'active' column — will cause Postgres column-not-found error.",
-        "sql_pattern": r"\bisched\.active\b|\binspection_schedule\b[^;]*\bisched\.active\b",
-        "message": (
-            "WRONG COLUMN: inspection_schedule has no 'active' column and is NOT soft-deleted. "
-            "Remove WHERE isched.active = true — it will cause a Postgres column-not-found error. "
-            "inspection_schedule columns: id, status, due_date, scheduled_date, facility_id, "
-            "inspector_id, inspectee_id, project_id, portfolio_details_id, inspection_report_id, "
-            "inspection_cycle_id, created_on, modified_on."
+            "created_on, modified_on. For a display label, use ic.start_date / ic.end_date / "
+            "ic.status (e.g. 'Jan 2026 cycle'), or join to frequency_definition for a "
+            "human-readable cadence name (fd.name via ip/ipd, see cycle-frequency seeds)."
         ),
     },
 
@@ -238,16 +223,17 @@ REGISTRY: list[dict] = [
         # across 5+ iterations because the retrieved seeds prominently feature
         # frequency_definition joins in other contexts. The correct path to
         # frequency is: isched.portfolio_details_id → ipd.frequency_definition_id → fd
-        # inspection_schedule columns: id, schedule_id, status, due_date,
+        # inspection_schedule columns: id, active, schedule_id, status, due_date,
         # schedule_date, facility_id, inspector_id, inspectee_id, project_id,
-        # portfolio_details_id, inspection_report_id, created_on, modified_on
-        # NO: frequency_definition_id, active
+        # portfolio_details_id, created_on, modified_on
+        # NO: frequency_definition_id, inspection_report_id (reach the report via
+        #     inspection_report.schedule_id = isched.id — the FK lives on the report)
         "sql_pattern": r"\bisched\.frequency_definition_id\b|\binspection_schedule\b[^;]*\bfrequency_definition_id\b",
         "message": (
             "WRONG COLUMN: inspection_schedule has no 'frequency_definition_id' column. "
-            "inspection_schedule columns: id, schedule_id, status, due_date, schedule_date, "
-            "facility_id, inspector_id, inspectee_id, project_id, portfolio_details_id, "
-            "inspection_report_id — NO frequency_definition_id, NO active. "
+            "inspection_schedule columns: id, active, schedule_id, status, due_date, schedule_date, "
+            "facility_id, inspector_id, inspectee_id, project_id, portfolio_details_id — "
+            "NO frequency_definition_id, NO inspection_report_id. "
             "To get frequency: JOIN inspector_portfolio_details ipd ON isched.portfolio_details_id = ipd.id "
             "JOIN frequency_definition fd ON ipd.frequency_definition_id = fd.id"
         ),
@@ -424,18 +410,6 @@ REGISTRY: list[dict] = [
         "description": "Dynamic fb_{uuid} answer tables — all answer data is in ai_answers.",
         "sql_pattern": r"\bfb_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}\b",
         "message":     "BLOCKED: Dynamic fb_<uuid> table. Use ai_answers instead.",
-    },
-    {
-        "id":          "block_table_impact",
-        "type":        BLOCK,
-        "description": "There is no 'impact' table — impact is stored in ai_answers where aq.label = 'Impact'.",
-        "sql_pattern": r"\bjoin\s+impact\b|\bfrom\s+impact\b",
-        "message":     (
-            "HALLUCINATION: table 'impact' does not exist. "
-            "Impact data is in ai_answers: JOIN ai_questions aq ON aa.element_id = aq.element_id "
-            "WHERE aq.label = 'Impact'. The score is aa.score (1-27), "
-            "categories are in aa.answer_text (comma-separated)."
-        ),
     },
     {
         "id":          "block_ica_ir_varchar_uuid_join",
@@ -830,8 +804,8 @@ REGISTRY: list[dict] = [
             "BLOCKED: close_on is a DEAD COLUMN — all values are NULL, confirmed. "
             "Any comparison or arithmetic on it always evaluates to NULL/false. "
             "Use completed_on for closure timing instead:\n"
-            "  'overdue' (still open, past due)     → status NOT IN ('CLOSED','CLOSE_WITH_DEFERRED') "
-            "AND target_close_out_date < CURRENT_DATE\n"
+            "  'overdue' (still open, past due)     → status = 'OVERDUE' (the authoritative field — "
+            "do not recompute from target_close_out_date)\n"
             "  'closed late' / 'not closed on time' → status = 'CLOSED' AND completed_on > target_close_out_date\n"
             "These two are MUTUALLY EXCLUSIVE — never OR them into one count."
         ),
@@ -1064,7 +1038,7 @@ REGISTRY: list[dict] = [
             "    COALESCE(SUM(ica.capex), 0)                  AS capex_generated,\n"
             "    COALESCE(SUM(p.total_po), 0)                 AS capex_converted,\n"
             "    ROUND(COALESCE(SUM(p.total_po), 0) * 100.0 / NULLIF(SUM(ica.capex), 0), 1) AS conversion_pct,\n"
-            "    COALESCE(SUM(pr.total_tr), 0)                AS opex_incurred\n"
+            "    COALESCE(SUM(pr.total_pr), 0)                AS opex_incurred\n"
             "FROM inspection_report ir\n"
             "JOIN users u ON ir.inspectee_user_id = u.id\n"
             "LEFT JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id AND ica.active = true AND ica.capex > 0\n"
@@ -1427,6 +1401,36 @@ REGISTRY: list[dict] = [
             " — no date filter, no extra conditions.\n"
         ),
     },
+    # Portfolio "sent back for modification" was getting hijacked by the
+    # semantically-similar-but-wrong-table "inspections returned for modification"
+    # seed example (2026-07-08: DeepSeek ignored Llama's correct ip.status='MODIFICATION'
+    # schema_hint and generated ir.status='RETURN_FOR_MODIFICATION' SQL instead —
+    # executed fine, silently answered the wrong question). required_tables forces
+    # a guarded retry if inspector_portfolio doesn't end up in the generated SQL.
+    {
+        "id":             "inject_portfolio_modification",
+        "type":           INJECT,
+        "priority":       92,
+        "description":    "Portfolio sent-back/modification questions — inspector_portfolio.status, NOT inspection_report.status.",
+        "required_tables": ["inspector_portfolio"],
+        "forbidden_patterns": [r"RETURN_FOR_MODIFICATION"],
+        "suppresses":     ["inject_return_for_modification"],
+        "question_pattern": (
+            r"\bportfolio.{0,30}(modif|sent\s*back|returned)\b"
+            r"|(modif|sent\s*back|returned).{0,30}\bportfolio\b"
+        ),
+        "hint": (
+            "\nPORTFOLIO MODIFICATION — this is about inspector_portfolio, NOT inspection_report:\n"
+            "  inspector_portfolio.status = 'MODIFICATION' means the portfolio was sent back for changes.\n"
+            "  This is a DIFFERENT enum on a DIFFERENT table from inspection_report.status = "
+            "'RETURN_FOR_MODIFICATION' — do not use ir.status here.\n"
+            "USE: SELECT u.first_name || ' ' || u.last_name AS inspector_name, ip.submitted_date\n"
+            "FROM inspector_portfolio ip\n"
+            "JOIN users u ON ip.user_id = u.id\n"
+            "WHERE ip.status = 'MODIFICATION' AND ip.active = true AND u.active = true\n"
+            "ORDER BY ip.submitted_date DESC;\n"
+        ),
+    },
     {
         "id":             "inject_overdue_quarter",
         "type":           INJECT,
@@ -1646,12 +1650,13 @@ REGISTRY: list[dict] = [
             "\nSCHEDULE STATUS — this is an inspection_schedule question, NOT inspection_report:\n"
             "  inspection_schedule.status values: PENDING | COMPLETED | OVERDUE | CANCELLED\n"
             "  (different enum from inspection_report — 'COMPLETED' here, 'CLOSED' there)\n"
-            "  NO active column on inspection_schedule — never filter isched.active\n"
-            "  Columns: schedule_date (NOT scheduled_date), due_date, schedule_id, status\n\n"
+            "  inspection_schedule DOES have an active column — always filter isched.active = true\n"
+            "  Columns: active, schedule_date (NOT scheduled_date), due_date, schedule_id, status\n\n"
             "PATTERN for completed vs overdue in the schedule this year:\n"
             "SELECT isched.status, COUNT(*) AS count\n"
             "FROM inspection_schedule isched\n"
             "WHERE isched.status IN ('COMPLETED','OVERDUE')\n"
+            "  AND isched.active = true\n"
             "  AND EXTRACT(YEAR FROM isched.due_date) = EXTRACT(YEAR FROM CURRENT_DATE)\n"
             "GROUP BY isched.status;\n"
         ),
@@ -1709,6 +1714,45 @@ REGISTRY: list[dict] = [
             "FROM inspection_corrective_action ica\n"
             "JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
             "WHERE rl.name = 'High';\n"
+        ),
+    },
+    # impact table columns — risk_level and impact are structurally IDENTICAL
+    # (id, active, name, scale numeric, is_positive_impact bool, short_code) which
+    # caused a 6-iteration, 2-error struggle on "highest impact scale rating"
+    # (2026-07-08): neither table's scale/is_positive_impact column is exposed by
+    # the normal lookup-table schema hint (which only ever shows .name), so the
+    # model guessed plausible-sounding names (impact_scale, impact_scale_rating).
+    {
+        "id":             "inject_impact_scale",
+        "type":           INJECT,
+        "priority":       94,
+        "description":    "Impact scale/rating/positive-impact questions — impact table has scale + is_positive_impact, NOT risk_level.",
+        "required_tables": ["impact"],
+        "question_pattern": (
+            r"\bimpact.{0,20}(scale|rating|score)\b"
+            r"|\b(scale|rating|score).{0,20}\bimpact\b"
+            r"|\bpositive\s+impact\b|\bimpact.{0,15}positive\b"
+        ),
+        "hint": (
+            "\nIMPACT SCALE/RATING — impact and risk_level are TWIN tables with the SAME columns "
+            "(id, name, scale numeric, is_positive_impact bool, short_code) but are DIFFERENT lookup "
+            "tables reached via DIFFERENT FKs — do not confuse them:\n"
+            "  risk_level = severity classification, JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
+            "  impact     = impact classification,   JOIN impact im ON ica.impact_id = im.id\n"
+            "ALWAYS: JOIN impact im ON ica.impact_id = im.id\n"
+            "ALWAYS: SELECT im.scale, im.is_positive_impact, im.name AS impact_name\n"
+            "NEVER:  im.impact_scale / im.impact_scale_rating / im.rating — these column names don't exist\n"
+            "\nHighest impact scale (canonical form):\n"
+            "SELECT ica.corrective_action_id, im.name AS impact_name, im.scale\n"
+            "FROM inspection_corrective_action ica\n"
+            "JOIN impact im ON ica.impact_id = im.id\n"
+            "WHERE ica.active = true AND im.active = true\n"
+            "ORDER BY im.scale DESC LIMIT 50;\n"
+            "\nCount with positive impact (canonical form):\n"
+            "SELECT COUNT(*) AS positive_impact_count\n"
+            "FROM inspection_corrective_action ica\n"
+            "JOIN impact im ON ica.impact_id = im.id\n"
+            "WHERE ica.active = true AND im.active = true AND im.is_positive_impact = true;\n"
         ),
     },
     # EDG-02 — "how many questions" routing disambiguation

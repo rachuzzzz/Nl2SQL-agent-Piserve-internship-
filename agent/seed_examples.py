@@ -61,8 +61,8 @@ except ImportError:
 -- SOFT-DELETE: these tables have an 'active' boolean column — ALWAYS filter WHERE active = true:
 --   inspection_report, inspection_corrective_action, facility, users,
 --   inspection_type, inspector_portfolio, inspector_portfolio_details,
---   frequency_definition, po_details, pr_details, risk_level
--- NO active column: ai_answers, ai_questions, role, user_roles, inspection_schedule
+--   frequency_definition, po_details, pr_details, risk_level, inspection_schedule
+-- NO active column: ai_answers, ai_questions, role, user_roles
 --   NEVER use aa.active or aq.active — these columns do not exist"""
     _CA_WORKFLOW_BLOCK = """\
 -- CORRECTIVE ACTION WORKFLOW — four independent tracks on ica:
@@ -88,11 +88,11 @@ CORE_CONTEXT = """\
 --
 """ + _CAST_BLOCK + """
 --
--- inspection_schedule useful columns: id (PK), status, due_date, facility_id, inspector_id, inspectee_id
+-- inspection_schedule useful columns: id (PK), active, status, due_date, facility_id, inspector_id, inspectee_id
+--   ALWAYS filter WHERE isched.active = true (confirmed real soft-delete flag, 21/2209 rows are false)
 --   NEVER SELECT isched.schedule_id — nullable internal UUID, almost always NULL in data
 --   NEVER SELECT isched.schedule_date — almost always NULL for pending schedules; use due_date instead
 --   NEVER: sched.scheduled_date — column is schedule_date (but prefer due_date anyway)
---   NEVER: sched.active — inspection_schedule has no active column
 --
 -- UNION / UNION ALL TYPE SAFETY:
 --   Every column position must have the SAME type in all branches.
@@ -418,14 +418,13 @@ WHERE fac.name ILIKE '%Al Ghadeer%'
         'nl':     'corrective actions not closed on time closed late past deadline late closure overdue when closed',
         'sql':    """\
 -- 'closed late' / 'not closed on time' — MUTUALLY EXCLUSIVE from 'overdue':
---   overdue     = still OPEN, past due, has NOT closed yet
+--   overdue     = status = 'OVERDUE' (the authoritative field — still OPEN, past due, has NOT closed yet)
 --   closed_late = DID close (status='CLOSED'), but completed_on was after target_close_out_date
 -- close_on is a DEAD COLUMN (all NULL) — use completed_on for closure timing
 -- NEVER OR these two concepts together into one count
 SELECT
     COUNT(*) FILTER (
-        WHERE status NOT IN ('CLOSED','CLOSE_WITH_DEFERRED')
-          AND target_close_out_date < CURRENT_DATE
+        WHERE status = 'OVERDUE'
     ) AS overdue_count,
     COUNT(*) FILTER (
         WHERE status = 'CLOSED' AND completed_on > target_close_out_date
@@ -469,7 +468,10 @@ WHERE ir.active = true
     {
         'nl':     'total capex and opex across all corrective actions',
         'sql':    """\
-SELECT SUM(ica.capex) AS total_capex, SUM(ica.opex) AS total_opex
+-- Bare "capex and opex" = GENERATED figures (ica-level estimates), not converted/incurred.
+-- capex_generated = SUM(ica.capex); opex_generated = SUM(ica.opex) — parallel concepts.
+-- If the user instead asks "converted"/"incurred", route to po_details/pr_details instead.
+SELECT SUM(ica.capex) AS capex_generated, SUM(ica.opex) AS opex_generated
 FROM inspection_corrective_action ica
 WHERE ica.active = true;
 """,
@@ -693,9 +695,12 @@ WHERE ir.active = true
         'nl':     'average number of observations per inspection',
         'sql':    """\
 -- Subquery pattern: count per inspection FIRST, then AVG
+-- COUNT(DISTINCT aa.submission_id), NOT COUNT(*) — a single observation can have
+-- multiple ai_answers rows (Risk Level, Impact, Observation Type, ...); COUNT(*)
+-- overcounts whenever more than one of those is answered per observation.
 SELECT ROUND(AVG(obs_count)::numeric, 2) AS avg_obs_per_inspection
 FROM (
-    SELECT aa.inspection_report_id, COUNT(*) AS obs_count
+    SELECT aa.inspection_report_id, COUNT(DISTINCT aa.submission_id) AS obs_count
     FROM ai_answers aa
     JOIN ai_questions aq ON aa.element_id = aq.element_id
     WHERE aq.label = 'Observation' AND aa.answer_text IS NOT NULL
@@ -1121,15 +1126,17 @@ ORDER BY overdue_count DESC LIMIT 1;
     {
         'nl':     'show inspection count grouped by country',
         'sql':    """\
--- country JOIN: inspection_report.country_id → country.id
--- ALWAYS GROUP BY c.name, not ir.country_id (uuid)
+-- inspection_report has NO country_id — country JOIN goes via facility:
+-- inspection_report.facility_id → facility.id, facility.country_id → country.id
+-- ALWAYS GROUP BY c.name, not fac.country_id (uuid)
 SELECT c.name AS country_name,
        COUNT(*) AS inspection_count,
        ROUND(AVG(ir.inspection_score)::numeric, 2) AS avg_score
 FROM inspection_report ir
-JOIN country c ON ir.country_id = c.id
+JOIN facility fac ON ir.facility_id = fac.id
+JOIN country c ON fac.country_id = c.id
 WHERE ir.active = true AND ir.status != 'DRAFT'
-  AND c.active = true
+  AND fac.active = true AND c.active = true
 GROUP BY c.id, c.name
 ORDER BY inspection_count DESC;
 """,
@@ -1241,15 +1248,18 @@ ORDER BY ca_count DESC;
     {
         'nl':     'show capex and opex by country',
         'sql':    """\
+-- Bare "capex and opex" = GENERATED figures (ica-level estimates), not converted/incurred.
+-- inspection_report has NO country_id — country JOIN goes via facility.
 SELECT c.name AS country_name,
-       COALESCE(SUM(ica.capex), 0) AS total_capex,
-       COALESCE(SUM(ica.opex),  0) AS total_opex
+       COALESCE(SUM(ica.capex), 0) AS capex_generated,
+       COALESCE(SUM(ica.opex),  0) AS opex_generated
 FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
-JOIN country c ON ir.country_id = c.id
-WHERE ica.active = true AND ir.active = true AND c.active = true
+JOIN facility fac ON ir.facility_id = fac.id
+JOIN country c ON fac.country_id = c.id
+WHERE ica.active = true AND ir.active = true AND fac.active = true AND c.active = true
 GROUP BY c.id, c.name
-ORDER BY total_capex DESC;
+ORDER BY capex_generated DESC;
 """,
         'domain': 'financial',
         'intent': 'aggregate',
@@ -1258,12 +1268,13 @@ ORDER BY total_capex DESC;
     {
         'nl':     'what is the total capex and opex by facility',
         'sql':    """\
+-- Bare "capex and opex" = GENERATED figures (ica-level estimates), not converted/incurred.
 SELECT fac.name AS facility_name,
-       SUM(ica.capex) AS total_capex, SUM(ica.opex) AS total_opex
+       SUM(ica.capex) AS capex_generated, SUM(ica.opex) AS opex_generated
 FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
 JOIN facility fac ON ir.facility_id = fac.id
-GROUP BY fac.name ORDER BY total_capex DESC NULLS LAST LIMIT 50;
+GROUP BY fac.name ORDER BY capex_generated DESC NULLS LAST LIMIT 50;
 """,
         'domain': 'financial',
         'intent': 'aggregate',
@@ -1774,6 +1785,38 @@ GROUP BY ir.inspection_id;
         'domain': 'form_answers',
         'intent': 'single_value',
         'limit':  1,
+    },
+    {
+        'nl':     'which corrective actions have the highest impact scale rating',
+        'sql':    """\
+-- impact and risk_level are TWIN tables with the SAME columns (id, name, scale, is_positive_impact,
+-- short_code) but are DIFFERENT lookup tables via DIFFERENT FKs — do not confuse them:
+--   risk_level = severity, JOIN risk_level rl ON ica.risk_level_id = rl.id
+--   impact     = impact classification, JOIN impact im ON ica.impact_id = im.id  ← use THIS for "impact"
+-- im.scale is numeric — there is no im.impact_scale / im.rating / im.impact_scale_rating column.
+SELECT ica.corrective_action_id, im.name AS impact_name, im.scale
+FROM inspection_corrective_action ica
+JOIN impact im ON ica.impact_id = im.id
+WHERE ica.active = true AND im.active = true
+ORDER BY im.scale DESC LIMIT 50;
+""",
+        'domain': 'corrective_action',
+        'intent': 'ranked_list',
+        'limit':  50,
+    },
+    {
+        'nl':     'how many corrective actions have a positive impact',
+        'sql':    """\
+-- is_positive_impact is a real boolean column on the impact lookup table — NOT a form
+-- question in ai_answers. JOIN impact im ON ica.impact_id = im.id, filter im.is_positive_impact = true.
+SELECT COUNT(*) AS positive_impact_count
+FROM inspection_corrective_action ica
+JOIN impact im ON ica.impact_id = im.id
+WHERE ica.active = true AND im.active = true AND im.is_positive_impact = true;
+""",
+        'domain': 'corrective_action',
+        'intent': 'aggregate',
+        'limit':  None,
     },
     {
         'nl':     'what is the risk level breakdown of all corrective actions',
@@ -2341,6 +2384,33 @@ ORDER BY u.last_name, fac.name LIMIT 100;
         'limit':  100,
     },
     {
+        'nl':     'which inspectors have not submitted a portfolio',
+        'sql':    """\
+-- "haven't submitted" means NO portfolio row exists at all for this cycle — NOT status='DRAFT'
+-- (a DRAFT row still exists; this is the stronger case of zero rows, confirmed to happen in practice:
+--  2026-07-08 audit found 6 of 46 inspectors with an inspection_schedule assignment had zero
+--  inspector_portfolio row for that cycle).
+-- Inspector role names (verified 2026-07-08): 'Internal Inspector', 'External Inspector' only —
+-- do NOT match 'Internal Auditor'/'External Auditor', they belong to a separate Audit domain.
+SELECT u.first_name || ' ' || u.last_name AS inspector_name, u.email
+FROM users u
+WHERE u.active = true
+  AND EXISTS (
+    SELECT 1 FROM user_roles ur JOIN role r ON ur.role_id = r.id
+    WHERE ur.user_id = u.id AND r.name IN ('Internal Inspector', 'External Inspector')
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM inspector_portfolio ip
+    WHERE ip.user_id = u.id
+      AND ip.cycle_id = (SELECT id FROM inspection_cycle ORDER BY start_date DESC LIMIT 1)
+  )
+ORDER BY u.last_name;
+""",
+        'domain': 'schedule',
+        'intent': 'filter',
+        'limit':  None,
+    },
+    {
         'nl':     'most recent inspection with form data available',
         'sql':    """\
 -- Must use ai_answers subquery — inspection_report.submitted_on may point to
@@ -2843,6 +2913,36 @@ ORDER BY ica.target_close_out_date DESC LIMIT 100;
         'limit':  100,
     },
     {
+        'nl':     'which cycle had the most medium risk corrective actions which cycle had the most high risk corrective actions cycle with the most corrective actions by risk level',
+        'sql':    """\
+-- USE THIS EXACT SQL for "which cycle had the most <risk> corrective actions":
+-- JOIN PATH: inspection_cycle ic -> inspection_report ir (ir.cycle_id = ic.id)
+--         -> inspection_corrective_action ica (ica.inspection_id = ir.id)
+--         -> risk_level rl (rl.id = ica.risk_level_id)
+-- NEVER join ic directly to ica — there is no FK between inspection_cycle and
+-- inspection_corrective_action; you MUST go through inspection_report.
+-- inspection_cycle has NO frequency_name / inspection_type_id columns —
+-- do not select or join on those.
+SELECT ic.id AS inspection_cycle_id,
+       TO_CHAR(ic.start_date, 'Month YYYY') AS cycle_month,
+       COUNT(*) AS risk_ca_count
+FROM inspection_cycle ic
+JOIN inspection_report ir ON ir.cycle_id = ic.id
+JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id
+JOIN risk_level rl ON rl.id = ica.risk_level_id
+WHERE rl.name = 'Medium'
+  AND ic.active = true
+  AND ir.active = true
+  AND ica.active = true
+GROUP BY ic.id, ic.start_date
+ORDER BY risk_ca_count DESC
+LIMIT 1;
+""",
+        'domain': 'corrective_action',
+        'intent': 'ranked_list',
+        'limit':  1,
+    },
+    {
         'nl':     'show all inspectors in a cycle facilities in a specific cycle',
         'sql':    """\
 -- USE THIS EXACT SQL for inspectors/facilities within a cycle:
@@ -3248,7 +3348,7 @@ SELECT
     fac.name                            AS facility_name,
     COALESCE(SUM(pr.total_pr), 0)       AS opex_incurred,
     COALESCE(SUM(p.total_po), 0)        AS capex_converted,
-    COALESCE(SUM(pr.total_tr), 0)
+    COALESCE(SUM(pr.total_pr), 0)
         - COALESCE(SUM(p.total_po), 0)  AS opex_excess
 FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
@@ -3257,7 +3357,7 @@ LEFT JOIN po_by_ica p  ON p.ica_id  = ica.id
 LEFT JOIN pr_by_ica pr ON pr.ica_id = ica.id
 WHERE ir.active = true AND ica.active = true AND fac.active = true
 GROUP BY fac.id, fac.name
-HAVING COALESCE(SUM(pr.total_tr), 0) > COALESCE(SUM(p.total_po), 0)
+HAVING COALESCE(SUM(pr.total_pr), 0) > COALESCE(SUM(p.total_po), 0)
 ORDER BY opex_excess DESC;
 """,
         'domain': 'financial',
@@ -3489,7 +3589,7 @@ ORDER BY capex_generated DESC LIMIT 10;
         'nl':     'fm manager most overdue corrective actions which fm manager overdue',
         'sql':    """\
 -- FM Manager = inspectee_user_id (NOT inspector_user_id)
--- Overdue = target_close_out_date < CURRENT_DATE AND status not closed
+-- Overdue = status = 'OVERDUE' (the authoritative field — do not recompute from target_close_out_date)
 SELECT
     u.first_name || ' ' || u.last_name  AS fm_manager,
     COUNT(ica.id)                       AS overdue_count
@@ -3497,8 +3597,7 @@ FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
 JOIN users u ON ir.inspectee_user_id = u.id
 WHERE ir.active = true AND ica.active = true AND u.active = true
-  AND ica.target_close_out_date < CURRENT_DATE
-  AND ica.status NOT IN ('CLOSED', 'CLOSE_WITH_DEFERRED')
+  AND ica.status = 'OVERDUE'
 GROUP BY u.id, u.first_name, u.last_name
 ORDER BY overdue_count DESC LIMIT 10;
 """,
@@ -3555,7 +3654,7 @@ SELECT
     COALESCE(SUM(ica.capex), 0)                  AS capex_generated,
     COALESCE(SUM(p.total_po), 0)                 AS capex_converted,
     ROUND(COALESCE(SUM(p.total_po), 0) * 100.0 / NULLIF(SUM(ica.capex), 0), 1) AS conversion_pct,
-    COALESCE(SUM(pr.total_tr), 0)                AS opex_incurred
+    COALESCE(SUM(pr.total_pr), 0)                AS opex_incurred
 FROM inspection_report ir
 JOIN users u ON ir.inspectee_user_id = u.id
 LEFT JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id AND ica.active = true AND ica.capex > 0
@@ -3649,7 +3748,7 @@ WITH pr_by_ica AS (
 SELECT
     u.first_name || ' ' || u.last_name  AS fm_manager,
     COUNT(DISTINCT ica.id)              AS ca_count,
-    COALESCE(SUM(pr.total_tr), 0)       AS opex_incurred
+    COALESCE(SUM(pr.total_pr), 0)       AS opex_incurred
 FROM inspection_report ir
 JOIN users u ON ir.inspectee_user_id = u.id
 LEFT JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id AND ica.active = true
@@ -3668,7 +3767,7 @@ LIMIT 20;
         'sql':    """\
 -- FM Manager = inspectee_user_id (NOT inspector_user_id, NOT ica.responsible)
 -- NEVER GROUP BY ica.responsible — gives CLIENT/INTERNAL_OPERATIONS/SUB_CONTRACTOR not people
--- Overdue: target_close_out_date < CURRENT_DATE AND status NOT IN closed statuses
+-- Overdue: status = 'OVERDUE' (the authoritative field — do not recompute from target_close_out_date)
 SELECT
     u.first_name || ' ' || u.last_name  AS fm_manager,
     COUNT(ica.id)                       AS overdue_count
@@ -3676,8 +3775,7 @@ FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
 JOIN users u ON ir.inspectee_user_id = u.id
 WHERE ir.active = true AND ica.active = true AND u.active = true
-  AND ica.target_close_out_date < CURRENT_DATE
-  AND ica.status NOT IN ('CLOSED', 'CLOSE_WITH_DEFERRED')
+  AND ica.status = 'OVERDUE'
 GROUP BY u.id, u.first_name, u.last_name
 ORDER BY overdue_count DESC LIMIT 10;
 """,
