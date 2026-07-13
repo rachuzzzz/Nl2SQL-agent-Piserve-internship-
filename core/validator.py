@@ -37,6 +37,7 @@ except ImportError:
     _HAS_GLOSSARY = False
 
 logger = logging.getLogger("inspectai.sql")
+_log_security = logging.getLogger("inspectai.security")
 
 
 # ---------------------------------------------------------------------------
@@ -705,18 +706,18 @@ class SQLValidator:
                 ))
                 ValidatorStats.record("SPLIT_NAME_MISMATCH", is_retry_trigger=True)
 
-        # ── 10e. "overdue" corrective actions via date arithmetic — HARD_FAIL ──
+        # ── 10e. "overdue" mitigative actions via date arithmetic — HARD_FAIL ──
         # status='OVERDUE' is the authoritative, maintained field. Reconstructing
         # it via `NOT status IN (...) AND target_close_out_date < CURRENT_DATE`
         # silently diverges from that field's business rule (grace periods,
         # deferrals, etc. are baked into the maintained status, not the raw date
         # comparison) — both 3B and 7B were observed doing this identically in
         # eval, always without error, so it was invisible until the SQL was
-        # read by hand. Scoped tightly to "overdue" + corrective/action to avoid
+        # read by hand. Scoped tightly to "overdue" + mitigative/action to avoid
         # over-firing on unrelated "active"/"status" questions.
         _overdue_ca_q = re.compile(
-            r"\boverdue\b.{0,25}\b(?:corrective|actions?)\b"
-            r"|\b(?:corrective|actions?)\b.{0,25}\boverdue\b",
+            r"\boverdue\b.{0,25}\b(?:mitigative|actions?)\b"
+            r"|\b(?:mitigative|actions?)\b.{0,25}\boverdue\b",
             re.IGNORECASE,
         )
         if question and _overdue_ca_q.search(question):
@@ -726,7 +727,7 @@ class SQLValidator:
             if not uses_overdue_status and uses_date_compare:
                 issues.append(ValidationIssue(
                     "HARD_FAIL", "OVERDUE_DATE_ARITHMETIC",
-                    "Overdue corrective actions must use status='OVERDUE', not date arithmetic",
+                    "Overdue mitigative actions must use status='OVERDUE', not date arithmetic",
                     detail="status='OVERDUE' is the authoritative field — do not recompute "
                            "overdue from target_close_out_date/CLOSED/CLOSE_WITH_DEFERRED",
                 ))
@@ -1005,7 +1006,7 @@ class SQLValidator:
                 ))
                 ValidatorStats.record("MISSING_COMPLETED_STATUS", is_retry_trigger=False)
 
-        # NOTE: "overdue corrective actions" via date arithmetic is now a HARD_FAIL,
+        # NOTE: "overdue mitigative actions" via date arithmetic is now a HARD_FAIL,
         # enforced in validate() (see OVERDUE_DATE_ARITHMETIC) — promoted out of this
         # advisory-only method because it was firing consistently (both 3B and 7B,
         # in eval) with no retry and no user-visible signal.
@@ -1568,43 +1569,116 @@ class SQLValidator:
         except Exception:
             return sql, []
 
-    # Tables that need row-level scoping when inspection_report is absent.
-    # Maps table name → FK column on inspection_report that links back to it.
-    # facility is intentionally excluded — it is public reference data visible
-    # to all authenticated users.
+    # facility is intentionally excluded — public reference data.
     _SECONDARY_SCOPE_TABLES: dict = {
-        'inspection_cycle': 'cycle_id',
+        'inspection_cycle': {
+            'mode': 'forward', 'fk_col': 'cycle_id',
+        },
+        'inspection_corrective_action': {
+            'mode': 'reverse', 'own_col': 'inspection_id',
+        },
+        'po_details': {
+            'mode': 'reverse2', 'own_col': 'mitigative_action_uuid',
+            'mid_table': 'inspection_corrective_action', 'mid_fk': 'inspection_id',
+        },
+        'pr_details': {
+            'mode': 'reverse2', 'own_col': 'mitigative_action_uuid',
+            'mid_table': 'inspection_corrective_action', 'mid_fk': 'inspection_id',
+        },
+        'inspection_schedule': {
+            'mode': 'direct',
+            'column_map': {'inspector_user_id': 'inspector_id', 'inspectee_user_id': 'inspectee_id'},
+        },
+        'inspector_portfolio': {
+            'mode': 'inspector_only', 'own_col': 'user_id',
+        },
+        'inspector_portfolio_details': {
+            'mode': 'inspector_only_reverse', 'own_col': 'portfolio_id',
+            'mid_table': 'inspector_portfolio', 'mid_col': 'user_id',
+        },
+        'users': {
+            'mode': 'connected_users', 'own_col': 'id',
+        },
     }
+
+    _USER_SUBQ_RE = re.compile(
+        r"\(SELECT id FROM users WHERE id_fk = \d+ AND active = true AND is_synced = true\)"
+    )
+
+    @classmethod
+    def _build_secondary_predicate(cls, tbl_name: str, spec: dict, alias: str,
+                                    scope_filter: str, ir_predicate: str) -> str:
+        mode = spec['mode']
+
+        if mode == 'forward':
+            return (
+                f"{alias}.id IN (SELECT DISTINCT {spec['fk_col']} "
+                f"FROM inspection_report WHERE {ir_predicate} AND active = true)"
+            )
+
+        if mode == 'reverse':
+            return (
+                f"{alias}.{spec['own_col']} IN (SELECT id FROM inspection_report "
+                f"WHERE {ir_predicate} AND active = true)"
+            )
+
+        if mode == 'reverse2':
+            return (
+                f"{alias}.{spec['own_col']} IN ("
+                f"SELECT _sc_mid.id FROM {spec['mid_table']} _sc_mid "
+                f"JOIN inspection_report _sc_ir ON _sc_mid.{spec['mid_fk']} = _sc_ir.id "
+                f"WHERE {ir_predicate} AND _sc_mid.active = true AND _sc_ir.active = true)"
+            )
+
+        if mode == 'direct':
+            pred = scope_filter
+            for old_col, new_col in spec['column_map'].items():
+                pred = pred.replace(f"ir.{old_col}", f"{alias}.{new_col}")
+            return pred
+
+        if mode == 'inspector_only':
+            if 'inspector_user_id' not in scope_filter:
+                return "1 = 0"
+            m = cls._USER_SUBQ_RE.search(scope_filter)
+            subq = m.group(0) if m else "(SELECT NULL)"
+            return f"{alias}.{spec['own_col']} = {subq}"
+
+        if mode == 'inspector_only_reverse':
+            if 'inspector_user_id' not in scope_filter:
+                return "1 = 0"
+            m = cls._USER_SUBQ_RE.search(scope_filter)
+            subq = m.group(0) if m else "(SELECT NULL)"
+            return (
+                f"{alias}.{spec['own_col']} IN (SELECT id FROM {spec['mid_table']} "
+                f"WHERE {spec['mid_col']} = {subq} AND active = true)"
+            )
+
+        if mode == 'connected_users':
+            return (
+                f"{alias}.{spec['own_col']} IN ("
+                f"SELECT inspector_user_id FROM inspection_report WHERE {ir_predicate} AND active = true "
+                f"UNION "
+                f"SELECT inspectee_user_id FROM inspection_report WHERE {ir_predicate} AND active = true)"
+            )
+
+        raise ValueError(f"unknown secondary-scope mode {mode!r} for {tbl_name}")
 
     def enforce_scope(self, sql: str, scope_filter: str) -> str:
         """Hard data-visibility guard — AST-level injection, always applied.
 
-        The system prompt is just a hint to the LLM for SQL quality.
-        THIS is the actual security enforcement — it rewrites the SQL via
-        the sqlglot AST unconditionally, independent of what the LLM generated.
-        A filter that exists only in the prompt can be bypassed by prompt
-        injection, model drift, or a SQL comment. This cannot.
-
         scope_filter == ''       → unrestricted, return SQL unchanged
         scope_filter == 'BLOCK'  → raise ValueError('SCOPE_BLOCKED')
-        anything else            → inject into every Select that:
-                                   (a) directly FROM/JOINs inspection_report, OR
-                                   (b) directly FROM/JOINs a secondary scoped
-                                       table (facility, inspection_cycle) without
-                                       inspection_report in the query
-
-        Secondary scoping: strips the "ir." alias prefix from scope_filter to
-        build a subquery predicate suitable for raw column names, e.g.:
-          "ir.inspector_user_id = (subq)" → "{alias}.id IN (SELECT DISTINCT
-           facility_id FROM inspection_report WHERE inspector_user_id = (subq)
-           AND active = true)"
+        anything else            → inject into every Select that directly
+                                   FROM/JOINs inspection_report, or a
+                                   secondary-scoped table (see
+                                   _SECONDARY_SCOPE_TABLES / _build_secondary_predicate)
 
         Raises ValueError('SCOPE_BLOCKED') — caller converts to HTTP 403.
         """
         if not scope_filter:
             return sql
         if scope_filter == 'BLOCK':
-            logger.warning("[SCOPE] enforce_scope called with BLOCK — raising SCOPE_BLOCKED")
+            _log_security.warning("[SCOPE] enforce_scope called with BLOCK — raising SCOPE_BLOCKED")
             raise ValueError('SCOPE_BLOCKED')
 
         sql_lower = sql.lower()
@@ -1615,18 +1689,21 @@ class SQLValidator:
         #  → "(inspector_user_id=X OR inspectee_user_id=X)")
         ir_predicate = scope_filter.replace('ir.', '')
 
-        secondary_tables = (
-            [(tbl, fk) for tbl, fk in self._SECONDARY_SCOPE_TABLES.items()
-             if tbl in sql_lower]
-            if not has_ir else []
-        )
+        secondary_tables = [
+            (tbl, spec) for tbl, spec in self._SECONDARY_SCOPE_TABLES.items()
+            if tbl in sql_lower
+        ]
 
         if not has_ir and not secondary_tables:
             # Pure reference tables (frequency_definition, inspection_type, etc.)
             # carry no row-level owner — no scope injection required.
             return sql
 
-        logger.debug("[SCOPE] injecting scope filter: %s", scope_filter[:120])
+        _log_security.info(
+            "[SCOPE] injecting scope filter: via=%s filter=%s",
+            (["inspection_report"] if has_ir else []) + [t for t, _ in secondary_tables],
+            scope_filter[:120],
+        )
 
         # ── Primary path: AST injection via sqlglot ──────────────────────────
         if _HAS_SQLGLOT:
@@ -1650,35 +1727,28 @@ class SQLValidator:
                                 return join.this.alias or tbl_name
                     return None
 
-                if has_ir:
-                    # Inject scope_filter into every SELECT that directly
-                    # FROM/JOINs inspection_report.
-                    def _inject_ir(node):
-                        if isinstance(node, exp.Select) and _alias_for_table(node, 'inspection_report'):
-                            return node.where(scope_expr.copy())
+                # Each SELECT node (including every branch of a UNION, and every
+                # subquery) is scoped independently — a query can mix a branch
+                # that joins inspection_report with a branch that reaches a
+                # secondary-scoped table bare; both must be caught on their
+                # own terms, not decided once for the whole statement.
+                def _inject(node):
+                    if not isinstance(node, exp.Select):
                         return node
+                    if _alias_for_table(node, 'inspection_report'):
+                        return node.where(scope_expr.copy())
+                    for tbl_name, spec in secondary_tables:
+                        alias = _alias_for_table(node, tbl_name)
+                        if alias:
+                            subq_where = self._build_secondary_predicate(
+                                tbl_name, spec, alias, scope_filter, ir_predicate
+                            )
+                            node = node.where(
+                                sqlglot.parse_one(subq_where, dialect="postgres")
+                            )
+                    return node
 
-                    rewritten = tree.transform(_inject_ir).sql(dialect="postgres", pretty=False)
-                else:
-                    # Inject a subquery scope for facility / inspection_cycle
-                    # queries that don't join through inspection_report directly.
-                    def _inject_secondary(node):
-                        if not isinstance(node, exp.Select):
-                            return node
-                        for tbl_name, fk_col in secondary_tables:
-                            alias = _alias_for_table(node, tbl_name)
-                            if alias:
-                                subq_where = (
-                                    f"{alias}.id IN ("
-                                    f"SELECT DISTINCT {fk_col} FROM inspection_report "
-                                    f"WHERE {ir_predicate} AND active = true)"
-                                )
-                                node = node.where(
-                                    sqlglot.parse_one(subq_where, dialect="postgres")
-                                )
-                        return node
-
-                    rewritten = tree.transform(_inject_secondary).sql(dialect="postgres", pretty=False)
+                rewritten = tree.transform(_inject).sql(dialect="postgres", pretty=False)
 
                 if rewritten and not rewritten.rstrip().endswith(";"):
                     rewritten = rewritten.rstrip() + ";"
@@ -1696,16 +1766,11 @@ class SQLValidator:
             r"\b(ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT)\b", sql_work, re.IGNORECASE
         )
 
-        if has_ir:
-            fragment = scope_filter
-        else:
-            # Build combined secondary predicate without a known alias
-            parts = [
-                f"id IN (SELECT DISTINCT {fk} FROM inspection_report "
-                f"WHERE {ir_predicate} AND active = true)"
-                for _, fk in secondary_tables
-            ]
-            fragment = " AND ".join(parts)
+        parts = ([scope_filter] if has_ir else []) + [
+            self._build_secondary_predicate(tbl_name, spec, tbl_name, scope_filter, ir_predicate)
+            for tbl_name, spec in secondary_tables
+        ]
+        fragment = " AND ".join(f"({p})" for p in parts)
 
         if term:
             pos = term.start()

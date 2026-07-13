@@ -21,13 +21,13 @@ try:
         core_context_cast_block as _cast_block,
         core_context_counting_block as _counting_block,
         core_context_columns_block as _columns_block,
-        core_context_ca_workflow_block as _ca_workflow_block,
+        core_context_ma_workflow_block as _ma_workflow_block,
     )
     _STATUS_BLOCK = _status_block()
     _CAST_BLOCK = _cast_block()
     _COUNTING_BLOCK = _counting_block()
     _COLUMNS_BLOCK = _columns_block()
-    _CA_WORKFLOW_BLOCK = _ca_workflow_block()
+    _MA_WORKFLOW_BLOCK = _ma_workflow_block()
 except ImportError:
     # Fallback — keep in sync with core/semantics_registry.py
     _STATUS_BLOCK = """\
@@ -45,7 +45,7 @@ except ImportError:
 --   NEVER use status IN ('CLOSED','SUBMITTED') — that mixes conducted and completed
 --   NEVER use status != 'DRAFT' alone for conducted — CLOSED is not conducted"""
     _CAST_BLOCK = """\
--- OBSERVATION → CA JOIN — exact form:
+-- OBSERVATION → MA JOIN — exact form:
 --   aa.submission_id = ica.observation_id::varchar
 --   NEVER: aa.submission_id::uuid = ica.observation_id
 --   NEVER: ica.observation_id::text = aa.submission_id"""
@@ -64,8 +64,8 @@ except ImportError:
 --   frequency_definition, po_details, pr_details, risk_level, inspection_schedule
 -- NO active column: ai_answers, ai_questions, role, user_roles
 --   NEVER use aa.active or aq.active — these columns do not exist"""
-    _CA_WORKFLOW_BLOCK = """\
--- CORRECTIVE ACTION WORKFLOW — four independent tracks on ica:
+    _MA_WORKFLOW_BLOCK = """\
+-- MITIGATIVE ACTION WORKFLOW — four independent tracks on ica:
 --   status (system):            OPEN | CLOSED | OVERDUE | CLOSE_WITH_DEFERRED
 --   progress_stage (inspectee): NOT_STARTED, ON_TRACK, BEHIND, AT_RISK, COMPLETED, CLOSE_WITH_DEFERRED
 --   implementation_status (reviewers): NULL | PENDING_FOR_REVIEW | APPROVE | RETURN_FOR_MODIFICATION
@@ -74,8 +74,8 @@ except ImportError:
 --     po_details is the authoritative money record — POs legitimately exist on REJECTED rows
 -- INVARIANTS:
 --   status = 'CLOSED'  ⟺  implementation_status = 'APPROVE' (closure IS the approval)
---   RETURN_FOR_MODIFICATION resets progress_stage to NULL — progress_stage='COMPLETED' MISSES returned CAs
---   inspection_report closes only when ALL its CAs are closed
+--   RETURN_FOR_MODIFICATION resets progress_stage to NULL — progress_stage='COMPLETED' MISSES returned MAs
+--   inspection_report closes only when ALL its MAs are closed
 -- TRAP: 'at risk' = progress_stage='AT_RISK' (schedule health), NOT risk_level='High' (severity)"""
 
 CORE_CONTEXT = """\
@@ -113,7 +113,7 @@ CORE_CONTEXT = """\
 --   Admin sets inspection schedules → Inspectors submit portfolios → Inspectors visit sites
 --   Inspector creates Inspection Report (ir) with Observations (Good Practice or Deviation)
 --   Deviation observations have a risk score (risk_level) and observation text
---   FM Manager (inspectee) raises Corrective Actions (ICA) against those observations
+--   FM Manager (inspectee) raises Mitigative Actions (ICA) against those observations
 --   Each ICA has a proposed cost (ica.capex) and/or internal cost (ica.opex)
 --   Client pays via Purchase Orders → po_details (CAPEX Converted — CLIENT pays — GOOD)
 --   Khidmah pays via Purchase Requisitions → pr_details (OPEX Incurred — KHIDMAH pays — BAD)
@@ -249,13 +249,13 @@ WHERE ir.active = true
         'nl':     'what needs attention right now critical issues urgent items what should I look at dashboard summary action items',
         'sql':    """\
 -- "Needs attention" dashboard — ONE ROW of scalar subqueries.
--- NEVER UNION ALL heterogeneous tables (CA list + schedule list) — column types
+-- NEVER UNION ALL heterogeneous tables (MA list + schedule list) — column types
 -- clash ('N/A' text vs date/enum) and the query fails at runtime.
 SELECT
     (SELECT COUNT(*) FROM inspection_corrective_action
-     WHERE status = 'OVERDUE' AND active = true)                    AS overdue_corrective_actions,
+     WHERE status = 'OVERDUE' AND active = true)                    AS overdue_mitigative_actions,
     (SELECT COUNT(*) FROM inspection_corrective_action
-     WHERE status = 'OPEN' AND active = true)                       AS open_corrective_actions,
+     WHERE status = 'OPEN' AND active = true)                       AS open_mitigative_actions,
     (SELECT COUNT(*) FROM inspection_schedule
      WHERE status = 'OVERDUE')                                      AS overdue_scheduled_inspections,
     (SELECT COUNT(*) FROM inspection_corrective_action ica
@@ -268,7 +268,7 @@ SELECT
         'limit':  None,
     },
     {
-        'nl':     'how many open corrective actions are there',
+        'nl':     'how many open mitigative actions are there',
         'sql':    """\
 SELECT COUNT(*) AS open_count
 FROM inspection_corrective_action ica
@@ -279,10 +279,10 @@ WHERE ica.active = true AND ica.status = 'OPEN';
         'limit':  None,
     },
     {
-        'nl':     'corrective actions pending approval awaiting review CAs waiting for FM manager approval pending review',
+        'nl':     'mitigative actions pending approval awaiting review MAs waiting for FM manager approval pending review',
         'sql':    """\
 -- Pending approval = implementation_status = 'PENDING_FOR_REVIEW' (EXACT string — not 'PENDING')
--- These are CAs the inspectee marked COMPLETED, awaiting FM manager + inspector approval
+-- These are MAs the inspectee marked COMPLETED, awaiting FM manager + inspector approval
 SELECT ica.corrective_action_id, ica.cause, ica.corrective_action,
        ica.responsible, ica.progress_stage, ica.implementation_status,
        fac.name AS facility_name, ir.inspection_id
@@ -299,7 +299,7 @@ LIMIT 100;
         'limit':  100,
     },
     {
-        'nl':     'corrective actions sent back returned for modification rejected by reviewer CAs returned to inspectee',
+        'nl':     'mitigative actions sent back returned for modification rejected by reviewer MAs returned to inspectee',
         'sql':    """\
 -- Sent back = implementation_status = 'RETURN_FOR_MODIFICATION'
 -- NOTE: this resets progress_stage to NULL — do not also filter progress_stage
@@ -319,12 +319,12 @@ LIMIT 100;
         'limit':  100,
     },
     {
-        'nl':     'corrective actions at risk behind schedule on track not started progress breakdown CA progress status',
+        'nl':     'mitigative actions at risk behind schedule on track not started progress breakdown MA progress status',
         'sql':    """\
 -- progress_stage = inspectee's self-reported SCHEDULE HEALTH (not severity!)
 -- 'at risk' here = progress_stage='AT_RISK' — NOT risk_level='High'
 -- Values: NOT_STARTED, ON_TRACK, BEHIND, AT_RISK, COMPLETED, CLOSE_WITH_DEFERRED
--- NULL progress_stage = not started yet (fresh CA)
+-- NULL progress_stage = not started yet (fresh MA)
 SELECT COALESCE(ica.progress_stage, 'NOT_STARTED') AS progress_stage,
        COUNT(*) AS ca_count
 FROM inspection_corrective_action ica
@@ -341,7 +341,7 @@ ORDER BY ca_count DESC;
         'nl':     'income cost and profit by facility P&L per facility revenue spend by facility capex converted vs opex incurred per facility financial data PO PR purchase order purchase requisition by facility show POs and PRs at facility income and cost at specific facility',
         'sql':    """\
 -- P&L by facility: Income = SUM(po.po_amount), Cost = SUM(pr.pr_amount)
--- CRITICAL JOIN PATH: mitigative_action_uuid → ica.id (the CA) — NEVER ir.id!
+-- CRITICAL JOIN PATH: mitigative_action_uuid → ica.id (the MA) — NEVER ir.id!
 -- po/pr_details → ica → inspection_report → facility (the ICA hop is mandatory)
 -- WRONG: mitigative_action_uuid = ir.id — matches ZERO rows → silent all-zero table
 -- FACILITY FILTER: NEVER put fac.name ILIKE inside a CTE — fac is not in scope there.
@@ -415,7 +415,7 @@ WHERE fac.name ILIKE '%Al Ghadeer%'
         'limit':  None,
     },
     {
-        'nl':     'corrective actions not closed on time closed late past deadline late closure overdue when closed',
+        'nl':     'mitigative actions not closed on time closed late past deadline late closure overdue when closed',
         'sql':    """\
 -- 'closed late' / 'not closed on time' — MUTUALLY EXCLUSIVE from 'overdue':
 --   overdue     = status = 'OVERDUE' (the authoritative field — still OPEN, past due, has NOT closed yet)
@@ -466,7 +466,7 @@ WHERE ir.active = true
         'limit':  None,
     },
     {
-        'nl':     'total capex and opex across all corrective actions',
+        'nl':     'total capex and opex across all mitigative actions',
         'sql':    """\
 -- Bare "capex and opex" = GENERATED figures (ica-level estimates), not converted/incurred.
 -- capex_generated = SUM(ica.capex); opex_generated = SUM(ica.opex) — parallel concepts.
@@ -483,7 +483,7 @@ WHERE ica.active = true;
         # WATERFALL PATTERN 1: single-row P&L — 3 numeric columns, 1 row.
         # chart_advisor Rule 1 fires: n==1, len(nums)>=2, has income+cost+profit → waterfall.
         # Column aliases MUST match: total_income, total_cost, net_profit (triggers _INCOME_RE/_COST_RE/_PROFIT_RE).
-        'nl':     'what is the total income cost and net profit from corrective actions P&L profit loss overall financial summary total revenue expenditure waterfall',
+        'nl':     'what is the total income cost and net profit from mitigative actions P&L profit loss overall financial summary total revenue expenditure waterfall',
         'sql':    """\
 -- WATERFALL: return exactly 3 columns — total_income, total_cost, net_profit (1 row).
 -- chart_advisor detects income+cost+profit on a single row and auto-selects waterfall.
@@ -661,7 +661,7 @@ ORDER BY profit DESC;
         'limit':  None,
     },
     {
-        'nl':     'what percentage of inspections resulted in at least one corrective action',
+        'nl':     'what percentage of inspections resulted in at least one mitigative action',
         'sql':    """\
 -- USE THIS EXACT SQL — scalar percentage, no GROUP BY:
 SELECT ROUND(
@@ -733,7 +733,7 @@ ORDER BY category DESC;
         'limit':  None,
     },
     {
-        'nl':     'how many corrective actions were raised vs closed this quarter',
+        'nl':     'how many mitigative actions were raised vs closed this quarter',
         'sql':    """\
 -- USE THIS EXACT SQL — single-row FILTER aggregate, NOT GROUP BY:
 -- Single-row FILTER — NOT GROUP BY status
@@ -816,7 +816,7 @@ ORDER BY high_risk_count DESC LIMIT 1;
         'limit':  1,
     },
     {
-        'nl':     'are corrective actions being closed faster or slower compared to last quarter',
+        'nl':     'are mitigative actions being closed faster or slower compared to last quarter',
         'sql':    """\
 -- USE THIS EXACT SQL for quarter-over-quarter closure rate:
 -- Returns TWO ROWS: one per quarter — use GROUP BY date_trunc quarter
@@ -859,7 +859,7 @@ ORDER BY ir.submitted_on DESC LIMIT 5;
         'limit':  5,
     },
     {
-        'nl':     'show all overdue corrective actions',
+        'nl':     'show all overdue mitigative actions',
         'sql':    """\
 SELECT ica.corrective_action_id, ica.cause, ica.corrective_action,
        ica.responsible, ica.target_close_out_date,
@@ -1041,7 +1041,7 @@ ORDER BY avg_score DESC;
         'limit':  None,
     },
     {
-        'nl':     'show corrective actions with their inspection facility and inspector',
+        'nl':     'show mitigative actions with their inspection facility and inspector',
         'sql':    """\
 SELECT ica.corrective_action_id, ica.cause, ica.corrective_action,
        ica.responsible, ica.status,
@@ -1058,7 +1058,7 @@ LIMIT 100;
         'limit':  100,
     },
     {
-        'nl':     'which client has the most overdue corrective actions',
+        'nl':     'which client has the most overdue mitigative actions',
         'sql':    """\
 SELECT cl.name AS client_name, COUNT(*) AS overdue_count
 FROM inspection_corrective_action ica
@@ -1109,7 +1109,7 @@ ORDER BY inspection_count DESC;
         'limit':  None,
     },
     {
-        'nl':     'which entity has the most overdue corrective actions',
+        'nl':     'which entity has the most overdue mitigative actions',
         'sql':    """SELECT ent.name AS entity_name, COUNT(*) AS overdue_count
 FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
@@ -1177,7 +1177,7 @@ ORDER BY facility_count DESC;
         'limit':  None,
     },
     {
-        'nl':     'show corrective action count by region',
+        'nl':     'show mitigative action count by region',
         'sql':    """SELECT reg.name AS region_name, COUNT(*) AS ca_count
 FROM inspection_corrective_action ica
 JOIN inspection_report ir ON ica.inspection_id = ir.id
@@ -1231,7 +1231,7 @@ ORDER BY avg_score DESC LIMIT 1;
         'limit':  1,
     },
     {
-        'nl':     'show corrective action count by project',
+        'nl':     'show mitigative action count by project',
         'sql':    """\
 SELECT proj.name AS project_name, COUNT(*) AS ca_count
 FROM inspection_corrective_action ica
@@ -1526,7 +1526,7 @@ ORDER BY ir.submitted_on DESC LIMIT 100;
         'limit':  100,
     },
     {
-        'nl':     'what are the most common causes of corrective actions',
+        'nl':     'what are the most common causes of mitigative actions',
         'sql':    """\
 SELECT ica.cause, COUNT(*) AS frequency
 FROM inspection_corrective_action ica
@@ -1694,12 +1694,12 @@ ORDER BY aa.score DESC LIMIT 10;
         'limit':  10,
     },
     {
-        'nl':     'show corrective actions linked to a specific observation CAs for observation corrective actions for this observation corrective actions for first observation corrective actions raised from this finding',
-        'sql':    """-- OBSERVATION → CA PATH: aa.submission_id = ica.observation_id::varchar
+        'nl':     'show mitigative actions linked to a specific observation MAs for observation mitigative actions for this observation mitigative actions for first observation mitigative actions raised from this finding',
+        'sql':    """-- OBSERVATION → MA PATH: aa.submission_id = ica.observation_id::varchar
 -- Cast UUID side to varchar — NOT aa.submission_id::uuid (submission_id is varchar, observation_id is UUID)
--- This is the DIRECT link — NOT ica.inspection_id = ir.id (that returns ALL CAs in the inspection)
--- CORRECT: aa.submission_id = ica.observation_id::varchar  (398 CAs have non-NULL observation_id)
--- NOT: JOIN inspection_report ir ON ica.inspection_id = ir.id (returns ALL CAs for the whole inspection)
+-- This is the DIRECT link — NOT ica.inspection_id = ir.id (that returns ALL MAs in the inspection)
+-- CORRECT: aa.submission_id = ica.observation_id::varchar  (398 MAs have non-NULL observation_id)
+-- NOT: JOIN inspection_report ir ON ica.inspection_id = ir.id (returns ALL MAs for the whole inspection)
 SELECT ica.corrective_action_id,
        ica.cause,
        ica.corrective_action,
@@ -1720,7 +1720,7 @@ ORDER BY ica.corrective_action_id;
         'limit':  None,
     },
     {
-        'nl':     'which observation triggered the most corrective actions observation with most CAs',
+        'nl':     'which observation triggered the most mitigative actions observation with most MAs',
         'sql':    """-- CAST direction: aa.submission_id = ica.observation_id::varchar
 -- submission_id is varchar, observation_id is UUID — cast UUID to varchar, NOT varchar to uuid
 SELECT aa.answer_text AS observation,
@@ -1787,7 +1787,7 @@ GROUP BY ir.inspection_id;
         'limit':  1,
     },
     {
-        'nl':     'which corrective actions have the highest impact scale rating',
+        'nl':     'which mitigative actions have the highest impact scale rating',
         'sql':    """\
 -- impact and risk_level are TWIN tables with the SAME columns (id, name, scale, is_positive_impact,
 -- short_code) but are DIFFERENT lookup tables via DIFFERENT FKs — do not confuse them:
@@ -1805,7 +1805,7 @@ ORDER BY im.scale DESC LIMIT 50;
         'limit':  50,
     },
     {
-        'nl':     'how many corrective actions have a positive impact',
+        'nl':     'how many mitigative actions have a positive impact',
         'sql':    """\
 -- is_positive_impact is a real boolean column on the impact lookup table — NOT a form
 -- question in ai_answers. JOIN impact im ON ica.impact_id = im.id, filter im.is_positive_impact = true.
@@ -1819,7 +1819,7 @@ WHERE ica.active = true AND im.active = true AND im.is_positive_impact = true;
         'limit':  None,
     },
     {
-        'nl':     'what is the risk level breakdown of all corrective actions',
+        'nl':     'what is the risk level breakdown of all mitigative actions',
         'sql':    """\
 -- ICA risk_level_id is UUID FK — NEVER compare to string, NEVER GROUP BY UUID
 -- Filter by ica.active only — do NOT reference ir.active without joining inspection_report
@@ -1834,7 +1834,7 @@ GROUP BY rl.name ORDER BY action_count DESC;
         'limit':  None,
     },
     {
-        'nl':     'how many corrective actions are high risk',
+        'nl':     'how many mitigative actions are high risk',
         'sql':    """\
 SELECT COUNT(*) AS high_risk_count
 FROM inspection_corrective_action ica
@@ -1846,7 +1846,7 @@ WHERE rl.name = 'High';
         'limit':  None,
     },
     {
-        'nl':     'show all high risk corrective actions',
+        'nl':     'show all high risk mitigative actions',
         'sql':    """\
 SELECT ica.corrective_action_id, ica.cause, ica.corrective_action,
        ica.responsible, ica.status, rl.name AS risk_level_name,
@@ -1863,7 +1863,7 @@ ORDER BY ica.target_close_out_date DESC LIMIT 100;
         'limit':  100,
     },
     {
-        'nl':     'show open corrective actions with high risk grouped by facility',
+        'nl':     'show open mitigative actions with high risk grouped by facility',
         'sql':    """\
 SELECT fac.name AS facility_name, COUNT(*) AS high_risk_open_count
 FROM inspection_corrective_action ica
@@ -1878,7 +1878,7 @@ GROUP BY fac.name ORDER BY high_risk_open_count DESC;
         'limit':  None,
     },
     {
-        'nl':     'show all deferred corrective actions',
+        'nl':     'show all deferred mitigative actions',
         'sql':    """\
 SELECT ica.corrective_action_id, ica.cause, ica.corrective_action,
        ica.responsible, ica.status, ica.deferred_on, ica.target_close_out_date,
@@ -1908,7 +1908,7 @@ GROUP BY fac.name ORDER BY deferred_issue_count DESC LIMIT 20;
         'limit':  20,
     },
     {
-        'nl':     'how many corrective actions have been carried forward more than once',
+        'nl':     'how many mitigative actions have been carried forward more than once',
         'sql':    """\
 SELECT COUNT(*) AS multi_deferred_count FROM (
     SELECT ica.cause, fac.name
@@ -2050,7 +2050,7 @@ ORDER BY aa.submitted_on DESC LIMIT 1;
         'limit':  1,
     },
     {
-        'nl':     'show breakdown of corrective action status by responsible party',
+        'nl':     'show breakdown of mitigative action status by responsible party',
         'sql':    """\
 SELECT ica.responsible AS responsible_party,
        COUNT(*) FILTER (WHERE ica.status = 'OPEN') AS open_count,
@@ -2307,7 +2307,7 @@ ORDER BY icg.name;
         'limit':  None,
     },
     {
-        'nl':     'which facilities have high risk observations but no corrective actions raised',
+        'nl':     'which facilities have high risk observations but no mitigative actions raised',
         'sql':    """\
 -- Cross-domain: ai_answers (risk=High) LEFT JOIN inspection_corrective_action IS NULL
 -- Step 1: find inspection_report_ids with high risk observations via ai_answers
@@ -2635,7 +2635,7 @@ ORDER BY tm.total_capex_generated DESC, DATE_TRUNC('month', ir.submitted_on);
         'limit':  5,
     },
     {
-        'nl':     'which corrective actions are awaiting capex approval',
+        'nl':     'which mitigative actions are awaiting capex approval',
         'sql':    """\
 -- capex_status IS NULL = awaiting approval (not yet actioned by approver)
 -- capex_status = 'ACCEPTED' = approved/converted
@@ -2659,9 +2659,9 @@ LIMIT 50;
         'limit':  50,
     },
     {
-        'nl':     'which corrective action has the highest cost capex opex',
+        'nl':     'which mitigative action has the highest cost capex opex',
         'sql':    """\
--- USE THIS EXACT SQL for highest cost corrective action:
+-- USE THIS EXACT SQL for highest cost mitigative action:
 -- capex and opex are NUMERIC columns (decimal amounts)
 -- expenditure is a STRING ENUM: NO_EXPENDITURE | CAPEX | OPEX | CAPEX_AND_OPEX
 -- NEVER cast expenditure to numeric — it is not an amount
@@ -2687,12 +2687,12 @@ LIMIT 1;
         'limit':  1,
     },
     {
-        'nl':     'capex breakdown for each corrective action at facility PO PR per corrective action conversion percentage per CA generated converted by corrective action',
+        'nl':     'capex breakdown for each mitigative action at facility PO PR per mitigative action conversion percentage per MA generated converted by mitigative action',
         'sql':    """\
--- Per-corrective-action capex/PO/PR breakdown for a facility
+-- Per-mitigative-action capex/PO/PR breakdown for a facility
 -- CRITICAL: pre-aggregate po_details and pr_details in SEPARATE CTEs before joining to ica.
 -- NEVER LEFT JOIN po_details AND pr_details directly into a GROUP BY query —
--- if a CA has >1 PO row or >1 PR row, the cross-join multiplies rows and
+-- if a MA has >1 PO row or >1 PR row, the cross-join multiplies rows and
 -- corrupts every SUM() (confirmed bug: 2 POs + 1 PR returned half the real capex).
 WITH po_agg AS (
     SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po, COUNT(*) AS po_count
@@ -2813,7 +2813,7 @@ LIMIT 20;
         'limit':  20,
     },
     {
-        'nl':     'list corrective actions with rejected capex status workflow',
+        'nl':     'list mitigative actions with rejected capex status workflow',
         'sql':    """\
 -- capex_status = 'REJECTED' means the client rejected the ICA for approval (workflow status)
 -- This lists ICAs by their workflow rejection — it is NOT the same as CAPEX Lost
@@ -2892,9 +2892,9 @@ WHERE EXTRACT(YEAR FROM po.po_date) = EXTRACT(YEAR FROM CURRENT_DATE);
         'limit':  None,
     },
     {
-        'nl':     'show high risk corrective actions from a specific cycle scoped to cycle',
+        'nl':     'show high risk mitigative actions from a specific cycle scoped to cycle',
         'sql':    """\
--- USE THIS EXACT SQL for high risk CAs scoped to a cycle:
+-- USE THIS EXACT SQL for high risk MAs scoped to a cycle:
 -- When active context has a cycle_id, ALWAYS add WHERE ir.cycle_id = '<UUID>'
 -- Replace <CYCLE_UUID> with the actual cycle UUID from conversation context
 SELECT ica.corrective_action_id, ica.cause, ica.corrective_action,
@@ -2913,9 +2913,9 @@ ORDER BY ica.target_close_out_date DESC LIMIT 100;
         'limit':  100,
     },
     {
-        'nl':     'which cycle had the most medium risk corrective actions which cycle had the most high risk corrective actions cycle with the most corrective actions by risk level',
+        'nl':     'which cycle had the most medium risk mitigative actions which cycle had the most high risk mitigative actions cycle with the most mitigative actions by risk level',
         'sql':    """\
--- USE THIS EXACT SQL for "which cycle had the most <risk> corrective actions":
+-- USE THIS EXACT SQL for "which cycle had the most <risk> mitigative actions":
 -- JOIN PATH: inspection_cycle ic -> inspection_report ir (ir.cycle_id = ic.id)
 --         -> inspection_corrective_action ica (ica.inspection_id = ir.id)
 --         -> risk_level rl (rl.id = ica.risk_level_id)
@@ -3393,6 +3393,36 @@ ORDER BY capex_generated DESC NULLS LAST;
         'limit':  None,
     },
     {
+        # entity != facility — separate table, separate FK (ir.entity_id), see prompts.py CAPEX GROUPING.
+        'nl':     'show capex generated and converted by entity capex generated and converted by entity this year',
+        'sql':    """\
+-- FIN-07b: "by entity" means GROUP BY the entity table, NOT facility.
+-- entity JOIN: inspection_report.entity_id → entity.id (DIRECT FK) — standalone business entity
+-- CAPEX generated = SUM(ica.capex), converted = SUM(po.po_amount) via po_details
+-- Pre-aggregate po_details to avoid row multiplication
+WITH po_by_ica AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po
+    FROM po_details WHERE active = true GROUP BY 1
+)
+SELECT
+    ent.name                                        AS entity_name,
+    COALESCE(SUM(ica.capex), 0)                     AS capex_generated,
+    COALESCE(SUM(p.total_po), 0)                    AS capex_converted,
+    ROUND(COALESCE(SUM(p.total_po), 0) * 100.0 / NULLIF(SUM(ica.capex), 0), 1) AS conversion_pct
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN entity ent ON ir.entity_id = ent.id
+LEFT JOIN po_by_ica p ON p.ica_id = ica.id
+WHERE ir.active = true AND ica.active = true AND ent.active = true AND ica.capex > 0
+  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
+GROUP BY ent.id, ent.name
+ORDER BY capex_generated DESC NULLS LAST;
+""",
+        'domain': 'financial',
+        'intent': 'trend',
+        'limit':  None,
+    },
+    {
         'nl':     'top 5 capex converters who converted the most capex po amount',
         'sql':    """\
 -- FIN-09: CAPEX converters = FM managers ranked by SUM(po.po_amount) from po_details
@@ -3498,7 +3528,7 @@ ORDER BY quarter_start;
     {
         'nl':     'high risk observations raised this month count risk level observations month',
         'sql':    """\
--- High-risk OBSERVATIONS = corrective actions with risk_level JOIN — NOT ai_answers
+-- High-risk OBSERVATIONS = mitigative actions with risk_level JOIN — NOT ai_answers
 -- NEVER: ai_answers WHERE label='Observation' AND answer_text ILIKE '%High%'
 SELECT COUNT(*) AS high_risk_observation_count
 FROM inspection_corrective_action ica
@@ -3586,7 +3616,7 @@ ORDER BY capex_generated DESC LIMIT 10;
         'limit':  10,
     },
     {
-        'nl':     'fm manager most overdue corrective actions which fm manager overdue',
+        'nl':     'fm manager most overdue mitigative actions which fm manager overdue',
         'sql':    """\
 -- FM Manager = inspectee_user_id (NOT inspector_user_id)
 -- Overdue = status = 'OVERDUE' (the authoritative field — do not recompute from target_close_out_date)
@@ -3763,7 +3793,7 @@ LIMIT 20;
         'limit':  20,
     },
     {
-        'nl':     'which fm manager has most overdue corrective actions fm manager overdue',
+        'nl':     'which fm manager has most overdue mitigative actions fm manager overdue',
         'sql':    """\
 -- FM Manager = inspectee_user_id (NOT inspector_user_id, NOT ica.responsible)
 -- NEVER GROUP BY ica.responsible — gives CLIENT/INTERNAL_OPERATIONS/SUB_CONTRACTOR not people
@@ -4021,25 +4051,25 @@ WHERE DATE_FORMAT(i.inspection_date, '%Y-%m') = DATE_FORMAT(CURDATE(), '%Y-%m');
 # ── Conditional CORE_CONTEXT additions — included only when relevant ────────
 # Deepseek-side counterpart to prompts.py's CONDITIONAL_BLOCKS / EXAMPLES_TIER2.
 # _COUNTING_BLOCK (good practice/deviation/observation counting, ~148 tok) and
-# _CA_WORKFLOW_BLOCK (CA workflow columns, ~805 tok) were always-on parts of
+# _MA_WORKFLOW_BLOCK (MA workflow columns, ~805 tok) were always-on parts of
 # CORE_CONTEXT before 2026-06-13's truncation fix — both grew this session and
 # are narrowly topical, so they're now conditional like their Llama-side
-# counterparts (CONDITIONAL_BLOCKS["CA workflow columns"] and the FORM-pattern
+# counterparts (CONDITIONAL_BLOCKS["MA workflow columns"] and the FORM-pattern
 # Tier-2 examples in prompts.py).
 #
-# Patterns are intentionally KEPT IN SYNC with prompts.py's CA/FORM patterns —
-# both sides should treat "is this question about corrective actions / form
+# Patterns are intentionally KEPT IN SYNC with prompts.py's MA/FORM patterns —
+# both sides should treat "is this question about mitigative actions / form
 # answers" the same way. If you edit one, edit the other.
 CORE_CONTEXT_CONDITIONAL = [
     {
-        "title": "CA workflow columns (Deepseek)",
+        "title": "MA workflow columns (Deepseek)",
         "question_pattern": (
-            r"(?i)\bcorrective\s+actions?\b|\bCAs?\b|\bicas?\b"
+            r"(?i)\bmitigative\s+actions?\b|\bMAs?\b"
             r"|\bcapex\b|\bopex\b|\bdeferred\b"
             r"|\bprogress[_\s]stage\b|\bimplementation[_\s]status\b"
             r"|\bneeds?\s+attention\b|\bcritical\s+issues?\b"
         ),
-        "get_text": lambda: _CA_WORKFLOW_BLOCK,
+        "get_text": lambda: _MA_WORKFLOW_BLOCK,
     },
     {
         "title": "Good practice / deviation / observation counting (Deepseek)",

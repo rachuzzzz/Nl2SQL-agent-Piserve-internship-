@@ -8,6 +8,8 @@ Sub-loggers used across the app:
   inspectai.query     — per-query lifecycle (entry, scope, exit)
   inspectai.llm       — LLM calls, tool selection, reasoning steps
   inspectai.sql       — SQL generation, validation, execution, retries
+  inspectai.security  — RBAC/scope decisions (ALLOWED/SCOPED/BLOCKED),
+                        tagged [SCOPE] for grepping
 
 By default writes to debug_llm_YYYYMMDD_HHMMSS.log — the same file that
 the orchestrator's raw LLM debug logger uses, so all logs appear in one place.
@@ -69,6 +71,8 @@ def setup_logging(log_level: str = "INFO", log_file: str | None = None) -> None:
     root.handlers.clear()
     root.addHandler(console)
     root.addHandler(rotating)
+
+    logging.getLogger("inspectai.security").handlers.clear()
 
     for noisy in (
         "httpx", "httpcore", "httpcore.connection", "httpcore.http11",

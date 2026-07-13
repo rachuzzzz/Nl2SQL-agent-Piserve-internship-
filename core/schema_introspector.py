@@ -49,8 +49,8 @@ ENUM_COLUMNS = {
 }
 
 BUSINESS_RULES = [
-    # NOTE: the observation↔CA cast direction below must match
-    # core.semantics_registry.observation_ca_join() — "aa.submission_id = ica.observation_id::varchar"
+    # NOTE: the observation↔MA cast direction below must match
+    # core.semantics_registry.observation_ma_join() — "aa.submission_id = ica.observation_id::varchar"
     "DRAFT inspections usually have NULL scores. Always add WHERE status != 'DRAFT' "
     "when querying inspection_score, unless the user explicitly asks about drafts.",
     "NEVER use SELECT *. Always specify the columns the user needs.",
@@ -58,15 +58,15 @@ BUSINESS_RULES = [
     "Use ILIKE for text matching, never LIKE.",
     "corrective_action_id is a human-readable ID like '2026/01/ST064/INS001_MA001', not a UUID.",
     "inspection_corrective_action.inspection_id is the PRIMARY FK to inspection_report.id.",
-    "OBSERVATION → CORRECTIVE ACTION — two distinct paths, NEVER confuse them: "
-    "PATH 1 — CAs for a SPECIFIC observation: JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar "
+    "OBSERVATION → MITIGATIVE ACTION — two distinct paths, NEVER confuse them: "
+    "PATH 1 — MAs for a SPECIFIC observation: JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar "
     "(cast the UUID side to varchar — NEVER aa.submission_id::uuid = ica.observation_id, NEVER ::text). "
-    "PATH 2 — ALL CAs for an inspection: JOIN ica ON ica.inspection_id = ir.id. "
+    "PATH 2 — ALL MAs for an inspection: JOIN ica ON ica.inspection_id = ir.id. "
     "Use PATH 1 only when the user references a SPECIFIC observation; "
-    "use PATH 2 for 'corrective actions for this inspection' generally.",
+    "use PATH 2 for 'mitigative actions for this inspection' generally.",
     "Use LEFT JOIN (not INNER JOIN) for optional lookups like inspection_sub_type, "
     "entity, and inspection_report_remark.",
-    "VOCABULARY — corrective action status: "
+    "VOCABULARY — mitigative action status: "
     "'open' = 'OPEN'. 'overdue' = 'OVERDUE'. "
     "'closed'/'resolved' = status IN ('CLOSED','CLOSE_WITH_DEFERRED').",
     "VOCABULARY — inspection report status: "
@@ -214,7 +214,7 @@ MULTI-HOP EXAMPLES:
     JOIN facility fac ON ir.facility_id = fac.id
     WHERE fac.name ILIKE '%Al Ghadeer%'
 
-  "corrective actions for safety inspections":
+  "mitigative actions for safety inspections":
     FROM inspection_corrective_action ica
     JOIN inspection_report ir ON ica.inspection_id = ir.id
     JOIN inspection_type it ON ir.inspection_type_id = it.id

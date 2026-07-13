@@ -37,14 +37,14 @@ TEST_SET = [
     },
     {
         "id": "AGG-03", "category": "Aggregate",
-        "question": "what is the total capex and opex across all corrective actions",
+        "question": "what is the total capex and opex across all mitigative actions",
         "expected_contains": ["capex", "opex"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Two aggregates",
     },
     {
         "id": "AGG-04", "category": "Aggregate",
-        "question": "how many open corrective actions are there",
+        "question": "how many open mitigative actions are there",
         "expected_contains": ["open"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Status filter count",
@@ -65,7 +65,7 @@ TEST_SET = [
     },
     {
         "id": "AGG-07", "category": "Aggregate",
-        "question": "how many corrective actions were raised vs closed this quarter",
+        "question": "how many mitigative actions were raised vs closed this quarter",
         "expected_contains": ["open", "closed"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "FILTER clause",
@@ -79,7 +79,7 @@ TEST_SET = [
     },
     {
         "id": "AGG-09", "category": "Aggregate",
-        "question": "what percentage of inspections resulted in at least one corrective action",
+        "question": "what percentage of inspections resulted in at least one mitigative action",
         "expected_contains": ["%"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "LEFT JOIN + COUNT DISTINCT ~66.8%",
@@ -101,7 +101,7 @@ TEST_SET = [
     },
     {
         "id": "FLT-02", "category": "Filter",
-        "question": "show all overdue corrective actions",
+        "question": "show all overdue mitigative actions",
         "expected_contains": ["action"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Date comparison filter",
@@ -165,28 +165,28 @@ TEST_SET = [
     },
     {
         "id": "JOI-04", "category": "Join",
-        "question": "show corrective actions with their inspection facility and inspector",
+        "question": "show mitigative actions with their inspection facility and inspector",
         "expected_contains": ["facility", "inspector"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "4-table join",
     },
     {
         "id": "JOI-05", "category": "Join",
-        "question": "what is the current open corrective action count by facility",
+        "question": "what is the current open mitigative action count by facility",
         "expected_contains": ["facility", "open"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Correct JOIN direction",
     },
     {
         "id": "JOI-06", "category": "Join",
-        "question": "which facility has the highest number of overdue corrective actions",
+        "question": "which facility has the highest number of overdue mitigative actions",
         "expected_contains": ["facility", "overdue"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "ADJD AA -Al Roya: 45",
     },
     {
         "id": "JOI-07", "category": "Join",
-        "question": "which client has the most overdue corrective actions",
+        "question": "which client has the most overdue mitigative actions",
         "expected_contains": ["client"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Kingfield: 72",
@@ -257,7 +257,7 @@ TEST_SET = [
     },
     {
         "id": "ANS-05", "category": "Form Answers",
-        "question": "what are the most common causes of corrective actions",
+        "question": "what are the most common causes of mitigative actions",
         "expected_contains": ["cause"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "ica.cause NOT form answers",
@@ -329,7 +329,7 @@ TEST_SET = [
     },
     {
         "id": "TRD-02", "category": "Trends",
-        "question": "are corrective actions being closed faster or slower compared to last quarter",
+        "question": "are mitigative actions being closed faster or slower compared to last quarter",
         "expected_contains": ["quarter", "closed"],
         "expected_nonempty": False,
         "expected_llm_calls": 1,
@@ -358,7 +358,7 @@ TEST_SET = [
     },
     {
         "id": "TRD-06", "category": "Trends",
-        "question": "which inspection type has the most corrective actions raised",
+        "question": "which inspection type has the most mitigative actions raised",
         "expected_contains": ["type", "action"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Regulatory/Insurance:103",
@@ -373,7 +373,7 @@ TEST_SET = [
     },
     {
         "id": "PPL-02", "category": "People",
-        "question": "show breakdown of corrective action status by responsible party",
+        "question": "show breakdown of mitigative action status by responsible party",
         "expected_contains": ["client", "internal"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "responsible is ENUM not FK",
@@ -421,7 +421,7 @@ TEST_SET = [
     # ── ICA Risk Level — Problem 2 fix ───────────────────────────────────────
     {
         "id": "ICA-01", "category": "ICA Risk Level",
-        "question": "show all high risk corrective actions",
+        "question": "show all high risk mitigative actions",
         "expected_contains": ["high", "risk"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
@@ -429,7 +429,7 @@ TEST_SET = [
     },
     {
         "id": "ICA-02", "category": "ICA Risk Level",
-        "question": "what is the risk level breakdown of all corrective actions",
+        "question": "what is the risk level breakdown of all mitigative actions",
         "expected_contains": ["high", "medium"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
@@ -437,7 +437,7 @@ TEST_SET = [
     },
     {
         "id": "ICA-03", "category": "ICA Risk Level",
-        "question": "how many corrective actions are high risk",
+        "question": "how many mitigative actions are high risk",
         "expected_contains": ["high"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
@@ -445,7 +445,7 @@ TEST_SET = [
     },
     {
         "id": "ICA-04", "category": "ICA Risk Level",
-        "question": "show open corrective actions with high risk grouped by facility",
+        "question": "show open mitigative actions with high risk grouped by facility",
         "expected_contains": ["facility", "high"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
@@ -454,7 +454,7 @@ TEST_SET = [
     # ── Deferred Chain — Problem 5 fix ───────────────────────────────────────
     {
         "id": "DEF-01", "category": "Deferred Chain",
-        "question": "show all deferred corrective actions",
+        "question": "show all deferred mitigative actions",
         "expected_contains": ["deferred", "action"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
@@ -478,7 +478,7 @@ TEST_SET = [
     },
     {
         "id": "DEF-04", "category": "Deferred Chain",
-        "question": "how many corrective actions have been carried forward more than once",
+        "question": "how many mitigative actions have been carried forward more than once",
         "expected_contains": ["deferred"],
         "expected_nonempty": False,
         "expected_llm_calls": 1,
@@ -509,7 +509,7 @@ TEST_SET = [
     },
     {
         "id": "EDG-03", "category": "Edge Case",
-        "question": "show corrective actions where responsible is client",
+        "question": "show mitigative actions where responsible is client",
         "expected_contains": ["client", "action"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Enum value filter",
@@ -565,7 +565,7 @@ TEST_SET = [
     # ── Cross-domain Complexity ───────────────────────────────────────────────
     {
         "id": "CROSS-01", "category": "Cross-domain",
-        "question": "which facilities have the most overdue corrective actions and the lowest inspection scores",
+        "question": "which facilities have the most overdue mitigative actions and the lowest inspection scores",
         "expected_contains": ["facility", "overdue", "score"],
         "expected_nonempty": True,
         "expected_llm_calls": 2,
@@ -573,7 +573,7 @@ TEST_SET = [
     },
     {
         "id": "CROSS-02", "category": "Cross-domain",
-        "question": "which inspection types generate the most high risk corrective actions",
+        "question": "which inspection types generate the most high risk mitigative actions",
         "expected_contains": ["inspection", "high", "risk"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
@@ -581,14 +581,14 @@ TEST_SET = [
     },
     {
         "id": "CROSS-03", "category": "Cross-domain",
-        "question": "list facilities that were inspected this year but have zero corrective actions",
+        "question": "list facilities that were inspected this year but have zero mitigative actions",
         "expected_contains": ["facility"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "LEFT JOIN ica WHERE ica.id IS NULL",
     },
     {
         "id": "CROSS-04", "category": "Cross-domain",
-        "question": "which facilities have high risk observations but no corrective actions raised",
+        "question": "which facilities have high risk observations but no mitigative actions raised",
         "expected_contains": ["facility"],
         "expected_nonempty": True,
         "expected_llm_calls": 2,
@@ -657,31 +657,31 @@ TEST_SET = [
     {
         "id": "CONV-02", "category": "Conversational",
         "question": "what needs attention right now",
-        "expected_contains": ["overdue", "risk", "corrective", "facility"],
+        "expected_contains": ["overdue", "risk", "mitigative", "facility"],
         "expected_nonempty": True,
         "expected_llm_calls": 2,
-        "notes": "Ambiguous — expect overdue CA or high risk observations",
+        "notes": "Ambiguous — expect overdue MA or high risk observations",
     },
     {
         "id": "CONV-03", "category": "Conversational",
         "question": "how are we doing overall",
-        "expected_contains": ["score", "inspection", "corrective", "average"],
+        "expected_contains": ["score", "inspection", "mitigative", "average"],
         "expected_nonempty": True,
         "expected_llm_calls": 2, "notes": "High-level summary — avg score or completion rate",
     },
     {
         "id": "CONV-04", "category": "Conversational",
         "question": "any critical issues I should know about",
-        "expected_contains": ["high", "risk", "overdue", "corrective"],
+        "expected_contains": ["high", "risk", "overdue", "mitigative"],
         "expected_nonempty": True,
         "expected_llm_calls": 2, "notes": "Should surface high risk + overdue items",
     },
     {
         "id": "CONV-05", "category": "Conversational",
         "question": "give me a breakdown of this quarter",
-        "expected_contains": ["quarter", "inspection", "corrective"],
+        "expected_contains": ["quarter", "inspection", "mitigative"],
         "expected_nonempty": True,
-        "expected_llm_calls": 2, "notes": "Quarter summary — inspections done, CAs raised",
+        "expected_llm_calls": 2, "notes": "Quarter summary — inspections done, MAs raised",
     },
 
     # ── Comparison / Ranking ─────────────────────────────────────────────────
@@ -694,21 +694,21 @@ TEST_SET = [
     },
     {
         "id": "COMP-02", "category": "Comparison",
-        "question": "rank inspection types by their average corrective actions per inspection",
+        "question": "rank inspection types by their average mitigative actions per inspection",
         "expected_contains": ["inspection"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "GROUP BY inspection_type ORDER BY avg_ca DESC",
     },
     {
         "id": "COMP-03", "category": "Comparison",
-        "question": "which inspection type has the highest corrective action rate",
+        "question": "which inspection type has the highest mitigative action rate",
         "expected_contains": ["inspection"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "CA count / inspection count by type",
+        "expected_llm_calls": 1, "notes": "MA count / inspection count by type",
     },
     {
         "id": "COMP-04", "category": "Comparison",
-        "question": "compare overdue corrective action counts between CLIENT and INTERNAL_OPERATIONS",
+        "question": "compare overdue mitigative action counts between CLIENT and INTERNAL_OPERATIONS",
         "expected_contains": ["client", "internal"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
@@ -718,14 +718,14 @@ TEST_SET = [
     # ── Extended Aggregates ───────────────────────────────────────────────────
     {
         "id": "AGG-EXT-01", "category": "Extended Aggregate",
-        "question": "what is the average number of corrective actions per inspection",
-        "expected_contains": ["average", "avg", "corrective"],
+        "question": "what is the average number of mitigative actions per inspection",
+        "expected_contains": ["average", "avg", "mitigative"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Subquery: COUNT per inspection, then AVG",
     },
     {
         "id": "AGG-EXT-02", "category": "Extended Aggregate",
-        "question": "how many corrective actions were closed on time vs late",
+        "question": "how many mitigative actions were closed on time vs late",
         "expected_contains": ["closed", "time", "late", "on_time", "overdue"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
@@ -733,7 +733,7 @@ TEST_SET = [
     },
     {
         "id": "AGG-EXT-03", "category": "Extended Aggregate",
-        "question": "what percentage of corrective actions are currently overdue",
+        "question": "what percentage of mitigative actions are currently overdue",
         "expected_contains": ["overdue", "%", "percent"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "OVERDUE / total * 100",
@@ -781,7 +781,7 @@ TEST_SET = [
     },
     {
         "id": "FIN-04", "category": "Financial",
-        "question": "show capex lost from rejected corrective actions",
+        "question": "show capex lost from rejected mitigative actions",
         "expected_contains": ["reject", "capex"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
@@ -809,7 +809,7 @@ TEST_SET = [
         "expected_contains": ["inspectee_user_id", "generated", "converted"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
-        "notes": "FM managers (inspectee_user_id) generate capex via CAs — NOT inspector_user_id. SUM(ica.capex) vs SUM(po.po_amount) per FM manager",
+        "notes": "FM managers (inspectee_user_id) generate capex via MAs — NOT inspector_user_id. SUM(ica.capex) vs SUM(po.po_amount) per FM manager",
     },
 ]
 

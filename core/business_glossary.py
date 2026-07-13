@@ -157,40 +157,40 @@ _RAW: list[dict] = [
     },
     {
         "id": "open_actions",
-        "terms": ["open action", "open actions", "open corrective", "open ca"],
+        "terms": ["open action", "open actions", "open mitigative", "open ma"],
         "required_pattern": r"status\s*=\s*'OPEN'",
         "forbidden_patterns": [],
         "correct_sql": "WHERE status = 'OPEN'",
-        "message": "open corrective actions: status = 'OPEN'",
+        "message": "open mitigative actions: status = 'OPEN'",
         "severity": "SOFT_WARN",
     },
     {
         "id": "overdue_actions",
-        "terms": ["overdue action", "overdue actions", "overdue corrective"],
+        "terms": ["overdue action", "overdue actions", "overdue mitigative"],
         "required_pattern": r"status\s*=\s*'OVERDUE'",
         "forbidden_patterns": [],
         "correct_sql": "WHERE status = 'OVERDUE'",
-        "message": "overdue corrective actions: status = 'OVERDUE'",
+        "message": "overdue mitigative actions: status = 'OVERDUE'",
         "severity": "SOFT_WARN",
     },
     {
         "id": "closed_actions",
-        "terms": ["closed action", "closed actions", "closed corrective"],
+        "terms": ["closed action", "closed actions", "closed mitigative"],
         "required_pattern": (
             r"status\s*(=\s*'CLOSED'|IN\s*\([^)]*'CLOSED'[^)]*\))"
         ),
         "forbidden_patterns": [],
         "correct_sql": "status IN ('CLOSED', 'CLOSE_WITH_DEFERRED')",
-        "message": "closed corrective actions include CLOSE_WITH_DEFERRED",
+        "message": "closed mitigative actions include CLOSE_WITH_DEFERRED",
         "severity": "SOFT_WARN",
     },
     {
         "id": "deferred_actions",
-        "terms": ["deferred action", "deferred actions", "deferred corrective", "carried forward"],
+        "terms": ["deferred action", "deferred actions", "deferred mitigative", "carried forward"],
         "required_pattern": r"CLOSE_WITH_DEFERRED",
         "forbidden_patterns": [],
         "correct_sql": "WHERE status = 'CLOSE_WITH_DEFERRED'",
-        "message": "deferred corrective actions: status = 'CLOSE_WITH_DEFERRED'",
+        "message": "deferred mitigative actions: status = 'CLOSE_WITH_DEFERRED'",
         "severity": "SOFT_WARN",
     },
 
@@ -307,11 +307,11 @@ _RAW: list[dict] = [
         "terms": ["conversion rate", "capex conversion", "how much was converted"],
         "required_pattern": r"po_details|po_by_ica|po\.po_amount",
         "forbidden_patterns": [
-            # Wrong: using inspection count / CA count as conversion rate
-            r"inspections_with_ca|inspection.*ca.*rate|ca.*inspection.*rate",
+            # Wrong: using inspection count / MA count as conversion rate
+            r"inspections_with_ca|inspections_with_ma|inspection.*ca.*rate|ca.*inspection.*rate",
         ],
         "correct_sql": "ROUND(SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100, 2) AS conversion_rate_pct",
-        "message": "CAPEX conversion rate = SUM(po_amount) / SUM(ica.capex) * 100 — NOT inspection-to-CA percentage",
+        "message": "CAPEX conversion rate = SUM(po_amount) / SUM(ica.capex) * 100 — NOT inspection-to-MA percentage",
         "severity": "HARD_FAIL",
     },
 
@@ -332,14 +332,14 @@ _RAW: list[dict] = [
         "terms": ["capex lost", "lost capex", "capex loss"],
         # Two valid shapes: (1) the arithmetic AGGREGATE (SUM(ica.capex) - SUM(po.po_amount))
         # via po_details, OR (2) a LISTING query filtered by capex_status='REJECTED'
-        # (e.g. "capex lost from rejected corrective actions" — see business_rules.py
+        # (e.g. "capex lost from rejected mitigative actions" — see business_rules.py
         # block_capex_status_rejected_as_loss, narrowed 2026-06-12 to allow exactly this).
         # Previously required_pattern only accepted (1), contradicting this entry's
         # own message which already said (2) is valid — aligned now.
         "required_pattern": r"po_details|po\.po_amount|po_by_ica|capex_status\s*=\s*'REJECTED'",
         "forbidden_patterns": [],
         "correct_sql": "SUM(ica.capex) WHERE ica.active=true AND ica.capex>0 MINUS SUM(po_details.po_amount) WHERE po_details.active=true — arithmetic gap",
-        "message": "CAPEX Lost = SUM(ica.capex) - SUM(po.po_amount) — arithmetic gap. capex_status=REJECTED is a valid filter for rejected CA queries.",
+        "message": "CAPEX Lost = SUM(ica.capex) - SUM(po.po_amount) — arithmetic gap. capex_status=REJECTED is a valid filter for rejected MA queries.",
         "severity": "SOFT_WARN",
     },
     {

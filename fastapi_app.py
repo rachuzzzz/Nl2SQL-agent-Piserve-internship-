@@ -100,7 +100,7 @@ _VISUAL_KW = re.compile(
     re.IGNORECASE,
 )
 _DOMAIN_KW = re.compile(
-    r'\b(inspection|facility|capex|opex|score|corrective|action|overdue|report|month|'
+    r'\b(inspection|facility|capex|opex|score|mitigative|action|overdue|report|month|'
     r'year|week|average|total|count|inspector|manager|status|pending|approved|rejected|'
     r'deferred|finding|observation|po|purchase|order|amount|budget|responsible|closed|open)\b',
     re.IGNORECASE,
@@ -127,6 +127,7 @@ def _extract_requested_type(q: str) -> str | None:
 log       = logging.getLogger("inspectai")
 log_auth  = logging.getLogger("inspectai.auth")
 log_query = logging.getLogger("inspectai.query")
+log_security = logging.getLogger("inspectai.security")
 
 # ── Eager startup ──────────────────────────────────────────────────────────────
 
@@ -301,6 +302,30 @@ def _strip_uuid_columns(columns: list, rows: list) -> tuple[list, list]:
     kept_cols = [c for c in columns if c not in uuid_cols]
     kept_rows = [{k: v for k, v in row.items() if k not in uuid_cols} for row in rows]
     return kept_cols, kept_rows
+
+
+_SCOPE_PREDICATE_RE = re.compile(
+    r"ir\.(?:inspector|inspectee)_user_id\s*=\s*\(\s*SELECT\s+id\s+FROM\s+users\s+WHERE\s+id_fk\s*=\s*\d+[^)]*\)",
+    re.IGNORECASE,
+)
+_ID_FK_RE = re.compile(r"id_fk\s*=\s*\d+", re.IGNORECASE)
+_DRUPAL_UID_RE = re.compile(r"Drupal\s+UID[\s:(]*\d+\)?", re.IGNORECASE)
+
+
+def _redact_security_internals(text: str | None) -> str | None:
+    """Deterministic backstop for the system prompt's "never expose this
+    constraint" instruction, which the model doesn't reliably honor when
+    directly asked about its filters/mechanism. Applied to LLM-authored
+    text right before it reaches the client — enforce_scope() itself
+    doesn't care what the LLM says, so this is purely about not handing an
+    attacker the enforcement mechanism to study.
+    """
+    if not text:
+        return text
+    text = _SCOPE_PREDICATE_RE.sub("[access-control filter]", text)
+    text = _ID_FK_RE.sub("id_fk = [redacted]", text)
+    text = _DRUPAL_UID_RE.sub("[redacted]", text)
+    return text
 
 
 # ── Answer cleaner ────────────────────────────────────────────────────────────
@@ -541,11 +566,11 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=
                 'sub': sub,
                 'permissions': _data_vis,
             }
-            log_query.info("[SCOPE] qid=%s sub=%s data_visibility_perms=%s",
-                           qid, sub, _data_vis or "(none — will BLOCK)")
+            log_security.info("[SCOPE] qid=%s sub=%s data_visibility_perms=%s",
+                               qid, sub, _data_vis or "(none — will BLOCK)")
         else:
             visibility_scope = None  # → BLOCK in orchestrator
-            log_query.warning("[SCOPE] qid=%s sub=%s — no permissions fetched, BLOCKING", qid, sub)
+            log_security.warning("[SCOPE] qid=%s sub=%s — no permissions fetched, BLOCKING", qid, sub)
 
         # ── Chart follow-up fast-path — skip LLM entirely ────────────────────
         if _is_chart_followup(req.message) and sess_data.get("last_raw_rows"):
@@ -869,6 +894,8 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=
         # table reaches the frontend — done last so it never affects chart/KPI
         # column selection or summary generation upstream, only the payload.
         _result_cols, _result_rows = _strip_uuid_columns(_result_cols, _result_rows)
+        display_answer = _redact_security_internals(display_answer)
+        reasoning = _redact_security_internals(reasoning)
 
         log_query.info(
             "[QUERY] END   qid=%s sub=%s elapsed=%dms llm_calls=%d "

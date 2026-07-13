@@ -8,7 +8,7 @@ present), not correctness. Run 20260610_231945 counted these as passes:
   JOI-07  returned Kingfield 140      — known truth 72
   JOI-06  returned 47                 — known truth 45
   AGG-10  returned 2.08               — known truth ~4.2
-  COMP-03 returned a 600% CA rate     — numerically nonsensical
+  COMP-03 returned a 600% MA rate     — numerically nonsensical
 
 This module adds RESULT-LEVEL verification: each covered case has canonical
 SQL (written against today's confirmed semantics), both queries execute, and
@@ -78,7 +78,7 @@ GROUND_TRUTH: dict[str, dict] = {
               AND EXTRACT(YEAR FROM submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
         """,
     },
-    "AGG-04": {  # open corrective actions
+    "AGG-04": {  # open mitigative actions
         "mode": "scalar",
         "sql": """
             SELECT COUNT(*)
@@ -86,7 +86,7 @@ GROUND_TRUTH: dict[str, dict] = {
             WHERE active = true AND status = 'OPEN'
         """,
     },
-    "AGG-09": {  # % of inspections with >=1 CA
+    "AGG-09": {  # % of inspections with >=1 MA
         "mode": "scalar",
         "tol": {"abs": 1.5},  # definitional wiggle (DRAFT handling) allowed
         "sql": """
@@ -114,7 +114,7 @@ GROUND_TRUTH: dict[str, dict] = {
     },
 
     # ── Joins / rankings ─────────────────────────────────────────────────────
-    "JOI-06": {  # facility with most overdue CAs — winner + count
+    "JOI-06": {  # facility with most overdue MAs — winner + count
         "mode": "top1",
         "sql": """
             SELECT fac.name, COUNT(*) AS overdue_count
@@ -128,7 +128,7 @@ GROUND_TRUTH: dict[str, dict] = {
             LIMIT 1
         """,
     },
-    "JOI-07": {  # client with most overdue CAs — JOI-07 returned 140 vs truth 72
+    "JOI-07": {  # client with most overdue MAs — JOI-07 returned 140 vs truth 72
         "mode": "top1",
         "sql": """
             SELECT cl.name, COUNT(*) AS overdue_count
@@ -144,7 +144,7 @@ GROUND_TRUTH: dict[str, dict] = {
     },
 
     # ── ICA risk ─────────────────────────────────────────────────────────────
-    "ICA-03": {  # how many CAs are high risk
+    "ICA-03": {  # how many MAs are high risk
         "mode": "scalar",
         "sql": """
             SELECT COUNT(*)

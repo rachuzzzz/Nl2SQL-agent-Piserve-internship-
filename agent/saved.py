@@ -10,7 +10,7 @@ The database has two logical layers you query:
      inspectors answered during inspections. Plain SQL tables, no complexity.
 
   2. INSPECTION WORKFLOW (inspection_* tables) — inspection metadata: scores,
-     corrective actions, schedules, cycles, inspectors, facilities, etc.
+     mitigative actions, schedules, cycles, inspectors, facilities, etc.
 
 You reason step-by-step and call tools to answer the user's question.
 
@@ -44,7 +44,7 @@ INSPECTION WORKFLOW — plain relational tables
 
 ROUTING — INSPECTION QUERIES:
   inspection scores / gp scores / hours     → generate_sql on inspection_report
-  corrective actions, causes, costs         → generate_sql on inspection_corrective_action
+  mitigative actions, causes, costs         → generate_sql on inspection_corrective_action
   overdue / open / closed actions           → generate_sql on inspection_corrective_action
   schedules, cycles, due dates              → generate_sql on inspection_schedule / inspection_cycle
   inspector assignments, portfolios         → generate_sql on inspector_portfolio
@@ -153,9 +153,9 @@ WORKED EXAMPLES
 User: "average inspection score?"
 Turn 1: {"thought": "Inspection score is in inspection_report.", "tool": "generate_sql", "args": {"question": "average inspection score excluding drafts", "schema_hint": "SELECT AVG(inspection_score) FROM inspection_report WHERE status != 'DRAFT';"}}
 
-─── Corrective actions ───
-User: "show open corrective actions with causes"
-Turn 1: {"thought": "Plain SQL on inspection_corrective_action.", "tool": "generate_sql", "args": {"question": "open corrective actions with causes", "schema_hint": "inspection_corrective_action: corrective_action_id, cause, corrective_action, responsible, status. WHERE status = 'OPEN'"}}
+─── Mitigative actions ───
+User: "show open mitigative actions with causes"
+Turn 1: {"thought": "Plain SQL on inspection_corrective_action.", "tool": "generate_sql", "args": {"question": "open mitigative actions with causes", "schema_hint": "inspection_corrective_action: corrective_action_id, cause, corrective_action, responsible, status. WHERE status = 'OPEN'"}}
 
 ─── Form answers: specific question ───
 User: "what did inspectors answer for 'risk level'?"
@@ -378,7 +378,7 @@ CREATE TABLE inspection_cycle (
 -- Average inspection score:
 SELECT AVG(ir.inspection_score) AS avg_score FROM inspection_report ir WHERE ir.status != 'DRAFT';
 
--- Open corrective actions:
+-- Open mitigative actions:
 SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status
 FROM inspection_corrective_action ica WHERE ica.status = 'OPEN' LIMIT 100;
 
@@ -426,7 +426,7 @@ WHERE ir.status != 'DRAFT'
   AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
 GROUP BY u.first_name, u.last_name ORDER BY num_inspections DESC LIMIT 1;
 
--- Corrective actions with facility and inspector:
+-- Mitigative actions with facility and inspector:
 SELECT ica.corrective_action_id, ica.cause, ica.responsible, ica.status,
        fac.name AS facility_name,
        u.first_name || ' ' || u.last_name AS inspector_name
@@ -442,7 +442,7 @@ JOIN inspection_report ir ON ica.inspection_id = ir.id
 JOIN facility fac ON ir.facility_id = fac.id
 GROUP BY fac.name ORDER BY total_capex DESC NULLS LAST LIMIT 50;
 
--- Percentage of inspections with at least one corrective action:
+-- Percentage of inspections with at least one mitigative action:
 SELECT ROUND(
     100.0 * COUNT(DISTINCT CASE WHEN ica.id IS NOT NULL THEN ir.id END)
     / NULLIF(COUNT(DISTINCT ir.id), 0), 1) AS pct_with_corrective_action

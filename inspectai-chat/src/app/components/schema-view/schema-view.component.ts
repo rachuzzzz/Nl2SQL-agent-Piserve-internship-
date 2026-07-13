@@ -16,7 +16,7 @@ const EHS_SCHEMA = [
   { name: 'finding', rows: '131,902', desc: 'Findings raised on inspections', cols: [
       ['id','uuid'],['report_id','uuid → inspection_report'],['severity','enum'],
       ['category','text'],['is_open','bool'],['raised_on','date']] },
-  { name: 'corrective_action', rows: '54,771', desc: 'CAPA tracking', cols: [
+  { name: 'corrective_action', rows: '54,771', desc: 'Mitigative action tracking', cols: [
       ['id','uuid'],['finding_id','uuid → finding'],['site_id','int'],['status','enum'],
       ['due_on','date'],['closed_on','date'],['owner','text']] },
   { name: 'incident', rows: '7,355', desc: 'Safety incidents & near-misses', cols: [

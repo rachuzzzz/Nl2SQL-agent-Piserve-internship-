@@ -51,7 +51,7 @@ const AUDIT_BARS        = bars([218, 196, 174, 161, 145], SW, SH);
 const SAVED_CARDS: SavedCard[] = [
   { name: 'Monthly inspection score', tag: 'Inspections', runs: 142, color: 'var(--accent)',
     sparkType: 'line', sparkPoly: AVG_SCORE_SPARK.poly, sparkArea: AVG_SCORE_SPARK.area, sparkBars: empty },
-  { name: 'Open CAPAs by site',       tag: 'CAPA',        runs: 98,  color: 'var(--viz-blue)',
+  { name: 'Open mitigative actions by site', tag: 'MA',    runs: 98,  color: 'var(--viz-blue)',
     sparkType: 'bar',  sparkPoly: '', sparkArea: '', sparkBars: OPEN_CAPA_BARS },
   { name: 'Permits expiring ≤30d',    tag: 'Permits',     runs: 211, color: 'var(--viz-amber)',
     sparkType: 'bar',  sparkPoly: '', sparkArea: '', sparkBars: PERMITS_BARS },

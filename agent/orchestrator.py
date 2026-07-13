@@ -11,9 +11,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-_log_query = logging.getLogger("inspectai.query")
-_log_llm   = logging.getLogger("inspectai.llm")
-_log_sql   = logging.getLogger("inspectai.sql")
+_log_query    = logging.getLogger("inspectai.query")
+_log_llm      = logging.getLogger("inspectai.llm")
+_log_sql      = logging.getLogger("inspectai.sql")
+_log_security = logging.getLogger("inspectai.security")
 
 from sqlalchemy import create_engine, text as sql_text
 
@@ -326,7 +327,7 @@ class ConversationSession:
             return ""
 
         # NOTE: bare "that"/"this" are deliberately excluded — they double as
-        # relative pronouns/determiners in ordinary questions ("corrective actions
+        # relative pronouns/determiners in ordinary questions ("mitigative actions
         # THAT are overdue", "show me THIS month's data") and caused the sticky
         # active-context gate below to false-positive-match plain global questions.
         # Demonstrative reference to a specific entity is still caught via the
@@ -453,7 +454,7 @@ class ConversationSession:
                 lines.append(
                     f"ACTIVE CONTEXT — The conversation is scoped to cycle "
                     f"'{active_value}'."
-                    f" All follow-up questions about inspections, corrective actions,"
+                    f" All follow-up questions about inspections, mitigative actions,"
                     f" facilities, or inspectors should include WHERE ir.cycle_id = '{active_value}'."
                     f" When user says 'they', 'that cycle', 'those facilities', 'those inspectors'"
                     f" — this is the scope."
@@ -496,7 +497,7 @@ class ConversationSession:
                     lines.append(
                         f"ACTIVE CONTEXT — The conversation is scoped to facility '{active_label}'"
                         f" (resolved facility_id='{_fid}')."
-                        f" ALL follow-up questions about corrective actions, inspections, scores,"
+                        f" ALL follow-up questions about mitigative actions, inspections, scores,"
                         f" or form answers should filter EXACTLY by WHERE fac.id = '{_fid}'"
                         f" — NOT ILIKE — unless the user explicitly asks for a global/all-facilities view."
                         f" Do NOT query globally when the context is scoped to this facility."
@@ -504,7 +505,7 @@ class ConversationSession:
                 else:
                     lines.append(
                         f"ACTIVE CONTEXT — The conversation is scoped to facility '{active_label}'."
-                        f" ALL follow-up questions about corrective actions, inspections, scores,"
+                        f" ALL follow-up questions about mitigative actions, inspections, scores,"
                         f" or form answers should include a facility filter"
                         f" (fac.name ILIKE '%{active_label}%') unless the user explicitly asks"
                         f" for a global/all-facilities view."
@@ -521,7 +522,7 @@ class ConversationSession:
                     lines.append(
                         f"ACTIVE CONTEXT — The conversation is scoped to {_tbl} '{active_label}'"
                         f" (resolved {_tbl}_id='{_eid}')."
-                        f" ALL follow-up questions about corrective actions, inspections, scores,"
+                        f" ALL follow-up questions about mitigative actions, inspections, scores,"
                         f" or form answers should filter EXACTLY by WHERE {_als}.id = '{_eid}'"
                         f" — NOT ILIKE — unless the user explicitly asks for a global view."
                         f" Do NOT query globally when the context is scoped to this {_tbl}."
@@ -529,7 +530,7 @@ class ConversationSession:
                 else:
                     lines.append(
                         f"ACTIVE CONTEXT — The conversation is scoped to {_tbl} '{active_label}'."
-                        f" ALL follow-up questions about corrective actions, inspections, scores,"
+                        f" ALL follow-up questions about mitigative actions, inspections, scores,"
                         f" or form answers should include a filter"
                         f" ({_als}.name ILIKE '%{active_label}%') unless the user explicitly asks"
                         f" for a global view."
@@ -537,7 +538,7 @@ class ConversationSession:
                     )
             elif active_type == "corrective_action":
                 lines.append(
-                    f"ACTIVE CONTEXT — The conversation is about corrective action '{active_value}'."
+                    f"ACTIVE CONTEXT — The conversation is about mitigative action '{active_value}'."
                 )
         elif is_followup and not is_clearly_fresh:
             # Fallback: legacy single-entity context. Same fix as the primary
@@ -819,7 +820,7 @@ class ConversationSession:
         # CONTEXT facility/entity branches above never fire for a same-turn
         # drilldown-click follow-up). Unlike the people block, the typical
         # follow-up here is a full sentence with the resolved name embedded
-        # (e.g. drilldown-click text "show corrective actions at Adnoc
+        # (e.g. drilldown-click text "show mitigative actions at Adnoc
         # Schools- Ghayathi"), not a bare name reply — so this matches by
         # substring containment against the whole question, not equality.
         if not is_clearly_fresh and last.entity_disambiguation_candidates:
@@ -875,8 +876,8 @@ _INSPECTION_REPORT_RE = re.compile(
     r'inspections?\s+by\s+type|inspections?\s+per\s+cycle)\b',
     re.IGNORECASE,
 )
-_CORRECTIVE_ACTION_RE = re.compile(
-    r'\b(corrective.?action|corrective|mitigative|finding|observation|'
+_MITIGATIVE_ACTION_RE = re.compile(
+    r'\b(mitigative.?action|mitigative|finding|observation|'
     r'cause|correction|responsible|progress.?stage|capex|opex|expenditure|'
     r'overdue|close.?out|target.?date|pending.?with|risk.?level|'
     r'open.?action|closed.?action|deferred)\b',
@@ -1018,8 +1019,13 @@ class AgentOrchestrator:
         else:
             scope_filter = build_scope_filter(visibility_scope)
 
+        _perm_count = len((visibility_scope or {}).get("permissions", []))
+
         if scope_filter == 'BLOCK':
-            _log_query.warning("[SCOPE] %sBLOCKED sub=%s — no data-visibility permissions", _pfx, _sub)
+            _log_security.warning(
+                "[SCOPE] %soutcome=BLOCKED sub=%s perms=%d question=%r",
+                _pfx, _sub, _perm_count, question[:120],
+            )
             stats.total_wall_ms = 0
             return AgentResult(
                 question=question,
@@ -1027,8 +1033,14 @@ class AgentOrchestrator:
                 steps=[], total_iterations=0, success=False, stats=stats,
             )
 
-        _log_query.info("[SCOPE] %ssub=%s filter=%r",
-                        _pfx, _sub, scope_filter[:120] if scope_filter else "(unrestricted)")
+        _log_security.info(
+            "[SCOPE] %soutcome=%s sub=%s perms=%d filter=%r question=%r",
+            _pfx,
+            "UNRESTRICTED" if not scope_filter else "SCOPED",
+            _sub, _perm_count,
+            scope_filter[:120] if scope_filter else "(unrestricted)",
+            question[:120],
+        )
 
         # Rank/budget-cap Tier-2 worked-examples and conditional blocks when
         # 2+ match the same question, instead of concatenating every match
@@ -1104,7 +1116,7 @@ class AgentOrchestrator:
                 re.IGNORECASE,
             )
             _HAS_NEW_SUBJECT_RE = re.compile(
-                r'\b(high|low|medium|risk|observation|finding|action|corrective|'
+                r'\b(high|low|medium|risk|observation|finding|action|mitigative|'
                 r'recommended|facility|inspector|score|form|module|inspection|cause|'
                 r'overdue|open|closed|month|week|today|by\s+\w+|for\s+\w+|'
                 r'at\s+\w+|in\s+\w+|about|from\s+\w+)\b',
@@ -2121,7 +2133,7 @@ class AgentOrchestrator:
             if tool_name == "generate_sql":
                 q_lower = question.lower()
                 hint = ""
-                if re.search(r'\b(corrective.?action|cause|correction|capex|opex|overdue)\b', q_lower):
+                if re.search(r'\b(mitigative.?action|cause|correction|capex|opex|overdue)\b', q_lower):
                     hint = (
                         "\n\nFALLBACK SQL:\n"
                         "SELECT corrective_action_id, cause, corrective_action, responsible, status\n"

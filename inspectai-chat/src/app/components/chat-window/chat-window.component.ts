@@ -547,16 +547,16 @@ export class ChatWindowComponent implements AfterViewChecked {
 
   quickQueries = [
     'What is the average inspection score?',
-    'Show overdue corrective actions',
-    'Which facility has the most high-risk CAs?',
+    'Show overdue mitigative actions',
+    'Which facility has the most high-risk MAs?',
     'How are we doing overall?',
-    'Rank inspection types by avg CAs per inspection',
+    'Rank inspection types by avg MAs per inspection',
   ];
 
   get inputPlaceholder(): string {
     return this.lastResultData
       ? 'Ask a question or type / for commands (/chart, /export, /sql...)'
-      : 'Ask about inspections, scores, corrective actions, facilities...';
+      : 'Ask about inspections, scores, mitigative actions, facilities...';
   }
 
   constructor(

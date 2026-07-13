@@ -137,9 +137,9 @@ REGISTRY: list[dict] = [
         "type":        BLOCK,
         "description": (
             "Joining po_details AND pr_details directly into the same query (not via separate "
-            "pre-aggregated CTEs) causes a cross-join row multiplication when a CA has more than "
+            "pre-aggregated CTEs) causes a cross-join row multiplication when an MA has more than "
             "one PO or PR row, silently corrupting SUM() results (confirmed in production "
-            "2026-06-15: a CA with 2 POs and 1 PR returned capex_generated=1000 instead of 2000, "
+            "2026-06-15: an MA with 2 POs and 1 PR returned capex_generated=1000 instead of 2000, "
             "and capex_converted=0 instead of 1000)."
         ),
         "sql_pattern": (
@@ -148,7 +148,7 @@ REGISTRY: list[dict] = [
         ),
         "message": (
             "BLOCKED: po_details and pr_details are both directly LEFT JOINed into a GROUP BY query. "
-            "If a corrective action has more than one PO or PR row, this cross-joins them and corrupts "
+            "If a mitigative action has more than one PO or PR row, this cross-joins them and corrupts "
             "every SUM() in the result (confirmed bug: 2 POs + 1 PR returned half the correct capex). "
             "ALWAYS pre-aggregate each table in its own CTE first:\n"
             "WITH po_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po "
@@ -328,7 +328,7 @@ REGISTRY: list[dict] = [
         ),
         "message": (
             "WRONG JOIN TARGET: mitigative_action_uuid points to inspection_corrective_action.id "
-            "(the CA), NEVER inspection_report.id or any other table. "
+            "(the MA), NEVER inspection_report.id or any other table. "
             "Correct path: po_details/pr_details → ica → inspection_report → facility:\n"
             "  JOIN inspection_corrective_action ica ON pd.mitigative_action_uuid = ica.id\n"
             "  JOIN inspection_report ir ON ica.inspection_id = ir.id\n"
@@ -423,10 +423,10 @@ REGISTRY: list[dict] = [
         ),
     },
     {
-        "id":          "block_ca_for_observation_wrong_path",
+        "id":          "block_ma_for_observation_wrong_path",
         "type":        BLOCK,
         "description": (
-            "When fetching CAs for a specific observation text (ILIKE), must use "
+            "When fetching MAs for a specific observation text (ILIKE), must use "
             "observation_id → submission_id path, not inspection join."
         ),
         # Fires when: ai_answers ILIKE filter present + ICA joined via inspection_report
@@ -439,10 +439,10 @@ REGISTRY: list[dict] = [
             r"(?!.*\bica\.observation_id\b)"                 # correct path absent
         ),
         "message":     (
-            "WRONG PATH: When filtering CAs by observation text (ILIKE), join via "
+            "WRONG PATH: When filtering MAs by observation text (ILIKE), join via "
             "aa.submission_id = ica.observation_id::varchar — NOT via ica.inspection_id = ir.id. "
-            "The inspection join returns ALL CAs in the inspection; the observation_id join "
-            "returns only CAs directly linked to that specific observation."
+            "The inspection join returns ALL MAs in the inspection; the observation_id join "
+            "returns only MAs directly linked to that specific observation."
         ),
     },
 
@@ -454,7 +454,7 @@ REGISTRY: list[dict] = [
         # Narrowed (2026-06-12): only fire when capex_status REJECTED/DEFERRED is
         # used to PRODUCE a capex_lost/capex_converted output column (a SUM/CASE
         # computing loss from capex_status), NOT when it's a plain WHERE filter
-        # for listing/displaying rows (e.g. "capex lost from rejected corrective
+        # for listing/displaying rows (e.g. "capex lost from rejected mitigative
         # actions" — legitimately filters WHERE ica.capex_status = 'REJECTED'
         # to list those rows; capex_status is user-entered/declarative and
         # POs can legitimately exist on REJECTED rows).
@@ -1058,17 +1058,17 @@ REGISTRY: list[dict] = [
         ),
     },
     {
-        "id":             "inject_avg_ca_close_time",
+        "id":             "inject_avg_ma_close_time",
         "type":           INJECT,
         "priority":       85,
-        "description":    "Average time to close corrective action — use target_close_out_date not close_on.",
+        "description":    "Average time to close mitigative action — use target_close_out_date not close_on.",
         "question_pattern": (
             r"\b(average|avg|mean).{0,20}(time|days?|hours?|duration).{0,20}"
-            r"(close|clos|resolv|complet).{0,20}(corrective|action|ca|ica)\b"
+            r"(close|clos|resolv|complet).{0,20}(mitigative|action|ma)\b"
             r"|\b(how.{0,10}long|time.{0,10}taken?).{0,30}(close|clos|resolv)\b"
         ),
         "hint": (
-            "\nAVERAGE TIME TO CLOSE CORRECTIVE ACTION:\n"
+            "\nAVERAGE TIME TO CLOSE MITIGATIVE ACTION:\n"
             "NEVER use close_on — it is NULL on most rows (only set in special workflows).\n"
             "USE target_close_out_date - created_on for the planned close window:\n"
             "SELECT\n"
@@ -1115,14 +1115,14 @@ REGISTRY: list[dict] = [
         ),
     },
     {
-        "id":             "inject_pct_with_ca",
+        "id":             "inject_pct_with_ma",
         "type":           INJECT,
         "priority":       100,
-        "description":    "Percentage of inspections with corrective action — inject exact SQL.",
+        "description":    "Percentage of inspections with mitigative action — inject exact SQL.",
         "question_pattern": (
             r"\b(percentage|percent|pct|proportion|ratio).{0,40}"
-            r"(corrective.?action|mitigative|finding)\b"
-            r"|\b(corrective.?action|mitigative|finding).{0,40}"
+            r"(mitigative|finding)\b"
+            r"|\b(mitigative|finding).{0,40}"
             r"(percentage|percent|pct|proportion|ratio)\b"
         ),
         "hint": (
@@ -1130,7 +1130,7 @@ REGISTRY: list[dict] = [
             "SELECT ROUND(\n"
             "  100.0 * COUNT(DISTINCT CASE WHEN ica.id IS NOT NULL THEN ir.id END)\n"
             "  / NULLIF(COUNT(DISTINCT ir.id), 0), 1\n"
-            ") AS pct_with_corrective_action\n"
+            ") AS pct_with_mitigative_action\n"
             "FROM inspection_report ir\n"
             "LEFT JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id\n"
             f"WHERE ir.{_DRAFT_EXCLUSION};\n"
@@ -1295,25 +1295,25 @@ REGISTRY: list[dict] = [
 
         "type":           INJECT,
         "priority":       87,
-        "description":    "ICA corrective action risk queries — route to risk_level table via UUID FK. Does NOT apply to form observation queries which correctly use ai_answers.",
+        "description":    "ICA mitigative action risk queries — route to risk_level table via UUID FK. Does NOT apply to form observation queries which correctly use ai_answers.",
         "suppresses":     [],
         "question_pattern": (
-            # Only fires for CORRECTIVE ACTION risk queries.
+            # Only fires for MITIGATIVE ACTION risk queries.
             # Form observation queries ("high risk observations") use ai_answers correctly.
             r"\b(high.{0,10}risk|critical.{0,10}risk).{0,30}"
-            r"(corrective.{0,10}action|\bca\b|\bica\b)|"
-            r"\b(corrective.{0,10}action|\bca\b|\bica\b).{0,30}"
+            r"(mitigative.{0,10}action)|"
+            r"\b(mitigative.{0,10}action).{0,30}"
             r"(high.{0,10}risk|critical.{0,10}risk)|"
             r"\b(risk.{0,10}breakdown|breakdown.{0,10}risk|"
             r"risk.{0,10}distribut|risk.{0,10}count|count.{0,10}risk|"
             r"risk.{0,10}by.{0,20}facilit|by.{0,10}risk.{0,10}level)\b"
         ),
         "hint": (
-            "\nICA RISK ROUTING — corrective action risk levels use inspection_corrective_action:\n"
-            "  For risk level COUNTS / BREAKDOWNS on corrective actions:\n"
+            "\nICA RISK ROUTING — mitigative action risk levels use inspection_corrective_action:\n"
+            "  For risk level COUNTS / BREAKDOWNS on mitigative actions:\n"
             "  ALWAYS use the risk_level table via inspection_corrective_action:\n"
             "  NOTE: form 'high risk observations' uses ai_answers correctly — this rule\n"
-            "  only applies to ICA/corrective-action risk queries.\n"
+            "  only applies to mitigative-action risk queries.\n"
             "  ALWAYS use the risk_level table via inspection_corrective_action:\n"
             "  JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
             "  WHERE rl.name = \'High\'   -- or \'Medium\' / \'Low\'\n"
@@ -1335,10 +1335,10 @@ REGISTRY: list[dict] = [
         "priority":       80,
         "description":    "ICA + facility/grouping — prevent varchar=UUID join mismatch.",
         "question_pattern": (
-            r"\b(corrective.?action|capex|opex).{0,50}"
+            r"\b(mitigative.?action|capex|opex).{0,50}"
             r"(facility|client|inspector|type|count|by|group|breakdown)\b"
             r"|\b(facility|client|inspector|type|breakdown).{0,50}"
-            r"(corrective.?action|capex|opex)\b"
+            r"(mitigative.?action|capex|opex)\b"
         ),
         "hint": (
             "\nCRITICAL JOIN — inspection_corrective_action to inspection_report:\n"
@@ -1450,11 +1450,11 @@ REGISTRY: list[dict] = [
         "id":             "inject_raised_vs_closed_quarter",
         "type":           INJECT,
         "priority":       85,
-        "description":    "Raised vs closed corrective actions — must use FILTER, not GROUP BY.",
+        "description":    "Raised vs closed mitigative actions — must use FILTER, not GROUP BY.",
         "question_pattern": (
             r"\b(raised|created|opened).{0,30}(closed|completed|resolved)\b"
             r"|\b(closed|completed|resolved).{0,30}(raised|created|opened)\b"
-            r"|\bhow\s+many.{0,30}corrective.{0,20}(raised|closed|quarter)\b"
+            r"|\bhow\s+many.{0,30}mitigative.{0,20}(raised|closed|quarter)\b"
         ),
         "hint": (
             "\nUSE THIS EXACT SINGLE-ROW FORM — NOT GROUP BY status:\n"
@@ -1582,25 +1582,26 @@ REGISTRY: list[dict] = [
             "  ica.responsible has no FK relationship to users at all.\n"
         ),
     },
-    # CA approval-workflow questions — route to implementation_status, never capex_status
+    # MA approval-workflow questions — route to implementation_status, never capex_status
     {
-        "id":             "inject_ca_approval_workflow",
+        "id":             "inject_ma_approval_workflow",
         "type":           INJECT,
         "priority":       78,
-        "description":    "CA approval/progress questions — implementation_status & progress_stage routing.",
+        "description":    "MA approval/progress questions — implementation_status & progress_stage routing.",
         "question_pattern": (
-            r"(?i)\b(awaiting|pending)\s*(for\s+)?(approval|review)\b"
-            r"|\bapproval\b.{0,30}\b(corrective|action|CA)s?\b"
-            r"|\b(approved|sent\s+back|returned)\b.{0,30}\b(corrective|action|CA)s?\b"
-            r"|\b(at\s+risk|behind\s+schedule|on\s+track|not\s+started)\b.{0,30}\b(corrective|action|CA)s?\b"
-            r"|\b(corrective|action|CA)s?\b.{0,40}\b(at\s+risk|behind|on\s+track|approved?|pending|sent\s+back|returned)\b"
+            r"(?i)\b(awaiting|pending)\s*(for\s+)?(approval|review)\b.{0,40}\b(action|MA)s?\b"
+            r"|\b(action|MA)s?\b.{0,40}\b(awaiting|pending)\s*(for\s+)?(approval|review)\b"
+            r"|\bapproval\b.{0,30}\b(action|MA)s?\b"
+            r"|\b(approved|sent\s+back|returned)\b.{0,30}\b(action|MA)s?\b"
+            r"|\b(at\s+risk|behind\s+schedule|on\s+track|not\s+started)\b.{0,30}\b(action|MA)s?\b"
+            r"|\b(action|MA)s?\b.{0,40}\b(at\s+risk|behind|on\s+track|approved?|pending|sent\s+back|returned)\b"
         ),
         "hint": (
-            "\nCA WORKFLOW ROUTING — four independent ica columns, do not confuse:\n"
+            "\nMA WORKFLOW ROUTING — four independent ica columns, do not confuse:\n"
             "  'awaiting/pending approval/review' → implementation_status = 'PENDING_FOR_REVIEW'\n"
             "      (EXACT string — NOT 'PENDING'. NEVER capex_status — that is the financial track)\n"
             "  'approved'                         → implementation_status = 'APPROVE' (NOT 'APPROVED')\n"
-            "  'sent back / returned' (CAs)       → ica.implementation_status = 'RETURN_FOR_MODIFICATION'\n"
+            "  'sent back / returned' (MAs)       → ica.implementation_status = 'RETURN_FOR_MODIFICATION'\n"
             "  'returned' (INSPECTIONS)           → ir.status = 'RETURN_FOR_MODIFICATION' — different table!\n"
             "  'at risk / behind / on track'      → progress_stage (schedule health)\n"
             "      'at risk' = progress_stage='AT_RISK' — NOT risk_level='High' (severity)\n"
@@ -1620,14 +1621,14 @@ REGISTRY: list[dict] = [
         ),
         "hint": (
             "\nDASHBOARD QUESTION — return ONE ROW of scalar subqueries.\n"
-            "NEVER UNION ALL heterogeneous tables (CA rows + schedule rows) — "
+            "NEVER UNION ALL heterogeneous tables (MA rows + schedule rows) — "
             "'N/A' placeholders clash with date/enum column types and fail at runtime.\n\n"
             "USE THIS PATTERN:\n"
             "SELECT\n"
             "    (SELECT COUNT(*) FROM inspection_corrective_action\n"
-            "     WHERE status = 'OVERDUE' AND active = true)  AS overdue_corrective_actions,\n"
+            "     WHERE status = 'OVERDUE' AND active = true)  AS overdue_mitigative_actions,\n"
             "    (SELECT COUNT(*) FROM inspection_corrective_action\n"
-            "     WHERE status = 'OPEN' AND active = true)     AS open_corrective_actions,\n"
+            "     WHERE status = 'OPEN' AND active = true)     AS open_mitigative_actions,\n"
             "    (SELECT COUNT(*) FROM inspection_schedule\n"
             "     WHERE status = 'OVERDUE')                    AS overdue_scheduled_inspections,\n"
             "    (SELECT COUNT(*) FROM inspection_corrective_action ica\n"
@@ -1690,11 +1691,11 @@ REGISTRY: list[dict] = [
         "priority":       95,
         "description":    "ICA risk level queries — ALWAYS JOIN risk_level table, never select UUID.",
         "question_pattern": (
-            # Must mention corrective action, ICA, or risk breakdown in context of actions/counts
-            r"\b(high|medium|low)\s*risk\s*(corrective.?action|action|count|breakdown|all\s+corrective)\b"
-            r"|\b(corrective.?action|ica).{0,40}(risk|high.?risk|medium.?risk|low.?risk)\b"
-            r"|\brisk.?level.{0,30}(corrective|action|breakdown|all\s+corrective)\b"
-            r"|\b(how\s+many|count|show|list).{0,20}(high|medium|low)\s*risk\s*(corrective|action)\b"
+            # Must mention mitigative action or risk breakdown in context of actions/counts
+            r"\b(high|medium|low)\s*risk\s*(mitigative.?action|action|count|breakdown|all\s+mitigative)\b"
+            r"|\b(mitigative.?action).{0,40}(risk|high.?risk|medium.?risk|low.?risk)\b"
+            r"|\brisk.?level.{0,30}(mitigative|action|breakdown|all\s+mitigative)\b"
+            r"|\b(how\s+many|count|show|list).{0,20}(high|medium|low)\s*risk\s*(mitigative|action)\b"
         ),
         "hint": (
             "\nICA RISK LEVEL — risk_level_id is a UUID FK, NEVER a string:\n"

@@ -24,7 +24,7 @@ DATA_VISIBILITY_PERMS: frozenset = frozenset({
     'view list of all inspection mitigative actions',
     'conduct an inspection',
     'can be an inspectee',
-    # Grants scoped access to PO details linked to the user's own CAs
+    # Grants scoped access to PO details linked to the user's own MAs
     'view po details in any mitigative action',
     # Scoped cycle and project dashboard access via the inspection chain
     'view inspection cycle list',
@@ -83,8 +83,6 @@ def build_scope_filter(visibility_scope: dict) -> str:
 
     # Unrestricted — can see every inspection / every MA (and thus every PO)
     if 'view list of all inspections' in perms:
-        return ''
-    if 'view list of all inspection mitigative actions' in perms:
         return ''
 
     # Sub-query to map Drupal UID → internal UUID
