@@ -15,8 +15,8 @@ from typing import Any, Optional
 from sqlalchemy import inspect as sa_inspect, text as sql_text
 from sqlalchemy.engine import Engine
 
-from core.semantic import SemanticQuestionIndex
-from core.validator import SQLValidator
+from khidmah.core.semantic import SemanticQuestionIndex
+from khidmah.core.validator import SQLValidator
 
 
 _SEMANTIC_MIN_SCORE = 0.55
@@ -499,7 +499,7 @@ def _join_graph_source(table_name: str) -> str:
 
 def _join_path_hints(relevant_tables: list) -> str:
     """Chain path_as_hint() across consecutive relevant_tables pairs."""
-    from agent.join_graph import path_as_hint
+    from khidmah.agent.join_graph import path_as_hint
     hints = []
     for a, b in zip(relevant_tables, relevant_tables[1:]):
         hint = path_as_hint(_join_graph_source(a), _join_graph_source(b))
@@ -532,13 +532,13 @@ def generate_sql(
             schema_hint = f"{auto_schema}\n{schema_hint}" if schema_hint else auto_schema
 
         if not sql_prompt_template:
-            from agent.prompts import SQL_GENERATION_PROMPT
+            from khidmah.agent.prompts import SQL_GENERATION_PROMPT
             sql_prompt_template = SQL_GENERATION_PROMPT
 
         # Retrieval-based example injection via SeedExampleIndex (cosine similarity)
         # Falls back to empty string if index not available or seed_examples not deployed.
         try:
-            from agent.seed_examples import CORE_CONTEXT, build_core_context_additions
+            from khidmah.agent.seed_examples import CORE_CONTEXT, build_core_context_additions
             _core_ctx = CORE_CONTEXT + build_core_context_additions(question)
         except ImportError:
             _core_ctx = (
@@ -597,7 +597,7 @@ def generate_sql(
         # This turns INJECT rules from suggestions into contracts. ───────────
         if _inject_rule_ids:
             try:
-                from core.business_rules import get_engine as _get_rules_engine
+                from khidmah.core.business_rules import get_engine as _get_rules_engine
                 _guard_engine = _get_rules_engine()   # singleton — no re-init cost
                 required = _guard_engine.required_tables_for(_inject_rule_ids)
                 forbidden = _guard_engine.forbidden_patterns_for(_inject_rule_ids)

@@ -20,7 +20,7 @@ try:
 except ImportError:
     _HAS_JSON_REPAIR = False
 
-from agent.tools import ToolRegistry
+from khidmah.agent.tools import ToolRegistry
 
 
 # ---------------------------------------------------------------------------

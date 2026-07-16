@@ -1,7 +1,7 @@
 """
 Prompt templates for the agentic NL2SQL system.
 
-STATUS GROUPINGS come from core.semantics_registry — the single source of
+STATUS GROUPINGS come from khidmah.core.semantics_registry — the single source of
 truth. Edit there, not here.
 """
 
@@ -9,7 +9,7 @@ import re
 
 # ── Registry-generated status block (single source of truth) ─────────────────
 try:
-    from core.semantics_registry import (
+    from khidmah.core.semantics_registry import (
         llama_status_block as _llama_status_block,
         llama_ma_workflow_block as _llama_ma_workflow_block,
         llama_columns_block as _llama_columns_block,

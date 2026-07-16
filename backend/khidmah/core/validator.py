@@ -31,7 +31,7 @@ except ImportError:
     _HAS_SQLGLOT = False
 
 try:
-    from core.business_glossary import check_glossary as _check_glossary
+    from khidmah.core.business_glossary import check_glossary as _check_glossary
     _HAS_GLOSSARY = True
 except ImportError:
     _HAS_GLOSSARY = False
@@ -332,7 +332,7 @@ class SQLValidator:
     _NON_RETRYABLE_CODES: frozenset = frozenset({"DML_BLOCKED"})
 
     def __init__(self):
-        from core.business_rules import get_engine
+        from khidmah.core.business_rules import get_engine
         self._rules = get_engine()
 
     def _registry_block_warn_issues(self, sql: str, question: str = "") -> list:

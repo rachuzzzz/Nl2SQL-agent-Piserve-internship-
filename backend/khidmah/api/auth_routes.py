@@ -21,9 +21,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials as _HTTPCreds
 from pydantic import BaseModel
 
-from app_state import get_orch
-from core.auth import _bearer_scheme, _decode_jwt_payload, _register_token, _valid_tokens, require_auth
-from core.rbac import DATA_VISIBILITY_PERMS
+from khidmah.api.deps import get_orch
+from khidmah.core.auth import _bearer_scheme, _decode_jwt_payload, _register_token, _valid_tokens, require_auth
+from khidmah.core.rbac import DATA_VISIBILITY_PERMS
 
 log_auth = logging.getLogger("inspectai.auth")
 

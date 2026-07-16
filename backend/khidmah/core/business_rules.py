@@ -40,7 +40,7 @@ import re
 
 # ── Semantics registry (single source of truth for status/cast rules) ─────────
 try:
-    from core.semantics_registry import (
+    from khidmah.core.semantics_registry import (
         inject_hint_status as _inject_hint_status,
         inject_hint_financial as _inject_hint_financial,
         draft_exclusion_filter as _draft_exclusion_filter,
@@ -1562,7 +1562,7 @@ REGISTRY: list[dict] = [
         ),
     },
     # Fault 1 — "completed/conducted/total" semantic mapping
-    # hint comes from core.semantics_registry — edit there, not here
+    # hint comes from khidmah.core.semantics_registry — edit there, not here
     # SCOPE LIMIT (eval regression FREQ-05): excludes schedule-context questions —
     # "completed vs overdue in the SCHEDULE" is an inspection_schedule question with
     # different status enums (COMPLETED/OVERDUE/PENDING), handled by the rule below.

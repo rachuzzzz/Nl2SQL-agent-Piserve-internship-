@@ -11,7 +11,6 @@ import asyncio
 import time
 import time as _time
 import os
-import sys
 import tempfile
 import subprocess
 import numpy as np
@@ -25,15 +24,17 @@ import uuid
 import logging
 from contextlib import asynccontextmanager
 
-from core.logging_config import setup_logging
-from core.rbac import DATA_VISIBILITY_PERMS, build_scope_filter
-from core.disambiguation import is_disambiguation_result, is_entity_disambiguation_result, extract_search_term
-from app_state import get_orch, get_orch_optional
+from khidmah.core.logging_config import setup_logging
+from khidmah.core.rbac import DATA_VISIBILITY_PERMS, build_scope_filter
+from khidmah.core.disambiguation import is_disambiguation_result, is_entity_disambiguation_result, extract_search_term
+from khidmah.api.deps import get_orch, get_orch_optional
 
 # ── TTS — lazy-loaded on first /api/tts call ──────────────────────────────────
 _tts_model = None
 
-_TTS_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+# __file__ is backend/khidmah/api/app.py — repo root is 4 levels up.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+_TTS_DIR    = os.path.join(_REPO_ROOT, "models")
 _TTS_MODEL  = os.path.join(_TTS_DIR, "kokoro-v1.0.onnx")
 _TTS_VOICES = os.path.join(_TTS_DIR, "voices-v1.0.bin")
 
@@ -87,9 +88,7 @@ def _get_asr():
         logging.info("ASR model ready.")
     return _asr_pipeline
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from chart_advisor import advise, force_config, get_alternatives, classify_columns, build_kpi_cards, should_show_dashboard
+from khidmah.charts.advisor import advise, force_config, get_alternatives, classify_columns, build_kpi_cards, should_show_dashboard
 
 # ── Chart follow-up fast-path ──────────────────────────────────────────────────
 # Detects pure chart requests that need no new SQL — handled before the LLM.
@@ -142,7 +141,7 @@ async def lifespan(app: FastAPI):
     setup_logging(log_level="INFO")
     log.info("[SERVER] Starting InspectAI — loading orchestrator (LLM + embeddings + schema)…")
     t0 = time.time()
-    from agent.orchestrator import AgentOrchestrator
+    from khidmah.agent.orchestrator import AgentOrchestrator
     app.state.orch = AgentOrchestrator.from_env()
     log.info("[SERVER] Orchestrator ready in %.1fs", time.time() - t0)
 
@@ -151,10 +150,13 @@ async def lifespan(app: FastAPI):
     # the SQL-generating LLM. This previously existed as a CLI-only tool nobody
     # ran automatically — the "overdue" bug (fixed 2026-07-07) sat undetected
     # for an unknown period because of exactly that gap.
-    from core.semantics_registry import verify_consistency
+    from khidmah.core.semantics_registry import verify_consistency
+    _khidmah_dir = os.path.join(_REPO_ROOT, "backend", "khidmah")
     _desyncs = verify_consistency([
-        "agent/prompts.py", "agent/seed_examples.py",
-        "core/business_rules.py", "agent/orchestrator.py",
+        os.path.join(_khidmah_dir, "agent", "prompts.py"),
+        os.path.join(_khidmah_dir, "agent", "seed_examples.py"),
+        os.path.join(_khidmah_dir, "core", "business_rules.py"),
+        os.path.join(_khidmah_dir, "agent", "orchestrator.py"),
     ])
     if _desyncs:
         log.warning("[SERVER] %d semantics desync(s) detected — see core.semantics_registry:", len(_desyncs))
@@ -179,8 +181,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from core.auth import require_auth
-from auth_routes import auth_router
+from khidmah.core.auth import require_auth
+from khidmah.api.auth_routes import auth_router
 
 app.include_router(auth_router)
 
@@ -258,7 +260,7 @@ class ChatResponse(BaseModel):
 # ── Session management ────────────────────────────────────────────────────────
 
 def get_or_create_session(session_id: str) -> dict:
-    from agent.orchestrator import ConversationSession
+    from khidmah.agent.orchestrator import ConversationSession
     if session_id not in _sessions:
         _sessions[session_id] = {
             "session": ConversationSession(),
@@ -1207,7 +1209,7 @@ async def validator_stats():
     start. In-memory only (resets on restart, same as _sessions) — enough to
     notice a SOFT_WARN firing constantly without needing to grep debug logs.
     """
-    from core.validator import ValidatorStats
+    from khidmah.core.validator import ValidatorStats
     return ValidatorStats.snapshot()
 
 
@@ -1308,8 +1310,7 @@ async def tts(req: TTSRequest, _: None = Depends(require_auth)):
 
 
 # ── Serve Angular build (must be last — catches all non-API routes) ───────────
-_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     "inspectai-chat", "dist", "inspectai-chat", "browser")
+_DIST = os.path.join(_REPO_ROOT, "inspectai-chat", "dist", "inspectai-chat", "browser")
 if os.path.isdir(_DIST):
     from fastapi.staticfiles import StaticFiles
     from fastapi.responses import FileResponse

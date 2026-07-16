@@ -13,9 +13,9 @@ exactly one allowlisted rule, so a failure here points at one specific rule.
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from core.validator import SQLValidator
+from khidmah.core.validator import SQLValidator
 
 validator = SQLValidator()
 

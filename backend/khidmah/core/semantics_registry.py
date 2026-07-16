@@ -679,13 +679,17 @@ def verify_consistency(file_paths: list[str], strict: bool = False) -> list[str]
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import os
     import sys
 
     if len(sys.argv) > 1 and sys.argv[1] == "check":
-        # python -m core.semantics_registry check file1.py file2.py ...
+        # python -m khidmah.core.semantics_registry check file1.py file2.py ...
+        _khidmah_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         targets = sys.argv[2:] or [
-            "agent/prompts.py", "agent/seed_examples.py",
-            "core/business_rules.py", "agent/orchestrator.py",
+            os.path.join(_khidmah_dir, "agent", "prompts.py"),
+            os.path.join(_khidmah_dir, "agent", "seed_examples.py"),
+            os.path.join(_khidmah_dir, "core", "business_rules.py"),
+            os.path.join(_khidmah_dir, "agent", "orchestrator.py"),
         ]
         probs = verify_consistency(targets)
         if probs:

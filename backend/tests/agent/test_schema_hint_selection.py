@@ -10,10 +10,10 @@ pytest-discoverable as-is).
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from core.schema_introspector import DatabaseSchema, TableSchema
-from agent.tools import _select_schema_block, _join_path_hints, _join_graph_source
+from khidmah.core.schema_introspector import DatabaseSchema, TableSchema
+from khidmah.agent.tools import _select_schema_block, _join_path_hints, _join_graph_source
 
 FAILURES = []
 

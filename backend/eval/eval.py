@@ -848,7 +848,7 @@ from collections import defaultdict
 def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
              skip_multiturn=False, category_filter=None, output_file=None):
 
-    from agent.orchestrator import AgentOrchestrator, ConversationSession
+    from khidmah.agent.orchestrator import AgentOrchestrator, ConversationSession
     from dotenv import load_dotenv
     load_dotenv()
 

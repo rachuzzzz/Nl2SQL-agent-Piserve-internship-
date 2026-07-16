@@ -23,15 +23,15 @@ from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-from core.semantic import SemanticQuestionIndex, SeedExampleIndex, text_similarity
-from core.validator import SQLValidator
-from core.schema_introspector import introspect_schema, BUSINESS_RULES, TABLE_RELATIONSHIPS
-from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT, build_dynamic_prompt_additions
-from agent.tools import ToolRegistry
-from agent.tool_dispatcher import parse_tool_call, dispatch
-from core.business_rules import get_engine as get_rules_engine
-from core.rbac import build_scope_filter
-from core.disambiguation import is_disambiguation_result, is_entity_disambiguation_result
+from khidmah.core.semantic import SemanticQuestionIndex, SeedExampleIndex, text_similarity
+from khidmah.core.validator import SQLValidator
+from khidmah.core.schema_introspector import introspect_schema, BUSINESS_RULES, TABLE_RELATIONSHIPS
+from khidmah.agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT, build_dynamic_prompt_additions
+from khidmah.agent.tools import ToolRegistry
+from khidmah.agent.tool_dispatcher import parse_tool_call, dispatch
+from khidmah.core.business_rules import get_engine as get_rules_engine
+from khidmah.core.rbac import build_scope_filter
+from khidmah.core.disambiguation import is_disambiguation_result, is_entity_disambiguation_result
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +63,7 @@ def _make_debug_logger() -> logging.Logger | None:
 
     # Find the file path already opened by setup_logging() on the inspectai logger.
     # Fall back to a fresh timestamped file if setup_logging() hasn't run yet.
-    from core.logging_config import get_log_file
+    from khidmah.core.logging_config import get_log_file
     log_path = get_log_file()
 
     logger = logging.getLogger("debug_llm_raw")
@@ -202,10 +202,10 @@ def _has_uuid_leak(rows: list, columns: list) -> list[str]:
 # Qwen's message (not in schema_hint which deepseek may override with seeds).
 # Rule: give the exact fix as a constraint, never a full replacement SQL.
 #
-# STATUS + CAST notes are generated from core.semantics_registry — the single
+# STATUS + CAST notes are generated from khidmah.core.semantics_registry — the single
 # source of truth. Never hardcode status groupings or cast directions here.
 try:
-    from core.semantics_registry import constraint_note_status, constraint_note_cast
+    from khidmah.core.semantics_registry import constraint_note_status, constraint_note_cast
     _NOTE_STATUS = constraint_note_status()
     _NOTE_CAST = constraint_note_cast()
 except ImportError:
@@ -938,7 +938,7 @@ class AgentOrchestrator:
         self.validator = SQLValidator()
 
         # Build seed example index — embeds NL questions for retrieval-based injection
-        from agent.seed_examples import SEED_EXAMPLES
+        from khidmah.agent.seed_examples import SEED_EXAMPLES
         self.seed_index = SeedExampleIndex(
             embed_model=embed_model,
             examples=SEED_EXAMPLES,
@@ -989,7 +989,7 @@ class AgentOrchestrator:
         # at startup rather than silently failing at query time.
         # Errors are logged as warnings — they don't prevent startup.
         try:
-            from agent.join_graph import validate_join_graph
+            from khidmah.agent.join_graph import validate_join_graph
             jg_errors = validate_join_graph(self.db_engine)
             if jg_errors:
                 print(f"  ⚠ JOIN_GRAPH validation ({len(jg_errors)} issues):")

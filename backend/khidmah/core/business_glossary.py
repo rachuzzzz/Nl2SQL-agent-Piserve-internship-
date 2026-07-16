@@ -26,7 +26,7 @@ from typing import Optional
 
 # ── Semantics registry (single source of truth for status definitions) ───────
 try:
-    from core.semantics_registry import (
+    from khidmah.core.semantics_registry import (
         completed_required_regex as _completed_required_regex,
         conducted_required_regex as _conducted_required_regex,
         old_completed_forbidden_regex as _old_completed_forbidden_regex,

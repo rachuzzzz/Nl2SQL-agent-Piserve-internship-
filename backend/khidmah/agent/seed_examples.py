@@ -8,7 +8,7 @@ Each entry is a dict with:
   intent: single_value | ranked_list | aggregate | filter | trend
   limit:  int or None — the LIMIT value in the SQL
 
-STATUS GROUPINGS + CAST RULES come from core.semantics_registry — the single
+STATUS GROUPINGS + CAST RULES come from khidmah.core.semantics_registry — the single
 source of truth. Edit there, not here.
 """
 
@@ -16,7 +16,7 @@ import re
 
 # ── Registry-generated blocks (single source of truth) ──────────────────────
 try:
-    from core.semantics_registry import (
+    from khidmah.core.semantics_registry import (
         core_context_status_block as _status_block,
         core_context_cast_block as _cast_block,
         core_context_counting_block as _counting_block,
