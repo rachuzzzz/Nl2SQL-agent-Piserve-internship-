@@ -9,7 +9,7 @@ authenticated user's permission list.
 Uses core.auth for token/JWT mechanics and core.rbac for the
 data-visibility permission whitelist — this file is just the HTTP-endpoint
 wiring around them. Included into the main app via
-`app.include_router(auth_router)` in fastapi_app.py.
+`app.include_router(auth_router)` in api/app.py.
 """
 
 import logging
