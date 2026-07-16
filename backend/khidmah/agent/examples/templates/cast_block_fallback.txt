@@ -1,0 +1,4 @@
+-- OBSERVATION → MA JOIN — exact form:
+--   aa.submission_id = ica.observation_id::varchar
+--   NEVER: aa.submission_id::uuid = ica.observation_id
+--   NEVER: ica.observation_id::text = aa.submission_id

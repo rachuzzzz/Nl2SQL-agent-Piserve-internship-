@@ -1,0 +1,296 @@
+### Task
+Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
+
+### Instructions
+- Generate a PostgreSQL SELECT query ONLY. No INSERT/UPDATE/DELETE/DROP.
+- Use ILIKE for partial text matching on labels and names. NEVER use LIKE.
+- Use ILIKE for answer_text matching: aa.answer_text ILIKE '%High%' (answer_text stores plain strings but ILIKE is safer for partial matches).
+- FULL NAME SEARCH (first + last): ALWAYS use the concatenated column:
+    WHERE (u.first_name || ' ' || u.last_name) ILIKE '%George Smith%'
+  NEVER split: WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%Smith%')
+  The OR split matches anyone named George OR anyone surnamed Smith — wrong.
+  Only use separate first_name/last_name ILIKE when the user provides a single partial word (not a full name).
+  Single partial word example: WHERE (u.first_name ILIKE '%george%' OR u.last_name ILIKE '%george%') — OK.
+  Full name example: WHERE (u.first_name || ' ' || u.last_name) ILIKE '%George Smith%' — required.
+- Include LIMIT 100 unless aggregating.
+- For "top / most / best / worst" ranking queries, use LIMIT 10 (even if the user asks "which one" singular). This provides context for charts and lists while still highlighting the #1 result.
+- NEVER use SELECT *. Specify only the columns the user needs.
+- NEVER use SQL reserved words as aliases (is, as, in, on, by, do, if).
+  Use: ir (inspection_report), ica (inspection_corrective_action),
+       ic (inspection_cycle), sched (inspection_schedule),
+       aa (ai_answers), aq (ai_questions), fac (facility), u (users), it (inspection_type).
+- SOFT-DELETE — ALWAYS add WHERE active = true (or AND active = true) when querying:
+  inspection_report, inspection_corrective_action, facility, users,
+  inspection_type, inspector_portfolio, inspector_portfolio_details,
+  frequency_definition, po_details, pr_details, risk_level, inspection_schedule,
+  country, region, organisation, project, client, entity.
+  NEVER return rows where active = false — those are deleted/archived records.
+- LOOKUP TABLE JOINS (inspection_report FK columns):
+  inspection_report.project_id      → project.id       (project.name)
+  inspection_report.client_id       → client.id        (client.name)
+  inspection_report.entity_id       → entity.id        (DIRECT FK)
+  # inspection_report has NO country_id — country is ONLY reachable via facility.country_id below
+  NOTE: inspection_report has NO organisation_id or region_id — join via facility
+  facility.organization_id          → organisation.id  ⚠ CONFIRMED DEAD (all 175 rows NULL) —
+                                        reach organisation via inspection_communication_group_organisations
+                                        or organisation_countries instead
+  facility.region_id                → region.id
+  facility.country_id               → country.id       (country.name — use this for country queries)
+  # facility.client_id does NOT exist — reach client via inspection_report.client_id
+  region.country_id                 → country.id       (region belongs to country)
+  project.organisation_id           → organisation.id
+- ENUM values are ALWAYS uppercase: status = 'OPEN', status = 'CLOSED', status = 'OVERDUE',
+  responsible = 'CLIENT', responsible = 'INTERNAL_OPERATIONS', responsible = 'SUB_CONTRACTOR'.
+  NEVER use lowercase for enum comparisons.
+- When grouping by facility/type/client/inspector/project/country/region/organisation/entity,
+  ALWAYS JOIN the lookup table and GROUP BY the name column. NEVER GROUP BY a UUID FK column.
+- For month display and chronological sorting, ALWAYS use DATE_TRUNC('month', col) for grouping and sorting.
+  Use: SELECT DATE_TRUNC('month', ir.submitted_on) AS month_idx, TO_CHAR(DATE_TRUNC('month', ir.submitted_on), 'Month YYYY') AS month_label, ...
+       GROUP BY month_idx, month_label
+       ORDER BY month_idx;
+  NEVER use only TO_CHAR(...) for grouping/sorting — it sorts alphabetically (April, August, December), which is incorrect for charts.
+- CALENDAR YEAR filter: EXTRACT(YEAR FROM col) = EXTRACT(YEAR FROM CURRENT_DATE)
+  or: col >= date_trunc('year', CURRENT_DATE)
+  NEVER: col > CURRENT_DATE - INTERVAL '1 year' — that is a rolling 365-day window, not a calendar year.
+- SPECIFIC MONTH filter (known month like Feb 2026):
+  CORRECT:  EXTRACT(MONTH FROM col) = 2 AND EXTRACT(YEAR FROM col) = 2026
+  CORRECT:  col >= '2026-02-01' AND col < '2026-03-01'
+  NEVER:    date_trunc('month', col) = date_trunc('month', '2026-02-01') — missing ::date cast causes error
+  IF cast needed: date_trunc('month', '2026-02-01'::date) is valid but prefer EXTRACT pattern
+- EXACT QUESTION LABELS (use = not ILIKE for known labels):
+  'Observation'      — free-text field written by inspector. NOT a type/category.
+  'Observation Type' — dropdown: 'Deviation' | 'Good Practice'  ← use THIS to count deviations or GP
+  'Risk Level'       — dropdown: High, Medium, Low, No Active Risk  (form answers only — NOT ICA risk)
+  'Impact'           — multi-select impact categories
+
+  CRITICAL: NEVER use aq.label ILIKE '%Observation%' — matches BOTH labels and overcounts.
+  Count Deviations:    WHERE aq.label = 'Observation Type' AND aa.answer_text ILIKE '%Deviation%'
+  Count Good Practice: WHERE aq.label = 'Observation Type' AND aa.answer_text ILIKE '%Good Practice%'
+  Read free-text:      WHERE aq.label = 'Observation'
+
+- FACILITY-LEVEL NEGATION (has NEVER had X across ALL history):
+  WRONG — only checks per inspection:
+    GROUP BY fac.name HAVING COUNT(CASE WHEN ... THEN 1 END) = 0
+  CORRECT — NOT IN subquery at facility level:
+    WHERE fac.id NOT IN (
+        SELECT DISTINCT ir.facility_id FROM ai_answers aa
+        JOIN ai_questions aq ON aa.element_id = aq.element_id
+        JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+        WHERE aq.label = 'Observation Type'
+          AND aa.answer_text ILIKE '%Good Practice%'
+          AND aa.module_name = 'Inspection Form'
+          AND ir.active = true AND ir.status != 'DRAFT'
+    )
+
+### CAPEX CONVERSION — CRITICAL DEFINITIONS:
+  CAPEX Generated  = SUM(ica.capex)              — the FM manager's quoted/estimated amount on each ICA
+  CAPEX Converted  = SUM(po_details.po_amount)   — what the client actually paid via PO (money HAS moved)
+  CAPEX Lost       = SUM(ica.capex) - COALESCE(SUM(po.po_amount), 0)
+                     — the arithmetic gap between quoted and paid. This is NOT capex_status='REJECTED'.
+                     — user phrases that mean CAPEX Lost: "didn't get converted", "not converted",
+                       "unconverted capex", "capex gap", "capex shortfall", "wasted capex",
+                       "how much capex was lost", "capex that wasn't paid"
+  OPEX Incurred    = SUM(pr_details.pr_amount)   — Khidmah's own internal spend via PR (bad: org paying itself)
+  Conversion Rate  = SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100
+
+  CAPEX GROUPING — "entity" and "facility" are DIFFERENT tables, NEVER treat as synonyms:
+    Facility: JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id
+    Entity:   JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN entity ent ON ir.entity_id = ent.id
+    Region:   ... → facility → region
+    Project:  JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN project proj ON ir.project_id = proj.id
+    FM Mgr:   JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN users u ON ir.inspectee_user_id = u.id
+  If the user says "by entity", GROUP BY ent.name (entity table) — do NOT substitute facility.
+
+  ica.expenditure is a CATEGORY FLAG ('CAPEX','OPEX','CAPEX_AND_OPEX','NO_EXPENDITURE')
+  NEVER use ica.expenditure to compute any financial amount — it is a category string, not a number
+  NEVER use capex_status='ACCEPTED' as a proxy for conversion — use po_details
+  NEVER use capex_status='REJECTED' to compute CAPEX Lost — use the arithmetic difference above
+  CAPEX Lost ≠ rejected CAPEX: a user asking about "wasted" or "unconverted" capex means the
+    arithmetic gap, not the subset where capex_status='REJECTED'. Only use capex_status='REJECTED'
+    when the user explicitly says "rejected" and wants to see those specific MA rows.
+
+  FAN-OUT RULE — ALWAYS pre-aggregate po_details and pr_details in CTEs before joining to ica.
+  One ICA can have MULTIPLE POs and MULTIPLE PRs — a direct LEFT JOIN multiplies rows silently.
+  NEVER: LEFT JOIN po_details p ON p.mitigative_action_uuid = ica.id  (causes fan-out)
+  ALWAYS use CTE pre-aggregation (or scalar subqueries for single-row totals):
+    WITH po_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po
+                    FROM po_details WHERE active = true GROUP BY 1)
+    LEFT JOIN po_agg po ON po.ica_id = ica.id
+
+### P&L (PROFIT & LOSS) MODEL — CRITICAL:
+  INCOME / CAPEX Converted = SUM(po_details.po_amount)   — client paid Khidmah (PO = Purchase Order)
+  COST   / OPEX Incurred   = SUM(pr_details.pr_amount)   — Khidmah paid out internally (PR = Payment Request)
+  PROFIT                   = SUM(po.po_amount) - SUM(pr.pr_amount)
+  LOSS                     = when COST > INCOME (negative profit)
+
+  "OPEX" in user language always means SUM(pr_details.pr_amount) — the PR spend.
+  "income" / "revenue" in user language always means SUM(po_details.po_amount).
+  NEVER use ica.capex as income or revenue — it is a QUOTE/ESTIMATE, no money has moved.
+
+  These totals are NOT fixed — they change as new POs/PRs are entered.
+  ALWAYS compute Income/Cost/Profit LIVE via SUM(). NEVER state remembered/previous totals.
+
+  P&L JOIN PATTERN — always pre-aggregate in CTEs to avoid row fan-out:
+    WITH po_agg AS (
+        SELECT mitigative_action_uuid AS ica_id,
+               SUM(po_amount) AS total_income
+        FROM po_details WHERE active = true GROUP BY 1
+    ),
+    pr_agg AS (
+        SELECT mitigative_action_uuid AS ica_id,
+               SUM(pr_amount) AS total_cost
+        FROM pr_details WHERE active = true GROUP BY 1
+    )
+    SELECT ...,
+           COALESCE(SUM(po.total_income), 0) AS income,
+           COALESCE(SUM(pr.total_cost),  0) AS cost,
+           COALESCE(SUM(po.total_income), 0) - COALESCE(SUM(pr.total_cost), 0) AS profit
+    FROM inspection_corrective_action ica
+    LEFT JOIN po_agg po ON po.ica_id = ica.id
+    LEFT JOIN pr_agg pr ON pr.ica_id = ica.id
+    ...GROUP BY ...
+
+  P&L GROUPING — can be broken down by:
+    Facility:   JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id
+    FM Manager: JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN users u ON ir.inspectee_user_id = u.id
+    Region:     ... → facility → region
+    Entity:     JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN entity ent ON ir.entity_id = ent.id
+    Project:    JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN project proj ON ir.project_id = proj.id
+    Country:    JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id JOIN country c ON fac.country_id = c.id
+
+### INSPECTION_REPORT — TWO USER FK COLUMNS (different people, NEVER mix):
+  inspector_user_id  → person who CONDUCTED the inspection (Inspector)
+  inspectee_user_id  → person being inspected (FM Manager / facility manager)
+
+  "who inspected" / "which inspector"          → JOIN users u ON ir.inspector_user_id  = u.id
+  "FM manager" / "facility manager"            → JOIN users u ON ir.inspectee_user_id  = u.id
+  Query needs BOTH inspector and FM manager    → use DISTINCT aliases:
+      JOIN users u_insp ON ir.inspector_user_id  = u_insp.id
+      JOIN users u_fm   ON ir.inspectee_user_id  = u_fm.id
+
+  NEVER join on one column and filter/EXISTS on the other:
+    WRONG: JOIN users u ON ir.inspector_user_id = u.id
+           WHERE ... ur.user_id = ir.inspectee_user_id  ← two different people!
+
+### OBSERVATION → MITIGATIVE ACTION LINK:
+  inspection_corrective_action.observation_id (UUID) → ai_answers.submission_id (varchar)
+  JOIN: aa.submission_id = ica.observation_id::varchar  ← cast UUID to varchar, NOT the other way
+  submission_id groups ALL answers for one observation (Risk Level, Observation Type, free-text etc.)
+  To get the free-text observation: MUST filter WHERE aq.label = 'Observation'
+  398 MAs have a non-NULL observation_id — directly linked to the observation group that triggered them.
+
+  "observation text for this MA" / "what was the observation":
+    JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
+    JOIN ai_questions aq ON aa.element_id = aq.element_id
+    WHERE aq.label = 'Observation'   ← ALWAYS add this to get free-text, not Risk Level/Type
+
+  "mitigative actions for this inspection" / "all MAs for this inspection":
+    WHERE ica.inspection_id = ir.id  ← all MAs for the whole inspection (ica.inspection_id is UUID FK to ir.id)
+
+  NEVER confuse: one observation ≠ all observations in an inspection.
+
+### AI FLAT TABLES — use these for all form question/answer data:
+
+  ai_questions EXACT columns (use ONLY these — nothing else exists):
+    element_id   uuid
+    label        text   ← this is the question text / display name
+    entity_type  varchar
+    module_id    uuid
+    module_name  text
+    created_at   timestamp
+  DO NOT USE: question_label, page_name, required, question_type, form_name
+              (none of these columns exist on ai_questions)
+
+  ai_answers EXACT columns (use ONLY these — nothing else exists):
+    id                   uuid
+    element_id           uuid  → JOIN to ai_questions.element_id
+    inspection_report_id uuid  → JOIN to inspection_report.id
+    inspection_id        varchar
+    answer_text          text   ← normalized plain string (use this for all filtering/display)
+    answer_text_raw      text   ← original pre-normalization value (JSON arrays/uuids) — for audit only
+    answer_numeric       numeric
+    score                numeric  ← weighted points earned for this answer (range 1–27 in data)
+    score_type           varchar
+    max_score            numeric  ← maximum possible points for this question
+    module_name          text
+
+  aa.score vs inspection_report.inspection_score:
+    aa.score              = points earned for ONE answer to ONE question (weighted per question)
+    inspection_report.inspection_score = overall % score for the whole inspection report
+    SUM(aa.score) per inspection ≠ inspection_report.inspection_score (different scales)
+
+  aa.score USE CASES:
+    CRITICAL: aa.score is ONLY populated for these question labels:
+      'Impact'           — MULTI-SELECT category field (comma-separated when multiple chosen)
+                           answer_text values: 'Client Relationship', 'Health & Safety (HS)',
+                           'Financial', 'Environmental', 'Legal / Regulatory', 'Reputational',
+                           'Operational - Asset Downtime', 'Operational - Manpower/Resource Impact',
+                           'Operational - Service Failure', 'Quality'
+                           aa.score = weighted points based on which categories were selected (1–27)
+                           Higher score = more/higher-weight categories selected
+                           NEVER treat Impact as High/Medium/Low severity — it is category-based
+                           To filter by category: aa.answer_text ILIKE '%Health & Safety%'
+      'Risk Level'       — FORM CONFIG ARTIFACT: score is set at form publication time, NOT by the inspector's answer
+                           Current forms always score=4; legacy forms always score=1 regardless of answer
+                           NEVER use aa.score WHERE label='Risk Level' for severity analysis — it is meaningless
+                           To analyse actual risk level: use aa.answer_text ILIKE '%High%' / '%Medium%' etc.
+                           answer_text values: 'High', 'Medium', 'Low', 'No Active Risk'
+      'Observation Type' — type score (range observed: 1, also a form config artifact — not meaningful)
+                           answer_text values: 'Deviation', 'Good Practice'
+    'Observation' (free-text) has NO score — NEVER use WHERE aq.label = 'Observation' AND aa.score IS NOT NULL
+
+    SEVERITY SIGNAL — aa.score WHERE label='Impact' is the ONLY valid severity metric from ai_answers:
+    "observation with highest impact score" → WHERE aq.label = 'Impact' ORDER BY aa.score DESC LIMIT N
+    "highest scoring answer for inspector X" → ORDER BY aa.score DESC WHERE aq.label = 'Impact'
+    "inspector with best form scores"        → GROUP BY inspector, AVG(aa.score) WHERE aq.label = 'Impact'
+    "facility with best scored answers"      → GROUP BY fac.name, AVG(aa.score) WHERE aq.label = 'Impact'
+    "total score for an inspection"          → SUM(aa.score) WHERE inspection_report_id = X AND aq.label = 'Impact'
+    ALWAYS filter: WHERE aa.score IS NOT NULL AND aa.module_name = 'Inspection Form'
+    module_id            uuid
+    submitted_on         timestamptz
+    status               varchar
+  DO NOT USE: answer_value, form_name, question_id, source_table
+              (none of these columns exist on ai_answers)
+
+  Standard JOIN:
+    FROM ai_answers aa
+  LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id
+
+  Join to inspection metadata:
+    JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+
+  CRITICAL — answer_text encoding:
+    Dropdown/checkbox answers are stored as plain strings (normalized).
+    e.g. Risk Level:          'High', 'Medium', 'Low', 'No Active Risk'  (single value — = works)
+         Observation Type:    'Deviation', 'Good Practice'               (single value — = works)
+         Impact (multi-select): 'Health & Safety (HS), Environmental'   (comma-joined — ILIKE required)
+    Single-value fields: exact match aa.answer_text = 'High' works; ILIKE '%High%' also safe.
+    Impact MUST use ILIKE: aa.answer_text ILIKE '%Health & Safety%'  (value is a comma-joined list)
+    For distribution/grouping: GROUP BY aa.answer_text returns clean readable values.
+    Raw pre-normalization values (JSON arrays with uuids) are in aa.answer_text_raw.
+    Known values: 'High', 'Medium', 'Low', 'No Active Risk', 'Deviation', 'Good Practice'
+
+  CRITICAL — ai_answers spans ALL 16 modules:
+    When user says 'the form', 'the inspection form', 'what they filled' without
+    specifying a module — filter to the main form only:
+      AND aa.module_name = 'Inspection Form'
+    Without this, queries return answers from all 16 modules (~10,000 rows instead of ~50).
+    Only omit this filter when user explicitly asks about another module.
+
+  CRITICAL — most recent inspection subquery (use aa.submitted_on, NOT ir.submitted_on):
+    CORRECT:   WHERE aa.inspection_report_id = (
+                   SELECT aa2.inspection_report_id FROM ai_answers aa2
+                   ORDER BY aa2.submitted_on DESC LIMIT 1)
+    WRONG:     WHERE ir.id = (SELECT id FROM inspection_report ORDER BY ir.submitted_on DESC LIMIT 1)
+               (ir.submitted_on and aa.submitted_on differ — use aa.submitted_on for most-recently-answered)
+
+
+### Additional context
+{schema_hint}
+
+### Examples
+{dynamic_examples}
+
+### Answer
+Given the database schema, here is the SQL query that answers [QUESTION]{question}[/QUESTION]
+[SQL]

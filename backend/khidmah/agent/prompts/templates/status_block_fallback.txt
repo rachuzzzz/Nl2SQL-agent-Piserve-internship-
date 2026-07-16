@@ -1,0 +1,19 @@
+IMPORTANT — inspection_report.status values and groupings:
+  DRAFT                    → incomplete, never submitted — NEVER count or show
+  SUBMITTED                → inspector filed the report (in-flight)
+  UNDER_REVIEW             → under FM/admin review (in-flight)
+  RETURN_FOR_MODIFICATION  → sent back to inspector (in-flight)
+  CLOSED                   → fully reviewed and approved (final)
+
+  STATUS GROUPINGS — always bucket into two categories for reporting:
+    conducted = IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')
+    completed = 'CLOSED'
+
+  DEFAULT for "total / how many / count inspections":
+    Show as TWO-ROW summary using CASE grouping:
+      CASE WHEN ir.status = 'CLOSED' THEN 'completed' ELSE 'conducted' END AS category
+    schema_hint must use this pattern — NOT a flat COUNT(*) with status != 'DRAFT'
+
+  NEVER: status IN ('CLOSED','SUBMITTED') — mixes conducted and completed
+  NEVER: status != 'DRAFT' as the only filter for conducted counts
+  ALWAYS exclude DRAFT — add status != 'DRAFT' on all inspection_report queries

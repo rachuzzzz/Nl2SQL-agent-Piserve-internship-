@@ -18,11 +18,17 @@ build/
 *.DS_Store
 Thumbs.db
 
+# Office temp lock files
+~$*
+
 # Logs
 *.log
 
 # Evaluation outputs
 eval_results_*.json
+
+# Generated output dir (logs, eval results, etc.)
+backend/var/
 
 #screenshots
 *.png

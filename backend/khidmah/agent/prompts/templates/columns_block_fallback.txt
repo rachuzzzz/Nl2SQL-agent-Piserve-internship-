@@ -1,0 +1,13 @@
+IMPORTANT — 'active' column existence (soft-delete):
+  HAS active column — include WHERE <alias>.active = true:
+    inspection_report, inspection_corrective_action, facility, users,
+    inspection_type, inspector_portfolio, inspector_portfolio_details, frequency_definition,
+    po_details, pr_details, risk_level, inspection_schedule
+  NO active column — NEVER write <alias>.active for these tables:
+    ai_answers, ai_questions, role, user_roles
+  In particular: inspection_schedule DOES have an active column (confirmed 2026-07-08:
+  21/2209 rows are active=false) — include WHERE isched.active = true unless the
+  question is specifically about cancelled/removed schedules.
+  inspection_schedule display columns — NEVER include these in SELECT, they are almost always NULL:
+    isched.schedule_id  (internal nullable UUID reference — useless for display, use isched.id the PK)
+    isched.schedule_date  (often NULL for pending schedules — use isched.due_date instead)

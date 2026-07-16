@@ -1,0 +1,7 @@
+-- GOOD PRACTICE / DEVIATION COUNTING — always COUNT(DISTINCT ir.id), NEVER COUNT(*):
+--   each inspection is Good Practice OR Deviation (mutually exclusive); COUNT(*) on ai_answers rows overcounts.
+--   Same rule applies to deviation counts.
+--   WRONG:  SELECT COUNT(*) ... WHERE aq.label='Observation Type' AND aa.answer_text ILIKE '%Good Practice%'
+--   CORRECT: SELECT COUNT(DISTINCT ir.id) ... same filters
+-- OBSERVATIONS PER INSPECTION — use COUNT(DISTINCT aa.submission_id):
+--   one submission_id per observation group; COUNT(*) counts every answer row (Risk Level, Impact, ...)

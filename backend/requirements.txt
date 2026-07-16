@@ -1,0 +1,53 @@
+# NL2SQL LlamaIndex Pipeline — Dependencies
+# Install with: pip install -r requirements.txt
+
+# LlamaIndex core + integrations
+llama-index-core>=0.12.0
+llama-index-llms-ollama>=0.5.0
+llama-index-embeddings-huggingface>=0.5.0
+
+# Web framework (FastAPI backend + legacy Flask server)
+fastapi>=0.111.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Database
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+
+# SQL AST parsing/repair (core/validator.py ast_repair — deterministic fixes
+# for known LLM SQL-generation biases; silently no-ops without this installed)
+sqlglot>=25.0
+
+# Config
+python-dotenv>=1.0
+pyyaml>=6.0
+
+# Async HTTP client (used by /api/login to proxy OAuth calls server-side)
+httpx>=0.27.0
+
+# JSON recovery (repairs truncated/malformed LLM output)
+json-repair>=0.30.0
+
+# Numeric / data
+numpy>=1.26.0
+
+# ASR (Whisper — lazy-loaded on /api/transcribe)
+torch>=2.2.0
+transformers>=4.40.0
+
+# TTS (Kokoro — CPU-friendly ONNX inference)
+kokoro-onnx>=0.3.0
+soundfile>=0.12
+huggingface_hub>=0.20
+
+# Testing
+pytest>=8.0
+
+# Linting — catches undefined-name/unused-import bugs static analysis
+# would miss otherwise (mixin/module splits are the main risk area: a
+# name available in the original single file silently going missing
+# after an extraction). Run: python -m pyflakes khidmah/
+pyflakes>=3.2

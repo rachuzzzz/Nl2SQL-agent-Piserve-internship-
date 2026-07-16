@@ -1,0 +1,62 @@
+
+### SQL RULES FOR DEEPSEEK (not for end user):
+-- ir.inspection_id (VARCHAR) = display id | ir.id (UUID) = JOIN/subquery only, NEVER SELECT
+-- ICA join: ON ica.inspection_id = ir.id  (NOT ir.inspection_id = ica.inspection_id)
+-- responsible: 'CLIENT','INTERNAL_OPERATIONS','SUB_CONTRACTOR'
+<<<STATUS_BLOCK>>>
+--
+<<<CAST_BLOCK>>>
+--
+-- inspection_schedule useful columns: id (PK), active, status, due_date, facility_id, inspector_id, inspectee_id
+--   ALWAYS filter WHERE isched.active = true (confirmed real soft-delete flag, 21/2209 rows are false)
+--   NEVER SELECT isched.schedule_id — nullable internal UUID, almost always NULL in data
+--   NEVER SELECT isched.schedule_date — almost always NULL for pending schedules; use due_date instead
+--   NEVER: sched.scheduled_date — column is schedule_date (but prefer due_date anyway)
+--
+-- UNION / UNION ALL TYPE SAFETY:
+--   Every column position must have the SAME type in all branches.
+--   NEVER 'N/A' placeholder against a date/numeric/enum column — runtime type-mismatch error.
+--   Placeholders must be explicitly typed: NULL::text, NULL::date, NULL::numeric.
+--   When mixing tables, cast real date/enum columns ::text in BOTH branches.
+--   PREFER scalar subqueries in one row over UNION of heterogeneous tables.
+-- NEVER: ir.id in SELECT | NEVER: ica.risk_level_id vs string | NEVER: GROUP BY ica.risk_level_id
+-- completed_cycle = status='COMPLETED' (NOT 'CLOSED', NOT status!='DRAFT')
+-- NEVER: ipd.cycle_id (no such column on inspector_portfolio_details)
+-- Cycle->Freq: inspection_cycle.id -> inspector_portfolio.cycle_id
+--   -> inspector_portfolio_details.portfolio_id -> frequency_definition.id
+-- FM Manager / inspectee = ir.inspectee_user_id (NOT ir.inspector_user_id)
+-- capex_status: NULL=awaiting approval | ACCEPTED | REJECTED | DEFERRED
+-- expenditure: NO_EXPENDITURE | CAPEX | OPEX | CAPEX_AND_OPEX
+--
+-- BUSINESS WORKFLOW (Khidmah inspection system):
+--   Admin sets inspection schedules → Inspectors submit portfolios → Inspectors visit sites
+--   Inspector creates Inspection Report (ir) with Observations (Good Practice or Deviation)
+--   Deviation observations have a risk score (risk_level) and observation text
+--   FM Manager (inspectee) raises Mitigative Actions (ICA) against those observations
+--   Each ICA has a proposed cost (ica.capex) and/or internal cost (ica.opex)
+--   Client pays via Purchase Orders → po_details (CAPEX Converted — CLIENT pays — GOOD)
+--   Khidmah pays via Purchase Requisitions → pr_details (OPEX Incurred — KHIDMAH pays — BAD)
+--   ai_answers is a complete flattened snapshot — every inspection_report has ai_answers rows
+--
+-- FINANCIAL METRICS:
+-- CAPEX Generated  = SUM(ica.capex)        — FM manager's proposed cost on the ICA
+-- CAPEX Converted  = SUM(po.po_amount)     — actual PO raised by client (good: client paying)
+-- CAPEX Lost       = SUM(ica.capex) - SUM(po.po_amount) — arithmetic gap (NOT capex_status='REJECTED')
+-- OPEX Incurred    = SUM(pr.pr_amount)     — Khidmah's own spend via PR (bad: org paying itself)
+-- po_details JOIN: ON po.mitigative_action_uuid = ica.id  (one ICA can have many POs)
+-- pr_details JOIN: ON pr.mitigative_action_uuid = ica.id  (one ICA can have many PRs)
+--
+-- FM MANAGER PERFORMANCE = high CAPEX conversion rate + low OPEX
+--   Conversion rate = SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100
+--   High OPEX means Khidmah is absorbing costs the client should bear — a negative indicator
+--
+<<<COLUMNS_BLOCK>>>
+--
+-- DATE FILTERING — month/year specific:
+--   CORRECT:  EXTRACT(MONTH FROM ir.submitted_on) = 1 AND EXTRACT(YEAR ...) = EXTRACT(YEAR FROM CURRENT_DATE)
+--   CORRECT:  ir.submitted_on >= '2026-01-01' AND ir.submitted_on < '2026-02-01'  (only when year explicit)
+--   WRONG:    TO_CHAR(ir.submitted_on, 'Month YYYY') = 'January 2026'
+--             ↑ NEVER use for WHERE filters — TO_CHAR pads month with spaces → 0 rows
+--   WRONG:    date_trunc('month', ir.submitted_on) = date_trunc('month', DATE '2023-01-01')
+--             ↑ NEVER hardcode a year like 2023 or 2024 in date literals — use CURRENT_DATE
+--   TO_CHAR is ONLY valid for GROUP BY labels / SELECT display, never WHERE filters
