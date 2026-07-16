@@ -555,8 +555,8 @@ export class AppComponent implements OnInit {
         this.isDark = true;
         document.body.setAttribute('data-theme', 'dark');
       }
-      this.loggedInUser = localStorage.getItem(USERNAME_KEY) || '';
-      const existingToken = localStorage.getItem(TOKEN_KEY);
+      this.loggedInUser = sessionStorage.getItem(USERNAME_KEY) || '';
+      const existingToken = sessionStorage.getItem(TOKEN_KEY);
       if (existingToken) {
         this.showLogin = false;
         this.authService.fetchPermissions().subscribe({
@@ -568,8 +568,8 @@ export class AppComponent implements OnInit {
           error: err => {
             if (err?.status === 401 || err?.status === 403) {
               this.authService.clearAuth();
-              localStorage.removeItem(TOKEN_KEY);
-              localStorage.removeItem(USERNAME_KEY);
+              sessionStorage.removeItem(TOKEN_KEY);
+              sessionStorage.removeItem(USERNAME_KEY);
               this.loggedInUser = '';
               this.showLogin    = true;
               if (err?.status === 403) {
@@ -605,10 +605,15 @@ export class AppComponent implements OnInit {
     }).subscribe({
       next: res => {
         if (isPlatformBrowser(this.platformId)) {
-          localStorage.setItem(TOKEN_KEY, res.access_token);
-          localStorage.setItem(USERNAME_KEY, this.loginUsername);
+          sessionStorage.setItem(TOKEN_KEY, res.access_token);
+          sessionStorage.setItem(USERNAME_KEY, this.loginUsername);
         }
         this.loggedInUser = this.loginUsername;
+        // Reset chat state on every successful login — logout already does this
+        // (see _clearAndRedirectToLogin below). Without it, a stale conversation/
+        // session_id from a previous login in this tab would carry over and get
+        // sent under the new user's token.
+        this.chatService.reset();
 
         this.authService.fetchPermissions().subscribe({
           next: permsRes => {
@@ -621,8 +626,8 @@ export class AppComponent implements OnInit {
           error: (err) => {
             this.loginLoading = false;
             if (err?.status === 403) {
-              localStorage.removeItem(TOKEN_KEY);
-              localStorage.removeItem(USERNAME_KEY);
+              sessionStorage.removeItem(TOKEN_KEY);
+              sessionStorage.removeItem(USERNAME_KEY);
               this.loggedInUser = '';
               this.loginError   = err?.error?.detail || 'You have no permission to access this feature.';
             } else {
@@ -689,8 +694,8 @@ export class AppComponent implements OnInit {
     this.authService.clearAuth();
     this.chatService.reset();
     if (isPlatformBrowser(this.platformId)) {
-      localStorage.removeItem(TOKEN_KEY);
-      localStorage.removeItem(USERNAME_KEY);
+      sessionStorage.removeItem(TOKEN_KEY);
+      sessionStorage.removeItem(USERNAME_KEY);
     }
     this.loggedInUser = '';
     this.showSplash   = false;

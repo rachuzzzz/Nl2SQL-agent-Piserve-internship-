@@ -37,6 +37,7 @@ except ImportError:
     _HAS_GLOSSARY = False
 
 logger = logging.getLogger("inspectai.sql")
+_log_security = logging.getLogger("inspectai.security")
 
 
 # ---------------------------------------------------------------------------
@@ -104,20 +105,6 @@ class ValidationResult:
             return "SQL validation failed."
         return "; ".join(str(f) for f in fails)
 
-    # ------------------------------------------------------------------
-    # Backward compatibility shim
-    # Remove once all callers migrate to ValidationResult.
-    # ------------------------------------------------------------------
-    def as_legacy_tuple(self) -> tuple[bool, list[str]]:
-        """
-        Returns (passed, errors_list) matching the old validate() return type.
-        Hard fails → error strings.
-        Soft warns → prefixed with 'WARNING:' to preserve old filtering logic.
-        """
-        hard = [str(i) for i in self.hard_fails]
-        soft = [f"WARNING: {i.message}" for i in self.soft_warns]
-        return self.passed, hard + soft
-
 
 # ---------------------------------------------------------------------------
 # Observability — lightweight rule hit counter
@@ -174,17 +161,6 @@ class SQLValidator:
       - Soft heuristics cannot cause retry cascades
       - Aggregation/window function SQL is never blocked by routing heuristics
     """
-
-    # Tables the LLM may hallucinate that do not exist.
-    HALLUCINATED_TABLES: set[str] = {
-        # Singular forms — most common mistake
-        "ai_question", "ai_answer",
-        # fb_* hallucinations
-        "fb_users", "fb_user",
-        "fb_answers", "fb_answer", "fb_form_answer", "fb_form_answers",
-        "fb_submissions", "fb_submission",
-        "fb_responses", "fb_response",
-    }
 
     # Columns that do not exist on ai_* tables — keyed by table → {col: hint}
     HALLUCINATED_AI_COLUMNS: dict[str, dict[str, str]] = {
@@ -321,27 +297,86 @@ class SQLValidator:
         "cycle_id":               ("inspection_cycle",   "ic",   "ic.start_date, ic.end_date, ic.status AS cycle_status"),
     }
 
-    # Precompiled patterns — class-level, built once
-    _DYNAMIC_TABLE_RE = re.compile(
-        r'\bfb_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}\b'
-    )
-    _HARDCODED_YEAR_RE = re.compile(
-        r"\bextract\s*\(\s*year\s+from\s+\w[\w.]*\s*\)\s*=\s*(20\d\d)\b",
-        re.IGNORECASE,
-    )
-    _DML_RE = re.compile(
-        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE)\b",
-        re.IGNORECASE,
-    )
-    _AGG_RE = re.compile(
-        r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(",
-        re.IGNORECASE,
-    )
-    _LIMIT_RE = re.compile(r"\bLIMIT\b", re.IGNORECASE)
-    _CLOSE_ON_ARITH_RE = re.compile(
-        r'\bclose_on\s*[-+]\s*\w|\bextract\s*\(.*?\bclose_on\b',
-        re.IGNORECASE | re.DOTALL,
-    )
+    # Rule ids from core/business_rules.py's REGISTRY that validate()/clean_sql()
+    # actually consume — an explicit allowlist so a new registry rule never
+    # silently starts firing in production without deliberate opt-in here.
+    #   Group A — pure consolidation of checks that used to be hand-written
+    #             duplicates in this file (DML block, hallucinated-table names,
+    #             dynamic fb_ tables, responsible/pending_with join, close_on
+    #             arithmetic, missing-limit warn, hardcoded-year warn, plus the
+    #             ICA/IR join and reserved-alias autocorrects).
+    #   Group B — new enforcement: dormant registry-only rules turned on for
+    #             the first time. block_po_pr_double_direct_join and
+    #             block_capex_left_join_multiplication guard a confirmed
+    #             production incident (2026-06-15, silent CAPEX/OPEX corruption
+    #             via row fan-out) that had no guard anywhere until now.
+    _CONSUMED_RULE_IDS: frozenset = frozenset({
+        # Group A
+        "block_dml", "block_table_ai_question_singular", "block_table_ai_answer_singular",
+        "block_table_fb_users", "block_table_fb_submissions", "block_table_fb_answers",
+        "block_table_fb_responses", "block_table_dynamic_fb", "block_responsible_fk_join",
+        "block_close_on_arithmetic", "warn_no_limit", "block_hardcoded_year",
+        "autocorrect_ica_ir_join_varchar_uuid", "autocorrect_ica_ir_join_reversed",
+        "autocorrect_ica_ir_join_cast", "autocorrect_ica_ir_join_cast_typecast",
+        "autocorrect_reserved_alias_is",
+        # Group B
+        "block_po_pr_double_direct_join", "block_capex_left_join_multiplication",
+        "block_po_pr_join_to_ir", "block_mitigative_uuid_wrong_target",
+        "block_expenditure_as_conversion", "block_inspector_not_in_pattern",
+    })
+
+    # block_dml used to early-return non-retryable, before any other check ran.
+    # Folding it into the generic registry-issue pass changes that control flow
+    # (other checks can now also fire on the same SQL), but this keeps its
+    # ValidatorStats/ValidationIssue observability semantics identical.
+    _NON_RETRYABLE_CODES: frozenset = frozenset({"DML_BLOCKED"})
+
+    def __init__(self):
+        from core.business_rules import get_engine
+        self._rules = get_engine()
+
+    def _registry_block_warn_issues(self, sql: str, question: str = "") -> list:
+        """
+        Consume business_rules.py's BLOCK/WARN registry rules, restricted to
+        _CONSUMED_RULE_IDS. Applies the same table_guard / question_pattern
+        gating RulesEngine precompiles onto each rule, but yields
+        ValidationIssue objects so results slot into this class's existing
+        pipeline (ValidatorStats, retry_message(), ...) unchanged.
+        """
+        issues: list[ValidationIssue] = []
+        for rule in self._rules._block_rules:
+            if rule["id"] not in self._CONSUMED_RULE_IDS:
+                continue
+            guard = rule.get("table_guard")
+            if guard and not re.search(rf"\b{re.escape(guard)}\b", sql, re.IGNORECASE):
+                continue
+            q_re = rule.get("_q_re")
+            if q_re and not (question and q_re.search(question)):
+                continue
+            if rule["_sql_re"].search(sql):
+                code = rule["code"]
+                retryable = code not in self._NON_RETRYABLE_CODES
+                issues.append(ValidationIssue("HARD_FAIL", code, rule["message"], retryable=retryable))
+                ValidatorStats.record(code, is_retry_trigger=retryable)
+        for rule in self._rules._warn_rules:
+            if rule["id"] not in self._CONSUMED_RULE_IDS:
+                continue
+            guard = rule.get("table_guard")
+            if guard and not re.search(rf"\b{re.escape(guard)}\b", sql, re.IGNORECASE):
+                continue
+            if rule["_sql_re"].search(sql):
+                code = rule["code"]
+                issues.append(ValidationIssue("SOFT_WARN", code, rule["message"], retryable=False))
+                ValidatorStats.record(code, is_retry_trigger=False)
+        return issues
+
+    def _registry_autocorrects(self, sql: str) -> str:
+        """Consume business_rules.py's AUTOCORRECT registry rules, restricted to _CONSUMED_RULE_IDS."""
+        for rule in self._rules._autocorr_rules:
+            if rule["id"] not in self._CONSUMED_RULE_IDS:
+                continue
+            sql = rule["_sql_re"].sub(rule["replacement"], sql)
+        return sql
 
     # ------------------------------------------------------------------ #
     # Primary validation — HARD_FAIL vs SOFT_WARN separation
@@ -372,27 +407,13 @@ class SQLValidator:
             ValidatorStats.record("EMPTY_SQL", is_retry_trigger=True)
             return ValidationResult(passed=False, issues=[issue])
 
-        # ── 2. DML/DDL — non-retryable, return immediately ───────────────
-        if self._DML_RE.search(sql):
-            issue = ValidationIssue(
-                "HARD_FAIL", "DML_BLOCKED",
-                "Only SELECT queries are allowed — DML/DDL detected",
-                retryable=False,
-            )
-            ValidatorStats.record("DML_BLOCKED", is_retry_trigger=False)
-            return ValidationResult(passed=False, issues=[issue])
-
         sql_lower = sql.lower()
 
-        # ── 3. Hallucinated tables ────────────────────────────────────────
-        for table in self.HALLUCINATED_TABLES:
-            if re.search(rf"\b{re.escape(table)}\b", sql_lower):
-                issues.append(ValidationIssue(
-                    "HARD_FAIL", "UNKNOWN_TABLE",
-                    f"Table '{table}' does not exist — use ai_answers / ai_questions (plural)",
-                    detail=f"Hallucinated table name: {table}",
-                ))
-                ValidatorStats.record("UNKNOWN_TABLE", is_retry_trigger=True)
+        # ── 2. Registry-driven BLOCK/WARN rules (core/business_rules.py) ──
+        # DML block, hallucinated table names, dynamic fb_ tables, responsible/
+        # pending_with join, close_on arithmetic, missing-limit, hardcoded-year,
+        # plus the Group-B financial-integrity guards — see _CONSUMED_RULE_IDS.
+        issues.extend(self._registry_block_warn_issues(sql, question))
 
         # ── 4. Hallucinated columns on ai_* tables ────────────────────────
         for table, col_hints in self.HALLUCINATED_AI_COLUMNS.items():
@@ -559,45 +580,6 @@ class SQLValidator:
         if _HAS_SQLGLOT:
             _check_undefined_table_aliases(sql, issues)
 
-        # ── 7. Dynamic fb_{uuid} table references ─────────────────────────
-        if self._DYNAMIC_TABLE_RE.search(sql):
-            issues.append(ValidationIssue(
-                "HARD_FAIL", "DYNAMIC_TABLE",
-                "Dynamic fb_<uuid> table detected — use ai_answers instead",
-            ))
-            ValidatorStats.record("DYNAMIC_TABLE", is_retry_trigger=True)
-
-        # ── 8. responsible / pending_with wrongly joined to users ─────────
-        if re.search(r'\bjoin\s+users\b', sql_lower):
-            if (re.search(r'\b(?:responsible|pending_with)\s*=\s*\w+\.id\b', sql_lower)
-                    or re.search(r'\bON\s+\w+\.(?:responsible|pending_with)\s*=',
-                                 sql, re.IGNORECASE)):
-                issues.append(ValidationIssue(
-                    "HARD_FAIL", "WRONG_JOIN",
-                    "'responsible' / 'pending_with' are string ENUMs, not UUID FKs to users",
-                    detail="Use: WHERE ica.responsible = 'CLIENT'  "
-                           "Values: CLIENT, INTERNAL_OPERATIONS, SUB_CONTRACTOR",
-                ))
-                ValidatorStats.record("WRONG_JOIN", is_retry_trigger=True)
-
-        # ── 9. Hardcoded year — SOFT_WARN only ───────────────────────────
-        # Moved from HARD_FAIL: a user may intentionally query a specific
-        # historical year (e.g. "inspector with most inspections in 2024").
-        # Blocking that is validator overreach — it caused Qwen to corrupt
-        # the query intent on retry (seen in traces: "projects without
-        # inspections in 2024" → retried → produced WHERE CURRENT_YEAR != 2024,
-        # which always evaluates TRUE, returning all projects).
-        # Log for observability; do NOT block execution.
-        for m in self._HARDCODED_YEAR_RE.finditer(sql_lower):
-            year = m.group(1)
-            issues.append(ValidationIssue(
-                "SOFT_WARN", "HARDCODED_YEAR",
-                f"Hardcoded year '= {year}' — consider EXTRACT(YEAR FROM CURRENT_DATE) for current-year queries",
-                detail="Only an issue for 'this year' intent; intentional historical year queries are fine",
-                retryable=False,
-            ))
-            ValidatorStats.record("HARDCODED_YEAR", is_retry_trigger=False)
-
         # ── 9b. Stale hardcoded date literal — HARD_FAIL ─────────────────
         # deepseek hallucinates DATE '2023-01-01' or '2022-...' from training data
         # when generating date range filters. These are always wrong — the data is
@@ -617,22 +599,6 @@ class SQLValidator:
             ))
             ValidatorStats.record("STALE_DATE_LITERAL", is_retry_trigger=True)
             break  # one report is enough
-
-        # ── 10. close_on arithmetic — HARD_FAIL (dead column, all NULL) ──────
-        # close_on exists as a real column but is confirmed always NULL
-        # (0/398 populated, 2026-07-08) — arithmetic on it silently produces NULL.
-
-        # business_rules.py block_close_on_arithmetic also blocks this at the
-        # INJECT layer; this validator check catches it at execution-time too.
-        if self._CLOSE_ON_ARITH_RE.search(sql):
-            issues.append(ValidationIssue(
-                "HARD_FAIL", "DEAD_COLUMN",
-                "BLOCKED: close_on is always NULL in production (dead column) — use completed_on "
-                "for closure timing (populated for status='CLOSED' rows)",
-                detail="For closed-late: status='CLOSED' AND completed_on > target_close_out_date",
-                retryable=True,
-            ))
-            ValidatorStats.record("DEAD_COLUMN", is_retry_trigger=True)
 
         # ── 10b. TO_CHAR used as a WHERE filter — HARD_FAIL ───────────────
         # TO_CHAR(col, 'Month YYYY') = 'January 2026' silently returns 0 rows
@@ -705,18 +671,18 @@ class SQLValidator:
                 ))
                 ValidatorStats.record("SPLIT_NAME_MISMATCH", is_retry_trigger=True)
 
-        # ── 10e. "overdue" corrective actions via date arithmetic — HARD_FAIL ──
+        # ── 10e. "overdue" mitigative actions via date arithmetic — HARD_FAIL ──
         # status='OVERDUE' is the authoritative, maintained field. Reconstructing
         # it via `NOT status IN (...) AND target_close_out_date < CURRENT_DATE`
         # silently diverges from that field's business rule (grace periods,
         # deferrals, etc. are baked into the maintained status, not the raw date
         # comparison) — both 3B and 7B were observed doing this identically in
         # eval, always without error, so it was invisible until the SQL was
-        # read by hand. Scoped tightly to "overdue" + corrective/action to avoid
+        # read by hand. Scoped tightly to "overdue" + mitigative/action to avoid
         # over-firing on unrelated "active"/"status" questions.
         _overdue_ca_q = re.compile(
-            r"\boverdue\b.{0,25}\b(?:corrective|actions?)\b"
-            r"|\b(?:corrective|actions?)\b.{0,25}\boverdue\b",
+            r"\boverdue\b.{0,25}\b(?:mitigative|actions?)\b"
+            r"|\b(?:mitigative|actions?)\b.{0,25}\boverdue\b",
             re.IGNORECASE,
         )
         if question and _overdue_ca_q.search(question):
@@ -726,7 +692,7 @@ class SQLValidator:
             if not uses_overdue_status and uses_date_compare:
                 issues.append(ValidationIssue(
                     "HARD_FAIL", "OVERDUE_DATE_ARITHMETIC",
-                    "Overdue corrective actions must use status='OVERDUE', not date arithmetic",
+                    "Overdue mitigative actions must use status='OVERDUE', not date arithmetic",
                     detail="status='OVERDUE' is the authoritative field — do not recompute "
                            "overdue from target_close_out_date/CLOSED/CLOSE_WITH_DEFERRED",
                 ))
@@ -783,15 +749,6 @@ class SQLValidator:
                            "SELECT SUM(pr.pr_amount)",
                 ))
                 ValidatorStats.record("OPEX_WRONG_TABLE", is_retry_trigger=True)
-
-        has_agg = bool(self._AGG_RE.search(sql))
-        if not has_agg and not self._LIMIT_RE.search(sql):
-            issues.append(ValidationIssue(
-                "SOFT_WARN", "MISSING_LIMIT",
-                "Non-aggregate query has no LIMIT — may return large result sets",
-                retryable=False,
-            ))
-            ValidatorStats.record("MISSING_LIMIT", is_retry_trigger=False)
 
         hard_fails = [i for i in issues if i.severity == "HARD_FAIL"]
         passed = len(hard_fails) == 0
@@ -1005,7 +962,7 @@ class SQLValidator:
                 ))
                 ValidatorStats.record("MISSING_COMPLETED_STATUS", is_retry_trigger=False)
 
-        # NOTE: "overdue corrective actions" via date arithmetic is now a HARD_FAIL,
+        # NOTE: "overdue mitigative actions" via date arithmetic is now a HARD_FAIL,
         # enforced in validate() (see OVERDUE_DATE_ARITHMETIC) — promoted out of this
         # advisory-only method because it was firing consistently (both 3B and 7B,
         # in eval) with no retry and no user-visible signal.
@@ -1060,34 +1017,6 @@ class SQLValidator:
         sql = re.sub(r"^[^\n;]*:\s*$", "", sql, flags=re.MULTILINE)
         sql = sql.strip()
 
-        # ICA→IR join structural fix.
-        # deepseek generates: ON ir.inspection_id = ica.inspection_id
-        # Correct form:       ON ica.inspection_id = ir.id
-        # Rationale: ica.inspection_id is UUID FK; ir.inspection_id is VARCHAR.
-        # Comparing them causes a PostgreSQL type mismatch error every time.
-        sql = re.sub(
-            r'\bir\.inspection_id\s*=\s*ica\.inspection_id\b',
-            'ica.inspection_id = ir.id',
-            sql, flags=re.IGNORECASE,
-        )
-        sql = re.sub(
-            r'\bica\.inspection_id\s*=\s*ir\.inspection_id\b',
-            'ica.inspection_id = ir.id',
-            sql, flags=re.IGNORECASE,
-        )
-        # CAST variant: CAST(ir.inspection_id AS TEXT) = ica.inspection_id
-        sql = re.sub(
-            r'CAST\s*\(\s*ir\.inspection_id\s+AS\s+\w+\s*\)\s*=\s*ica\.inspection_id\b',
-            'ica.inspection_id = ir.id',
-            sql, flags=re.IGNORECASE,
-        )
-        # Cast operator variant: ir.inspection_id::varchar(255) = ica.inspection_id
-        sql = re.sub(
-            r'\bir\.inspection_id\s*::\s*\w+(?:\(\d+\))?\s*=\s*ica\.inspection_id\b',
-            'ica.inspection_id = ir.id',
-            sql, flags=re.IGNORECASE,
-        )
-
         # Extract SELECT/WITH from any LLM preamble prose
         if "SELECT" in sql.upper():
             select_pos = sql.upper().find("SELECT")
@@ -1105,34 +1034,31 @@ class SQLValidator:
         if semi:
             sql = sql[:semi.end()]
 
-        sql = self.fix_reserved_aliases(sql)
+        # ICA→IR join structural fix (4 variants: direct, reversed, CAST, ::type)
+        # and reserved-alias fix ('is' → 'isch') — both consumed from
+        # core/business_rules.py's REGISTRY via _registry_autocorrects().
+        # Rationale for the ICA/IR fix: ica.inspection_id is UUID FK;
+        # ir.inspection_id is VARCHAR — comparing them is always a type error.
+        _sql_before_autocorrect = sql
+        sql = self._registry_autocorrects(sql)
+        # fix_reserved_aliases (removed) additionally rewrote bare "is."
+        # qualifiers anywhere in the query, once "is" was confirmed used as a
+        # table alias — the registry's autocorrect_reserved_alias_is rule only
+        # fixes the alias *declaration* site itself. No registry equivalent for
+        # this broader cleanup; preserved here directly, same trigger condition.
+        _is_alias_rule = next(
+            (r for r in self._rules._autocorr_rules if r["id"] == "autocorrect_reserved_alias_is"),
+            None,
+        )
+        if _is_alias_rule and _is_alias_rule["_sql_re"].search(_sql_before_autocorrect):
+            sql = re.sub(r'\bis\.', 'isch.', sql)
+
         sql = re.sub(r"\s*\[/?[A-Z_]+\]\s*$", "", sql, flags=re.IGNORECASE).rstrip()
 
         if sql and not sql.rstrip().endswith(";"):
             sql = sql.rstrip() + ";"
 
         return sql
-
-    def fix_reserved_aliases(self, sql: str) -> str:
-        """Fix SQL reserved words used as table aliases (e.g. 'is' for inspection_schedule)."""
-        replacements = {"is": "isch"}
-        for reserved, safe in replacements.items():
-            alias_pattern = re.compile(
-                r'(\b\w+\s+)' + r'\b' + re.escape(reserved) + r'\b'
-                r'(?=\s*\.|\s+ON\b|\s+WHERE\b|\s+GROUP\b|\s+ORDER\b'
-                r'|\s+LEFT\b|\s+JOIN\b|\s+INNER\b|\s*\n|\s*,)',
-                re.IGNORECASE,
-            )
-            if alias_pattern.search(sql):
-                sql = alias_pattern.sub(lambda m, s=safe: m.group(1) + s, sql)
-                sql = re.sub(r'\b' + re.escape(reserved) + r'\.', safe + '.', sql)
-        return sql
-
-    def is_dynamic_answer_table(self, table_name: str) -> bool:
-        return bool(re.match(
-            r'^fb_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}$',
-            table_name,
-        ))
 
     # ------------------------------------------------------------------ #
     # AST repair — deterministic post-generation fixes via sqlglot
@@ -1568,43 +1494,116 @@ class SQLValidator:
         except Exception:
             return sql, []
 
-    # Tables that need row-level scoping when inspection_report is absent.
-    # Maps table name → FK column on inspection_report that links back to it.
-    # facility is intentionally excluded — it is public reference data visible
-    # to all authenticated users.
+    # facility is intentionally excluded — public reference data.
     _SECONDARY_SCOPE_TABLES: dict = {
-        'inspection_cycle': 'cycle_id',
+        'inspection_cycle': {
+            'mode': 'forward', 'fk_col': 'cycle_id',
+        },
+        'inspection_corrective_action': {
+            'mode': 'reverse', 'own_col': 'inspection_id',
+        },
+        'po_details': {
+            'mode': 'reverse2', 'own_col': 'mitigative_action_uuid',
+            'mid_table': 'inspection_corrective_action', 'mid_fk': 'inspection_id',
+        },
+        'pr_details': {
+            'mode': 'reverse2', 'own_col': 'mitigative_action_uuid',
+            'mid_table': 'inspection_corrective_action', 'mid_fk': 'inspection_id',
+        },
+        'inspection_schedule': {
+            'mode': 'direct',
+            'column_map': {'inspector_user_id': 'inspector_id', 'inspectee_user_id': 'inspectee_id'},
+        },
+        'inspector_portfolio': {
+            'mode': 'inspector_only', 'own_col': 'user_id',
+        },
+        'inspector_portfolio_details': {
+            'mode': 'inspector_only_reverse', 'own_col': 'portfolio_id',
+            'mid_table': 'inspector_portfolio', 'mid_col': 'user_id',
+        },
+        'users': {
+            'mode': 'connected_users', 'own_col': 'id',
+        },
     }
+
+    _USER_SUBQ_RE = re.compile(
+        r"\(SELECT id FROM users WHERE id_fk = \d+ AND active = true AND is_synced = true\)"
+    )
+
+    @classmethod
+    def _build_secondary_predicate(cls, tbl_name: str, spec: dict, alias: str,
+                                    scope_filter: str, ir_predicate: str) -> str:
+        mode = spec['mode']
+
+        if mode == 'forward':
+            return (
+                f"{alias}.id IN (SELECT DISTINCT {spec['fk_col']} "
+                f"FROM inspection_report WHERE {ir_predicate} AND active = true)"
+            )
+
+        if mode == 'reverse':
+            return (
+                f"{alias}.{spec['own_col']} IN (SELECT id FROM inspection_report "
+                f"WHERE {ir_predicate} AND active = true)"
+            )
+
+        if mode == 'reverse2':
+            return (
+                f"{alias}.{spec['own_col']} IN ("
+                f"SELECT _sc_mid.id FROM {spec['mid_table']} _sc_mid "
+                f"JOIN inspection_report _sc_ir ON _sc_mid.{spec['mid_fk']} = _sc_ir.id "
+                f"WHERE {ir_predicate} AND _sc_mid.active = true AND _sc_ir.active = true)"
+            )
+
+        if mode == 'direct':
+            pred = scope_filter
+            for old_col, new_col in spec['column_map'].items():
+                pred = pred.replace(f"ir.{old_col}", f"{alias}.{new_col}")
+            return pred
+
+        if mode == 'inspector_only':
+            if 'inspector_user_id' not in scope_filter:
+                return "1 = 0"
+            m = cls._USER_SUBQ_RE.search(scope_filter)
+            subq = m.group(0) if m else "(SELECT NULL)"
+            return f"{alias}.{spec['own_col']} = {subq}"
+
+        if mode == 'inspector_only_reverse':
+            if 'inspector_user_id' not in scope_filter:
+                return "1 = 0"
+            m = cls._USER_SUBQ_RE.search(scope_filter)
+            subq = m.group(0) if m else "(SELECT NULL)"
+            return (
+                f"{alias}.{spec['own_col']} IN (SELECT id FROM {spec['mid_table']} "
+                f"WHERE {spec['mid_col']} = {subq} AND active = true)"
+            )
+
+        if mode == 'connected_users':
+            return (
+                f"{alias}.{spec['own_col']} IN ("
+                f"SELECT inspector_user_id FROM inspection_report WHERE {ir_predicate} AND active = true "
+                f"UNION "
+                f"SELECT inspectee_user_id FROM inspection_report WHERE {ir_predicate} AND active = true)"
+            )
+
+        raise ValueError(f"unknown secondary-scope mode {mode!r} for {tbl_name}")
 
     def enforce_scope(self, sql: str, scope_filter: str) -> str:
         """Hard data-visibility guard — AST-level injection, always applied.
 
-        The system prompt is just a hint to the LLM for SQL quality.
-        THIS is the actual security enforcement — it rewrites the SQL via
-        the sqlglot AST unconditionally, independent of what the LLM generated.
-        A filter that exists only in the prompt can be bypassed by prompt
-        injection, model drift, or a SQL comment. This cannot.
-
         scope_filter == ''       → unrestricted, return SQL unchanged
         scope_filter == 'BLOCK'  → raise ValueError('SCOPE_BLOCKED')
-        anything else            → inject into every Select that:
-                                   (a) directly FROM/JOINs inspection_report, OR
-                                   (b) directly FROM/JOINs a secondary scoped
-                                       table (facility, inspection_cycle) without
-                                       inspection_report in the query
-
-        Secondary scoping: strips the "ir." alias prefix from scope_filter to
-        build a subquery predicate suitable for raw column names, e.g.:
-          "ir.inspector_user_id = (subq)" → "{alias}.id IN (SELECT DISTINCT
-           facility_id FROM inspection_report WHERE inspector_user_id = (subq)
-           AND active = true)"
+        anything else            → inject into every Select that directly
+                                   FROM/JOINs inspection_report, or a
+                                   secondary-scoped table (see
+                                   _SECONDARY_SCOPE_TABLES / _build_secondary_predicate)
 
         Raises ValueError('SCOPE_BLOCKED') — caller converts to HTTP 403.
         """
         if not scope_filter:
             return sql
         if scope_filter == 'BLOCK':
-            logger.warning("[SCOPE] enforce_scope called with BLOCK — raising SCOPE_BLOCKED")
+            _log_security.warning("[SCOPE] enforce_scope called with BLOCK — raising SCOPE_BLOCKED")
             raise ValueError('SCOPE_BLOCKED')
 
         sql_lower = sql.lower()
@@ -1615,18 +1614,21 @@ class SQLValidator:
         #  → "(inspector_user_id=X OR inspectee_user_id=X)")
         ir_predicate = scope_filter.replace('ir.', '')
 
-        secondary_tables = (
-            [(tbl, fk) for tbl, fk in self._SECONDARY_SCOPE_TABLES.items()
-             if tbl in sql_lower]
-            if not has_ir else []
-        )
+        secondary_tables = [
+            (tbl, spec) for tbl, spec in self._SECONDARY_SCOPE_TABLES.items()
+            if tbl in sql_lower
+        ]
 
         if not has_ir and not secondary_tables:
             # Pure reference tables (frequency_definition, inspection_type, etc.)
             # carry no row-level owner — no scope injection required.
             return sql
 
-        logger.debug("[SCOPE] injecting scope filter: %s", scope_filter[:120])
+        _log_security.info(
+            "[SCOPE] injecting scope filter: via=%s filter=%s",
+            (["inspection_report"] if has_ir else []) + [t for t, _ in secondary_tables],
+            scope_filter[:120],
+        )
 
         # ── Primary path: AST injection via sqlglot ──────────────────────────
         if _HAS_SQLGLOT:
@@ -1650,35 +1652,28 @@ class SQLValidator:
                                 return join.this.alias or tbl_name
                     return None
 
-                if has_ir:
-                    # Inject scope_filter into every SELECT that directly
-                    # FROM/JOINs inspection_report.
-                    def _inject_ir(node):
-                        if isinstance(node, exp.Select) and _alias_for_table(node, 'inspection_report'):
-                            return node.where(scope_expr.copy())
+                # Each SELECT node (including every branch of a UNION, and every
+                # subquery) is scoped independently — a query can mix a branch
+                # that joins inspection_report with a branch that reaches a
+                # secondary-scoped table bare; both must be caught on their
+                # own terms, not decided once for the whole statement.
+                def _inject(node):
+                    if not isinstance(node, exp.Select):
                         return node
+                    if _alias_for_table(node, 'inspection_report'):
+                        return node.where(scope_expr.copy())
+                    for tbl_name, spec in secondary_tables:
+                        alias = _alias_for_table(node, tbl_name)
+                        if alias:
+                            subq_where = self._build_secondary_predicate(
+                                tbl_name, spec, alias, scope_filter, ir_predicate
+                            )
+                            node = node.where(
+                                sqlglot.parse_one(subq_where, dialect="postgres")
+                            )
+                    return node
 
-                    rewritten = tree.transform(_inject_ir).sql(dialect="postgres", pretty=False)
-                else:
-                    # Inject a subquery scope for facility / inspection_cycle
-                    # queries that don't join through inspection_report directly.
-                    def _inject_secondary(node):
-                        if not isinstance(node, exp.Select):
-                            return node
-                        for tbl_name, fk_col in secondary_tables:
-                            alias = _alias_for_table(node, tbl_name)
-                            if alias:
-                                subq_where = (
-                                    f"{alias}.id IN ("
-                                    f"SELECT DISTINCT {fk_col} FROM inspection_report "
-                                    f"WHERE {ir_predicate} AND active = true)"
-                                )
-                                node = node.where(
-                                    sqlglot.parse_one(subq_where, dialect="postgres")
-                                )
-                        return node
-
-                    rewritten = tree.transform(_inject_secondary).sql(dialect="postgres", pretty=False)
+                rewritten = tree.transform(_inject).sql(dialect="postgres", pretty=False)
 
                 if rewritten and not rewritten.rstrip().endswith(";"):
                     rewritten = rewritten.rstrip() + ";"
@@ -1696,16 +1691,11 @@ class SQLValidator:
             r"\b(ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT)\b", sql_work, re.IGNORECASE
         )
 
-        if has_ir:
-            fragment = scope_filter
-        else:
-            # Build combined secondary predicate without a known alias
-            parts = [
-                f"id IN (SELECT DISTINCT {fk} FROM inspection_report "
-                f"WHERE {ir_predicate} AND active = true)"
-                for _, fk in secondary_tables
-            ]
-            fragment = " AND ".join(parts)
+        parts = ([scope_filter] if has_ir else []) + [
+            self._build_secondary_predicate(tbl_name, spec, tbl_name, scope_filter, ir_predicate)
+            for tbl_name, spec in secondary_tables
+        ]
+        fragment = " AND ".join(f"({p})" for p in parts)
 
         if term:
             pos = term.start()

@@ -70,7 +70,7 @@ SEMANTICS: dict = {
 
     # ── Join paths with non-obvious cast directions ─────────────────────────
     "joins": {
-        "observation_to_ca": {
+        "observation_to_ma": {
             "sql":   "aa.submission_id = ica.observation_id::varchar",
             "left":  ("ai_answers.submission_id", "varchar"),
             "right": ("inspection_corrective_action.observation_id", "uuid"),
@@ -80,7 +80,7 @@ SEMANTICS: dict = {
                 "ica.observation_id::text = aa.submission_id",
             ],
         },
-        "ca_to_po": {
+        "ma_to_po": {
             "sql":   "po.mitigative_action_uuid = ica.id",
             "never": [
                 "ica.mitigative_action_uuid = po.*  (column does not exist on ica)",
@@ -181,10 +181,10 @@ SEMANTICS: dict = {
         ],
     },
 
-    # ── Corrective action workflow — four independent-but-coupled tracks ─────
+    # ── Mitigative action workflow — four independent-but-coupled tracks ─────
     # Discovered via pgAdmin state-matrix introspection 2026-06-11.
-    "ca_workflow": {
-        "status": {  # overall CA lifecycle (system-managed)
+    "ma_workflow": {
+        "status": {  # overall MA lifecycle (system-managed)
             "values": ["OPEN", "CLOSED", "OVERDUE", "CLOSE_WITH_DEFERRED"],
         },
         "progress_stage": {  # inspectee's SELF-REPORTED progress (inspectee-owned)
@@ -204,7 +204,7 @@ SEMANTICS: dict = {
             "values": {
                 None:                      "inspectee hasn't marked complete yet",
                 "PENDING_FOR_REVIEW":      "inspectee completed, awaiting FM manager + inspector",
-                "APPROVE":                 "both approvers accepted — CA closes",
+                "APPROVE":                 "both approvers accepted — MA closes",
                 "RETURN_FOR_MODIFICATION": "a reviewer sent it back to the inspectee",
             },
             "owner": "FM manager + inspector (both must approve)",
@@ -227,9 +227,9 @@ SEMANTICS: dict = {
             "status = 'CLOSED'  ⟺  implementation_status = 'APPROVE' (closure IS the approval)",
             "implementation_status = 'PENDING_FOR_REVIEW' only co-occurs with progress_stage = 'COMPLETED'",
             "RETURN_FOR_MODIFICATION resets progress_stage to NULL — "
-            "so progress_stage = 'COMPLETED' MISSES returned CAs",
-            "inspection_report.status = 'UNDER_REVIEW' is driven by CAs awaiting approval",
-            "inspection_report closes only when ALL its CAs are closed",
+            "so progress_stage = 'COMPLETED' MISSES returned MAs",
+            "inspection_report.status = 'UNDER_REVIEW' is driven by MAs awaiting approval",
+            "inspection_report closes only when ALL its MAs are closed",
         ],
         "unreliable_columns": {
             "pending_with":    "observed NULL across rows — derive 'who must act' from implementation_status",
@@ -342,10 +342,6 @@ def old_completed_forbidden_regex() -> str:
     return r"status\s*IN\s*\(\s*'CLOSED'\s*,\s*'SUBMITTED'\s*\)"
 
 
-def observation_ca_join() -> str:
-    return SEMANTICS["joins"]["observation_to_ca"]["sql"]
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Generated blocks — one per consumer layer
 # ═══════════════════════════════════════════════════════════════════════════
@@ -392,10 +388,10 @@ def core_context_status_block() -> str:
 
 
 def core_context_cast_block() -> str:
-    """For agent/seed_examples.py CORE_CONTEXT — the observation↔CA cast rule."""
-    j = SEMANTICS["joins"]["observation_to_ca"]
+    """For agent/seed_examples.py CORE_CONTEXT — the observation↔MA cast rule."""
+    j = SEMANTICS["joins"]["observation_to_ma"]
     nevers = "\n".join(f"--   NEVER: {n}" for n in j["never"])
-    return f"""-- OBSERVATION → CA JOIN — exact form:
+    return f"""-- OBSERVATION → MA JOIN — exact form:
 --   {j['sql']}
 --   ({j['rule']})
 {nevers}"""
@@ -440,7 +436,7 @@ def constraint_note_status() -> str:
 
 def constraint_note_cast() -> str:
     """For agent/orchestrator.py _CONSTRAINT_NOTE_MAP['WRONG_CAST_DIR']."""
-    j = SEMANTICS["joins"]["observation_to_ca"]
+    j = SEMANTICS["joins"]["observation_to_ma"]
     nevers = "\n".join(f"--   NEVER: {n}" for n in j["never"])
     return (
         f"-- CAST RULE: JOIN ON {j['sql']}\n"
@@ -508,15 +504,15 @@ def llama_columns_block() -> str:
   question is specifically about cancelled/removed schedules."""
 
 
-def core_context_ca_workflow_block() -> str:
-    """For agent/seed_examples.py CORE_CONTEXT — the CA approval workflow."""
-    w = SEMANTICS["ca_workflow"]
+def core_context_ma_workflow_block() -> str:
+    """For agent/seed_examples.py CORE_CONTEXT — the MA approval workflow."""
+    w = SEMANTICS["ma_workflow"]
     ps = w["progress_stage"]["values"]
     ps_list = ", ".join(k for k in ps)
     inv = "\n".join(f"--   {i}" for i in w["invariants"])
     vocab = "\n".join(f"--   '{k}' → {v}" for k, v in w["vocabulary"].items())
     t = w["timeliness"]
-    return f"""-- CORRECTIVE ACTION WORKFLOW — four independent tracks on ica:
+    return f"""-- MITIGATIVE ACTION WORKFLOW — four independent tracks on ica:
 --   status (system):            OPEN | CLOSED | OVERDUE | CLOSE_WITH_DEFERRED
 --   progress_stage (inspectee): {ps_list}
 --   implementation_status (reviewers): NULL | PENDING_FOR_REVIEW | APPROVE | RETURN_FOR_MODIFICATION
@@ -578,12 +574,12 @@ def inject_hint_financial() -> str:
     )
 
 
-def llama_ca_workflow_block() -> str:
+def llama_ma_workflow_block() -> str:
     """For agent/prompts.py SYSTEM_PROMPT — Llama must route approval vocabulary correctly."""
-    w = SEMANTICS["ca_workflow"]
+    w = SEMANTICS["ma_workflow"]
     vocab = "\n".join(f"    \"{k}\" → {v}" for k, v in w["vocabulary"].items())
     t = w["timeliness"]
-    return f"""IMPORTANT — corrective action (ica) workflow columns (four independent tracks):
+    return f"""IMPORTANT — mitigative action (ica) workflow columns (four independent tracks):
   status (system):       OPEN | CLOSED | OVERDUE | CLOSE_WITH_DEFERRED
   progress_stage:        NOT_STARTED | ON_TRACK | BEHIND | AT_RISK | COMPLETED | CLOSE_WITH_DEFERRED
                          (inspectee's self-reported SCHEDULE HEALTH — not severity)
@@ -707,7 +703,7 @@ if __name__ == "__main__":
         ("CORE_CONTEXT COUNTING (seed_examples.py)",   core_context_counting_block()),
         ("CORE_CONTEXT COLUMNS (seed_examples.py)",    core_context_columns_block()),
         ("LLAMA COLUMNS (prompts.py)",                  llama_columns_block()),
-        ("CORE_CONTEXT CA WORKFLOW (seed_examples.py)", core_context_ca_workflow_block()),
+        ("CORE_CONTEXT MA WORKFLOW (seed_examples.py)", core_context_ma_workflow_block()),
         ("INJECT HINT STATUS (business_rules.py)",     inject_hint_status()),
         ("INJECT HINT FINANCIAL (business_rules.py)",  inject_hint_financial()),
         ("CONSTRAINT NOTE STATUS (orchestrator.py)",   constraint_note_status()),

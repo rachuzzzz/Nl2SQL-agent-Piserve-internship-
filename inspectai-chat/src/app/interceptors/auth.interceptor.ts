@@ -11,7 +11,7 @@ export const authInterceptor: HttpInterceptorFn = (
     return next(req);
   }
 
-  const token = localStorage.getItem(TOKEN_KEY);
+  const token = sessionStorage.getItem(TOKEN_KEY);
   const authReq = token
     ? req.clone({ setHeaders: { Authorization: `Bearer ${token}` } })
     : req;
@@ -19,8 +19,8 @@ export const authInterceptor: HttpInterceptorFn = (
   return next(authReq).pipe(
     catchError((err: HttpErrorResponse) => {
       if (err.status === 401) {
-        localStorage.removeItem(TOKEN_KEY);
-        localStorage.removeItem('octaai_username');
+        sessionStorage.removeItem(TOKEN_KEY);
+        sessionStorage.removeItem('octaai_username');
         window.location.reload();
       }
       // 403 — propagate; route guards / components handle the UI response

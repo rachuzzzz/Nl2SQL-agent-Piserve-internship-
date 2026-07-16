@@ -20,7 +20,6 @@ from core.validator import SQLValidator
 
 
 _SEMANTIC_MIN_SCORE = 0.55
-_SEMANTIC_FALLBACK_MIN_SCORE = 0.50
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +459,55 @@ def _fetch_key_schemas(db_engine: Engine) -> str:
         return ""
 
 
+def _select_schema_block(db_schema, relevant_tables: list | None, db_engine=None) -> str:
+    """
+    Prefer a targeted, full-column-detail block for the tables the reasoning
+    model said are relevant (DatabaseSchema.for_schema_hint) over the static
+    curated slim block (for_sql_prompt_slim) that's sent on every call
+    regardless of question — replacement, not blend, since for_schema_hint
+    already includes its own lookup-tables + TABLE_RELATIONSHIPS sections.
+
+    relevant_tables is LLM-supplied and may be malformed (e.g. a bare string
+    instead of a JSON array, since this is the only list-typed tool argument
+    in this codebase) — the isinstance guard prevents silently iterating
+    individual characters as "table names" if that happens.
+    """
+    if db_schema is not None:
+        if isinstance(relevant_tables, list) and relevant_tables:
+            clean = [t for t in relevant_tables if isinstance(t, str) and t.strip()]
+            if clean:
+                block = db_schema.for_schema_hint(clean)
+                if len(clean) >= 2:
+                    block += _join_path_hints(clean)
+                return block
+        return db_schema.for_sql_prompt_slim()
+    if db_engine:
+        return _fetch_key_schemas(db_engine)
+    return ""
+
+
+def _join_graph_source(table_name: str) -> str:
+    """
+    JOIN_GRAPH (agent/join_graph.py) has no "users" key — only role-specific
+    "users_inspector"/"users_inspectee" pseudo-nodes. Default to the inspector
+    role when a caller says "users" with no role context; this is a heuristic,
+    not a real disambiguation — informational hint text only, never used to
+    filter/scope data.
+    """
+    return "users_inspector" if table_name == "users" else table_name
+
+
+def _join_path_hints(relevant_tables: list) -> str:
+    """Chain path_as_hint() across consecutive relevant_tables pairs."""
+    from agent.join_graph import path_as_hint
+    hints = []
+    for a, b in zip(relevant_tables, relevant_tables[1:]):
+        hint = path_as_hint(_join_graph_source(a), _join_graph_source(b))
+        if hint:
+            hints.append(hint)
+    return "".join(hints)
+
+
 def generate_sql(
     sql_llm, validator: SQLValidator, question: str,
     schema_hint: str = "", db_engine=None,
@@ -470,17 +518,15 @@ def generate_sql(
     _db_schema=None,
     _active_cycle_uuid: str = "",
     _retry_attempt: int = 0,
+    relevant_tables: list | None = None,
 ) -> dict[str, Any]:
     try:
-        # Schema block — use the slim version to keep context under ~600 tokens.
-        # for_sql_prompt() dumps full introspected column lists (~2000+ tokens) which
-        # inflates deepseek's context 3x and degrades 7B model generation quality.
-        if _db_schema is not None:
-            auto_schema = _db_schema.for_sql_prompt_slim()
-        elif db_engine:
-            auto_schema = _fetch_key_schemas(db_engine)
-        else:
-            auto_schema = ""
+        # Schema block — the slim version keeps context under ~600 tokens.
+        # A full introspected column dump for every table (~2000+ tokens) inflates
+        # deepseek's context 3x and degrades 7B model generation quality.
+        # When the reasoning model supplies relevant_tables, use a targeted
+        # full-detail block for just those tables instead (see _select_schema_block).
+        auto_schema = _select_schema_block(_db_schema, relevant_tables, db_engine)
 
         if auto_schema and not schema_hint.startswith("Use"):
             schema_hint = f"{auto_schema}\n{schema_hint}" if schema_hint else auto_schema
@@ -825,12 +871,35 @@ def execute_sql(db_engine: Engine, validator: SQLValidator, sql: str, question: 
         return {"success": False, "result": None, "error": str(exc)}
 
 
-def get_schema(db_engine: Engine, table_name: Optional[str] = None) -> dict[str, Any]:
+def get_schema(db_engine: Engine, table_name: Optional[str] = None,
+                db_schema=None) -> dict[str, Any]:
     try:
-        inspector = sa_inspect(db_engine)
         if table_name is None:
+            inspector = sa_inspect(db_engine)
             tables = inspector.get_table_names()
             return {"success": True, "result": {"tables": tables}, "error": None}
+
+        # Prefer the curated schema (FK-resolution JOINs, enum values, useful-column
+        # notes) already built for the SQL model — richer than a bare column dump,
+        # and the same level of detail the reasoning LLM's system prompt used to
+        # always carry before it was slimmed (see DatabaseSchema.for_reasoning_prompt).
+        # Only used when the table is one db_schema actually introspected — for_schema_hint()
+        # unconditionally appends the lookup/relationships boilerplate even for an
+        # unrecognized name, so membership is checked here first rather than relying
+        # on its return value being empty.
+        if db_schema is not None:
+            known = (db_schema.tables.get(table_name)
+                     or db_schema.ai_tables.get(table_name)
+                     or db_schema.lookup_tables.get(table_name))
+            if known:
+                return {"success": True,
+                        "result": {"detail": db_schema.for_schema_hint([table_name])},
+                        "error": None}
+
+        # Fallback: raw introspection — covers tables outside the curated sets
+        # (e.g. a typo, or a table db_schema doesn't track) so a valid table name
+        # never comes back empty just because it wasn't pre-curated.
+        inspector = sa_inspect(db_engine)
         columns = inspector.get_columns(table_name)
         col_info = [{"name": c["name"], "type": str(c["type"])} for c in columns]
         return {"success": True, "result": {"columns": col_info}, "error": None}
@@ -973,6 +1042,8 @@ class ToolRegistry:
                     _db_schema=self._db_schema,
                     _active_cycle_uuid=str(args.get("_active_cycle_uuid", "")),
                     _retry_attempt=_retry_attempt,
+                    relevant_tables=args.get("relevant_tables")
+                        if isinstance(args.get("relevant_tables"), list) else None,
                 )
 
             if name == "execute_sql":
@@ -982,7 +1053,8 @@ class ToolRegistry:
 
             if name == "get_schema":
                 return get_schema(self._db_engine,
-                                  table_name=args.get("table_name"))
+                                  table_name=args.get("table_name"),
+                                  db_schema=self._db_schema)
 
         except KeyError as exc:
             return {"success": False, "result": None,

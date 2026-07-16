@@ -539,24 +539,24 @@ export class ChatWindowComponent implements AfterViewChecked {
   }
 
   get displayName(): string {
-    const first = localStorage.getItem('octaai_firstname') || '';
+    const first = sessionStorage.getItem('octaai_firstname') || '';
     if (first) return first;
-    const username = localStorage.getItem('octaai_username') || '';
+    const username = sessionStorage.getItem('octaai_username') || '';
     return username ? username.charAt(0).toUpperCase() + username.slice(1) : 'there';
   }
 
   quickQueries = [
     'What is the average inspection score?',
-    'Show overdue corrective actions',
-    'Which facility has the most high-risk CAs?',
+    'Show overdue mitigative actions',
+    'Which facility has the most high-risk MAs?',
     'How are we doing overall?',
-    'Rank inspection types by avg CAs per inspection',
+    'Rank inspection types by avg MAs per inspection',
   ];
 
   get inputPlaceholder(): string {
     return this.lastResultData
       ? 'Ask a question or type / for commands (/chart, /export, /sql...)'
-      : 'Ask about inspections, scores, corrective actions, facilities...';
+      : 'Ask about inspections, scores, mitigative actions, facilities...';
   }
 
   constructor(

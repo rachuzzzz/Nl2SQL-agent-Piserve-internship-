@@ -36,8 +36,6 @@ Conflict detection
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Optional
 
 
 # ── Semantics registry (single source of truth for status/cast rules) ─────────
@@ -120,6 +118,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_po_pr_join_to_ir",
         "type":        BLOCK,
+        "code":        "PO_PR_JOIN_TO_IR",
         "description": "po/pr_details.mitigative_action_uuid must join to ica.id, NEVER to ir.id (inspection_report). Joining to ir.id matches zero rows.",
         "sql_pattern": r"mitigative_action_uuid\s*=\s*ir\.id",
         "message":     (
@@ -135,11 +134,12 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_po_pr_double_direct_join",
         "type":        BLOCK,
+        "code":        "PO_PR_DOUBLE_JOIN",
         "description": (
             "Joining po_details AND pr_details directly into the same query (not via separate "
-            "pre-aggregated CTEs) causes a cross-join row multiplication when a CA has more than "
+            "pre-aggregated CTEs) causes a cross-join row multiplication when an MA has more than "
             "one PO or PR row, silently corrupting SUM() results (confirmed in production "
-            "2026-06-15: a CA with 2 POs and 1 PR returned capex_generated=1000 instead of 2000, "
+            "2026-06-15: an MA with 2 POs and 1 PR returned capex_generated=1000 instead of 2000, "
             "and capex_converted=0 instead of 1000)."
         ),
         "sql_pattern": (
@@ -148,7 +148,7 @@ REGISTRY: list[dict] = [
         ),
         "message": (
             "BLOCKED: po_details and pr_details are both directly LEFT JOINed into a GROUP BY query. "
-            "If a corrective action has more than one PO or PR row, this cross-joins them and corrupts "
+            "If a mitigative action has more than one PO or PR row, this cross-joins them and corrupts "
             "every SUM() in the result (confirmed bug: 2 POs + 1 PR returned half the correct capex). "
             "ALWAYS pre-aggregate each table in its own CTE first:\n"
             "WITH po_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po "
@@ -173,6 +173,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_dml",
         "type":        BLOCK,
+        "code":        "DML_BLOCKED",
         "description": "Only SELECT is allowed — no data modification.",
         "sql_pattern": r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE)\b",
         "message":     "BLOCKED: DML/DDL detected. Only SELECT is allowed.",
@@ -318,6 +319,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_mitigative_uuid_wrong_target",
         "type":        BLOCK,
+        "code":        "MITIGATIVE_UUID_WRONG_TARGET",
         "description": "po/pr_details.mitigative_action_uuid joins to ica.id only.",
         # Catches the WRONG form: mitigative_action_uuid = ir.id / ir.<col> / fac.id etc.
         # Silent-zero failure mode: the join matches nothing, LEFT JOIN +
@@ -328,7 +330,7 @@ REGISTRY: list[dict] = [
         ),
         "message": (
             "WRONG JOIN TARGET: mitigative_action_uuid points to inspection_corrective_action.id "
-            "(the CA), NEVER inspection_report.id or any other table. "
+            "(the MA), NEVER inspection_report.id or any other table. "
             "Correct path: po_details/pr_details → ica → inspection_report → facility:\n"
             "  JOIN inspection_corrective_action ica ON pd.mitigative_action_uuid = ica.id\n"
             "  JOIN inspection_report ir ON ica.inspection_id = ir.id\n"
@@ -365,6 +367,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_ai_question_singular",
         "type":        BLOCK,
+        "code":        "UNKNOWN_TABLE",
         "description": "ai_question (singular) does not exist — use ai_questions.",
         "sql_pattern": r"\bai_question\b(?!s)",
         "message":     "HALLUCINATION: table 'ai_question' does not exist. Use ai_questions (plural).",
@@ -372,6 +375,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_ai_answer_singular",
         "type":        BLOCK,
+        "code":        "UNKNOWN_TABLE",
         "description": "ai_answer (singular) does not exist — use ai_answers.",
         "sql_pattern": r"\bai_answer\b(?!s)",
         "message":     "HALLUCINATION: table 'ai_answer' does not exist. Use ai_answers (plural).",
@@ -379,6 +383,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_fb_users",
         "type":        BLOCK,
+        "code":        "UNKNOWN_TABLE",
         "description": "fb_users does not exist — use users.",
         "sql_pattern": r"\bfb_users?\b",
         "message":     "HALLUCINATION: table 'fb_users' does not exist. Use the 'users' table.",
@@ -386,6 +391,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_fb_submissions",
         "type":        BLOCK,
+        "code":        "UNKNOWN_TABLE",
         "description": "fb_submissions / fb_submission do not exist.",
         "sql_pattern": r"\bfb_submissions?\b",
         "message":     "HALLUCINATION: fb_submissions does not exist. Answer data is in ai_answers.",
@@ -393,6 +399,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_fb_answers",
         "type":        BLOCK,
+        "code":        "UNKNOWN_TABLE",
         "description": "fb_answers / fb_answer / fb_form_answers do not exist.",
         "sql_pattern": r"\bfb_(form_)?answers?\b",
         "message":     "HALLUCINATION: fb_answers does not exist. Use ai_answers.",
@@ -400,6 +407,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_fb_responses",
         "type":        BLOCK,
+        "code":        "UNKNOWN_TABLE",
         "description": "fb_responses / fb_response do not exist.",
         "sql_pattern": r"\bfb_responses?\b",
         "message":     "HALLUCINATION: fb_responses does not exist. Use ai_answers.",
@@ -407,6 +415,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_dynamic_fb",
         "type":        BLOCK,
+        "code":        "DYNAMIC_TABLE",
         "description": "Dynamic fb_{uuid} answer tables — all answer data is in ai_answers.",
         "sql_pattern": r"\bfb_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}\b",
         "message":     "BLOCKED: Dynamic fb_<uuid> table. Use ai_answers instead.",
@@ -423,10 +432,10 @@ REGISTRY: list[dict] = [
         ),
     },
     {
-        "id":          "block_ca_for_observation_wrong_path",
+        "id":          "block_ma_for_observation_wrong_path",
         "type":        BLOCK,
         "description": (
-            "When fetching CAs for a specific observation text (ILIKE), must use "
+            "When fetching MAs for a specific observation text (ILIKE), must use "
             "observation_id → submission_id path, not inspection join."
         ),
         # Fires when: ai_answers ILIKE filter present + ICA joined via inspection_report
@@ -439,10 +448,10 @@ REGISTRY: list[dict] = [
             r"(?!.*\bica\.observation_id\b)"                 # correct path absent
         ),
         "message":     (
-            "WRONG PATH: When filtering CAs by observation text (ILIKE), join via "
+            "WRONG PATH: When filtering MAs by observation text (ILIKE), join via "
             "aa.submission_id = ica.observation_id::varchar — NOT via ica.inspection_id = ir.id. "
-            "The inspection join returns ALL CAs in the inspection; the observation_id join "
-            "returns only CAs directly linked to that specific observation."
+            "The inspection join returns ALL MAs in the inspection; the observation_id join "
+            "returns only MAs directly linked to that specific observation."
         ),
     },
 
@@ -454,7 +463,7 @@ REGISTRY: list[dict] = [
         # Narrowed (2026-06-12): only fire when capex_status REJECTED/DEFERRED is
         # used to PRODUCE a capex_lost/capex_converted output column (a SUM/CASE
         # computing loss from capex_status), NOT when it's a plain WHERE filter
-        # for listing/displaying rows (e.g. "capex lost from rejected corrective
+        # for listing/displaying rows (e.g. "capex lost from rejected mitigative
         # actions" — legitimately filters WHERE ica.capex_status = 'REJECTED'
         # to list those rows; capex_status is user-entered/declarative and
         # POs can legitimately exist on REJECTED rows).
@@ -480,6 +489,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_capex_left_join_multiplication",
         "type":        BLOCK,
+        "code":        "CAPEX_LEFT_JOIN_MULT",
         "description": "Direct LEFT JOIN po_details inflates SUM(ica.capex) when one ICA has multiple POs",
         # Must match: SUM(ica.capex) AND LEFT JOIN po_details in the main query
         # but NOT when po_details only appears inside a CTE (WITH ... AS (...po_details...))
@@ -504,6 +514,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_expenditure_as_conversion",
         "type":        BLOCK,
+        "code":        "EXPENDITURE_AS_CONVERSION",
         "description": "expenditure column is a category flag, NOT a conversion indicator",
         "sql_pattern": r"expenditure.*IN.*CAPEX.*converted|converted.*expenditure.*IN.*CAPEX|CASE.*expenditure.*CAPEX.*capex",
         "message":     (
@@ -760,6 +771,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_inspector_not_in_pattern",
         "type":        BLOCK,
+        "code":        "INSPECTOR_NOT_IN_PATTERN",
         "description": "NOT IN (SELECT inspector_user_id) misses new inspectors with zero inspections.",
         # Fires when: query asks about inactive/missing inspectors using NOT IN subquery
         # on inspection_report — this silently excludes brand-new inspectors.
@@ -784,6 +796,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_responsible_fk_join",
         "type":        BLOCK,
+        "code":        "WRONG_JOIN",
         "description": "ica.responsible is a string ENUM — never JOIN it to users.",
         "sql_pattern": r"\bjoin\s+users\b.*?\b(?:responsible|pending_with)\s*=\s*\w+\.id\b",
         "message":     "HALLUCINATION: responsible and pending_with are plain string ENUMs, NOT UUID FKs. Never JOIN them to users. Use: WHERE ica.responsible = 'CLIENT' (uppercase).",
@@ -793,6 +806,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_close_on_arithmetic",
         "type":        BLOCK,
+        "code":        "DEAD_COLUMN",
         "description": "close_on is a DEAD COLUMN (all values NULL, confirmed) — any comparison/arithmetic is meaningless.",
         # Catches arithmetic (+/-), EXTRACT/date_trunc, AND comparisons (>, <, >=, <=, =)
         "sql_pattern": (
@@ -833,10 +847,16 @@ REGISTRY: list[dict] = [
     },
     {
         "id":          "block_hardcoded_year",
-        "type":        BLOCK,
-        "description": "Never hardcode years — use EXTRACT(YEAR FROM CURRENT_DATE).",
+        "type":        WARN,
+        "code":        "HARDCODED_YEAR",
+        "description": (
+            "Hardcoded year — consider EXTRACT(YEAR FROM CURRENT_DATE) for current-year queries. "
+            "SOFT_WARN, not BLOCK: intentional historical-year queries (e.g. 'inspections in 2024') "
+            "are legitimate and must not be hard-rejected — matches core/validator.py's existing, "
+            "deliberate demotion of this same check (see validator.py's HARDCODED_YEAR comment)."
+        ),
         "sql_pattern": r"\bextract\s*\(\s*year\s+from\s+\w[\w.]*\s*\)\s*=\s*20\d\d\b",
-        "message":     "HARDCODED YEAR: Never use '= 20XX'. Always use: EXTRACT(YEAR FROM submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)",
+        "message":     "Hardcoded year '= 20XX' — consider EXTRACT(YEAR FROM CURRENT_DATE) for current-year queries",
     },
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -846,6 +866,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "warn_no_limit",
         "type":        WARN,
+        "code":        "MISSING_LIMIT",
         "description": "Non-aggregate queries without LIMIT can return huge result sets.",
         "sql_pattern": r"^(?!.*\b(COUNT|SUM|AVG|MIN|MAX)\s*\()(?!.*\bLIMIT\b)",
         "message":     "WARNING: No LIMIT on non-aggregate query. Add LIMIT 100.",
@@ -1058,17 +1079,17 @@ REGISTRY: list[dict] = [
         ),
     },
     {
-        "id":             "inject_avg_ca_close_time",
+        "id":             "inject_avg_ma_close_time",
         "type":           INJECT,
         "priority":       85,
-        "description":    "Average time to close corrective action — use target_close_out_date not close_on.",
+        "description":    "Average time to close mitigative action — use target_close_out_date not close_on.",
         "question_pattern": (
             r"\b(average|avg|mean).{0,20}(time|days?|hours?|duration).{0,20}"
-            r"(close|clos|resolv|complet).{0,20}(corrective|action|ca|ica)\b"
+            r"(close|clos|resolv|complet).{0,20}(mitigative|action|ma)\b"
             r"|\b(how.{0,10}long|time.{0,10}taken?).{0,30}(close|clos|resolv)\b"
         ),
         "hint": (
-            "\nAVERAGE TIME TO CLOSE CORRECTIVE ACTION:\n"
+            "\nAVERAGE TIME TO CLOSE MITIGATIVE ACTION:\n"
             "NEVER use close_on — it is NULL on most rows (only set in special workflows).\n"
             "USE target_close_out_date - created_on for the planned close window:\n"
             "SELECT\n"
@@ -1115,14 +1136,14 @@ REGISTRY: list[dict] = [
         ),
     },
     {
-        "id":             "inject_pct_with_ca",
+        "id":             "inject_pct_with_ma",
         "type":           INJECT,
         "priority":       100,
-        "description":    "Percentage of inspections with corrective action — inject exact SQL.",
+        "description":    "Percentage of inspections with mitigative action — inject exact SQL.",
         "question_pattern": (
             r"\b(percentage|percent|pct|proportion|ratio).{0,40}"
-            r"(corrective.?action|mitigative|finding)\b"
-            r"|\b(corrective.?action|mitigative|finding).{0,40}"
+            r"(mitigative|finding)\b"
+            r"|\b(mitigative|finding).{0,40}"
             r"(percentage|percent|pct|proportion|ratio)\b"
         ),
         "hint": (
@@ -1130,7 +1151,7 @@ REGISTRY: list[dict] = [
             "SELECT ROUND(\n"
             "  100.0 * COUNT(DISTINCT CASE WHEN ica.id IS NOT NULL THEN ir.id END)\n"
             "  / NULLIF(COUNT(DISTINCT ir.id), 0), 1\n"
-            ") AS pct_with_corrective_action\n"
+            ") AS pct_with_mitigative_action\n"
             "FROM inspection_report ir\n"
             "LEFT JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id\n"
             f"WHERE ir.{_DRAFT_EXCLUSION};\n"
@@ -1295,25 +1316,25 @@ REGISTRY: list[dict] = [
 
         "type":           INJECT,
         "priority":       87,
-        "description":    "ICA corrective action risk queries — route to risk_level table via UUID FK. Does NOT apply to form observation queries which correctly use ai_answers.",
+        "description":    "ICA mitigative action risk queries — route to risk_level table via UUID FK. Does NOT apply to form observation queries which correctly use ai_answers.",
         "suppresses":     [],
         "question_pattern": (
-            # Only fires for CORRECTIVE ACTION risk queries.
+            # Only fires for MITIGATIVE ACTION risk queries.
             # Form observation queries ("high risk observations") use ai_answers correctly.
             r"\b(high.{0,10}risk|critical.{0,10}risk).{0,30}"
-            r"(corrective.{0,10}action|\bca\b|\bica\b)|"
-            r"\b(corrective.{0,10}action|\bca\b|\bica\b).{0,30}"
+            r"(mitigative.{0,10}action)|"
+            r"\b(mitigative.{0,10}action).{0,30}"
             r"(high.{0,10}risk|critical.{0,10}risk)|"
             r"\b(risk.{0,10}breakdown|breakdown.{0,10}risk|"
             r"risk.{0,10}distribut|risk.{0,10}count|count.{0,10}risk|"
             r"risk.{0,10}by.{0,20}facilit|by.{0,10}risk.{0,10}level)\b"
         ),
         "hint": (
-            "\nICA RISK ROUTING — corrective action risk levels use inspection_corrective_action:\n"
-            "  For risk level COUNTS / BREAKDOWNS on corrective actions:\n"
+            "\nICA RISK ROUTING — mitigative action risk levels use inspection_corrective_action:\n"
+            "  For risk level COUNTS / BREAKDOWNS on mitigative actions:\n"
             "  ALWAYS use the risk_level table via inspection_corrective_action:\n"
             "  NOTE: form 'high risk observations' uses ai_answers correctly — this rule\n"
-            "  only applies to ICA/corrective-action risk queries.\n"
+            "  only applies to mitigative-action risk queries.\n"
             "  ALWAYS use the risk_level table via inspection_corrective_action:\n"
             "  JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
             "  WHERE rl.name = \'High\'   -- or \'Medium\' / \'Low\'\n"
@@ -1335,10 +1356,10 @@ REGISTRY: list[dict] = [
         "priority":       80,
         "description":    "ICA + facility/grouping — prevent varchar=UUID join mismatch.",
         "question_pattern": (
-            r"\b(corrective.?action|capex|opex).{0,50}"
+            r"\b(mitigative.?action|capex|opex).{0,50}"
             r"(facility|client|inspector|type|count|by|group|breakdown)\b"
             r"|\b(facility|client|inspector|type|breakdown).{0,50}"
-            r"(corrective.?action|capex|opex)\b"
+            r"(mitigative.?action|capex|opex)\b"
         ),
         "hint": (
             "\nCRITICAL JOIN — inspection_corrective_action to inspection_report:\n"
@@ -1450,11 +1471,11 @@ REGISTRY: list[dict] = [
         "id":             "inject_raised_vs_closed_quarter",
         "type":           INJECT,
         "priority":       85,
-        "description":    "Raised vs closed corrective actions — must use FILTER, not GROUP BY.",
+        "description":    "Raised vs closed mitigative actions — must use FILTER, not GROUP BY.",
         "question_pattern": (
             r"\b(raised|created|opened).{0,30}(closed|completed|resolved)\b"
             r"|\b(closed|completed|resolved).{0,30}(raised|created|opened)\b"
-            r"|\bhow\s+many.{0,30}corrective.{0,20}(raised|closed|quarter)\b"
+            r"|\bhow\s+many.{0,30}mitigative.{0,20}(raised|closed|quarter)\b"
         ),
         "hint": (
             "\nUSE THIS EXACT SINGLE-ROW FORM — NOT GROUP BY status:\n"
@@ -1582,25 +1603,26 @@ REGISTRY: list[dict] = [
             "  ica.responsible has no FK relationship to users at all.\n"
         ),
     },
-    # CA approval-workflow questions — route to implementation_status, never capex_status
+    # MA approval-workflow questions — route to implementation_status, never capex_status
     {
-        "id":             "inject_ca_approval_workflow",
+        "id":             "inject_ma_approval_workflow",
         "type":           INJECT,
         "priority":       78,
-        "description":    "CA approval/progress questions — implementation_status & progress_stage routing.",
+        "description":    "MA approval/progress questions — implementation_status & progress_stage routing.",
         "question_pattern": (
-            r"(?i)\b(awaiting|pending)\s*(for\s+)?(approval|review)\b"
-            r"|\bapproval\b.{0,30}\b(corrective|action|CA)s?\b"
-            r"|\b(approved|sent\s+back|returned)\b.{0,30}\b(corrective|action|CA)s?\b"
-            r"|\b(at\s+risk|behind\s+schedule|on\s+track|not\s+started)\b.{0,30}\b(corrective|action|CA)s?\b"
-            r"|\b(corrective|action|CA)s?\b.{0,40}\b(at\s+risk|behind|on\s+track|approved?|pending|sent\s+back|returned)\b"
+            r"(?i)\b(awaiting|pending)\s*(for\s+)?(approval|review)\b.{0,40}\b(action|MA)s?\b"
+            r"|\b(action|MA)s?\b.{0,40}\b(awaiting|pending)\s*(for\s+)?(approval|review)\b"
+            r"|\bapproval\b.{0,30}\b(action|MA)s?\b"
+            r"|\b(approved|sent\s+back|returned)\b.{0,30}\b(action|MA)s?\b"
+            r"|\b(at\s+risk|behind\s+schedule|on\s+track|not\s+started)\b.{0,30}\b(action|MA)s?\b"
+            r"|\b(action|MA)s?\b.{0,40}\b(at\s+risk|behind|on\s+track|approved?|pending|sent\s+back|returned)\b"
         ),
         "hint": (
-            "\nCA WORKFLOW ROUTING — four independent ica columns, do not confuse:\n"
+            "\nMA WORKFLOW ROUTING — four independent ica columns, do not confuse:\n"
             "  'awaiting/pending approval/review' → implementation_status = 'PENDING_FOR_REVIEW'\n"
             "      (EXACT string — NOT 'PENDING'. NEVER capex_status — that is the financial track)\n"
             "  'approved'                         → implementation_status = 'APPROVE' (NOT 'APPROVED')\n"
-            "  'sent back / returned' (CAs)       → ica.implementation_status = 'RETURN_FOR_MODIFICATION'\n"
+            "  'sent back / returned' (MAs)       → ica.implementation_status = 'RETURN_FOR_MODIFICATION'\n"
             "  'returned' (INSPECTIONS)           → ir.status = 'RETURN_FOR_MODIFICATION' — different table!\n"
             "  'at risk / behind / on track'      → progress_stage (schedule health)\n"
             "      'at risk' = progress_stage='AT_RISK' — NOT risk_level='High' (severity)\n"
@@ -1620,14 +1642,14 @@ REGISTRY: list[dict] = [
         ),
         "hint": (
             "\nDASHBOARD QUESTION — return ONE ROW of scalar subqueries.\n"
-            "NEVER UNION ALL heterogeneous tables (CA rows + schedule rows) — "
+            "NEVER UNION ALL heterogeneous tables (MA rows + schedule rows) — "
             "'N/A' placeholders clash with date/enum column types and fail at runtime.\n\n"
             "USE THIS PATTERN:\n"
             "SELECT\n"
             "    (SELECT COUNT(*) FROM inspection_corrective_action\n"
-            "     WHERE status = 'OVERDUE' AND active = true)  AS overdue_corrective_actions,\n"
+            "     WHERE status = 'OVERDUE' AND active = true)  AS overdue_mitigative_actions,\n"
             "    (SELECT COUNT(*) FROM inspection_corrective_action\n"
-            "     WHERE status = 'OPEN' AND active = true)     AS open_corrective_actions,\n"
+            "     WHERE status = 'OPEN' AND active = true)     AS open_mitigative_actions,\n"
             "    (SELECT COUNT(*) FROM inspection_schedule\n"
             "     WHERE status = 'OVERDUE')                    AS overdue_scheduled_inspections,\n"
             "    (SELECT COUNT(*) FROM inspection_corrective_action ica\n"
@@ -1690,11 +1712,11 @@ REGISTRY: list[dict] = [
         "priority":       95,
         "description":    "ICA risk level queries — ALWAYS JOIN risk_level table, never select UUID.",
         "question_pattern": (
-            # Must mention corrective action, ICA, or risk breakdown in context of actions/counts
-            r"\b(high|medium|low)\s*risk\s*(corrective.?action|action|count|breakdown|all\s+corrective)\b"
-            r"|\b(corrective.?action|ica).{0,40}(risk|high.?risk|medium.?risk|low.?risk)\b"
-            r"|\brisk.?level.{0,30}(corrective|action|breakdown|all\s+corrective)\b"
-            r"|\b(how\s+many|count|show|list).{0,20}(high|medium|low)\s*risk\s*(corrective|action)\b"
+            # Must mention mitigative action or risk breakdown in context of actions/counts
+            r"\b(high|medium|low)\s*risk\s*(mitigative.?action|action|count|breakdown|all\s+mitigative)\b"
+            r"|\b(mitigative.?action).{0,40}(risk|high.?risk|medium.?risk|low.?risk)\b"
+            r"|\brisk.?level.{0,30}(mitigative|action|breakdown|all\s+mitigative)\b"
+            r"|\b(how\s+many|count|show|list).{0,20}(high|medium|low)\s*risk\s*(mitigative|action)\b"
         ),
         "hint": (
             "\nICA RISK LEVEL — risk_level_id is a UUID FK, NEVER a string:\n"
@@ -1917,24 +1939,21 @@ REGISTRY: list[dict] = [
 
 # ── RulesEngine ────────────────────────────────────────────────────────────────
 
-@dataclass
-class RuleMatch:
-    rule_id:  str
-    rule_type: str
-    message:  str
-    fix:      Optional[str] = None
-
-
 class RulesEngine:
     """
     Loads and applies the business rules registry.
 
     Usage
     -----
-    engine = RulesEngine()                       # validates registry at init
-    errors  = engine.validate_sql(sql)           # BLOCK + WARN rules
-    sql     = engine.autocorrect_sql(sql)        # AUTOCORRECT rules
-    hint    = engine.hint_for_question(question) # INJECT rules
+    engine = RulesEngine()                            # validates registry at init
+    hint    = engine.hint_for_question(question)       # INJECT rules
+    ids     = engine.matching_inject_ids(question)
+    tables  = engine.required_tables_for(rule_ids)
+    forbidden = engine.forbidden_patterns_for(rule_ids)
+
+    BLOCK/WARN/AUTOCORRECT rules are consumed by core/validator.py's
+    SQLValidator (_registry_block_warn_issues / _registry_autocorrects),
+    restricted to an explicit allowlist — not through this class directly.
     """
 
     def __init__(self, rules: list[dict] | None = None):
@@ -2015,67 +2034,6 @@ class RulesEngine:
         self._warn_rules   = [r for r in self._compiled if r["type"] == WARN]
         self._autocorr_rules = [r for r in self._compiled if r["type"] == AUTOCORRECT]
 
-    # ── SQL validation ────────────────────────────────────────────────────────
-
-    def validate_sql(self, sql: str, question: str = "") -> tuple[bool, list[str]]:
-        """
-        Apply BLOCK and WARN rules to the given SQL.
-        Returns (passed, [error/warning strings]).
-        Real errors (BLOCK) cause passed=False.
-
-        question — optional user question text. When provided, BLOCK rules with a
-                   question_pattern will only fire if that pattern matches the question.
-                   Allows context-sensitive rules (e.g. INTERVAL '30 days' is only wrong
-                   when user asked about 'this month', not when they said 'last 30 days').
-        """
-        errors: list[str] = []
-        sql_lower = sql.lower()
-        q_lower = question.lower() if question else ""
-
-        for rule in self._block_rules:
-            pattern_re: re.Pattern = rule["_sql_re"]
-            # Optional table_guard: rule only fires if a specific table is present
-            guard = rule.get("table_guard")
-            if guard and guard.lower() not in sql_lower:
-                continue
-            # Optional question_pattern: rule only fires if question matches.
-            # If question is empty/unknown, skip question_pattern rules entirely —
-            # we have no context to evaluate them, so don't block.
-            q_pat = rule.get("_q_re")
-            if q_pat:
-                if not q_lower or not q_pat.search(q_lower):
-                    continue
-            if pattern_re.search(sql):
-                errors.append(rule["message"])
-
-        warnings: list[str] = []
-        for rule in self._warn_rules:
-            pattern_re = rule["_sql_re"]
-            guard = rule.get("table_guard")
-            if guard and guard.lower() not in sql_lower:
-                continue
-            if pattern_re.search(sql):
-                warnings.append(rule["message"])
-
-        all_messages = errors + warnings
-        return len(errors) == 0, all_messages
-
-    # ── SQL autocorrection ────────────────────────────────────────────────────
-
-    def autocorrect_sql(self, sql: str) -> tuple[str, list[str]]:
-        """
-        Apply AUTOCORRECT rules to the given SQL.
-        Returns (corrected_sql, [log_messages]).
-        """
-        logs: list[str] = []
-        for rule in self._autocorr_rules:
-            pattern_re: re.Pattern = rule["_sql_re"]
-            replacement = rule.get("replacement", "")
-            if pattern_re.search(sql):
-                sql = pattern_re.sub(replacement, sql)
-                logs.append(rule.get("message", f"[autocorrect] applied rule '{rule['id']}'"))
-        return sql, logs
-
     # ── Question-level hint injection ─────────────────────────────────────────
 
     def hint_for_question(self, question: str) -> str:
@@ -2107,12 +2065,6 @@ class RulesEngine:
 
     def rules_by_type(self, rule_type: str) -> list[dict]:
         return [r for r in self._rules if r["type"] == rule_type]
-
-    def get_rule(self, rule_id: str) -> dict | None:
-        for r in self._rules:
-            if r["id"] == rule_id:
-                return r
-        return None
 
     def required_tables_for(self, rule_ids: list) -> list:
         """Return all required_tables for a set of fired INJECT rule IDs."""

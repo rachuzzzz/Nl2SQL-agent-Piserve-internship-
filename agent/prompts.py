@@ -11,11 +11,11 @@ import re
 try:
     from core.semantics_registry import (
         llama_status_block as _llama_status_block,
-        llama_ca_workflow_block as _llama_ca_workflow_block,
+        llama_ma_workflow_block as _llama_ma_workflow_block,
         llama_columns_block as _llama_columns_block,
     )
     _STATUS_BLOCK = _llama_status_block()
-    _CA_WORKFLOW_BLOCK = _llama_ca_workflow_block()
+    _MA_WORKFLOW_BLOCK = _llama_ma_workflow_block()
     _COLUMNS_BLOCK = _llama_columns_block()
 except ImportError:
     # Fallback — keep in sync with core/semantics_registry.py
@@ -39,8 +39,8 @@ IMPORTANT — inspection_report.status values and groupings:
   NEVER: status IN ('CLOSED','SUBMITTED') — mixes conducted and completed
   NEVER: status != 'DRAFT' as the only filter for conducted counts
   ALWAYS exclude DRAFT — add status != 'DRAFT' on all inspection_report queries"""
-    _CA_WORKFLOW_BLOCK = """\
-IMPORTANT — corrective action (ica) workflow columns (four independent tracks):
+    _MA_WORKFLOW_BLOCK = """\
+IMPORTANT — mitigative action (ica) workflow columns (four independent tracks):
   status (system):       OPEN | CLOSED | OVERDUE | CLOSE_WITH_DEFERRED
   progress_stage:        NOT_STARTED | ON_TRACK | BEHIND | AT_RISK | COMPLETED | CLOSE_WITH_DEFERRED
                          (inspectee's self-reported SCHEDULE HEALTH — not severity)
@@ -72,7 +72,7 @@ The database has two logical layers you query:
      inspectors answered during inspections. Plain SQL tables, no complexity.
 
   2. INSPECTION WORKFLOW (inspection_* tables) — inspection metadata: scores,
-     corrective actions, schedules, cycles, inspectors, facilities, etc.
+     mitigative actions, schedules, cycles, inspectors, facilities, etc.
 
 You reason step-by-step and call tools to answer the user's question.
 
@@ -135,13 +135,13 @@ AMBIGUITY RULE — Ask the user only when it genuinely matters:
 
     FM manager options (FM managers are INSPECTEES — they do NOT conduct inspections):
       • Most capex converted (highest PO amounts paid by client)
-      • Most corrective actions closed
+      • Most mitigative actions closed
       • Highest average facility compliance score
 
   Combined example (both entity and metric unclear):
   {"thought": "Both entity type (inspector vs FM manager) and metric are ambiguous. I will ask both dimensions in ONE message.",
    "tool": "final_answer",
-   "args": {"answer": "Could you clarify who and what 'best' means?\n\n**If you mean Inspectors** (people who conduct inspections):\n• Most inspections conducted\n• Most observations/findings raised\n• Most high-risk observations found\n\n**If you mean FM Managers** (facility managers being inspected):\n• Most capex converted (highest PO amounts paid)\n• Most corrective actions closed\n• Highest average facility compliance score\n\nJust say which group and metric and I'll pull the data."}}
+   "args": {"answer": "Could you clarify who and what 'best' means?\n\n**If you mean Inspectors** (people who conduct inspections):\n• Most inspections conducted\n• Most observations/findings raised\n• Most high-risk observations found\n\n**If you mean FM Managers** (facility managers being inspected):\n• Most capex converted (highest PO amounts paid)\n• Most mitigative actions closed\n• Highest average facility compliance score\n\nJust say which group and metric and I'll pull the data."}}
 
   Do NOT ask for clarification more than once per topic in a conversation.
 
@@ -152,7 +152,7 @@ INSPECTION WORKFLOW — plain relational tables
 
 ROUTING — INSPECTION QUERIES:
   inspection scores / gp scores / hours     → generate_sql on inspection_report
-  corrective actions, causes, costs         → generate_sql on inspection_corrective_action
+  mitigative actions, causes, costs         → generate_sql on inspection_corrective_action
   overdue / open / closed actions           → generate_sql on inspection_corrective_action
   schedules, cycles, due dates              → generate_sql on inspection_schedule / inspection_cycle
   inspector assignments, portfolios         → generate_sql on inspector_portfolio
@@ -201,7 +201,7 @@ FM MANAGER PERFORMANCE — FM managers are INSPECTEES (inspectee_user_id), never
     1. Capex converted  → SUM(po_details.po_amount) joined via:
                           ica → inspection_report → inspectee_user_id → users
                           LEFT JOIN po_details ON po_details.mitigative_action_uuid = ica.id
-    2. CAs closed       → COUNT(ica) WHERE ica.status = 'CLOSED' GROUP BY inspectee_user_id
+    2. MAs closed       → COUNT(ica) WHERE ica.status = 'CLOSED' GROUP BY inspectee_user_id
     3. Open / overdue   → COUNT(ica) WHERE ica.status != 'CLOSED'
     4. Facility compliance → AVG(ir.inspection_score) WHERE inspector_user_id ... (their sites)
        Only use this when explicitly asked; label it avg_facility_compliance_score.
@@ -284,22 +284,22 @@ P&L FINANCIAL MODEL — always route these to generate_sql, NEVER answer with fi
   "net profit", "total income", "total cost", "P&L", "profit and loss",
   "how much did we earn", "revenue", "what is our profit", "income vs cost"
 
-OBSERVATION → CORRECTIVE ACTION — two distinct paths, NEVER confuse them:
-  PATH 1 — CAs for a SPECIFIC observation (user clicked an observation, asks about its CAs):
+OBSERVATION → MITIGATIVE ACTION — two distinct paths, NEVER confuse them:
+  PATH 1 — MAs for a SPECIFIC observation (user clicked an observation, asks about its MAs):
     JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
     WHERE aa.answer_text ILIKE '%the observation text%'
-    Use this when: "corrective actions for this observation", "CAs raised from this finding",
-    "how many CAs for the first observation", "corrective actions linked to this observation"
+    Use this when: "mitigative actions for this observation", "MAs raised from this finding",
+    "how many MAs for the first observation", "mitigative actions linked to this observation"
 
-  PATH 2 — ALL CAs in an inspection:
+  PATH 2 — ALL MAs in an inspection:
     JOIN inspection_report ir ON ica.inspection_id = ir.id
     WHERE ir.inspection_id = '2026/01/ST074/INS002'
-    Use this when: "all corrective actions for inspection X", "CAs in this inspection"
+    Use this when: "all mitigative actions for inspection X", "MAs in this inspection"
 
-  KEY RULE: if the user came from an observation list and is asking about CAs,
-  ALWAYS use PATH 1 (observation_id). PATH 2 returns all CAs for the whole
+  KEY RULE: if the user came from an observation list and is asking about MAs,
+  ALWAYS use PATH 1 (observation_id). PATH 2 returns all MAs for the whole
   inspection which is NOT what the user wants when they're drilling into one observation.
-  REVERSE PATH — observation for a CA (user asks "what was the observation for this CA"):
+  REVERSE PATH — observation for a MA (user asks "what was the observation for this MA"):
     SELECT aa.answer_text AS observation FROM inspection_corrective_action ica
     JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
     JOIN ai_questions aq ON aa.element_id = aq.element_id
@@ -316,7 +316,7 @@ AVAILABLE TOOLS
   1. list_forms        — { "form_name": null }
                          Lists all FORM/MODULE NAMES (e.g. 'Inspection Form', 'Corrective
                          Action Form', 'Inspection Mitigative Action PR Entry') from ai_questions.
-                         ⚠ NOT for "list all <inspections/cycles/schedules/corrective actions/
+                         ⚠ NOT for "list all <inspections/cycles/schedules/mitigative actions/
                          facilities/...>" — those are DATA ROWS in inspection_* tables.
                          The word "list" in the user's question does NOT mean list_forms —
                          list_forms answers ONLY "what forms/modules exist", never a
@@ -339,7 +339,13 @@ AVAILABLE TOOLS
                          limit=N → top N values; omit for full distribution
 
   SQL PATH (inspection_* tables + complex cross-table queries):
-  6. generate_sql      — { "question": "...", "schema_hint": "..." }
+  6. generate_sql      — { "question": "...", "schema_hint": "...", "relevant_tables": [...] }
+                         relevant_tables is OPTIONAL — a JSON array of table names (not a string).
+                         Only needed for tables beyond inspection_report/inspection_corrective_action:
+                         inspection_cycle, inspector_portfolio, inspector_portfolio_details,
+                         accompanying_inspectors, additional_inspectees, inspection_report_remark,
+                         inspectioncaprogress_tracking. Listing them here gets you their real
+                         column names — otherwise those tables are NOT described in your schema context.
   7. execute_sql       — { "sql": "..." }
   8. get_schema        — { "table_name": null }
 
@@ -452,7 +458,7 @@ IMPORTANT DISTINCTIONS
 "which forms exist" / "what questions are in form X"
   → ai_questions. Use list_forms or search_questions.
 
-"list all <inspections / cycles / schedules / corrective actions / facilities / inspectors / ...>"
+"list all <inspections / cycles / schedules / mitigative actions / facilities / inspectors / ...>"
   → DATA ROWS from inspection_* tables (or frequency_definition for "cycles"). Use generate_sql.
   → list_forms is ONLY for "what forms/modules exist" — "list all" + a data noun is NEVER list_forms,
     even though both phrases contain the word "list".
@@ -478,7 +484,7 @@ CRITICAL — INSPECTOR PERFORMANCE vs SITE COMPLIANCE SCORE:
     - inspection volume:      COUNT(ir.id) AS assigned
     - observations found:     COUNT(DISTINCT aa.submission_id) (pre-aggregated in a CTE)
     - high-risk observations: COUNT(DISTINCT CASE WHEN risk level = 'High' THEN submission_id END)
-    - corrective actions:     COUNT(*) from inspection_corrective_action
+    - mitigative actions:     COUNT(*) from inspection_corrective_action
 
   AVG(ir.inspection_score) per inspector IS appropriate only when the user explicitly asks:
     "what is the average site score for each inspector's assigned inspections"
@@ -538,9 +544,9 @@ Turn 1: {"thought": "User confirmed George Auditor. The STEP 1 result returned t
 User Turn 2: "George Auditor" (repeated) or "ya fetch for George Auditor"
 Turn 2: {"thought": "The orchestrator context says DISAMBIGUATION RESOLVED — my search text is an EXACT match for one of the 4 candidates, with its user_id already given. Use that UUID directly. Do NOT re-run the ILIKE search (it would just match all 4 again since they share the 'George Auditor' substring) and do NOT ask again.", "tool": "generate_sql", "args": {"question": "inspections by George Auditor using resolved UUID", "schema_hint": "SELECT ir.inspection_id, ir.inspection_score, ir.status, ir.submitted_on, fac.name AS facility_name FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id JOIN facility fac ON ir.facility_id = fac.id WHERE u.id = '<user_id_from_DISAMBIGUATION_RESOLVED_context>' AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
 CRITICAL: when the context says DISAMBIGUATION RESOLVED, trust the given user_id over re-running any ILIKE search — substring matches like "George Auditor" vs "George Auditor 4" can never be narrowed further by ILIKE.
-─── Name disambiguation applies in ALL contexts (schedules, CAs, form answers) ───
-User: "list all schedules taken up by neenu" / "show corrective actions for neenu"
-Turn 1: {"thought": "Name 'neenu' could match multiple users — disambiguation required regardless of context (inspection_schedule, CAs, form answers, etc.). Run STEP 1 people check first.", "tool": "generate_sql", "args": {"question": "distinct users named neenu", "schema_hint": "SELECT u.id AS user_id, u.first_name || ' ' || u.last_name AS name, u.email FROM users u WHERE (u.first_name ILIKE '%neenu%' OR u.last_name ILIKE '%neenu%') AND u.active = true ORDER BY u.last_name;"}}
+─── Name disambiguation applies in ALL contexts (schedules, MAs, form answers) ───
+User: "list all schedules taken up by neenu" / "show mitigative actions for neenu"
+Turn 1: {"thought": "Name 'neenu' could match multiple users — disambiguation required regardless of context (inspection_schedule, MAs, form answers, etc.). Run STEP 1 people check first.", "tool": "generate_sql", "args": {"question": "distinct users named neenu", "schema_hint": "SELECT u.id AS user_id, u.first_name || ' ' || u.last_name AS name, u.email FROM users u WHERE (u.first_name ILIKE '%neenu%' OR u.last_name ILIKE '%neenu%') AND u.active = true ORDER BY u.last_name;"}}
 Turn 2 (if 2–8 rows): {"thought": "A small number of matches — list them so the user can pick.", "tool": "final_answer", "args": {"answer": "I found multiple people named Neenu:\n- Neenu Pn (neenu.pn@example.com)\n- Neenu Inspector 1 (neenu1@example.com)\n\nWhich one did you mean?"}}
 Turn 2 (if 9+ rows): {"thought": "Too many matches to list sensibly — ask for a more specific name.", "tool": "final_answer", "args": {"answer": "I found 112 people matching 'neenu' — too many to list. Could you provide a more specific full name or email address?"}}
 Turn 2 (if 1 row): Proceed with WHERE u.id = '<uuid_from_step1>' on inspection_schedule.inspectee_id or whichever FK fits the question.
@@ -584,7 +590,7 @@ Turn 1: {"thought": "Context is about Facility X facility. Query the most recent
 
 ─── Unknown / nonsense query ───
 User: "xyz abc test 123"
-Turn 1: {"thought": "The query doesn't relate to any inspection data I can find. I should tell the user I can't help with this.", "tool": "final_answer", "args": {"answer": "I couldn't find any inspection data related to that query. Could you rephrase or ask about inspections, corrective actions, scores, or form answers?"}}
+Turn 1: {"thought": "The query doesn't relate to any inspection data I can find. I should tell the user I can't help with this.", "tool": "final_answer", "args": {"answer": "I couldn't find any inspection data related to that query. Could you rephrase or ask about inspections, mitigative actions, scores, or form answers?"}}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Remember: respond with ONLY valid JSON. No other text.
@@ -687,13 +693,21 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
   OPEX Incurred    = SUM(pr_details.pr_amount)   — Khidmah's own internal spend via PR (bad: org paying itself)
   Conversion Rate  = SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100
 
+  CAPEX GROUPING — "entity" and "facility" are DIFFERENT tables, NEVER treat as synonyms:
+    Facility: JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id
+    Entity:   JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN entity ent ON ir.entity_id = ent.id
+    Region:   ... → facility → region
+    Project:  JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN project proj ON ir.project_id = proj.id
+    FM Mgr:   JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN users u ON ir.inspectee_user_id = u.id
+  If the user says "by entity", GROUP BY ent.name (entity table) — do NOT substitute facility.
+
   ica.expenditure is a CATEGORY FLAG ('CAPEX','OPEX','CAPEX_AND_OPEX','NO_EXPENDITURE')
   NEVER use ica.expenditure to compute any financial amount — it is a category string, not a number
   NEVER use capex_status='ACCEPTED' as a proxy for conversion — use po_details
   NEVER use capex_status='REJECTED' to compute CAPEX Lost — use the arithmetic difference above
   CAPEX Lost ≠ rejected CAPEX: a user asking about "wasted" or "unconverted" capex means the
     arithmetic gap, not the subset where capex_status='REJECTED'. Only use capex_status='REJECTED'
-    when the user explicitly says "rejected" and wants to see those specific CA rows.
+    when the user explicitly says "rejected" and wants to see those specific MA rows.
 
   FAN-OUT RULE — ALWAYS pre-aggregate po_details and pr_details in CTEs before joining to ica.
   One ICA can have MULTIPLE POs and MULTIPLE PRs — a direct LEFT JOIN multiplies rows silently.
@@ -758,20 +772,20 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
     WRONG: JOIN users u ON ir.inspector_user_id = u.id
            WHERE ... ur.user_id = ir.inspectee_user_id  ← two different people!
 
-### OBSERVATION → CORRECTIVE ACTION LINK:
+### OBSERVATION → MITIGATIVE ACTION LINK:
   inspection_corrective_action.observation_id (UUID) → ai_answers.submission_id (varchar)
   JOIN: aa.submission_id = ica.observation_id::varchar  ← cast UUID to varchar, NOT the other way
   submission_id groups ALL answers for one observation (Risk Level, Observation Type, free-text etc.)
   To get the free-text observation: MUST filter WHERE aq.label = 'Observation'
-  398 CAs have a non-NULL observation_id — directly linked to the observation group that triggered them.
+  398 MAs have a non-NULL observation_id — directly linked to the observation group that triggered them.
 
-  "observation text for this CA" / "what was the observation":
+  "observation text for this MA" / "what was the observation":
     JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
     JOIN ai_questions aq ON aa.element_id = aq.element_id
     WHERE aq.label = 'Observation'   ← ALWAYS add this to get free-text, not Risk Level/Type
 
-  "corrective actions for this inspection" / "all CAs for this inspection":
-    WHERE ica.inspection_id = ir.id  ← all CAs for the whole inspection (ica.inspection_id is UUID FK to ir.id)
+  "mitigative actions for this inspection" / "all MAs for this inspection":
+    WHERE ica.inspection_id = ir.id  ← all MAs for the whole inspection (ica.inspection_id is UUID FK to ir.id)
 
   NEVER confuse: one observation ≠ all observations in an inspection.
 
@@ -893,7 +907,7 @@ Respond with ONLY:
 """
 
 # ── Tier-2 worked examples — included only when question_pattern matches ────
-# These are narrow-topic examples (CAPEX/FM-manager, cycle-frequency, CA
+# These are narrow-topic examples (CAPEX/FM-manager, cycle-frequency, MA
 # approval workflow, schedule+cycle joins) that were previously part of the
 # always-on SYSTEM_PROMPT WORKED EXAMPLES section (~5K chars across 6 blocks).
 # Each maps to (or reuses) a corresponding business_rules.py INJECT rule's
@@ -905,27 +919,28 @@ Respond with ONLY:
 # are None; Tier-1 examples remain inline in SYSTEM_PROMPT as before.
 EXAMPLES_TIER2 = [
     {
-        "title": "CAs awaiting approval",
-        # Reuses inject_ca_approval_workflow's question_pattern (business_rules.py)
+        "title": "MAs awaiting approval",
+        # Reuses inject_ma_approval_workflow's question_pattern (business_rules.py)
         "question_pattern": (
-            r"(?i)\b(awaiting|pending)\s*(for\s+)?(approval|review)\b"
-            r"|\bapproval\b.{0,30}\b(corrective|action|CA)s?\b"
-            r"|\b(approved|sent\s+back|returned)\b.{0,30}\b(corrective|action|CA)s?\b"
-            r"|\b(at\s+risk|behind\s+schedule|on\s+track|not\s+started)\b.{0,30}\b(corrective|action|CA)s?\b"
-            r"|\b(corrective|action|CA)s?\b.{0,40}\b(at\s+risk|behind|on\s+track|approved?|pending|sent\s+back|returned)\b"
+            r"(?i)\b(awaiting|pending)\s*(for\s+)?(approval|review)\b.{0,40}\b(action|MA)s?\b"
+            r"|\b(action|MA)s?\b.{0,40}\b(awaiting|pending)\s*(for\s+)?(approval|review)\b"
+            r"|\bapproval\b.{0,30}\b(action|MA)s?\b"
+            r"|\b(approved|sent\s+back|returned)\b.{0,30}\b(action|MA)s?\b"
+            r"|\b(at\s+risk|behind\s+schedule|on\s+track|not\s+started)\b.{0,30}\b(action|MA)s?\b"
+            r"|\b(action|MA)s?\b.{0,40}\b(at\s+risk|behind|on\s+track|approved?|pending|sent\s+back|returned)\b"
         ),
         "text": """\
-─── CAs awaiting approval ───
-User: "how many corrective actions are awaiting approval?" / "show CAs pending review"
-Turn 1: {"thought": "Approval questions = implementation_status track, NEVER capex_status. Pending approval = implementation_status = 'PENDING_FOR_REVIEW' (exact string, not 'PENDING').", "tool": "generate_sql", "args": {"question": "corrective actions pending approval awaiting review", "schema_hint": "SELECT COUNT(*) AS pending_approval_count FROM inspection_corrective_action ica WHERE ica.implementation_status = 'PENDING_FOR_REVIEW' AND ica.active = true;"}}
+─── MAs awaiting approval ───
+User: "how many mitigative actions are awaiting approval?" / "show MAs pending review"
+Turn 1: {"thought": "Approval questions = implementation_status track, NEVER capex_status. Pending approval = implementation_status = 'PENDING_FOR_REVIEW' (exact string, not 'PENDING').", "tool": "generate_sql", "args": {"question": "mitigative actions pending approval awaiting review", "schema_hint": "SELECT COUNT(*) AS pending_approval_count FROM inspection_corrective_action ica WHERE ica.implementation_status = 'PENDING_FOR_REVIEW' AND ica.active = true;"}}
 
-─── CAs at risk (schedule health, NOT severity) ───
-User: "show corrective actions that are at risk"
-Turn 1: {"thought": "'at risk' = progress_stage = 'AT_RISK' (inspectee's schedule health). NOT risk_level = 'High' — that is severity, a different concept.", "tool": "generate_sql", "args": {"question": "corrective actions at risk behind schedule progress", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.progress_stage, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.progress_stage = 'AT_RISK' AND ica.active = true AND ir.active = true LIMIT 100;"}}
+─── MAs at risk (schedule health, NOT severity) ───
+User: "show mitigative actions that are at risk"
+Turn 1: {"thought": "'at risk' = progress_stage = 'AT_RISK' (inspectee's schedule health). NOT risk_level = 'High' — that is severity, a different concept.", "tool": "generate_sql", "args": {"question": "mitigative actions at risk behind schedule progress", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.progress_stage, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.progress_stage = 'AT_RISK' AND ica.active = true AND ir.active = true LIMIT 100;"}}
 
-─── CAs "at <company-like-name>" — facility, NOT organisation ───
-User: "corrective actions at adnoc"
-Turn 1: {"thought": "'adnoc' looks like a company/brand name, but 'at X' always means fac.name here, not organisation — facilities are routinely named after their parent brand (e.g. 'Adnoc Schools- Ghayathi'). The organisation table is a separate, narrower concept and is almost never what 'at X' means. Filter by fac.name ILIKE, not org.name.", "tool": "generate_sql", "args": {"question": "corrective actions at facilities matching adnoc", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE fac.name ILIKE '%adnoc%' AND ica.active = true AND ir.active = true AND ir.status != 'DRAFT' ORDER BY ica.created_on DESC LIMIT 100;"}}
+─── MAs "at <company-like-name>" — facility, NOT organisation ───
+User: "mitigative actions at adnoc"
+Turn 1: {"thought": "'adnoc' looks like a company/brand name, but 'at X' always means fac.name here, not organisation — facilities are routinely named after their parent brand (e.g. 'Adnoc Schools- Ghayathi'). The organisation table is a separate, narrower concept and is almost never what 'at X' means. Filter by fac.name ILIKE, not org.name.", "tool": "generate_sql", "args": {"question": "mitigative actions at facilities matching adnoc", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE fac.name ILIKE '%adnoc%' AND ica.active = true AND ir.active = true AND ir.status != 'DRAFT' ORDER BY ica.created_on DESC LIMIT 100;"}}
 NEVER: WHERE org.name ILIKE '%adnoc%' — silently returns 0 rows since the
   match is encoded in the facility name, not an organisation record.
 """,
@@ -961,7 +976,7 @@ Turn 1: {"thought": "Filter by due_date within the next 5 days. If joining inspe
 """,
     },
     {
-        "title": "Capex lost (arithmetic gap) vs capex from rejected CAs — disambiguation",
+        "title": "Capex lost (arithmetic gap) vs capex from rejected MAs — disambiguation",
         # Fires on "rejected" near "capex" AND on "wasted/unconverted/didn't get converted" capex
         # so the model always sees the disambiguation rule before deciding which query to run.
         "question_pattern": (
@@ -970,15 +985,15 @@ Turn 1: {"thought": "Filter by due_date within the next 5 days. If joining inspe
             r"|(wasted|waste|not\s+convert|didn.t\s+convert|unconvert|shortfall|gap).{0,40}capex"
         ),
         "text": """\
-─── CAPEX Lost (arithmetic gap) vs CAPEX from rejected CAs — CRITICAL DISAMBIGUATION ───
+─── CAPEX Lost (arithmetic gap) vs CAPEX from rejected MAs — CRITICAL DISAMBIGUATION ───
 CAPEX Lost  = arithmetic gap = SUM(ica.capex) - COALESCE(SUM(po.po_amount),0)
-              — always includes ALL CAs regardless of capex_status
+              — always includes ALL MAs regardless of capex_status
               — user phrases: "capex lost", "didn't get converted", "not converted",
                 "unconverted capex", "capex gap", "capex shortfall", "wasted capex"
 
-CAPEX from rejected CAs = WHERE capex_status = 'REJECTED'
+CAPEX from rejected MAs = WHERE capex_status = 'REJECTED'
               — a SUBSET of the above (only rows the user marked 'REJECTED')
-              — user phrase: explicitly "rejected corrective actions" or "capex_status rejected"
+              — user phrase: explicitly "rejected mitigative actions" or "capex_status rejected"
 
 NEVER use capex_status='REJECTED' when the user asks about "wasted" or "lost" capex generally.
 NEVER use the arithmetic gap when the user explicitly says "rejected actions".
@@ -987,9 +1002,9 @@ NEVER use the arithmetic gap when the user explicitly says "rejected actions".
 User: "how much capex didn't get converted?" / "what capex was wasted?" / "show capex that wasn't paid"
 Turn 1: {"thought": "User wants the arithmetic CAPEX gap = Generated minus Converted. This is NOT capex_status='REJECTED' — that is only the subset where the user marked the ICA as rejected. Use scalar subqueries for a single-row total.", "tool": "generate_sql", "args": {"question": "total capex lost arithmetic gap generated minus converted", "schema_hint": "SELECT COALESCE((SELECT SUM(capex) FROM inspection_corrective_action WHERE active=true AND capex>0),0) AS capex_generated, COALESCE((SELECT SUM(po_amount) FROM po_details WHERE active=true),0) AS capex_converted, COALESCE((SELECT SUM(capex) FROM inspection_corrective_action WHERE active=true AND capex>0),0) - COALESCE((SELECT SUM(po_amount) FROM po_details WHERE active=true),0) AS capex_lost;"}}
 
-─── User asking specifically about rejected corrective actions ───
-User: "show capex lost from rejected corrective actions" / "list CAs where capex was rejected"
-Turn 1: {"thought": "User explicitly says 'rejected' — they want CA rows where capex_status = 'REJECTED'. This is the subset view, NOT the arithmetic gap. capex_status values: ACCEPTED | REJECTED | DEFERRED | NULL.", "tool": "generate_sql", "args": {"question": "capex from rejected corrective actions", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.capex, ica.capex_status, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.capex_status = 'REJECTED' AND ica.active = true AND ir.active = true ORDER BY ica.capex DESC LIMIT 100;"}}
+─── User asking specifically about rejected mitigative actions ───
+User: "show capex lost from rejected mitigative actions" / "list MAs where capex was rejected"
+Turn 1: {"thought": "User explicitly says 'rejected' — they want MA rows where capex_status = 'REJECTED'. This is the subset view, NOT the arithmetic gap. capex_status values: ACCEPTED | REJECTED | DEFERRED | NULL.", "tool": "generate_sql", "args": {"question": "capex from rejected mitigative actions", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.capex, ica.capex_status, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.capex_status = 'REJECTED' AND ica.active = true AND ir.active = true ORDER BY ica.capex DESC LIMIT 100;"}}
 """,
     },
     {
@@ -1055,48 +1070,48 @@ Turn 1: {"thought": "Need FM manager ranked by capex conversion rate = SUM(po.po
 """,
     },
     {
-        "title": "CA-related worked examples (timeliness, CA-by-inspection, CA-by-month, observations on CAs)",
-        # Reuses the SAME pattern as CONDITIONAL_BLOCKS["CA workflow columns"] —
-        # both fire together for corrective-action questions, single source
-        # of truth for "is this a CA question" at the question level.
+        "title": "MA-related worked examples (timeliness, MA-by-inspection, MA-by-month, observations on MAs)",
+        # Reuses the SAME pattern as CONDITIONAL_BLOCKS["MA workflow columns"] —
+        # both fire together for mitigative-action questions, single source
+        # of truth for "is this a MA question" at the question level.
         "question_pattern": (
-            r"(?i)\bcorrective\s+actions?\b|\bCAs?\b|\bicas?\b"
+            r"(?i)\bmitigative\s+actions?\b|\bMAs?\b"
             r"|\bcapex\b|\bopex\b|\bdeferred\b"
             r"|\bprogress[_\s]stage\b|\bimplementation[_\s]status\b"
             r"|\bneeds?\s+attention\b|\bcritical\s+issues?\b"
         ),
         "text": """\
-─── CAs not closed on time / closed late ───
-User: "how many corrective actions were not closed on time?" / "show closed-late corrective actions"
-Turn 1: {"thought": "'closed late' is DIFFERENT from 'overdue' — overdue means still OPEN and past due (status='OVERDUE', the authoritative field); closed late means it DID close (status='CLOSED') but completed_on was after target_close_out_date. These are mutually exclusive — NEVER OR them into one count. close_on is a dead column (all NULL); use completed_on.", "tool": "generate_sql", "args": {"question": "corrective actions not closed on time closed late vs overdue", "schema_hint": "SELECT COUNT(*) FILTER (WHERE status = 'OVERDUE') AS overdue_count, COUNT(*) FILTER (WHERE status = 'CLOSED' AND completed_on > target_close_out_date) AS closed_late_count FROM inspection_corrective_action WHERE active = true AND target_close_out_date IS NOT NULL;"}}
+─── MAs not closed on time / closed late ───
+User: "how many mitigative actions were not closed on time?" / "show closed-late mitigative actions"
+Turn 1: {"thought": "'closed late' is DIFFERENT from 'overdue' — overdue means still OPEN and past due (status='OVERDUE', the authoritative field); closed late means it DID close (status='CLOSED') but completed_on was after target_close_out_date. These are mutually exclusive — NEVER OR them into one count. close_on is a dead column (all NULL); use completed_on.", "tool": "generate_sql", "args": {"question": "mitigative actions not closed on time closed late vs overdue", "schema_hint": "SELECT COUNT(*) FILTER (WHERE status = 'OVERDUE') AS overdue_count, COUNT(*) FILTER (WHERE status = 'CLOSED' AND completed_on > target_close_out_date) AS closed_late_count FROM inspection_corrective_action WHERE active = true AND target_close_out_date IS NOT NULL;"}}
 
-─── CAs timeliness breakdown (closed on time / closed late / overdue) ───
-User: "show corrective actions closed on time vs closed late vs overdue" / "give me a timeliness breakdown of corrective actions"
-Turn 1: {"thought": "Three-category breakdown using only ica columns (status, completed_on, target_close_out_date) — SINGLE TABLE, no joins needed. NEVER add JOIN inspection_report or reference ir.active here — there's nothing for ir to join on and it causes a missing-FROM-clause error. 'overdue' = status = 'OVERDUE', the authoritative field, not date arithmetic.", "tool": "generate_sql", "args": {"question": "corrective actions timeliness breakdown closed on time closed late overdue", "schema_hint": "SELECT CASE WHEN status = 'CLOSED' AND completed_on <= target_close_out_date THEN 'closed on time' WHEN status = 'CLOSED' AND completed_on > target_close_out_date THEN 'closed late' WHEN status = 'OVERDUE' THEN 'overdue' ELSE 'other' END AS timeliness_category, COUNT(*) AS ca_count FROM inspection_corrective_action WHERE active = true AND target_close_out_date IS NOT NULL GROUP BY timeliness_category ORDER BY timeliness_category;"}}
+─── MAs timeliness breakdown (closed on time / closed late / overdue) ───
+User: "show mitigative actions closed on time vs closed late vs overdue" / "give me a timeliness breakdown of mitigative actions"
+Turn 1: {"thought": "Three-category breakdown using only ica columns (status, completed_on, target_close_out_date) — SINGLE TABLE, no joins needed. NEVER add JOIN inspection_report or reference ir.active here — there's nothing for ir to join on and it causes a missing-FROM-clause error. 'overdue' = status = 'OVERDUE', the authoritative field, not date arithmetic.", "tool": "generate_sql", "args": {"question": "mitigative actions timeliness breakdown closed on time closed late overdue", "schema_hint": "SELECT CASE WHEN status = 'CLOSED' AND completed_on <= target_close_out_date THEN 'closed on time' WHEN status = 'CLOSED' AND completed_on > target_close_out_date THEN 'closed late' WHEN status = 'OVERDUE' THEN 'overdue' ELSE 'other' END AS timeliness_category, COUNT(*) AS ca_count FROM inspection_corrective_action WHERE active = true AND target_close_out_date IS NOT NULL GROUP BY timeliness_category ORDER BY timeliness_category;"}}
 
-─── Most common causes of corrective actions — ica.cause, NOT form answers ───
-User: "what are the most common causes of corrective actions" / "top CA causes" / "most frequent causes"
+─── Most common causes of mitigative actions — ica.cause, NOT form answers ───
+User: "what are the most common causes of mitigative actions" / "top MA causes" / "most frequent causes"
 ROUTING: ica.cause is a plain VARCHAR column on inspection_corrective_action — NOT a form field. NEVER use get_answer_stats. Always generate_sql.
-Turn 1: {"thought": "ica.cause is a plain column, not a form answer — generate_sql with GROUP BY ica.cause, never get_answer_stats.", "tool": "generate_sql", "args": {"question": "most common causes of corrective actions ranked by frequency", "schema_hint": "SELECT ica.cause, COUNT(*) AS ca_count, ROUND(COUNT(*)*100.0/SUM(COUNT(*)) OVER(),1) AS percentage FROM inspection_corrective_action ica WHERE ica.active = true AND ica.cause IS NOT NULL GROUP BY ica.cause ORDER BY ca_count DESC LIMIT 20;"}}
+Turn 1: {"thought": "ica.cause is a plain column, not a form answer — generate_sql with GROUP BY ica.cause, never get_answer_stats.", "tool": "generate_sql", "args": {"question": "most common causes of mitigative actions ranked by frequency", "schema_hint": "SELECT ica.cause, COUNT(*) AS ca_count, ROUND(COUNT(*)*100.0/SUM(COUNT(*)) OVER(),1) AS percentage FROM inspection_corrective_action ica WHERE ica.active = true AND ica.cause IS NOT NULL GROUP BY ica.cause ORDER BY ca_count DESC LIMIT 20;"}}
 
-─── Corrective actions ───
-User: "show open corrective actions with causes"
-Turn 1: {"thought": "Plain SQL on inspection_corrective_action.", "tool": "generate_sql", "args": {"question": "open corrective actions with causes", "schema_hint": "inspection_corrective_action: corrective_action_id, cause, corrective_action, responsible, status. WHERE status = 'OPEN'"}}
+─── Mitigative actions ───
+User: "show open mitigative actions with causes"
+Turn 1: {"thought": "Plain SQL on inspection_corrective_action.", "tool": "generate_sql", "args": {"question": "open mitigative actions with causes", "schema_hint": "inspection_corrective_action: corrective_action_id, cause, corrective_action, responsible, status. WHERE status = 'OPEN'"}}
 
-─── Observation for a specific corrective action ───
-User: "show the observation for the first corrective action"
-Turn 1: {"thought": "User wants the free-text observation the inspector wrote for this CA. ica.observation_id (UUID) links to ai_answers.submission_id (varchar) — a group of answers for that observation. Must filter aq.label = 'Observation' to get the free-text field only, not Observation Type/Risk Level/Impact. Cast: aa.submission_id = ica.observation_id::varchar. NEVER use get_answers(inspection_id=...) — returns whole form.", "tool": "generate_sql", "args": {"question": "observation text linked to corrective action", "schema_hint": "SELECT aa.answer_text AS observation, ir.inspection_id, fac.name AS facility_name FROM inspection_corrective_action ica JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.corrective_action_id = '<CA_ID>' AND aq.label = 'Observation' AND ica.active = true AND aa.answer_text IS NOT NULL LIMIT 1;"}}
-─── High risk corrective actions for a specific month ───
-User: "show high risk corrective actions from February 2026"
-Turn 1: {"thought": "Need high risk CAs from Feb 2026. Risk level is on ica.risk_level_id — JOIN risk_level table. Date filter on ir.submitted_on using EXTRACT. NEVER join ai_answers to get risk level — ica.risk_level_id is a direct UUID FK to risk_level table.", "tool": "generate_sql", "args": {"question": "high risk corrective actions from February 2026", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, rl.name AS risk_level, ica.target_close_out_date, fac.name AS facility_name FROM inspection_corrective_action ica JOIN risk_level rl ON ica.risk_level_id = rl.id JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE rl.name = 'High' AND EXTRACT(MONTH FROM ir.submitted_on) = 2 AND EXTRACT(YEAR FROM ir.submitted_on) = 2026 AND ica.active = true AND ir.active = true AND ir.status != 'DRAFT' ORDER BY ica.target_close_out_date ASC LIMIT 100;"}}
-─── Corrective actions for a specific inspection ───
-User: "show corrective actions for inspection 2026/04/ST158/INS005"
-Turn 1: {"thought": "Need corrective actions for a specific inspection. ica.inspection_id is UUID FK to inspection_report.id — must join and filter by ir.inspection_id (varchar). NEVER use ica.due_date (use target_close_out_date), NEVER use ica.actual_date (use close_on), NEVER use ica.mitigative_action_uuid (that is on po_details/pr_details pointing TO ica.id).", "tool": "generate_sql", "args": {"question": "corrective actions for inspection 2026/04/ST158/INS005", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, ica.target_close_out_date, ica.close_on, ica.capex, ica.opex, ica.progress_stage FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id WHERE ir.inspection_id = '2026/04/ST158/INS005' AND ica.active = true AND ir.active = true ORDER BY ica.created_on ASC LIMIT 100;"}}
+─── Observation for a specific mitigative action ───
+User: "show the observation for the first mitigative action"
+Turn 1: {"thought": "User wants the free-text observation the inspector wrote for this MA. ica.observation_id (UUID) links to ai_answers.submission_id (varchar) — a group of answers for that observation. Must filter aq.label = 'Observation' to get the free-text field only, not Observation Type/Risk Level/Impact. Cast: aa.submission_id = ica.observation_id::varchar. NEVER use get_answers(inspection_id=...) — returns whole form.", "tool": "generate_sql", "args": {"question": "observation text linked to mitigative action", "schema_hint": "SELECT aa.answer_text AS observation, ir.inspection_id, fac.name AS facility_name FROM inspection_corrective_action ica JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.corrective_action_id = '<CA_ID>' AND aq.label = 'Observation' AND ica.active = true AND aa.answer_text IS NOT NULL LIMIT 1;"}}
+─── High risk mitigative actions for a specific month ───
+User: "show high risk mitigative actions from February 2026"
+Turn 1: {"thought": "Need high risk MAs from Feb 2026. Risk level is on ica.risk_level_id — JOIN risk_level table. Date filter on ir.submitted_on using EXTRACT. NEVER join ai_answers to get risk level — ica.risk_level_id is a direct UUID FK to risk_level table.", "tool": "generate_sql", "args": {"question": "high risk mitigative actions from February 2026", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, rl.name AS risk_level, ica.target_close_out_date, fac.name AS facility_name FROM inspection_corrective_action ica JOIN risk_level rl ON ica.risk_level_id = rl.id JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE rl.name = 'High' AND EXTRACT(MONTH FROM ir.submitted_on) = 2 AND EXTRACT(YEAR FROM ir.submitted_on) = 2026 AND ica.active = true AND ir.active = true AND ir.status != 'DRAFT' ORDER BY ica.target_close_out_date ASC LIMIT 100;"}}
+─── Mitigative actions for a specific inspection ───
+User: "show mitigative actions for inspection 2026/04/ST158/INS005"
+Turn 1: {"thought": "Need mitigative actions for a specific inspection. ica.inspection_id is UUID FK to inspection_report.id — must join and filter by ir.inspection_id (varchar). NEVER use ica.due_date (use target_close_out_date), NEVER use ica.actual_date (use close_on), NEVER use ica.mitigative_action_uuid (that is on po_details/pr_details pointing TO ica.id).", "tool": "generate_sql", "args": {"question": "mitigative actions for inspection 2026/04/ST158/INS005", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, ica.target_close_out_date, ica.close_on, ica.capex, ica.opex, ica.progress_stage FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id WHERE ir.inspection_id = '2026/04/ST158/INS005' AND ica.active = true AND ir.active = true ORDER BY ica.created_on ASC LIMIT 100;"}}
 ─── Responsible party filter — NEVER GROUP BY all, filter to what was asked ───
-User: "compare overdue corrective actions between CLIENT and INTERNAL_OPERATIONS"
+User: "compare overdue mitigative actions between CLIENT and INTERNAL_OPERATIONS"
 COLUMN: ica.responsible — enum, always uppercase: 'CLIENT' | 'INTERNAL_OPERATIONS' | 'SUB_CONTRACTOR'
 CRITICAL: when user names specific parties, add WHERE ica.responsible IN (...) — do NOT return all groups.
-Turn 1: {"thought": "ica.responsible is the enum column for who owns the CA. User asked about CLIENT and INTERNAL_OPERATIONS only — must filter with IN, not a naked GROUP BY which would also return SUB_CONTRACTOR.", "tool": "generate_sql", "args": {"question": "overdue corrective action count by responsible party CLIENT and INTERNAL_OPERATIONS", "schema_hint": "SELECT ica.responsible, COUNT(*) AS overdue_count FROM inspection_corrective_action ica WHERE ica.status = 'OVERDUE' AND ica.responsible IN ('CLIENT', 'INTERNAL_OPERATIONS') AND ica.active = true GROUP BY ica.responsible ORDER BY overdue_count DESC;"}}""",
+Turn 1: {"thought": "ica.responsible is the enum column for who owns the MA. User asked about CLIENT and INTERNAL_OPERATIONS only — must filter with IN, not a naked GROUP BY which would also return SUB_CONTRACTOR.", "tool": "generate_sql", "args": {"question": "overdue mitigative action count by responsible party CLIENT and INTERNAL_OPERATIONS", "schema_hint": "SELECT ica.responsible, COUNT(*) AS overdue_count FROM inspection_corrective_action ica WHERE ica.status = 'OVERDUE' AND ica.responsible IN ('CLIENT', 'INTERNAL_OPERATIONS') AND ica.active = true GROUP BY ica.responsible ORDER BY overdue_count DESC;"}}""",
     },
     {
         "title": "Schedule/frequency/portfolio worked examples",
@@ -1113,7 +1128,7 @@ Turn 1: {"thought": "inspection_schedule DOES have an active column — add isch
 
 ─── Facilities scheduled for a specific frequency ───
 User: "which facilities are scheduled for daily inspections"
-Turn 1: {"thought": "Daily inspections come from frequency_definition → inspector_portfolio_details → facility. Do NOT use inspection_schedule for this — frequency is set on the portfolio, not the schedule. Filter frequency_definition.name = 'Daily'.", "tool": "generate_sql", "args": {"question": "facilities scheduled for daily inspections", "schema_hint": "SELECT DISTINCT fac.name AS facility_name, fd.name AS frequency FROM frequency_definition fd JOIN inspector_portfolio_details ipd ON ipd.frequency_definition_id = fd.id JOIN facility fac ON fac.id = ipd.facility_id WHERE fd.name = 'Daily' AND fd.active = true AND ipd.active = true AND fac.active = true ORDER BY fac.name;"}}
+Turn 1: {"thought": "Daily inspections come from frequency_definition → inspector_portfolio_details → facility. Do NOT use inspection_schedule for this — frequency is set on the portfolio, not the schedule. Filter frequency_definition.name = 'Daily'. inspector_portfolio_details isn't in my default schema context, so I'll list it in relevant_tables to get its real columns.", "tool": "generate_sql", "args": {"question": "facilities scheduled for daily inspections", "schema_hint": "SELECT DISTINCT fac.name AS facility_name, fd.name AS frequency FROM frequency_definition fd JOIN inspector_portfolio_details ipd ON ipd.frequency_definition_id = fd.id JOIN facility fac ON fac.id = ipd.facility_id WHERE fd.name = 'Daily' AND fd.active = true AND ipd.active = true AND fac.active = true ORDER BY fac.name;", "relevant_tables": ["inspector_portfolio_details", "frequency_definition"]}}
 ─── Inspection schedule: overdue inspections ───
 User: "show all overdue inspections"
 Turn 1: {"thought": "Overdue inspections are in inspection_schedule WHERE status = 'OVERDUE'. inspection_schedule has NO inspection_id or inspection_report_id column — get facility, inspector, inspectee from FKs on inspection_schedule itself. To reach inspection_report instead, the FK is on the report: inspection_report.schedule_id = isched.id (not the other way round). Do NOT select inspection_id from inspection_schedule.", "tool": "generate_sql", "args": {"question": "overdue inspections with facility inspector and due date", "schema_hint": "SELECT fac.name AS facility_name, proj.name AS project_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, u_ins.first_name || ' ' || u_ins.last_name AS inspectee_name, isched.due_date, (CURRENT_DATE - isched.due_date::date) AS days_overdue FROM inspection_schedule isched JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN project proj ON isched.project_id = proj.id JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN users u_ins ON isched.inspectee_id = u_ins.id WHERE isched.status = 'OVERDUE' AND isched.active = true AND fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}
@@ -1127,7 +1142,7 @@ Turn 1: {"thought": "Count by status from inspection_schedule. inspection_schedu
     # observations/risk level/deviations/good practice/total score/ai_answers"
     # — meaning EVERY one of these 19 scenarios fired together on nearly any
     # form-related question, e.g. "which facilities have high risk
-    # observations but no corrective actions" pulled in the full block even
+    # observations but no mitigative actions" pulled in the full block even
     # though only 1-2 of the 19 examples are actually relevant. Combined with
     # the baseline SYSTEM_PROMPT this pushed the reasoning-LLM prompt close
     # enough to its 20K-token num_ctx to produce empty completions (see
@@ -1418,21 +1433,21 @@ NEVER offer "most inspections conducted" or "most observations found" for FM man
 
 FM manager metrics (domain-correct):
   • Capex converted: SUM(po_details.po_amount) via inspectee_user_id
-  • Corrective actions closed: COUNT(ica WHERE status='CLOSED')
-  • Open / overdue CAs: COUNT(ica WHERE status != 'CLOSED')
+  • Mitigative actions closed: COUNT(ica WHERE status='CLOSED')
+  • Open / overdue MAs: COUNT(ica WHERE status != 'CLOSED')
   • Average facility compliance: AVG(ir.inspection_score) on their sites
 
 "Best manager" is AMBIGUOUS on two dimensions: entity type AND metric.
 When both are unclear → ask BOTH in ONE message (never two separate turns).
 
 User: "who are the top 10 best managers?"
-Turn 1: {"thought": "'Manager' is ambiguous (inspector vs FM manager) and 'best' metric is also unknown. I must ask BOTH dimensions together in ONE message — not ask entity first then metric next turn.", "tool": "final_answer", "args": {"answer": "Could you clarify who and what 'best' means?\n\n**If you mean Inspectors** (people who conduct inspections):\n• Most inspections conducted\n• Most observations/findings raised\n• Most high-risk observations found\n\n**If you mean FM Managers** (facility managers being inspected):\n• Most capex converted (highest PO amounts paid by client)\n• Most corrective actions closed\n• Highest average facility compliance score\n\nJust say which group and metric and I'll pull the data."}}
+Turn 1: {"thought": "'Manager' is ambiguous (inspector vs FM manager) and 'best' metric is also unknown. I must ask BOTH dimensions together in ONE message — not ask entity first then metric next turn.", "tool": "final_answer", "args": {"answer": "Could you clarify who and what 'best' means?\n\n**If you mean Inspectors** (people who conduct inspections):\n• Most inspections conducted\n• Most observations/findings raised\n• Most high-risk observations found\n\n**If you mean FM Managers** (facility managers being inspected):\n• Most capex converted (highest PO amounts paid by client)\n• Most mitigative actions closed\n• Highest average facility compliance score\n\nJust say which group and metric and I'll pull the data."}}
 
 User follow-up: "i mean FM managers by most capex converted" (user answered both — DO NOT ask again, execute immediately)
 Turn 1: {"thought": "User clarified: FM managers (inspectee_user_id) ranked by capex converted (po_details). Previous turn was my clarification. I must NOT ask again. Proceed.", "tool": "generate_sql", "args": {"question": "top FM managers by capex converted using po_details", "schema_hint": "WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po FROM po_details WHERE active = true GROUP BY 1) SELECT u.first_name || ' ' || u.last_name AS fm_manager, COALESCE(SUM(ica.capex), 0) AS capex_generated, COALESCE(SUM(p.total_po), 0) AS capex_converted, ROUND(COALESCE(SUM(p.total_po), 0) * 100.0 / NULLIF(SUM(ica.capex), 0), 1) AS conversion_rate_pct FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id AND ir.active = true JOIN users u ON ir.inspectee_user_id = u.id AND u.active = true LEFT JOIN po_by_ica p ON p.ica_id = ica.id WHERE ica.active = true AND ica.capex > 0 GROUP BY u.id, u.first_name, u.last_name ORDER BY capex_converted DESC LIMIT 10;"}}
 
 User follow-up: "i mean FM managers" alone (user answered entity only — ask metric ONCE more with FM-correct options, then stop asking)
-Turn 1: {"thought": "User clarified entity = FM managers. I know to use inspectee_user_id. Still need metric — I will ask ONCE more about metric only, with FM-manager-appropriate options, NEVER inspector options.", "tool": "final_answer", "args": {"answer": "Got it — FM managers. What metric should I use to rank them?\n• Most capex converted (highest PO amounts paid by client)\n• Most corrective actions closed\n• Highest average facility compliance score\n\nLet me know and I'll run it."}}
+Turn 1: {"thought": "User clarified entity = FM managers. I know to use inspectee_user_id. Still need metric — I will ask ONCE more about metric only, with FM-manager-appropriate options, NEVER inspector options.", "tool": "final_answer", "args": {"answer": "Got it — FM managers. What metric should I use to rank them?\n• Most capex converted (highest PO amounts paid by client)\n• Most mitigative actions closed\n• Highest average facility compliance score\n\nLet me know and I'll run it."}}
 
 User follow-up after "i mean FM managers": "most capex converted" (DO NOT ask again — execute immediately)
 Turn 1: {"thought": "User answered metric. Entity already confirmed (FM managers = inspectee_user_id). Metric = capex converted = SUM(po_details.po_amount). Must NOT ask again.", "tool": "generate_sql", "args": {"question": "top FM managers by capex converted using po_details", "schema_hint": "WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po FROM po_details WHERE active = true GROUP BY 1) SELECT u.first_name || ' ' || u.last_name AS fm_manager, COALESCE(SUM(ica.capex), 0) AS capex_generated, COALESCE(SUM(p.total_po), 0) AS capex_converted FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id AND ir.active = true JOIN users u ON ir.inspectee_user_id = u.id AND u.active = true LEFT JOIN po_by_ica p ON p.ica_id = ica.id WHERE ica.active = true AND ica.capex > 0 GROUP BY u.id, u.first_name, u.last_name ORDER BY capex_converted DESC LIMIT 10;"}}
@@ -1522,22 +1537,22 @@ def build_worked_examples(
 
 # ── Conditional registry-derived blocks — included only when relevant ───────
 # Unlike EXAMPLES_TIER2 (Turn-1 worked examples), these are semantic FACT
-# blocks generated by core.semantics_registry. CA_WORKFLOW_BLOCK (521 tokens)
+# blocks generated by core.semantics_registry. MA_WORKFLOW_BLOCK (521 tokens)
 # was previously always-on; moved here 2026-06-13 as part of the num_ctx
 # truncation fix — it's entirely about inspection_corrective_action (ica)
 # workflow columns (status/progress_stage/implementation_status/capex_status/
-# timeliness) and is only relevant when the question is about corrective
+# timeliness) and is only relevant when the question is about mitigative
 # actions at all.
 CONDITIONAL_BLOCKS = [
     {
-        "title": "CA workflow columns",
+        "title": "MA workflow columns",
         "question_pattern": (
-            r"(?i)\bcorrective\s+actions?\b|\bCAs?\b|\bicas?\b"
+            r"(?i)\bmitigative\s+actions?\b|\bMAs?\b"
             r"|\bcapex\b|\bopex\b|\bdeferred\b"
             r"|\bprogress[_\s]stage\b|\bimplementation[_\s]status\b"
             r"|\bneeds?\s+attention\b|\bcritical\s+issues?\b"
         ),
-        "get_text": lambda: _CA_WORKFLOW_BLOCK,
+        "get_text": lambda: _MA_WORKFLOW_BLOCK,
     },
 ]
 

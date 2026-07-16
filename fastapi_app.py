@@ -100,7 +100,7 @@ _VISUAL_KW = re.compile(
     re.IGNORECASE,
 )
 _DOMAIN_KW = re.compile(
-    r'\b(inspection|facility|capex|opex|score|corrective|action|overdue|report|month|'
+    r'\b(inspection|facility|capex|opex|score|mitigative|action|overdue|report|month|'
     r'year|week|average|total|count|inspector|manager|status|pending|approved|rejected|'
     r'deferred|finding|observation|po|purchase|order|amount|budget|responsible|closed|open)\b',
     re.IGNORECASE,
@@ -127,6 +127,7 @@ def _extract_requested_type(q: str) -> str | None:
 log       = logging.getLogger("inspectai")
 log_auth  = logging.getLogger("inspectai.auth")
 log_query = logging.getLogger("inspectai.query")
+log_security = logging.getLogger("inspectai.security")
 
 # ── Eager startup ──────────────────────────────────────────────────────────────
 
@@ -253,10 +254,6 @@ class ChatResponse(BaseModel):
     chart_config: ChartConfig | None = None
     dashboard: DashboardData | None = None
 
-class SessionInfo(BaseModel):
-    session_id: str
-    message_count: int
-
 
 # ── Session management ────────────────────────────────────────────────────────
 
@@ -301,6 +298,44 @@ def _strip_uuid_columns(columns: list, rows: list) -> tuple[list, list]:
     kept_cols = [c for c in columns if c not in uuid_cols]
     kept_rows = [{k: v for k, v in row.items() if k not in uuid_cols} for row in rows]
     return kept_cols, kept_rows
+
+
+_SCOPE_PREDICATE_RE = re.compile(
+    r"ir\.(?:inspector|inspectee)_user_id\s*=\s*\(\s*SELECT\s+id\s+FROM\s+users\s+WHERE\s+id_fk\s*=\s*\d+[^)]*\)",
+    re.IGNORECASE,
+)
+_ID_FK_RE = re.compile(r"id_fk\s*=\s*\d+", re.IGNORECASE)
+# No trailing \)? — consuming an optional closing paren here ate it on redact,
+# leaving unbalanced markdown like "(Drupal UID [redacted]" in the response.
+_DRUPAL_UID_RE = re.compile(r"Drupal\s+UID[\s:(]*\d+", re.IGNORECASE)
+# Catches the model explaining the scope mechanism in prose instead of the
+# literal SQL shape _SCOPE_PREDICATE_RE expects — e.g. "Inspectors see
+# inspections they conduct (via inspector_user_id)" or "WHERE ur.user_id =
+# 11223" — observed live in production logs from an ordinary, non-adversarial
+# question ("how do you determine what I'm allowed to see"), which the SQL-
+# shaped regex above does not match at all.
+_FK_COLUMN_MENTION_RE = re.compile(
+    r"`?\b(?:inspector_user_id|inspectee_user_id)\b`?", re.IGNORECASE
+)
+_USER_ID_VALUE_RE = re.compile(r"\buser_id\s*=\s*\d+", re.IGNORECASE)
+
+
+def _redact_security_internals(text: str | None) -> str | None:
+    """Deterministic backstop for the system prompt's "never expose this
+    constraint" instruction, which the model doesn't reliably honor when
+    directly asked about its filters/mechanism. Applied to LLM-authored
+    text right before it reaches the client — enforce_scope() itself
+    doesn't care what the LLM says, so this is purely about not handing an
+    attacker the enforcement mechanism to study.
+    """
+    if not text:
+        return text
+    text = _SCOPE_PREDICATE_RE.sub("[access-control filter]", text)
+    text = _ID_FK_RE.sub("id_fk = [redacted]", text)
+    text = _DRUPAL_UID_RE.sub("[redacted]", text)
+    text = _FK_COLUMN_MENTION_RE.sub("[access-control column]", text)
+    text = _USER_ID_VALUE_RE.sub("user_id = [redacted]", text)
+    return text
 
 
 # ── Answer cleaner ────────────────────────────────────────────────────────────
@@ -496,27 +531,6 @@ _ALT_MAP = {
     'scatter':  ['line', 'bar'],
 }
 
-def _chart_suggestion_sentence(columns: list, rows: list) -> str:
-    """Build a conversational chart suggestion to append to the answer text."""
-    try:
-        from chart_advisor import advise
-        rec = advise(columns, rows)
-        if not rec["chart_type"]:
-            return ""
-        rtype = rec["chart_type"]
-        rlabel = _TYPE_LABELS.get(rtype, rtype.title())
-        alts = _ALT_MAP.get(rtype, [])[:2]
-        alt_str = " or a ".join(f"**{_TYPE_LABELS.get(a, a.title())}**" for a in alts)
-        hint = rec["reason"]
-
-        signal = f"\n📊__CHART_AVAILABLE__:{rtype}:{hint}"
-        if alts:
-            return f"{signal}\n\nI can visualize this as a **{rlabel}** ({hint}), or as a {alt_str} if you prefer — just say the word."
-        return f"{signal}\n\nI can visualize this as a **{rlabel}** ({hint}) — just ask."
-    except Exception:
-        return ""
-
-
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -541,11 +555,11 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=
                 'sub': sub,
                 'permissions': _data_vis,
             }
-            log_query.info("[SCOPE] qid=%s sub=%s data_visibility_perms=%s",
-                           qid, sub, _data_vis or "(none — will BLOCK)")
+            log_security.info("[SCOPE] qid=%s sub=%s data_visibility_perms=%s",
+                               qid, sub, _data_vis or "(none — will BLOCK)")
         else:
             visibility_scope = None  # → BLOCK in orchestrator
-            log_query.warning("[SCOPE] qid=%s sub=%s — no permissions fetched, BLOCKING", qid, sub)
+            log_security.warning("[SCOPE] qid=%s sub=%s — no permissions fetched, BLOCKING", qid, sub)
 
         # ── Chart follow-up fast-path — skip LLM entirely ────────────────────
         if _is_chart_followup(req.message) and sess_data.get("last_raw_rows"):
@@ -869,6 +883,8 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=
         # table reaches the frontend — done last so it never affects chart/KPI
         # column selection or summary generation upstream, only the payload.
         _result_cols, _result_rows = _strip_uuid_columns(_result_cols, _result_rows)
+        display_answer = _redact_security_internals(display_answer)
+        reasoning = _redact_security_internals(reasoning)
 
         log_query.info(
             "[QUERY] END   qid=%s sub=%s elapsed=%dms llm_calls=%d "
@@ -934,31 +950,6 @@ def _refetch_for_calendar(sql: str, orch, limit: int = 1000, params: dict | None
         return [dict(zip(cols, r)) for r in rows]
     except Exception:
         return []
-
-
-def _count_total(sql: str, orch) -> int | None:
-    """
-    Count total rows for the SQL query without LIMIT/OFFSET.
-    Works for both plain SELECT and GROUP BY queries by wrapping in a subquery.
-    Returns None only on DB error.
-    """
-    import re as _re
-    # Strip trailing LIMIT / OFFSET / semicolon
-    stripped = _re.sub(
-        r'\bLIMIT\s+\d+(\s+OFFSET\s+\d+)?\s*;?\s*$', '',
-        sql.strip(), flags=_re.IGNORECASE
-    ).strip().rstrip(';')
-
-    # Also strip any WITH ... AS CTEs that are already in the main query —
-    # they're preserved inside the subquery so the count is accurate
-    count_sql = f"SELECT COUNT(*) AS _total FROM ({stripped}) _sub"
-    try:
-        from sqlalchemy import text as sql_text
-        with orch.db_engine.connect() as conn:
-            row = conn.execute(sql_text(count_sql)).fetchone()
-            return int(row[0]) if row else None
-    except Exception:
-        return None
 
 
 def _paginate_sql(sql: str, page: int, page_size: int) -> str:
@@ -1044,13 +1035,6 @@ async def get_page(req: PageRequest, token_data: dict = Depends(require_auth), o
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-
-
-async def get_session_info(session_id: str):
-    data = _sessions.get(session_id)
-    if not data:
-        raise HTTPException(status_code=404, detail="Session not found")
-    return SessionInfo(session_id=session_id, message_count=data["message_count"])
 
 
 @app.delete("/api/sessions/{session_id}")

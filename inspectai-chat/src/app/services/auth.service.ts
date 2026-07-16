@@ -22,21 +22,24 @@ export class AuthService {
 
   get token(): string | null {
     if (!isPlatformBrowser(this.platformId)) return null;
-    return localStorage.getItem(TOKEN_KEY);
+    return sessionStorage.getItem(TOKEN_KEY);
   }
 
   get sub(): string | null { return this._sub$.value; }
 
   get firstName(): string {
     if (!isPlatformBrowser(this.platformId)) return '';
-    return localStorage.getItem(FIRSTNAME_KEY) || '';
+    return sessionStorage.getItem(FIRSTNAME_KEY) || '';
   }
 
   setAuth(token: string, sub: string, permissions: string[], firstName = ''): void {
     if (isPlatformBrowser(this.platformId)) {
-      localStorage.setItem(TOKEN_KEY, token);
-      localStorage.setItem(SUB_KEY, sub);
-      if (firstName) localStorage.setItem(FIRSTNAME_KEY, firstName);
+      // sessionStorage (not localStorage) — deliberately per-tab, not shared across
+      // tabs of the same browser. Two tabs logging in as different users must not
+      // silently clobber each other's token; each tab now needs its own login.
+      sessionStorage.setItem(TOKEN_KEY, token);
+      sessionStorage.setItem(SUB_KEY, sub);
+      if (firstName) sessionStorage.setItem(FIRSTNAME_KEY, firstName);
     }
     this._sub$.next(sub);
     // Deduplicate on receipt — the Java API sometimes repeats entries
@@ -45,10 +48,10 @@ export class AuthService {
 
   clearAuth(): void {
     if (isPlatformBrowser(this.platformId)) {
-      localStorage.removeItem(TOKEN_KEY);
-      localStorage.removeItem(SUB_KEY);
-      localStorage.removeItem(FIRSTNAME_KEY);
-      localStorage.removeItem('octaai_username');
+      sessionStorage.removeItem(TOKEN_KEY);
+      sessionStorage.removeItem(SUB_KEY);
+      sessionStorage.removeItem(FIRSTNAME_KEY);
+      sessionStorage.removeItem('octaai_username');
     }
     this._sub$.next(null);
     this._permissions$.next([]);

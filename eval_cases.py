@@ -8,7 +8,7 @@ Changes from v1 (104 questions):
     These test the ai_answers ETL boundary / most-recently-answered-form path.
     Bugs are fixed in seed_examples.py — re-add once confirmed passing in dev.
 
-  ADDED — ADM, FAC, FIN, CA, RISK, SCHED, TREND categories (admin user queries)
+  ADDED — ADM, FAC, FIN, MA, RISK, SCHED, TREND categories (admin user queries)
 
 Format per case:
   id        — unique test identifier
@@ -74,7 +74,7 @@ EVAL_CASES = [
 
     {
         "id": "FAC-01",
-        "question": "Which facility has the most high-risk corrective actions?",
+        "question": "Which facility has the most high-risk mitigative actions?",
         "keywords": ["facility", "risk_level", "inspection_corrective_action", "COUNT"],
         "category": "facility",
     },
@@ -93,7 +93,7 @@ EVAL_CASES = [
     },
     {
         "id": "FAC-04",
-        "question": "Which facility has the most overdue corrective actions?",
+        "question": "Which facility has the most overdue mitigative actions?",
         "keywords": ["facility", "inspection_corrective_action", "COUNT"],
         "category": "facility",
         "note": "Agent may use status=OVERDUE or target_close_out_date < CURRENT_DATE — both valid",
@@ -144,7 +144,7 @@ EVAL_CASES = [
     },
     {
         "id": "FIN-04",
-        "question": "Which corrective actions have the highest CAPEX still awaiting approval?",
+        "question": "Which mitigative actions have the highest CAPEX still awaiting approval?",
         "keywords": ["inspection_corrective_action", "capex", "capex_status", "IS NULL"],
         "category": "financial",
         "note": "capex_status IS NULL = awaiting approval",
@@ -169,7 +169,7 @@ EVAL_CASES = [
     },
     {
         "id": "FIN-08",
-        "question": "Which corrective actions have POs raised against them?",
+        "question": "Which mitigative actions have POs raised against them?",
         "keywords": ["po_details", "mitigative_action_uuid", "inspection_corrective_action"],
         "category": "financial",
     },
@@ -219,7 +219,7 @@ EVAL_CASES = [
     },
     {
         "id": "FM-05",
-        "question": "Which FM manager has the most overdue corrective actions?",
+        "question": "Which FM manager has the most overdue mitigative actions?",
         "keywords": ["inspectee_user_id", "inspection_corrective_action", "target_close_out_date"],
         "category": "fm_manager",
     },
@@ -231,66 +231,66 @@ EVAL_CASES = [
     },
 
     # ══════════════════════════════════════════════════════════════════════
-    # CA — Corrective Actions
+    # MA — Mitigative Actions
     # ══════════════════════════════════════════════════════════════════════
 
     {
-        "id": "CA-01",
-        "question": "How many corrective actions are currently open?",
+        "id": "MA-01",
+        "question": "How many mitigative actions are currently open?",
         "keywords": ["inspection_corrective_action", "status", "COUNT"],
         "category": "corrective_action",
     },
     {
-        "id": "CA-02",
-        "question": "Show me all overdue corrective actions",
+        "id": "MA-02",
+        "question": "Show me all overdue mitigative actions",
         "keywords": ["inspection_corrective_action", "target_close_out_date"],
         "category": "corrective_action",
     },
     {
-        "id": "CA-03",
-        "question": "Which corrective actions have been deferred more than once?",
+        "id": "MA-03",
+        "question": "Which mitigative actions have been deferred more than once?",
         "keywords": ["inspection_corrective_action", "CLOSE_WITH_DEFERRED", "status"],
         "category": "corrective_action",
     },
     {
-        "id": "CA-04",
-        "question": "What is the average time to close a corrective action?",
+        "id": "MA-04",
+        "question": "What is the average time to close a mitigative action?",
         "keywords": ["inspection_corrective_action", "AVG"],
         "category": "corrective_action",
     },
     {
-        "id": "CA-05",
-        "question": "How many corrective actions were raised this month?",
+        "id": "MA-05",
+        "question": "How many mitigative actions were raised this month?",
         "keywords": ["inspection_corrective_action", "COUNT", "created_on", "CURRENT_DATE"],
         "category": "corrective_action",
     },
     {
-        "id": "CA-06",
-        "question": "Show corrective actions by responsible party",
+        "id": "MA-06",
+        "question": "Show mitigative actions by responsible party",
         "keywords": ["inspection_corrective_action", "responsible", "COUNT", "GROUP BY"],
         "category": "corrective_action",
     },
     {
-        "id": "CA-07",
-        "question": "Which corrective actions are awaiting CAPEX approval?",
+        "id": "MA-07",
+        "question": "Which mitigative actions are awaiting CAPEX approval?",
         "keywords": ["inspection_corrective_action", "capex_status", "IS NULL", "capex"],
         "category": "corrective_action",
     },
     {
-        "id": "CA-08",
-        "question": "What is the corrective action closure rate this quarter?",
+        "id": "MA-08",
+        "question": "What is the mitigative action closure rate this quarter?",
         "keywords": ["inspection_corrective_action", "CLOSED", "COUNT", "quarter"],
         "category": "corrective_action",
     },
     {
-        "id": "CA-09",
-        "question": "Show me corrective actions raised this month that are still pending",
+        "id": "MA-09",
+        "question": "Show me mitigative actions raised this month that are still pending",
         "keywords": ["inspection_corrective_action", "created_on", "status", "CURRENT_DATE"],
         "category": "corrective_action",
     },
     {
-        "id": "CA-10",
-        "question": "How many corrective actions does each inspector have on average per inspection?",
+        "id": "MA-10",
+        "question": "How many mitigative actions does each inspector have on average per inspection?",
         "keywords": ["inspection_corrective_action", "inspection_report", "AVG", "COUNT"],
         "category": "corrective_action",
     },
@@ -313,13 +313,13 @@ EVAL_CASES = [
     },
     {
         "id": "RISK-03",
-        "question": "Show all open corrective actions with high risk level",
+        "question": "Show all open mitigative actions with high risk level",
         "keywords": ["risk_level", "inspection_corrective_action", "status"],
         "category": "risk",
     },
     {
         "id": "RISK-04",
-        "question": "What is the breakdown of corrective actions by risk level?",
+        "question": "What is the breakdown of mitigative actions by risk level?",
         "keywords": ["risk_level", "inspection_corrective_action", "COUNT", "GROUP BY"],
         "category": "risk",
     },
@@ -331,7 +331,7 @@ EVAL_CASES = [
     },
     {
         "id": "RISK-06",
-        "question": "Show me the percentage of inspections that have at least one corrective action",
+        "question": "Show me the percentage of inspections that have at least one mitigative action",
         "keywords": ["inspection_report", "inspection_corrective_action", "COUNT", "NULLIF"],
         "category": "risk",
     },
@@ -401,7 +401,7 @@ EVAL_CASES = [
     },
     {
         "id": "TREND-05",
-        "question": "Are corrective action closure rates improving or declining over the last 3 months?",
+        "question": "Are mitigative action closure rates improving or declining over the last 3 months?",
         "keywords": ["inspection_corrective_action", "CLOSED", "date_trunc", "month", "COUNT"],
         "category": "trend",
     },

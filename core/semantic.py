@@ -419,8 +419,8 @@ class SeedExampleIndex:
                                 'list questions','show questions'],
         '[schedule]':          ['schedule','portfolio','frequency','daily',
                                 'cycle','assigned to','pending inspection'],
-        '[corrective_action]': ['corrective action','overdue action','cause',
-                                'deferred','responsible party'],
+        '[corrective_action]': ['mitigative action','overdue action',
+                                'cause','deferred','responsible party'],
     }
 
     @classmethod
@@ -550,7 +550,7 @@ class SeedExampleIndex:
             # High-confidence stage 1 result — skip aug embedding call
             reranked = candidates
         else:
-            aug_query = f"{query} | context: inspection management facility corrective action capex opex"
+            aug_query = f"{query} | context: inspection management facility mitigative action capex opex"
             q_aug_emb = np.array(self.embed_model.get_text_embedding(aug_query))
             q_aug_norm = np.linalg.norm(q_aug_emb)
 

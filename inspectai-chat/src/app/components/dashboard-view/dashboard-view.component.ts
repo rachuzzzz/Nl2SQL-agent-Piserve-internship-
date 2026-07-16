@@ -54,14 +54,14 @@ const ICON_INCIDENT = 'M13 2L3 14h9l-1 8 10-12h-9l1-8z';
 
 const KPIS: Kpi[] = [
   { label: 'INSPECTIONS THIS MONTH', value: '1,284', delta: '+8.2%', up: true,  iconPath: ICON_ROWS },
-  { label: 'OPEN CORRECTIVE ACTIONS', value: '168',   delta: '−12',   up: true,  iconPath: ICON_WARN },
+  { label: 'OPEN MITIGATIVE ACTIONS', value: '168',   delta: '−12',   up: true,  iconPath: ICON_WARN },
   { label: 'PERMITS EXPIRING ≤30d',   value: '23',    delta: '+5',    up: false, iconPath: ICON_PERMIT },
   { label: 'LOST-TIME INCIDENTS YTD', value: '2',     delta: '0',     up: true,  iconPath: ICON_INCIDENT },
 ];
 
 const RECENT: RecentItem[] = [
   { title: 'What is the average inspection score across months?', tag: 'Inspections' },
-  { title: 'Show open corrective actions by site',                tag: 'CAPA' },
+  { title: 'Show open mitigative actions by site',                tag: 'MA' },
   { title: 'How many permits expire in the next 30 days?',        tag: 'Permits' },
   { title: 'Trend of safety incidents by severity this year',     tag: 'Safety' },
   { title: 'Top 5 inspectors by audits completed',               tag: 'Audits' },
@@ -149,10 +149,10 @@ const RECENT: RecentItem[] = [
             </svg>
           </div>
 
-          <!-- Bar: open CAPAs by site -->
+          <!-- Bar: open mitigative actions by site -->
           <div class="chart-card">
             <div class="chart-card-head">
-              <h3 class="chart-title">Open corrective actions by site</h3>
+              <h3 class="chart-title">Open mitigative actions by site</h3>
               <button class="open-btn" (click)="switchToChat.emit()">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"
                      stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>

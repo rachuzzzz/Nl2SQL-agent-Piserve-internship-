@@ -118,7 +118,7 @@ export interface Message {
   dashboard?:      DashboardData | null;
   sourceQuestion?: string;  // the user question that produced this AI message's resultData —
                              // lets a drilldown click on the resulting table build a follow-up
-                             // that preserves what the user actually asked about (e.g. "corrective
+                             // that preserves what the user actually asked about (e.g. "mitigative
                              // actions") instead of always assuming "inspections"
 }
 
