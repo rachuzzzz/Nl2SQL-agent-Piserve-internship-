@@ -13,12 +13,10 @@ _log_query = logging.getLogger("inspectai.query")
 _log_llm   = logging.getLogger("inspectai.llm")
 
 from sqlalchemy import text as sql_text
-from llama_index.core.llms import ChatMessage, MessageRole
 
-from khidmah.agent.prompts import FORCE_SUMMARY_PROMPT
 from khidmah.core.disambiguation import is_disambiguation_result
 
-from khidmah.agent.orchestrator.models import AgentStep, ConversationTurn, AgentResult
+from khidmah.agent.orchestrator.models import AgentStep, QueryStats, ConversationTurn, AgentResult
 from khidmah.agent.orchestrator.debug import _ilike_escape, _has_uuid_leak, _dbg, _detect_truncation
 
 

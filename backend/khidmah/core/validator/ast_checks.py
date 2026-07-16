@@ -13,7 +13,7 @@ try:
 except ImportError:
     _HAS_SQLGLOT = False
 
-from khidmah.core.validator.models import ValidationIssue
+from khidmah.core.validator.models import ValidationIssue, ValidatorStats
 
 
 
