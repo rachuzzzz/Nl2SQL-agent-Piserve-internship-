@@ -43,11 +43,23 @@ async def lifespan(app: FastAPI):
     # for an unknown period because of exactly that gap.
     from khidmah.core.semantics_registry import verify_consistency
     _khidmah_dir = os.path.join(REPO_ROOT, "backend", "khidmah")
+    # prompts.py/seed_examples.py/business_rules.py/orchestrator.py are now
+    # packages (see the restructure) — check every file that can actually
+    # carry hardcoded status/cast prose or SQL text, not just one file per
+    # former module.
     _desyncs = verify_consistency([
-        os.path.join(_khidmah_dir, "agent", "prompts.py"),
-        os.path.join(_khidmah_dir, "agent", "seed_examples.py"),
-        os.path.join(_khidmah_dir, "core", "business_rules.py"),
-        os.path.join(_khidmah_dir, "agent", "orchestrator.py"),
+        os.path.join(_khidmah_dir, "agent", "prompts", "templates", "system_prompt.txt"),
+        os.path.join(_khidmah_dir, "agent", "prompts", "templates", "sql_generation_prompt.txt"),
+        os.path.join(_khidmah_dir, "agent", "prompts", "templates", "force_summary_prompt.txt"),
+        os.path.join(_khidmah_dir, "agent", "prompts", "examples_tier2.py"),
+        os.path.join(_khidmah_dir, "agent", "examples", "templates", "core_context.txt"),
+        os.path.join(_khidmah_dir, "agent", "examples", "seed_data.py"),
+        os.path.join(_khidmah_dir, "core", "business_rules", "rules", "block_rules.py"),
+        os.path.join(_khidmah_dir, "core", "business_rules", "rules", "warn_rules.py"),
+        os.path.join(_khidmah_dir, "core", "business_rules", "rules", "autocorrect_rules.py"),
+        os.path.join(_khidmah_dir, "core", "business_rules", "rules", "inject_rules.py"),
+        os.path.join(_khidmah_dir, "agent", "orchestrator", "core.py"),
+        os.path.join(_khidmah_dir, "agent", "orchestrator", "synthesis.py"),
     ])
     if _desyncs:
         log.warning("[SERVER] %d semantics desync(s) detected — see core.semantics_registry:", len(_desyncs))

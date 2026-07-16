@@ -686,10 +686,18 @@ if __name__ == "__main__":
         # python -m khidmah.core.semantics_registry check file1.py file2.py ...
         _khidmah_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         targets = sys.argv[2:] or [
-            os.path.join(_khidmah_dir, "agent", "prompts.py"),
-            os.path.join(_khidmah_dir, "agent", "seed_examples.py"),
-            os.path.join(_khidmah_dir, "core", "business_rules.py"),
-            os.path.join(_khidmah_dir, "agent", "orchestrator.py"),
+            os.path.join(_khidmah_dir, "agent", "prompts", "templates", "system_prompt.txt"),
+            os.path.join(_khidmah_dir, "agent", "prompts", "templates", "sql_generation_prompt.txt"),
+            os.path.join(_khidmah_dir, "agent", "prompts", "templates", "force_summary_prompt.txt"),
+            os.path.join(_khidmah_dir, "agent", "prompts", "examples_tier2.py"),
+            os.path.join(_khidmah_dir, "agent", "examples", "templates", "core_context.txt"),
+            os.path.join(_khidmah_dir, "agent", "examples", "seed_data.py"),
+            os.path.join(_khidmah_dir, "core", "business_rules", "rules", "block_rules.py"),
+            os.path.join(_khidmah_dir, "core", "business_rules", "rules", "warn_rules.py"),
+            os.path.join(_khidmah_dir, "core", "business_rules", "rules", "autocorrect_rules.py"),
+            os.path.join(_khidmah_dir, "core", "business_rules", "rules", "inject_rules.py"),
+            os.path.join(_khidmah_dir, "agent", "orchestrator", "core.py"),
+            os.path.join(_khidmah_dir, "agent", "orchestrator", "synthesis.py"),
         ]
         probs = verify_consistency(targets)
         if probs:
