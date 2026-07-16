@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Thin compatibility wrapper — the real CLI now lives at
-backend/scripts/run.py (part of the khidmah package). This forwards to it
+backend/scripts/run.py (part of the src package). This forwards to it
 so `python run.py` keeps working unchanged from the repo root.
 """
 

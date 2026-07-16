@@ -15,7 +15,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from khidmah.core.validator import SQLValidator
+from src.core.validator import SQLValidator
 
 validator = SQLValidator()
 

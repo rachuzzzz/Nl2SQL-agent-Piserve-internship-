@@ -5,7 +5,7 @@ Interactive CLI for the NL2SQL agent.
 
 import sys
 import textwrap
-from khidmah.agent.orchestrator import AgentOrchestrator, ConversationSession
+from src.agent.orchestrator import AgentOrchestrator, ConversationSession
 
 
 def _format_result_summary(tool, result):

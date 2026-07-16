@@ -21,13 +21,13 @@ The system uses a split-brain architecture to maximize accuracy and reasoning:
 
 To prevent hallucinations and "silent metric corruption," the backend uses a multi-layered validation system:
 
-- **Semantics Registry (`backend/khidmah/core/semantics_registry.py`)**: The single source of truth for all domain rules (e.g., "completed" vs "conducted" inspections).
-- **Business Glossary (`backend/khidmah/core/business_glossary.py`)**: Enforces specific SQL patterns. For example, it forces `SUM(po_amount)` for CAPEX conversion and blocks incorrect join paths.
-- **SQL Validator (`backend/khidmah/core/validator.py`)**: A final gatekeeper that parses the generated SQL and checks it against security and business constraints before execution.
+- **Semantics Registry (`backend/src/core/semantics_registry.py`)**: The single source of truth for all domain rules (e.g., "completed" vs "conducted" inspections).
+- **Business Glossary (`backend/src/core/business_glossary.py`)**: Enforces specific SQL patterns. For example, it forces `SUM(po_amount)` for CAPEX conversion and blocks incorrect join paths.
+- **SQL Validator (`backend/src/core/validator.py`)**: A final gatekeeper that parses the generated SQL and checks it against security and business constraints before execution.
 
 ## 📊 Chart Advisor
 
-The `backend/khidmah/charts/advisor.py` module analyzes the shape of the SQL result set to recommend the best Apache ECharts visualization. It uses a combination of heuristics (Cardinality, Data Types, Semantics) and optional LLM advice to ensure users see their data in the most meaningful format.
+The `backend/src/charts/advisor.py` module analyzes the shape of the SQL result set to recommend the best Apache ECharts visualization. It uses a combination of heuristics (Cardinality, Data Types, Semantics) and optional LLM advice to ensure users see their data in the most meaningful format.
 
 ## 🚀 API Endpoints
 
@@ -44,10 +44,11 @@ The `backend/khidmah/charts/advisor.py` module analyzes the shape of the SQL res
 - Ollama (running `llama3.1` and `deepseek-coder-v2`)
 
 ### Layout
-The Python backend lives under `backend/khidmah/` (a proper package, imported
-as `khidmah.*`). `run.py` at the repo root is a thin wrapper that forwards to
+The Python backend lives under `backend/src/` (a proper package, imported
+as `src.*`). `run.py` at the repo root is a thin wrapper that forwards to
 `backend/scripts/run.py`, kept so existing commands don't change. Tests live
-in `backend/tests/`, the eval harness in `backend/eval/`.
+in `backend/tests/`, the eval harness in `backend/eval/`. The Angular
+frontend lives in `frontend/`.
 
 ### Setup
 1. Create a virtual environment: `python -m venv venv`
@@ -59,6 +60,6 @@ in `backend/tests/`, the eval harness in `backend/eval/`.
    USE_LLM_CHART_ADVISOR=true
    ```
 4. Run the server (from the repo root, so `.env` and the Angular build resolve correctly):
-   `uvicorn khidmah.api.app:app --app-dir backend --port 8001`
+   `uvicorn src.api.app:app --app-dir backend --port 8001`
 5. Run the CLI: `python run.py`
 6. Run tests: `python -m pytest backend/tests/` (or run a test file directly, e.g. `python backend/tests/core/test_business_rules_consumption.py`)
