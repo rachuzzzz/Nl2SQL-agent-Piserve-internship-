@@ -42,3 +42,6 @@ transformers>=4.40.0
 kokoro-onnx>=0.3.0
 soundfile>=0.12
 huggingface_hub>=0.20
+
+# Testing
+pytest>=8.0

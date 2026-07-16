@@ -18,6 +18,9 @@ build/
 *.DS_Store
 Thumbs.db
 
+# Office temp lock files
+~$*
+
 # Logs
 *.log
 
