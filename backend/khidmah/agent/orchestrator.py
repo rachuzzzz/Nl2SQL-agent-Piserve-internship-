@@ -938,7 +938,7 @@ class AgentOrchestrator:
         self.validator = SQLValidator()
 
         # Build seed example index — embeds NL questions for retrieval-based injection
-        from khidmah.agent.seed_examples import SEED_EXAMPLES
+        from khidmah.agent.examples import SEED_EXAMPLES
         self.seed_index = SeedExampleIndex(
             embed_model=embed_model,
             examples=SEED_EXAMPLES,

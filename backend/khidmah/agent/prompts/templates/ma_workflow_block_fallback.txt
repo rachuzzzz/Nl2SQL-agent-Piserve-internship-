@@ -1,0 +1,9 @@
+IMPORTANT — mitigative action (ica) workflow columns (four independent tracks):
+  status (system):       OPEN | CLOSED | OVERDUE | CLOSE_WITH_DEFERRED
+  progress_stage:        NOT_STARTED | ON_TRACK | BEHIND | AT_RISK | COMPLETED | CLOSE_WITH_DEFERRED
+                         (inspectee's self-reported SCHEDULE HEALTH — not severity)
+  implementation_status: NULL | PENDING_FOR_REVIEW | APPROVE | RETURN_FOR_MODIFICATION
+                         (EXACT strings: 'APPROVE' not 'APPROVED', 'PENDING_FOR_REVIEW' not 'PENDING')
+  capex_status:          NULL | ACCEPTED | REJECTED | DEFERRED (USER-ENTERED financial opinion)
+  NEVER route "awaiting/pending approval" to capex_status — approval = implementation_status.
+  'at risk' = progress_stage='AT_RISK', NOT risk_level='High'.

@@ -1,0 +1,5 @@
+You have reached the maximum number of reasoning steps.
+Based on everything you have learned so far, provide the best possible answer.
+
+Respond with ONLY:
+{{"thought": "Summarising findings so far.", "tool": "final_answer", "args": {{"answer": "<your best answer>"}}}}

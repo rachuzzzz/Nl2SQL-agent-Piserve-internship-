@@ -1,0 +1,6 @@
+-- SOFT-DELETE: these tables have an 'active' boolean column — ALWAYS filter WHERE active = true:
+--   inspection_report, inspection_corrective_action, facility, users,
+--   inspection_type, inspector_portfolio, inspector_portfolio_details,
+--   frequency_definition, po_details, pr_details, risk_level, inspection_schedule
+-- NO active column: ai_answers, ai_questions, role, user_roles
+--   NEVER use aa.active or aq.active — these columns do not exist

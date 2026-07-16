@@ -1,0 +1,13 @@
+-- DRAFT RECORDS ARE NEVER COUNTED — GLOBAL RULE:
+--   DRAFT inspections are incomplete — they must NEVER appear in any count, list, average, or aggregate.
+--
+-- STATUS GROUPINGS — always bucket into two categories (never expose raw status names to user):
+--   conducted  = status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION') — in-flight
+--   completed  = status = 'CLOSED'                                                — fully approved
+--
+-- DEFAULT for "total inspections / how many inspections / inspections in <month>":
+--   Show as TWO-ROW summary using CASE grouping:
+--     CASE WHEN ir.status = 'CLOSED' THEN 'completed' ELSE 'conducted' END AS category
+--   NEVER show raw status breakdown (SUBMITTED/UNDER_REVIEW/etc) unless user explicitly asks
+--   NEVER use status IN ('CLOSED','SUBMITTED') — that mixes conducted and completed
+--   NEVER use status != 'DRAFT' alone for conducted — CLOSED is not conducted

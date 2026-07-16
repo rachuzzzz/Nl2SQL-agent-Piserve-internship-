@@ -538,7 +538,7 @@ def generate_sql(
         # Retrieval-based example injection via SeedExampleIndex (cosine similarity)
         # Falls back to empty string if index not available or seed_examples not deployed.
         try:
-            from khidmah.agent.seed_examples import CORE_CONTEXT, build_core_context_additions
+            from khidmah.agent.examples import CORE_CONTEXT, build_core_context_additions
             _core_ctx = CORE_CONTEXT + build_core_context_additions(question)
         except ImportError:
             _core_ctx = (

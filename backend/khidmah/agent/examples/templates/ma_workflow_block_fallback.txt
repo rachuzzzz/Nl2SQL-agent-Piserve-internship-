@@ -1,0 +1,12 @@
+-- MITIGATIVE ACTION WORKFLOW — four independent tracks on ica:
+--   status (system):            OPEN | CLOSED | OVERDUE | CLOSE_WITH_DEFERRED
+--   progress_stage (inspectee): NOT_STARTED, ON_TRACK, BEHIND, AT_RISK, COMPLETED, CLOSE_WITH_DEFERRED
+--   implementation_status (reviewers): NULL | PENDING_FOR_REVIEW | APPROVE | RETURN_FOR_MODIFICATION
+--     EXACT STRINGS: 'APPROVE' not 'APPROVED' — 'PENDING_FOR_REVIEW' not 'PENDING'
+--   capex_status (USER-ENTERED, declarative only): NULL | ACCEPTED | REJECTED | DEFERRED
+--     po_details is the authoritative money record — POs legitimately exist on REJECTED rows
+-- INVARIANTS:
+--   status = 'CLOSED'  ⟺  implementation_status = 'APPROVE' (closure IS the approval)
+--   RETURN_FOR_MODIFICATION resets progress_stage to NULL — progress_stage='COMPLETED' MISSES returned MAs
+--   inspection_report closes only when ALL its MAs are closed
+-- TRAP: 'at risk' = progress_stage='AT_RISK' (schedule health), NOT risk_level='High' (severity)
