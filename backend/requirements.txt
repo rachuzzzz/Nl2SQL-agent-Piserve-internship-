@@ -45,3 +45,9 @@ huggingface_hub>=0.20
 
 # Testing
 pytest>=8.0
+
+# Linting — catches undefined-name/unused-import bugs static analysis
+# would miss otherwise (mixin/module splits are the main risk area: a
+# name available in the original single file silently going missing
+# after an extraction). Run: python -m pyflakes khidmah/
+pyflakes>=3.2
