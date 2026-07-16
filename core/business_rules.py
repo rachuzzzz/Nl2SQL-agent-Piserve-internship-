@@ -36,8 +36,6 @@ Conflict detection
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Optional
 
 
 # ── Semantics registry (single source of truth for status/cast rules) ─────────
@@ -120,6 +118,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_po_pr_join_to_ir",
         "type":        BLOCK,
+        "code":        "PO_PR_JOIN_TO_IR",
         "description": "po/pr_details.mitigative_action_uuid must join to ica.id, NEVER to ir.id (inspection_report). Joining to ir.id matches zero rows.",
         "sql_pattern": r"mitigative_action_uuid\s*=\s*ir\.id",
         "message":     (
@@ -135,6 +134,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_po_pr_double_direct_join",
         "type":        BLOCK,
+        "code":        "PO_PR_DOUBLE_JOIN",
         "description": (
             "Joining po_details AND pr_details directly into the same query (not via separate "
             "pre-aggregated CTEs) causes a cross-join row multiplication when an MA has more than "
@@ -173,6 +173,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_dml",
         "type":        BLOCK,
+        "code":        "DML_BLOCKED",
         "description": "Only SELECT is allowed — no data modification.",
         "sql_pattern": r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE)\b",
         "message":     "BLOCKED: DML/DDL detected. Only SELECT is allowed.",
@@ -318,6 +319,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_mitigative_uuid_wrong_target",
         "type":        BLOCK,
+        "code":        "MITIGATIVE_UUID_WRONG_TARGET",
         "description": "po/pr_details.mitigative_action_uuid joins to ica.id only.",
         # Catches the WRONG form: mitigative_action_uuid = ir.id / ir.<col> / fac.id etc.
         # Silent-zero failure mode: the join matches nothing, LEFT JOIN +
@@ -365,6 +367,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_ai_question_singular",
         "type":        BLOCK,
+        "code":        "UNKNOWN_TABLE",
         "description": "ai_question (singular) does not exist — use ai_questions.",
         "sql_pattern": r"\bai_question\b(?!s)",
         "message":     "HALLUCINATION: table 'ai_question' does not exist. Use ai_questions (plural).",
@@ -372,6 +375,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_ai_answer_singular",
         "type":        BLOCK,
+        "code":        "UNKNOWN_TABLE",
         "description": "ai_answer (singular) does not exist — use ai_answers.",
         "sql_pattern": r"\bai_answer\b(?!s)",
         "message":     "HALLUCINATION: table 'ai_answer' does not exist. Use ai_answers (plural).",
@@ -379,6 +383,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_fb_users",
         "type":        BLOCK,
+        "code":        "UNKNOWN_TABLE",
         "description": "fb_users does not exist — use users.",
         "sql_pattern": r"\bfb_users?\b",
         "message":     "HALLUCINATION: table 'fb_users' does not exist. Use the 'users' table.",
@@ -386,6 +391,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_fb_submissions",
         "type":        BLOCK,
+        "code":        "UNKNOWN_TABLE",
         "description": "fb_submissions / fb_submission do not exist.",
         "sql_pattern": r"\bfb_submissions?\b",
         "message":     "HALLUCINATION: fb_submissions does not exist. Answer data is in ai_answers.",
@@ -393,6 +399,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_fb_answers",
         "type":        BLOCK,
+        "code":        "UNKNOWN_TABLE",
         "description": "fb_answers / fb_answer / fb_form_answers do not exist.",
         "sql_pattern": r"\bfb_(form_)?answers?\b",
         "message":     "HALLUCINATION: fb_answers does not exist. Use ai_answers.",
@@ -400,6 +407,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_fb_responses",
         "type":        BLOCK,
+        "code":        "UNKNOWN_TABLE",
         "description": "fb_responses / fb_response do not exist.",
         "sql_pattern": r"\bfb_responses?\b",
         "message":     "HALLUCINATION: fb_responses does not exist. Use ai_answers.",
@@ -407,6 +415,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_table_dynamic_fb",
         "type":        BLOCK,
+        "code":        "DYNAMIC_TABLE",
         "description": "Dynamic fb_{uuid} answer tables — all answer data is in ai_answers.",
         "sql_pattern": r"\bfb_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}\b",
         "message":     "BLOCKED: Dynamic fb_<uuid> table. Use ai_answers instead.",
@@ -480,6 +489,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_capex_left_join_multiplication",
         "type":        BLOCK,
+        "code":        "CAPEX_LEFT_JOIN_MULT",
         "description": "Direct LEFT JOIN po_details inflates SUM(ica.capex) when one ICA has multiple POs",
         # Must match: SUM(ica.capex) AND LEFT JOIN po_details in the main query
         # but NOT when po_details only appears inside a CTE (WITH ... AS (...po_details...))
@@ -504,6 +514,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_expenditure_as_conversion",
         "type":        BLOCK,
+        "code":        "EXPENDITURE_AS_CONVERSION",
         "description": "expenditure column is a category flag, NOT a conversion indicator",
         "sql_pattern": r"expenditure.*IN.*CAPEX.*converted|converted.*expenditure.*IN.*CAPEX|CASE.*expenditure.*CAPEX.*capex",
         "message":     (
@@ -760,6 +771,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_inspector_not_in_pattern",
         "type":        BLOCK,
+        "code":        "INSPECTOR_NOT_IN_PATTERN",
         "description": "NOT IN (SELECT inspector_user_id) misses new inspectors with zero inspections.",
         # Fires when: query asks about inactive/missing inspectors using NOT IN subquery
         # on inspection_report — this silently excludes brand-new inspectors.
@@ -784,6 +796,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_responsible_fk_join",
         "type":        BLOCK,
+        "code":        "WRONG_JOIN",
         "description": "ica.responsible is a string ENUM — never JOIN it to users.",
         "sql_pattern": r"\bjoin\s+users\b.*?\b(?:responsible|pending_with)\s*=\s*\w+\.id\b",
         "message":     "HALLUCINATION: responsible and pending_with are plain string ENUMs, NOT UUID FKs. Never JOIN them to users. Use: WHERE ica.responsible = 'CLIENT' (uppercase).",
@@ -793,6 +806,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "block_close_on_arithmetic",
         "type":        BLOCK,
+        "code":        "DEAD_COLUMN",
         "description": "close_on is a DEAD COLUMN (all values NULL, confirmed) — any comparison/arithmetic is meaningless.",
         # Catches arithmetic (+/-), EXTRACT/date_trunc, AND comparisons (>, <, >=, <=, =)
         "sql_pattern": (
@@ -833,10 +847,16 @@ REGISTRY: list[dict] = [
     },
     {
         "id":          "block_hardcoded_year",
-        "type":        BLOCK,
-        "description": "Never hardcode years — use EXTRACT(YEAR FROM CURRENT_DATE).",
+        "type":        WARN,
+        "code":        "HARDCODED_YEAR",
+        "description": (
+            "Hardcoded year — consider EXTRACT(YEAR FROM CURRENT_DATE) for current-year queries. "
+            "SOFT_WARN, not BLOCK: intentional historical-year queries (e.g. 'inspections in 2024') "
+            "are legitimate and must not be hard-rejected — matches core/validator.py's existing, "
+            "deliberate demotion of this same check (see validator.py's HARDCODED_YEAR comment)."
+        ),
         "sql_pattern": r"\bextract\s*\(\s*year\s+from\s+\w[\w.]*\s*\)\s*=\s*20\d\d\b",
-        "message":     "HARDCODED YEAR: Never use '= 20XX'. Always use: EXTRACT(YEAR FROM submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)",
+        "message":     "Hardcoded year '= 20XX' — consider EXTRACT(YEAR FROM CURRENT_DATE) for current-year queries",
     },
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -846,6 +866,7 @@ REGISTRY: list[dict] = [
     {
         "id":          "warn_no_limit",
         "type":        WARN,
+        "code":        "MISSING_LIMIT",
         "description": "Non-aggregate queries without LIMIT can return huge result sets.",
         "sql_pattern": r"^(?!.*\b(COUNT|SUM|AVG|MIN|MAX)\s*\()(?!.*\bLIMIT\b)",
         "message":     "WARNING: No LIMIT on non-aggregate query. Add LIMIT 100.",
@@ -1918,24 +1939,21 @@ REGISTRY: list[dict] = [
 
 # ── RulesEngine ────────────────────────────────────────────────────────────────
 
-@dataclass
-class RuleMatch:
-    rule_id:  str
-    rule_type: str
-    message:  str
-    fix:      Optional[str] = None
-
-
 class RulesEngine:
     """
     Loads and applies the business rules registry.
 
     Usage
     -----
-    engine = RulesEngine()                       # validates registry at init
-    errors  = engine.validate_sql(sql)           # BLOCK + WARN rules
-    sql     = engine.autocorrect_sql(sql)        # AUTOCORRECT rules
-    hint    = engine.hint_for_question(question) # INJECT rules
+    engine = RulesEngine()                            # validates registry at init
+    hint    = engine.hint_for_question(question)       # INJECT rules
+    ids     = engine.matching_inject_ids(question)
+    tables  = engine.required_tables_for(rule_ids)
+    forbidden = engine.forbidden_patterns_for(rule_ids)
+
+    BLOCK/WARN/AUTOCORRECT rules are consumed by core/validator.py's
+    SQLValidator (_registry_block_warn_issues / _registry_autocorrects),
+    restricted to an explicit allowlist — not through this class directly.
     """
 
     def __init__(self, rules: list[dict] | None = None):
@@ -2016,67 +2034,6 @@ class RulesEngine:
         self._warn_rules   = [r for r in self._compiled if r["type"] == WARN]
         self._autocorr_rules = [r for r in self._compiled if r["type"] == AUTOCORRECT]
 
-    # ── SQL validation ────────────────────────────────────────────────────────
-
-    def validate_sql(self, sql: str, question: str = "") -> tuple[bool, list[str]]:
-        """
-        Apply BLOCK and WARN rules to the given SQL.
-        Returns (passed, [error/warning strings]).
-        Real errors (BLOCK) cause passed=False.
-
-        question — optional user question text. When provided, BLOCK rules with a
-                   question_pattern will only fire if that pattern matches the question.
-                   Allows context-sensitive rules (e.g. INTERVAL '30 days' is only wrong
-                   when user asked about 'this month', not when they said 'last 30 days').
-        """
-        errors: list[str] = []
-        sql_lower = sql.lower()
-        q_lower = question.lower() if question else ""
-
-        for rule in self._block_rules:
-            pattern_re: re.Pattern = rule["_sql_re"]
-            # Optional table_guard: rule only fires if a specific table is present
-            guard = rule.get("table_guard")
-            if guard and guard.lower() not in sql_lower:
-                continue
-            # Optional question_pattern: rule only fires if question matches.
-            # If question is empty/unknown, skip question_pattern rules entirely —
-            # we have no context to evaluate them, so don't block.
-            q_pat = rule.get("_q_re")
-            if q_pat:
-                if not q_lower or not q_pat.search(q_lower):
-                    continue
-            if pattern_re.search(sql):
-                errors.append(rule["message"])
-
-        warnings: list[str] = []
-        for rule in self._warn_rules:
-            pattern_re = rule["_sql_re"]
-            guard = rule.get("table_guard")
-            if guard and guard.lower() not in sql_lower:
-                continue
-            if pattern_re.search(sql):
-                warnings.append(rule["message"])
-
-        all_messages = errors + warnings
-        return len(errors) == 0, all_messages
-
-    # ── SQL autocorrection ────────────────────────────────────────────────────
-
-    def autocorrect_sql(self, sql: str) -> tuple[str, list[str]]:
-        """
-        Apply AUTOCORRECT rules to the given SQL.
-        Returns (corrected_sql, [log_messages]).
-        """
-        logs: list[str] = []
-        for rule in self._autocorr_rules:
-            pattern_re: re.Pattern = rule["_sql_re"]
-            replacement = rule.get("replacement", "")
-            if pattern_re.search(sql):
-                sql = pattern_re.sub(replacement, sql)
-                logs.append(rule.get("message", f"[autocorrect] applied rule '{rule['id']}'"))
-        return sql, logs
-
     # ── Question-level hint injection ─────────────────────────────────────────
 
     def hint_for_question(self, question: str) -> str:
@@ -2108,12 +2065,6 @@ class RulesEngine:
 
     def rules_by_type(self, rule_type: str) -> list[dict]:
         return [r for r in self._rules if r["type"] == rule_type]
-
-    def get_rule(self, rule_id: str) -> dict | None:
-        for r in self._rules:
-            if r["id"] == rule_id:
-                return r
-        return None
 
     def required_tables_for(self, rule_ids: list) -> list:
         """Return all required_tables for a set of fired INJECT rule IDs."""

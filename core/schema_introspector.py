@@ -48,9 +48,20 @@ ENUM_COLUMNS = {
     ],  # DRAFT = not yet submitted; PENDING = awaiting review; MODIFICATION = sent back
 }
 
+# users.id (UUID PK) vs users.id_fk (integer Drupal UID) is a recurring source of
+# "operator does not exist: uuid = integer" failures — the model repeatedly guesses
+# `u.id = <int>` for "my role" / "Drupal UID <n>" style questions. Surfaced directly
+# on the users lookup-table line (both _fmt_lookup and for_sql_prompt_slim) since
+# that's the block actually reaching the SQL-generation model by default.
+_USERS_ID_NOTE = (
+    "id_fk is the integer Drupal UID (e.g. 11410) — id is the UUID PK. "
+    "Filtering by a raw numeric user ID → WHERE id_fk = <int>, NEVER WHERE id = <int>."
+)
+
 BUSINESS_RULES = [
     # NOTE: the observation↔MA cast direction below must match
-    # core.semantics_registry.observation_ma_join() — "aa.submission_id = ica.observation_id::varchar"
+    # core.semantics_registry.SEMANTICS["joins"]["observation_to_ma"]["sql"]
+    # — "aa.submission_id = ica.observation_id::varchar"
     "DRAFT inspections usually have NULL scores. Always add WHERE status != 'DRAFT' "
     "when querying inspection_score, unless the user explicitly asks about drafts.",
     "NEVER use SELECT *. Always specify the columns the user needs.",
@@ -403,17 +414,44 @@ class DatabaseSchema:
     lookup_tables: dict = field(default_factory=dict)
     enum_values: dict = field(default_factory=dict)  # table → list of name values (dynamic)
     _system_cache: Optional[str] = field(default=None, repr=False)
-    _sql_cache: Optional[str] = field(default=None, repr=False)
+    _reasoning_cache: Optional[str] = field(default=None, repr=False)
 
     def for_system_prompt(self) -> str:
         if not self._system_cache:
             self._system_cache = self._build_system_block()
         return self._system_cache
 
-    def for_sql_prompt(self) -> str:
-        if not self._sql_cache:
-            self._sql_cache = self._build_sql_block()
-        return self._sql_cache
+    def for_reasoning_prompt(self) -> str:
+        """
+        Compact schema block for the reasoning LLM's system prompt — curated
+        key columns per table (not the full per-column dump _build_system_block
+        produces), plus the lookup/JOIN-pattern section. Mirrors the token-budget
+        fix already applied to the SQL model in for_sql_prompt_slim(): dumping
+        full columns for all 29 tables on every call pushed the reasoning LLM's
+        prompt to 19953/20000 num_ctx tokens, causing truncated tool-call JSON.
+        """
+        if not self._reasoning_cache:
+            self._reasoning_cache = self._build_reasoning_block()
+        return self._reasoning_cache
+
+    def _build_reasoning_block(self) -> str:
+        lines = ["━━━ INSPECTION WORKFLOW TABLES — key columns ━━━", ""]
+        for tname in INSPECTION_TABLES + AI_TABLES:
+            cols = USEFUL_COLUMNS.get(tname)
+            if cols:
+                lines.append(f"  {tname}: {', '.join(cols)}")
+            else:
+                lines.append(f"  {tname} (call get_schema for columns)")
+        lines.append("")
+        lines.append(self._fmt_lookup())
+        lines.append("")
+        lines.append(
+            "AI FLAT TABLES join pattern:\n"
+            "  FROM ai_answers aa\n"
+            "  LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
+            "  JOIN inspection_report ir ON aa.inspection_report_id = ir.id"
+        )
+        return "\n".join(lines)
 
     def for_sql_prompt_slim(self) -> str:
         """
@@ -439,6 +477,8 @@ class DatabaseSchema:
             elif ev and isinstance(ev[0], dict):
                 names = ", ".join(repr(d["name"]) for d in ev[:8])
                 lines.append(f"  {tname}.name → [{names}]")
+            elif tname == "users":
+                lines.append(f"  users: {_USERS_ID_NOTE}")
             else:
                 lines.append(f"  {tname}.name (UUID FK)")
 
@@ -555,6 +595,8 @@ class DatabaseSchema:
                 lines.append(f"  {tname}: {expr}  [definitions: {names}]")
             else:
                 lines.append(f"  {tname}: {expr}")
+            if tname == "users":
+                lines.append(f"    ⚠ {_USERS_ID_NOTE}")
 
         # Show live status enum values for key tables
         for col_key in ("inspection_report.status", "inspection_cycle.status",
@@ -582,22 +624,6 @@ class DatabaseSchema:
         lines.append("BUSINESS RULES:")
         for rule in BUSINESS_RULES:
             lines.append(f"  - {rule}")
-        lines.append("")
-        lines.append(TABLE_RELATIONSHIPS)
-        return "\n".join(lines)
-
-    def _build_sql_block(self) -> str:
-        lines = ["### INSPECTION WORKFLOW tables:", ""]
-        for tname in INSPECTION_TABLES:
-            ts = self.tables.get(tname)
-            if ts:
-                lines.append(self._fmt_table(ts))
-                lines.append("")
-        lines.append(self._fmt_lookup())
-        lines.append(self._fmt_ai_section())
-        lines.append("")
-        for rule in BUSINESS_RULES:
-            lines.append(f"- {rule}")
         lines.append("")
         lines.append(TABLE_RELATIONSHIPS)
         return "\n".join(lines)

@@ -342,10 +342,6 @@ def old_completed_forbidden_regex() -> str:
     return r"status\s*IN\s*\(\s*'CLOSED'\s*,\s*'SUBMITTED'\s*\)"
 
 
-def observation_ma_join() -> str:
-    return SEMANTICS["joins"]["observation_to_ma"]["sql"]
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Generated blocks — one per consumer layer
 # ═══════════════════════════════════════════════════════════════════════════

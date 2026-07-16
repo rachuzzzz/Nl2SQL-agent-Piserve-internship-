@@ -539,9 +539,9 @@ export class ChatWindowComponent implements AfterViewChecked {
   }
 
   get displayName(): string {
-    const first = localStorage.getItem('octaai_firstname') || '';
+    const first = sessionStorage.getItem('octaai_firstname') || '';
     if (first) return first;
-    const username = localStorage.getItem('octaai_username') || '';
+    const username = sessionStorage.getItem('octaai_username') || '';
     return username ? username.charAt(0).toUpperCase() + username.slice(1) : 'there';
   }
 

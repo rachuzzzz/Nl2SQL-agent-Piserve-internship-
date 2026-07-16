@@ -339,7 +339,13 @@ AVAILABLE TOOLS
                          limit=N → top N values; omit for full distribution
 
   SQL PATH (inspection_* tables + complex cross-table queries):
-  6. generate_sql      — { "question": "...", "schema_hint": "..." }
+  6. generate_sql      — { "question": "...", "schema_hint": "...", "relevant_tables": [...] }
+                         relevant_tables is OPTIONAL — a JSON array of table names (not a string).
+                         Only needed for tables beyond inspection_report/inspection_corrective_action:
+                         inspection_cycle, inspector_portfolio, inspector_portfolio_details,
+                         accompanying_inspectors, additional_inspectees, inspection_report_remark,
+                         inspectioncaprogress_tracking. Listing them here gets you their real
+                         column names — otherwise those tables are NOT described in your schema context.
   7. execute_sql       — { "sql": "..." }
   8. get_schema        — { "table_name": null }
 
@@ -1122,7 +1128,7 @@ Turn 1: {"thought": "inspection_schedule DOES have an active column — add isch
 
 ─── Facilities scheduled for a specific frequency ───
 User: "which facilities are scheduled for daily inspections"
-Turn 1: {"thought": "Daily inspections come from frequency_definition → inspector_portfolio_details → facility. Do NOT use inspection_schedule for this — frequency is set on the portfolio, not the schedule. Filter frequency_definition.name = 'Daily'.", "tool": "generate_sql", "args": {"question": "facilities scheduled for daily inspections", "schema_hint": "SELECT DISTINCT fac.name AS facility_name, fd.name AS frequency FROM frequency_definition fd JOIN inspector_portfolio_details ipd ON ipd.frequency_definition_id = fd.id JOIN facility fac ON fac.id = ipd.facility_id WHERE fd.name = 'Daily' AND fd.active = true AND ipd.active = true AND fac.active = true ORDER BY fac.name;"}}
+Turn 1: {"thought": "Daily inspections come from frequency_definition → inspector_portfolio_details → facility. Do NOT use inspection_schedule for this — frequency is set on the portfolio, not the schedule. Filter frequency_definition.name = 'Daily'. inspector_portfolio_details isn't in my default schema context, so I'll list it in relevant_tables to get its real columns.", "tool": "generate_sql", "args": {"question": "facilities scheduled for daily inspections", "schema_hint": "SELECT DISTINCT fac.name AS facility_name, fd.name AS frequency FROM frequency_definition fd JOIN inspector_portfolio_details ipd ON ipd.frequency_definition_id = fd.id JOIN facility fac ON fac.id = ipd.facility_id WHERE fd.name = 'Daily' AND fd.active = true AND ipd.active = true AND fac.active = true ORDER BY fac.name;", "relevant_tables": ["inspector_portfolio_details", "frequency_definition"]}}
 ─── Inspection schedule: overdue inspections ───
 User: "show all overdue inspections"
 Turn 1: {"thought": "Overdue inspections are in inspection_schedule WHERE status = 'OVERDUE'. inspection_schedule has NO inspection_id or inspection_report_id column — get facility, inspector, inspectee from FKs on inspection_schedule itself. To reach inspection_report instead, the FK is on the report: inspection_report.schedule_id = isched.id (not the other way round). Do NOT select inspection_id from inspection_schedule.", "tool": "generate_sql", "args": {"question": "overdue inspections with facility inspector and due date", "schema_hint": "SELECT fac.name AS facility_name, proj.name AS project_name, u_insp.first_name || ' ' || u_insp.last_name AS inspector_name, u_ins.first_name || ' ' || u_ins.last_name AS inspectee_name, isched.due_date, (CURRENT_DATE - isched.due_date::date) AS days_overdue FROM inspection_schedule isched JOIN facility fac ON isched.facility_id = fac.id LEFT JOIN project proj ON isched.project_id = proj.id JOIN users u_insp ON isched.inspector_id = u_insp.id LEFT JOIN users u_ins ON isched.inspectee_id = u_ins.id WHERE isched.status = 'OVERDUE' AND isched.active = true AND fac.active = true AND u_insp.active = true ORDER BY isched.due_date ASC LIMIT 100;"}}

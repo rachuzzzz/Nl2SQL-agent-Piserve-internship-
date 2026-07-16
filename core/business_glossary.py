@@ -452,14 +452,3 @@ def check_glossary(question: str, sql: str) -> list[tuple[str, str]]:
         if msg:
             violations.append((entry.severity, msg))
     return violations
-
-
-def get_term(term_id: str) -> Optional[GlossaryTerm]:
-    for entry in GLOSSARY:
-        if entry.id == term_id:
-            return entry
-    return None
-
-
-def summary() -> str:
-    return f"BusinessGlossary: {len(GLOSSARY)} terms"

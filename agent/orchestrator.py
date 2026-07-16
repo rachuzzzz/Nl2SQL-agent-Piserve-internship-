@@ -25,13 +25,25 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from core.semantic import SemanticQuestionIndex, SeedExampleIndex, text_similarity
 from core.validator import SQLValidator
-from core.schema_introspector import introspect_schema
+from core.schema_introspector import introspect_schema, BUSINESS_RULES, TABLE_RELATIONSHIPS
 from agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT, build_dynamic_prompt_additions
 from agent.tools import ToolRegistry
 from agent.tool_dispatcher import parse_tool_call, dispatch
 from core.business_rules import get_engine as get_rules_engine
 from core.rbac import build_scope_filter
 from core.disambiguation import is_disambiguation_result, is_entity_disambiguation_result
+
+
+# ---------------------------------------------------------------------------
+# SQL literal escaping — for names pulled from query results (facility,
+# inspector, entity candidates) that get spliced into ILIKE '%...%' text
+# fed to the SQL-generating LLM. Without this, a name containing an
+# apostrophe (e.g. "O'Brien's Yard") breaks the string literal.
+# ---------------------------------------------------------------------------
+
+def _ilike_escape(value: str) -> str:
+    """Escape a raw value for safe interpolation into a SQL string literal."""
+    return value.replace("'", "''")
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +139,7 @@ class ConversationTurn:
     inspector_names: list = field(default_factory=list)  # e.g. ["neenu extinsp1"]
     cycle_ids: list = field(default_factory=list)        # UUIDs from cycle_id column
     user_ids: list = field(default_factory=list)         # resolved user UUIDs after disambiguation
+    facility_ids: list = field(default_factory=list)     # resolved facility UUIDs, captured opportunistically from facility_id/fac_id columns
     disambiguation_name: str = ""   # name that was disambiguated (e.g. "george"), total_count stored in total_count
     disambiguation_candidates: list = field(default_factory=list)  # [{"name": ..., "user_id": ...}] from disambiguation rows
     disambiguation_origin_question: str = ""  # the ORIGINAL question that started this disambiguation chain (e.g. "which schedules is assigned to neenu") — carried forward across narrowing turns so the agent doesn't lose the actual goal while resolving a name
@@ -478,7 +491,7 @@ class ConversationSession:
                     lines.append(
                         f"ACTIVE CONTEXT — The conversation is about inspector '{active_label}'."
                         f" When user says 'they', 'that inspector', 'their inspections'"
-                        f" — filter by u.first_name || ' ' || u.last_name ILIKE '%{active_label}%'"
+                        f" — filter by u.first_name || ' ' || u.last_name ILIKE '%{_ilike_escape(active_label)}%'"
                         f" on the users table joined via the appropriate FK."
                         f" Do NOT broaden to all inspectors."
                     )
@@ -490,9 +503,21 @@ class ConversationSession:
                     f" (or aa.inspection_id = '{active_value}' for form answers)."
                 )
             elif active_type == "facility":
-                # Prefer exact id filter if we captured one from a disambiguation
-                # query — same pattern as the inspector branch above.
-                _fid = _lookup_entity_id(active_label)
+                # Prefer an exact id filter if one is available. Two sources,
+                # checked in order: (1) a facility_id/fac_id column captured
+                # directly from an ordinary query result (_last_with_fid —
+                # mirrors _last_with_uid for inspectors above), (2) a name
+                # resolved via the STEP 1 disambiguation flow (_lookup_entity_id,
+                # unchanged). Only falls back to ILIKE if neither has an id.
+                _last_with_fid = next(
+                    (t for t in reversed(self.turns) if t.facility_ids),
+                    None
+                )
+                _fid = ""
+                if _last_with_fid and len(_last_with_fid.facility_ids) == 1:
+                    _fid = _last_with_fid.facility_ids[0]
+                if not _fid:
+                    _fid = _lookup_entity_id(active_label)
                 if _fid:
                     lines.append(
                         f"ACTIVE CONTEXT — The conversation is scoped to facility '{active_label}'"
@@ -507,7 +532,7 @@ class ConversationSession:
                         f"ACTIVE CONTEXT — The conversation is scoped to facility '{active_label}'."
                         f" ALL follow-up questions about mitigative actions, inspections, scores,"
                         f" or form answers should include a facility filter"
-                        f" (fac.name ILIKE '%{active_label}%') unless the user explicitly asks"
+                        f" (fac.name ILIKE '%{_ilike_escape(active_label)}%') unless the user explicitly asks"
                         f" for a global/all-facilities view."
                         f" Do NOT query globally when the context is scoped to this facility."
                     )
@@ -532,7 +557,7 @@ class ConversationSession:
                         f"ACTIVE CONTEXT — The conversation is scoped to {_tbl} '{active_label}'."
                         f" ALL follow-up questions about mitigative actions, inspections, scores,"
                         f" or form answers should include a filter"
-                        f" ({_als}.name ILIKE '%{active_label}%') unless the user explicitly asks"
+                        f" ({_als}.name ILIKE '%{_ilike_escape(active_label)}%') unless the user explicitly asks"
                         f" for a global view."
                         f" Do NOT query globally when the context is scoped to this {_tbl}."
                     )
@@ -585,7 +610,7 @@ class ConversationSession:
             elif last.facility_names and len(last.facility_names) == 1:
                 lines.append(
                     f"CONTEXT — The conversation is about facility '{last.facility_names[0]}'."
-                    f" Filter by fac.name ILIKE '%{last.facility_names[0]}%'."
+                    f" Filter by fac.name ILIKE '%{_ilike_escape(last.facility_names[0])}%'."
                 )
             elif last.single_row_values:
                 lines.append(f"CONTEXT — Last query returned a single result: {last.single_row_values}")
@@ -770,7 +795,7 @@ class ConversationSession:
                         f" '{_dn}' (too many to list). The user now appears to be providing"
                         f" a specific full name: '{_specific}'.\n"
                         f"  STEP A: Run a targeted lookup using the concatenated full name:\n"
-                        f"    WHERE (u.first_name || ' ' || u.last_name) ILIKE '%{_specific}%'"
+                        f"    WHERE (u.first_name || ' ' || u.last_name) ILIKE '%{_ilike_escape(_specific)}%'"
                         f"  — NOT separate first_name OR last_name conditions. If '{_specific}'"
                         f"  includes a role/descriptor rather than a real name (e.g. 'neenu qa"
                         f"  inspector'), instead search by the name part alone and use the role"
@@ -802,7 +827,7 @@ class ConversationSession:
                         f" '{_specific}'. Use the UUID already returned in the previous result"
                         f" (WHERE u.id = '<uuid>') to run the original query."
                         f" If UUID is not in history, look up by full name:"
-                        f" WHERE (u.first_name || ' ' || u.last_name) ILIKE '%{_specific}%'."
+                        f" WHERE (u.first_name || ' ' || u.last_name) ILIKE '%{_ilike_escape(_specific)}%'."
                         f"{_origin_note}"
                     )
                 else:
@@ -865,35 +890,6 @@ class AgentResult:
     stats: QueryStats = field(default_factory=QueryStats)
 
 
-# ---------------------------------------------------------------------------
-# Inspection intent detection — auto-injects schema hints for generate_sql
-# ---------------------------------------------------------------------------
-
-_INSPECTION_REPORT_RE = re.compile(
-    r'\b(inspection.?score|gp.?score|inspection.?hour|total.?hour|'
-    r'inspection.?report|inspection.?status|inspector|inspectee|'
-    r'inspection.?type|inspection.?sub.?type|facility|'
-    r'inspections?\s+by\s+type|inspections?\s+per\s+cycle)\b',
-    re.IGNORECASE,
-)
-_MITIGATIVE_ACTION_RE = re.compile(
-    r'\b(mitigative.?action|mitigative|finding|observation|'
-    r'cause|correction|responsible|progress.?stage|capex|opex|expenditure|'
-    r'overdue|close.?out|target.?date|pending.?with|risk.?level|'
-    r'open.?action|closed.?action|deferred)\b',
-    re.IGNORECASE,
-)
-_SCHEDULE_CYCLE_RE = re.compile(
-    r'\b(schedule|inspection.?schedule|inspection.?cycle|cycle|'
-    r'due.?date|schedule.?date|portfolio|inspector.?portfolio)\b',
-    re.IGNORECASE,
-)
-# NOTE: _INSPECTOR_COUNT_RE, _ICA_JOIN_RE, _MOST_RECENT_INSPECTION_RE removed —
-# these duplicated INJECT rules already handled by business_rules.py:
-#   inject_inspector_count, inject_ica_join, inject_most_recent_inspection.
-# business_rules.hint_for_question() fires all three via the registry at line ~697.
-
-
 class AgentOrchestrator:
 
     def __init__(self, db_connection_string, db_schema="public",
@@ -910,12 +906,25 @@ class AgentOrchestrator:
 
         self.db_schema = introspect_schema(self.db_engine)
 
+        # Reasoning LLM gets the curated/slim schema block (for_reasoning_prompt),
+        # not the full per-column dump (for_system_prompt) — the full dump pushed
+        # this prompt to 19953/20000 num_ctx tokens, causing truncated tool-call
+        # JSON (see debug_llm_*.log "TRUNCATED — unclosed brace(s)" warnings).
+        # BUSINESS_RULES/TABLE_RELATIONSHIPS are re-appended verbatim (same content
+        # _build_system_block() would include) since routing logic still relies on them.
+        _rules_block = "BUSINESS_RULES:\n" + "\n".join(f"  - {r}" for r in BUSINESS_RULES)
         self._system_prompt = SYSTEM_PROMPT.replace(
-            "{inspection_schema}", self.db_schema.for_system_prompt()
+            "{inspection_schema}",
+            self.db_schema.for_reasoning_prompt() + "\n\n" + _rules_block + "\n\n" + TABLE_RELATIONSHIPS
         )
         # {inspection_schema_sql} removed — injecting full DDL exceeded num_ctx:16384,
         # causing Ollama to truncate the prompt from the front.
-        # Per-query schema context is injected via schema_hint (_detect_inspection_tables).
+        # Per-call SQL-model context is built in agent/tools.py::generate_sql
+        # (via _select_schema_block): DatabaseSchema.for_sql_prompt_slim() (a
+        # fixed curated subset) by default, or DatabaseSchema.for_schema_hint()
+        # for just the tables named in the reasoning LLM's optional
+        # relevant_tables tool-call argument — real per-question targeting,
+        # not deterministic table detection.
         self._sql_prompt = SQL_GENERATION_PROMPT.replace("{inspection_schema_sql}", "")
 
         print(f"  Loading embedding model: {embedding_model}...")
@@ -1543,18 +1552,6 @@ class AgentOrchestrator:
             ))
         return AgentResult(question, ans, steps, max_iterations, False, stats)
 
-    def test_connection(self):
-        try:
-            with self.db_engine.connect() as conn:
-                nq = conn.execute(sql_text("SELECT COUNT(*) FROM ai_questions")).fetchone()[0]
-                na = conn.execute(sql_text("SELECT COUNT(*) FROM ai_answers")).fetchone()[0]
-                nr = conn.execute(sql_text("SELECT COUNT(*) FROM inspection_report")).fetchone()[0]
-            print(f"  ✓ DB OK — {nq} questions, {na} answers, {nr} inspection reports")
-            return True
-        except Exception as e:
-            print(f"  ✗ Connection failed: {e}")
-            return False
-
     @classmethod
     def from_env(cls, env_path=".env"):
         from dotenv import load_dotenv; load_dotenv(env_path)
@@ -1610,6 +1607,7 @@ class AgentOrchestrator:
 
         # Extract key entities from result rows for follow-up context
         insp_ids, fac_names, insp_names, cycle_ids, user_ids = [], [], [], [], []
+        facility_ids = []
         single_row_vals = {}
         _UUID_PAT = re.compile(
             r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
@@ -1627,6 +1625,13 @@ class AgentOrchestrator:
                 v = row.get(col)
                 if v and str(v) not in fac_names:
                     fac_names.append(str(v))
+            # Capture resolved facility UUID when the query happens to select
+            # it (mirrors the user_id capture below) — lets build_context_block
+            # prefer an exact fac.id filter over ILIKE on the name.
+            for col in ("facility_id", "fac_id"):
+                v = row.get(col)
+                if v and str(v) not in facility_ids and _UUID_PAT.match(str(v).strip()):
+                    facility_ids.append(str(v).strip())
             for col in ("inspector_name", "inspector"):
                 v = row.get(col)
                 if v and str(v) not in insp_names:
@@ -1635,8 +1640,9 @@ class AgentOrchestrator:
                 v = row.get(col)
                 if v and str(v) not in cycle_ids and _UUID_PAT.match(str(v).strip()):
                     cycle_ids.append(str(v).strip())
-            # Capture resolved user UUID from disambiguation queries (SELECT u.id AS user_id)
-            for col in ("user_id",):
+            # Capture resolved user UUID from disambiguation queries (SELECT u.id AS user_id),
+            # also matching the inspector_user_id FK alias used elsewhere in the schema.
+            for col in ("user_id", "inspector_user_id"):
                 v = row.get(col)
                 if v and str(v) not in user_ids and _UUID_PAT.match(str(v).strip()):
                     user_ids.append(str(v).strip())
@@ -1731,7 +1737,7 @@ class AgentOrchestrator:
             # falling back to the worked-example placeholder "INS-EXAMPLE-001".
             if fac_names and not insp_ids and len(last_rows) <= 3:
                 try:
-                    fac_escaped = fac_names[0].replace("'", "''")
+                    fac_escaped = _ilike_escape(fac_names[0])
                     _lookup = (
                         "SELECT ir.inspection_id FROM inspection_report ir "
                         "JOIN facility fac ON ir.facility_id = fac.id "
@@ -1789,6 +1795,7 @@ class AgentOrchestrator:
                 inspector_names=insp_names[:5],
                 cycle_ids=cycle_ids[:3],
                 user_ids=user_ids[:5],
+                facility_ids=facility_ids[:5],
                 disambiguation_name=_disambig_name,
                 disambiguation_candidates=_disambig_candidates,
                 disambiguation_origin_question=_disambig_origin_question,
@@ -1821,8 +1828,6 @@ class AgentOrchestrator:
 
     _COUNT_RE = re.compile(
         r'\b(how\s+many|count|number\s+of|total)\b', re.IGNORECASE)
-    _LIST_ALL_RE = re.compile(
-        r'\b(show\s+all|list\s+all|all\s+forms|every\s+form)\b', re.IGNORECASE)
 
     def _synthesize(self, question, tool_name, tool_result, max_display_rows=20, sql=""):
         data = tool_result.get("result", {})
@@ -2378,7 +2383,7 @@ class AgentOrchestrator:
                     f"({r.get('inspection_count')} inspections).\n"
                     f"Original question: \"{question}\"\n"
                     f"This is STEP 2a — call generate_sql again using "
-                    f"{alias}.name ILIKE '%{r.get('name')}%' to filter by this {table}. "
+                    f"{alias}.name ILIKE '%{_ilike_escape(str(r.get('name') or ''))}%' to filter by this {table}. "
                     f"Do NOT use {alias}.id UUID — the SQL model ignores UUID filters "
                     f"and will generate ILIKE anyway. Use the exact name directly."
                 )
@@ -2417,7 +2422,7 @@ class AgentOrchestrator:
                     f"'{name_filter}' — '{r.get('name')}'.\n"
                     f"Original question: \"{question}\"\n"
                     f"This is STEP 2a — call generate_sql again filtered by name: "
-                    f"WHERE u.first_name ILIKE '%{_first}%' AND u.last_name ILIKE '%{_last}%' "
+                    f"WHERE u.first_name ILIKE '%{_ilike_escape(_first)}%' AND u.last_name ILIKE '%{_ilike_escape(_last)}%' "
                     f"(joined via inspector_user_id or inspectee_user_id per the question's "
                     f"role wording). Do NOT use u.id UUID — the SQL model ignores UUID "
                     f"filters and will generate ILIKE anyway."
