@@ -4,7 +4,6 @@ Agent Orchestrator — the main reasoning loop.
 
 import json
 import logging
-import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -58,7 +57,8 @@ def _make_debug_logger() -> logging.Logger | None:
     RotatingFileHandler) so all logs — structured and raw — go to the same
     debug_llm_*.log file rather than creating a second file.
     """
-    if not os.getenv("DEBUG_LLM", "").strip() in ("1", "true", "yes"):
+    from khidmah.config.settings import get_settings
+    if not get_settings().debug_llm:
         return None
 
     # Find the file path already opened by setup_logging() on the inspectai logger.
@@ -1555,17 +1555,18 @@ class AgentOrchestrator:
     @classmethod
     def from_env(cls, env_path=".env"):
         from dotenv import load_dotenv; load_dotenv(env_path)
-        g = os.getenv
+        from khidmah.config.settings import get_settings
+        settings = get_settings()
         return cls(
             db_connection_string=(
-                f"postgresql://{g('DB_USER','postgres')}:{g('DB_PASSWORD','')}@"
-                f"{g('DB_HOST','localhost')}:{g('DB_PORT','5432')}/{g('DB_NAME','postgres')}"
+                f"postgresql://{settings.db_user}:{settings.db_password}@"
+                f"{settings.db_host}:{settings.db_port}/{settings.db_name}"
             ),
-            db_schema=g("DB_SCHEMA", "public"),
-            ollama_url=g("OLLAMA_URL", "http://localhost:11434"),
-            sql_model=g("OLLAMA_SQL_MODEL", "sqlcoder:7b"),
-            chat_model=g("OLLAMA_CHAT_MODEL", "qwen2.5:14b-instruct-q4_K_M"),
-            embedding_model=g("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
+            db_schema=settings.db_schema,
+            ollama_url=settings.ollama_url,
+            sql_model=settings.ollama_sql_model,
+            chat_model=settings.ollama_chat_model,
+            embedding_model=settings.embedding_model,
         )
 
     # ------------------------------------------------------------------ #

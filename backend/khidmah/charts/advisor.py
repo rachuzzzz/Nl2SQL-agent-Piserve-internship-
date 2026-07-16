@@ -29,7 +29,6 @@ Return format of advise():
 
 from __future__ import annotations
 import json
-import os
 import re
 from typing import Any
 
@@ -1148,9 +1147,9 @@ def _get_llm():
     global _llm_client
     if _llm_client is None:
         from llama_index.llms.ollama import Ollama
-        url   = os.getenv("OLLAMA_URL", "http://localhost:11434")
-        model = os.getenv("OLLAMA_CHAT_MODEL", "qwen2.5:14b-instruct-q4_K_M")
-        _llm_client = Ollama(model=model, base_url=url, request_timeout=15.0)
+        from khidmah.config.settings import get_settings
+        settings = get_settings()
+        _llm_client = Ollama(model=settings.ollama_chat_model, base_url=settings.ollama_url, request_timeout=15.0)
     return _llm_client
 
 def _llm_advise(columns, rows):
@@ -1221,7 +1220,8 @@ def advise(columns, rows):
       labels_column, values_columns,
       alternatives: list of {chart_type, label, config}
     """
-    use_llm = os.getenv("USE_LLM_CHART_ADVISOR","false").lower() in ("1","true","yes")
+    from khidmah.config.settings import get_settings
+    use_llm = get_settings().use_llm_chart_advisor
     result  = _llm_advise(columns, rows) if use_llm else _rules_advise(columns, rows)
 
     # Always attach alternatives (built from rules regardless of llm/rules mode)

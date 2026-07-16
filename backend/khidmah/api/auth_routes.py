@@ -13,7 +13,6 @@ wiring around them. Included into the main app via
 """
 
 import logging
-import os
 import re
 
 import httpx
@@ -22,6 +21,7 @@ from fastapi.security import HTTPAuthorizationCredentials as _HTTPCreds
 from pydantic import BaseModel
 
 from khidmah.api.deps import get_orch
+from khidmah.config.settings import get_settings
 from khidmah.core.auth import _bearer_scheme, _decode_jwt_payload, _register_token, _valid_tokens, require_auth
 from khidmah.core.rbac import DATA_VISIBILITY_PERMS
 
@@ -40,11 +40,12 @@ async def login(req: LoginRequest, request: Request):
     """Proxy OAuth password-grant to the identity server.
     Client credentials never leave the backend. Returns the OAuth response
     plus the decoded Drupal sub so Angular can display user info."""
-    oauth_url     = os.getenv("OAUTH_URL", "https://10.77.20.51/oauth/token?_format=json")
-    client_id     = os.getenv("CLIENT_ID", "").strip()
-    client_secret = os.getenv("CLIENT_SECRET", "").strip()
-    ca_cert = os.getenv("OAUTH_CA_CERT", "").strip()
-    skip_tls = os.getenv("OAUTH_SKIP_TLS_VERIFY", "").strip().lower() in ("1", "true", "yes")
+    settings = get_settings()
+    oauth_url     = settings.oauth_url
+    client_id     = settings.client_id
+    client_secret = settings.client_secret
+    ca_cert = settings.oauth_ca_cert
+    skip_tls = settings.oauth_skip_tls_verify
     verify: str | bool = False if skip_tls else (ca_cert if ca_cert else True)
 
     payload = {
@@ -171,7 +172,7 @@ async def get_my_permissions(
     user_uuid  = str(row.id)
     first_name = (row.first_name or "").strip()
 
-    perms_base = os.getenv("PERMISSIONS_API_URL", "http://10.77.20.54:8083")
+    perms_base = get_settings().permissions_api_url
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(f"{perms_base}/api/users/{user_uuid}/permissions")

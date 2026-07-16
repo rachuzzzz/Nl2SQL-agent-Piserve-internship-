@@ -1188,7 +1188,9 @@ async def health(request: Request):
     if _health_orch is not None:
         model_label = f"{_health_orch.chat_model_name} + {_health_orch.sql_model_name}"
     else:
-        import os
+        # Intentionally not khidmah.config.settings here — this display-only
+        # fallback uses "—" as its default (shown when the orchestrator hasn't
+        # started yet), not settings.py's functional default for these vars.
         chat = os.getenv("OLLAMA_CHAT_MODEL", "—")
         sql  = os.getenv("OLLAMA_SQL_MODEL",  "—")
         model_label = f"{chat} + {sql}"

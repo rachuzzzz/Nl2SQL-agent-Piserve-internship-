@@ -25,7 +25,6 @@ Problem 4 fix — SeedExampleIndex:
 """
 
 import math
-import os
 import numpy as np
 from dataclasses import dataclass
 from datetime import datetime
@@ -384,11 +383,12 @@ class SeedExampleIndex:
             self._seed_tags = [f'[{d}]' if d else '' for d in self._seed_domains]
 
             # Try loading CrossEncoder if RERANKER_MODEL is configured
-            reranker_model = os.environ.get("RERANKER_MODEL", "").strip()
+            from khidmah.config.settings import get_settings
+            reranker_model = get_settings().reranker_model
             if reranker_model:
                 try:
                     from sentence_transformers import CrossEncoder
-                    device = os.environ.get("RERANKER_DEVICE", "cpu")
+                    device = get_settings().reranker_device
                     print(f"  Loading CrossEncoder reranker: {reranker_model} ({device})...")
                     self._cross_encoder = CrossEncoder(reranker_model, device=device)
                     print(f"  ✓ Seed example index ready (CrossEncoder reranker)")
