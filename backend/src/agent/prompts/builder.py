@@ -16,10 +16,13 @@ examples, ~550 lines) is pure Python data (regex question_patterns + text)
 and lives in examples_tier2.py instead.
 """
 
+import logging
 import re
 from pathlib import Path
 
 from src.knowledge.question_patterns import MA_WORKFLOW_TOPIC
+
+_log_prompts = logging.getLogger("inspectai.prompts")
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
@@ -211,7 +214,16 @@ def build_dynamic_prompt_additions(question: str, score_fn=None) -> str:
     concatenating every regex match unconditionally — without it, behavior is
     unchanged from before this parameter existed.
     """
-    return (
-        build_conditional_blocks(question, score_fn=score_fn)
-        + build_worked_examples(question, score_fn=score_fn)
-    )
+    conditional = build_conditional_blocks(question, score_fn=score_fn)
+    worked = build_worked_examples(question, score_fn=score_fn)
+    if question and not conditional and not worked:
+        # Silent-miss signal: no CONDITIONAL_BLOCKS/EXAMPLES_TIER2 pattern matched
+        # this question at all. Not an error — most questions match nothing — but
+        # tracking it in logs lets topic-pattern drift (new phrasings real users
+        # try that the regexes never anticipated) become visible over time instead
+        # of invisible, since a miss here degrades context silently otherwise.
+        _log_prompts.debug(
+            "[PROMPTS] no reasoning-side conditional block/worked example matched: %r",
+            question[:120],
+        )
+    return conditional + worked

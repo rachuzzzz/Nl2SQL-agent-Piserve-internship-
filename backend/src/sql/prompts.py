@@ -12,10 +12,13 @@ STATUS GROUPINGS + CAST RULES come from src.knowledge.semantics_registry -- the
 single source of truth. Edit there, not here.
 """
 
+import logging
 import re
 from pathlib import Path
 
 from src.knowledge.question_patterns import MA_WORKFLOW_TOPIC
+
+_log_prompts = logging.getLogger("inspectai.prompts")
 
 _TEMPLATES_DIR = Path(__file__).parent / "examples" / "templates"
 
@@ -105,5 +108,10 @@ def build_core_context_additions(question: str) -> str:
         except re.error:
             continue
     if not matched:
+        # Silent-miss signal — see agent/prompts/builder.py's build_dynamic_prompt_additions
+        # for the reasoning-side counterpart and the full rationale.
+        _log_prompts.debug(
+            "[PROMPTS] no SQL-side conditional block matched: %r", question[:120]
+        )
         return ""
     return "\n--\n" + "\n--\n".join(matched)
