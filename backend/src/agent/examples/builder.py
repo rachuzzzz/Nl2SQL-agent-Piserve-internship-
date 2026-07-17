@@ -15,6 +15,8 @@ seed_data.py instead — see its module docstring for the field schema.
 import re
 from pathlib import Path
 
+from src.core.question_patterns import MA_WORKFLOW_TOPIC
+
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
@@ -62,18 +64,15 @@ from src.agent.examples.seed_data import SEED_EXAMPLES
 # counterparts (CONDITIONAL_BLOCKS["MA workflow columns"] and the FORM-pattern
 # Tier-2 examples in prompts.py).
 #
-# Patterns are intentionally KEPT IN SYNC with prompts.py's MA/FORM patterns —
-# both sides should treat "is this question about mitigative actions / form
-# answers" the same way. If you edit one, edit the other.
+# The MA pattern is shared with prompts.py's CONDITIONAL_BLOCKS via
+# src.core.question_patterns.MA_WORKFLOW_TOPIC (single source of truth —
+# edit there, not here) so both sides treat "is this question about
+# mitigative actions" the same way. The counting pattern below has no
+# cross-file counterpart today and stays defined inline.
 CORE_CONTEXT_CONDITIONAL = [
     {
         "title": "MA workflow columns (Deepseek)",
-        "question_pattern": (
-            r"(?i)\bmitigative\s+actions?\b|\bMAs?\b"
-            r"|\bcapex\b|\bopex\b|\bdeferred\b"
-            r"|\bprogress[_\s]stage\b|\bimplementation[_\s]status\b"
-            r"|\bneeds?\s+attention\b|\bcritical\s+issues?\b"
-        ),
+        "question_pattern": MA_WORKFLOW_TOPIC,
         "get_text": lambda: _MA_WORKFLOW_BLOCK,
     },
     {

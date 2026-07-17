@@ -2487,7 +2487,7 @@ ORDER BY tm.total_capex_generated DESC, DATE_TRUNC('month', ir.submitted_on);
 """,
         'domain': 'financial',
         # 'ranked_list', not 'per_row_breakdown' — the Stage 0 intent
-        # pre-filter (core/semantic.py's SeedExampleIndex.retrieve) only
+        # pre-filter (core/retrieval.py's SeedExampleIndex.retrieve) only
         # allows ('ranked_list', 'aggregate', 'filter', 'general') seeds
         # through for a "top N ..." query (classified 'ranked_list'), so a
         # different intent value here would silently exclude this example

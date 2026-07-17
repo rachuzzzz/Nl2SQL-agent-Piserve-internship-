@@ -7,6 +7,7 @@ these are aggregated and consumed.
 
 from src.core.business_rules._types import INJECT
 from src.core.business_rules.engine import _STATUS_HINT, _FINANCIAL_HINT, _DRAFT_EXCLUSION
+from src.core.question_patterns import MA_APPROVAL_WORKFLOW_TOPIC, FINANCIAL_ROUTING_TOPIC
 
 INJECT_RULES: list[dict] = [
 
@@ -312,26 +313,7 @@ INJECT_RULES: list[dict] = [
         "type":           INJECT,
         "priority":       88,
         "description":    "CAPEX/OPEX financial queries — route to po_details/pr_details/ai_answers.",
-        "question_pattern": (
-            r"\b(po[_\s]detail|pr[_\s]detail|purchase\s+order|purchase\s+requisition|"
-            r"purchase\s+order\s+amount|po\s+amount|total\s+po|"
-            r"capex.{0,30}(generat|convert|lost|loss|incurr)|"
-            r"opex.{0,30}(incurr|facilit|spend|higher|exceed)|"
-            r"(generat|convert|lost|incurr).{0,30}(capex|opex)|"
-            r"how\s+much.{0,40}(convert|capex|opex|po|purchase)|"
-            r"opex.{0,30}(higher|more|greater|exceed).{0,30}capex|"
-            r"conversion\s+rate|capex\s+conversion|"
-            r"(convert|capex).{0,20}(inspectee|fm|manager|facility)|"
-            # plural 'converters' / 'generators' explicitly
-            r"(capex|opex)\s+(converter|generator)s?|"
-            r"(converter|generator)s?\s+(capex|opex)|"
-            r"top.{0,15}(capex|opex).{0,15}(converter|generator)s?|"
-            # facility cost / expenditure queries
-            r"(facility|site).{0,30}(costs?|spend|expenditure|expensive)|"
-            r"(cost|spend|expenditure).{0,30}(facility|site)|"
-            r"most\s+expensive\s+(facility|site)|"
-            r"rival.{0,20}(quote|bid|amount)|financial\s+summary)\b"
-        ),
+        "question_pattern": FINANCIAL_ROUTING_TOPIC,
         "hint": _FINANCIAL_HINT,
     },
 
@@ -693,14 +675,7 @@ INJECT_RULES: list[dict] = [
         "type":           INJECT,
         "priority":       78,
         "description":    "MA approval/progress questions — implementation_status & progress_stage routing.",
-        "question_pattern": (
-            r"(?i)\b(awaiting|pending)\s*(for\s+)?(approval|review)\b.{0,40}\b(action|MA)s?\b"
-            r"|\b(action|MA)s?\b.{0,40}\b(awaiting|pending)\s*(for\s+)?(approval|review)\b"
-            r"|\bapproval\b.{0,30}\b(action|MA)s?\b"
-            r"|\b(approved|sent\s+back|returned)\b.{0,30}\b(action|MA)s?\b"
-            r"|\b(at\s+risk|behind\s+schedule|on\s+track|not\s+started)\b.{0,30}\b(action|MA)s?\b"
-            r"|\b(action|MA)s?\b.{0,40}\b(at\s+risk|behind|on\s+track|approved?|pending|sent\s+back|returned)\b"
-        ),
+        "question_pattern": MA_APPROVAL_WORKFLOW_TOPIC,
         "hint": (
             "\nMA WORKFLOW ROUTING — four independent ica columns, do not confuse:\n"
             "  'awaiting/pending approval/review' → implementation_status = 'PENDING_FOR_REVIEW'\n"

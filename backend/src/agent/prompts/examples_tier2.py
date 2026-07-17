@@ -4,18 +4,17 @@ agent/prompts.py. See src.agent.prompts.builder for how these are
 matched against a question and budget-capped.
 """
 
+from src.core.question_patterns import (
+    MA_WORKFLOW_TOPIC,
+    MA_APPROVAL_WORKFLOW_TOPIC,
+    FINANCIAL_ROUTING_TOPIC,
+)
+
 EXAMPLES_TIER2 = [
     {
         "title": "MAs awaiting approval",
         # Reuses inject_ma_approval_workflow's question_pattern (business_rules.py)
-        "question_pattern": (
-            r"(?i)\b(awaiting|pending)\s*(for\s+)?(approval|review)\b.{0,40}\b(action|MA)s?\b"
-            r"|\b(action|MA)s?\b.{0,40}\b(awaiting|pending)\s*(for\s+)?(approval|review)\b"
-            r"|\bapproval\b.{0,30}\b(action|MA)s?\b"
-            r"|\b(approved|sent\s+back|returned)\b.{0,30}\b(action|MA)s?\b"
-            r"|\b(at\s+risk|behind\s+schedule|on\s+track|not\s+started)\b.{0,30}\b(action|MA)s?\b"
-            r"|\b(action|MA)s?\b.{0,40}\b(at\s+risk|behind|on\s+track|approved?|pending|sent\s+back|returned)\b"
-        ),
+        "question_pattern": MA_APPROVAL_WORKFLOW_TOPIC,
         "text": """\
 ─── MAs awaiting approval ───
 User: "how many mitigative actions are awaiting approval?" / "show MAs pending review"
@@ -97,9 +96,7 @@ Turn 1: {"thought": "User explicitly says 'rejected' — they want MA rows where
     {
         "title": "Total capex generated converted and lost",
         # Reuses inject_financial_routing's question_pattern (business_rules.py)
-        "question_pattern": (
-            r"\b(po[_\s]detail|pr[_\s]detail|purchase\s+order|purchase\s+requisition|purchase\s+order\s+amount|po\s+amount|total\s+po|capex.{0,30}(generat|convert|lost|loss|incurr)|opex.{0,30}(incurr|facilit|spend|higher|exceed)|(generat|convert|lost|incurr).{0,30}(capex|opex)|how\s+much.{0,40}(convert|capex|opex|po|purchase)|opex.{0,30}(higher|more|greater|exceed).{0,30}capex|conversion\s+rate|capex\s+conversion|(convert|capex).{0,20}(inspectee|fm|manager|facility)|(capex|opex)\s+(converter|generator)s?|(converter|generator)s?\s+(capex|opex)|top.{0,15}(capex|opex).{0,15}(converter|generator)s?|(facility|site).{0,30}(costs?|spend|expenditure|expensive)|(cost|spend|expenditure).{0,30}(facility|site)|most\s+expensive\s+(facility|site)|rival.{0,20}(quote|bid|amount)|financial\s+summary)\b"
-        ),
+        "question_pattern": FINANCIAL_ROUTING_TOPIC,
         "text": """\
 ─── Total capex generated converted and lost ───
 User: "what is the total capex generated converted and lost"
@@ -161,12 +158,7 @@ Turn 1: {"thought": "Need FM manager ranked by capex conversion rate = SUM(po.po
         # Reuses the SAME pattern as CONDITIONAL_BLOCKS["MA workflow columns"] —
         # both fire together for mitigative-action questions, single source
         # of truth for "is this a MA question" at the question level.
-        "question_pattern": (
-            r"(?i)\bmitigative\s+actions?\b|\bMAs?\b"
-            r"|\bcapex\b|\bopex\b|\bdeferred\b"
-            r"|\bprogress[_\s]stage\b|\bimplementation[_\s]status\b"
-            r"|\bneeds?\s+attention\b|\bcritical\s+issues?\b"
-        ),
+        "question_pattern": MA_WORKFLOW_TOPIC,
         "text": """\
 ─── MAs not closed on time / closed late ───
 User: "how many mitigative actions were not closed on time?" / "show closed-late mitigative actions"

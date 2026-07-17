@@ -16,6 +16,8 @@ question_patterns + text) and lives in examples_tier2.py instead.
 import re
 from pathlib import Path
 
+from src.core.question_patterns import MA_WORKFLOW_TOPIC
+
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
@@ -155,12 +157,7 @@ def build_worked_examples(
 CONDITIONAL_BLOCKS = [
     {
         "title": "MA workflow columns",
-        "question_pattern": (
-            r"(?i)\bmitigative\s+actions?\b|\bMAs?\b"
-            r"|\bcapex\b|\bopex\b|\bdeferred\b"
-            r"|\bprogress[_\s]stage\b|\bimplementation[_\s]status\b"
-            r"|\bneeds?\s+attention\b|\bcritical\s+issues?\b"
-        ),
+        "question_pattern": MA_WORKFLOW_TOPIC,
         "get_text": lambda: _MA_WORKFLOW_BLOCK,
     },
 ]

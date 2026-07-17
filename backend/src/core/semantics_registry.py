@@ -696,7 +696,7 @@ if __name__ == "__main__":
             os.path.join(_src_dir, "core", "business_rules", "rules", "warn_rules.py"),
             os.path.join(_src_dir, "core", "business_rules", "rules", "autocorrect_rules.py"),
             os.path.join(_src_dir, "core", "business_rules", "rules", "inject_rules.py"),
-            os.path.join(_src_dir, "agent", "orchestrator", "core.py"),
+            os.path.join(_src_dir, "agent", "orchestrator", "loop.py"),
             os.path.join(_src_dir, "agent", "orchestrator", "synthesis.py"),
         ]
         probs = verify_consistency(targets)

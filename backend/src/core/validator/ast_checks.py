@@ -1,5 +1,5 @@
 """
-Module-level sqlglot-AST helper functions shared by core.py (validate())
+Module-level sqlglot-AST helper functions shared by engine.py (validate())
 and semantic.py (validate_semantic()). Extracted verbatim from the
 original core/validator.py.
 """
