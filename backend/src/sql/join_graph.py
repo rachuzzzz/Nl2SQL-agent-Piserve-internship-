@@ -8,7 +8,7 @@ Startup validation checks every edge against the live DB — schema changes are
 caught immediately rather than silently breaking queries.
 
 Usage:
-    from src.agent.join_graph import JOIN_GRAPH, find_join_path, validate_join_graph
+    from src.sql.join_graph import JOIN_GRAPH, find_join_path, validate_join_graph
 
     path = find_join_path("inspection_cycle", "frequency_definition")
     # Returns:

@@ -5,7 +5,7 @@ in original relative order). See core.business_rules.engine for how
 these are aggregated and consumed.
 """
 
-from src.core.business_rules._types import WARN
+from src.sql.rules._types import WARN
 
 WARN_RULES: list[dict] = [
     {

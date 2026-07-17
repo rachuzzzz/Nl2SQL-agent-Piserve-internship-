@@ -1,15 +1,15 @@
 """
-CORE_CONTEXT (Deepseek/SQL-generation-side prompt additions) and the
-question-triggered conditional blocks that supplement it.
+SQL-generation prompt assembly ("Deepseek-side"): SQL_GENERATION_PROMPT (the
+base template) and CORE_CONTEXT (registry-derived status/cast/columns facts
+plus conditional counting/MA-workflow blocks), both consumed by
+sql/generation.py::generate_sql(). Companion to agent/prompts/builder.py,
+which assembles the reasoning-LLM's SYSTEM_PROMPT instead — SYSTEM_PROMPT
+and SQL_GENERATION_PROMPT are different prompts for different models and
+were merged from two separate builder.py files (agent/prompts,
+former agent/examples) that used to live in the agent package.
 
-STATUS GROUPINGS + CAST RULES come from src.core.semantics_registry — the
+STATUS GROUPINGS + CAST RULES come from src.core.semantics_registry -- the
 single source of truth. Edit there, not here.
-
-CORE_CONTEXT's body lives in templates/core_context.txt with
-<<<STATUS_BLOCK>>> / <<<CAST_BLOCK>>> / <<<COLUMNS_BLOCK>>> sentinels marking
-where the registry-generated blocks below get spliced in. SEED_EXAMPLES (the
-actual nl/sql example list, ~3900 lines) is pure Python data and lives in
-seed_data.py instead — see its module docstring for the field schema.
 """
 
 import re
@@ -17,11 +17,14 @@ from pathlib import Path
 
 from src.core.question_patterns import MA_WORKFLOW_TOPIC
 
-_TEMPLATES_DIR = Path(__file__).parent / "templates"
+_TEMPLATES_DIR = Path(__file__).parent / "examples" / "templates"
 
 
 def _read_template(name: str) -> str:
     return (_TEMPLATES_DIR / name).read_text(encoding="utf-8")
+
+
+SQL_GENERATION_PROMPT = _read_template("sql_generation_prompt.txt")
 
 
 # ── Registry-generated blocks (single source of truth) ──────────────────────
@@ -53,19 +56,17 @@ CORE_CONTEXT = (
     .replace("<<<COLUMNS_BLOCK>>>", _COLUMNS_BLOCK)
 )
 
-from src.agent.examples.seed_data import SEED_EXAMPLES
-
 # ── Conditional CORE_CONTEXT additions — included only when relevant ────────
-# Deepseek-side counterpart to prompts.py's CONDITIONAL_BLOCKS / EXAMPLES_TIER2.
-# _COUNTING_BLOCK (good practice/deviation/observation counting, ~148 tok) and
-# _MA_WORKFLOW_BLOCK (MA workflow columns, ~805 tok) were always-on parts of
-# CORE_CONTEXT before 2026-06-13's truncation fix — both grew this session and
-# are narrowly topical, so they're now conditional like their Llama-side
-# counterparts (CONDITIONAL_BLOCKS["MA workflow columns"] and the FORM-pattern
-# Tier-2 examples in prompts.py).
+# Deepseek-side counterpart to agent/prompts/builder.py's CONDITIONAL_BLOCKS /
+# EXAMPLES_TIER2. _COUNTING_BLOCK (good practice/deviation/observation
+# counting, ~148 tok) and _MA_WORKFLOW_BLOCK (MA workflow columns, ~805 tok)
+# were always-on parts of CORE_CONTEXT before 2026-06-13's truncation fix —
+# both grew this session and are narrowly topical, so they're now conditional
+# like their Llama-side counterparts (CONDITIONAL_BLOCKS["MA workflow
+# columns"] and the FORM-pattern Tier-2 examples in agent/prompts/builder.py).
 #
-# The MA pattern is shared with prompts.py's CONDITIONAL_BLOCKS via
-# src.core.question_patterns.MA_WORKFLOW_TOPIC (single source of truth —
+# The MA pattern is shared with agent/prompts/builder.py's CONDITIONAL_BLOCKS
+# via src.core.question_patterns.MA_WORKFLOW_TOPIC (single source of truth --
 # edit there, not here) so both sides treat "is this question about
 # mitigative actions" the same way. The counting pattern below has no
 # cross-file counterpart today and stays defined inline.
@@ -89,8 +90,8 @@ CORE_CONTEXT_CONDITIONAL = [
 def build_core_context_additions(question: str) -> str:
     """
     Return additional CORE_CONTEXT blocks whose question_pattern matches the
-    current question. Call from tools.py's generate_sql: append the result to
-    CORE_CONTEXT before building dynamic_examples.
+    current question. Called from sql/generation.py::generate_sql(): append
+    the result to CORE_CONTEXT before building dynamic_examples.
 
     Returns "" if nothing matches — no size penalty for unrelated questions.
     """

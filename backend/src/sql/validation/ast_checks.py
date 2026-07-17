@@ -13,7 +13,7 @@ try:
 except ImportError:
     _HAS_SQLGLOT = False
 
-from src.core.validator.models import ValidationIssue, ValidatorStats
+from src.sql.validation.models import ValidationIssue, ValidatorStats
 
 
 

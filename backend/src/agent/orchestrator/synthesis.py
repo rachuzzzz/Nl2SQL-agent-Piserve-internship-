@@ -14,7 +14,7 @@ _log_llm   = logging.getLogger("inspectai.llm")
 
 from sqlalchemy import text as sql_text
 
-from src.core.disambiguation import is_disambiguation_result
+from src.sql.result_shape import is_disambiguation_result
 
 from src.agent.orchestrator.models import AgentStep, QueryStats, ConversationTurn, AgentResult
 from src.agent.orchestrator.debug import _ilike_escape, _has_uuid_leak, _dbg, _detect_truncation

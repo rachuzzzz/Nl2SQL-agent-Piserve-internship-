@@ -34,18 +34,18 @@ except ImportError:
 
 logger = logging.getLogger("inspectai.sql")
 
-from src.core.validator.models import ValidationIssue, ValidationResult, ValidatorStats
-from src.core.validator.ast_checks import (
+from src.sql.validation.models import ValidationIssue, ValidationResult, ValidatorStats
+from src.sql.validation.ast_checks import (
     _strip_nested_parens,
     _check_undefined_table_aliases,
     _check_ir_id_in_select_ast,
     _check_uuid_leaks_ast,
     _check_uuid_leaks_regex,
 )
-from src.core.validator.cleaner import CleanerMixin
-from src.core.validator.shape import ShapeMixin
-from src.core.validator.semantic import SemanticMixin
-from src.core.validator.scope import ScopeMixin
+from src.sql.validation.cleaner import CleanerMixin
+from src.sql.validation.shape import ShapeMixin
+from src.sql.validation.semantic import SemanticMixin
+from src.sql.validation.scope import ScopeMixin
 
 
 class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
@@ -241,7 +241,7 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
 
 
     def __init__(self):
-        from src.core.business_rules import get_engine
+        from src.sql.rules import get_engine
         self._rules = get_engine()
 
 

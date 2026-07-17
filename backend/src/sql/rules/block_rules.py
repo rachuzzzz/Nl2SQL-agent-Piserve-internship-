@@ -5,7 +5,7 @@ in original relative order). See core.business_rules.engine for how
 these are aggregated and consumed.
 """
 
-from src.core.business_rules._types import BLOCK
+from src.sql.rules._types import BLOCK
 
 BLOCK_RULES: list[dict] = [
 

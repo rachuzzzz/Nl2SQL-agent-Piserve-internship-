@@ -13,7 +13,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from src.core.schema_introspector import DatabaseSchema, TableSchema
-from src.agent.tools import _select_schema_block, _join_path_hints, _join_graph_source
+from src.sql.generation import _select_schema_block, _join_path_hints, _join_graph_source
 
 FAILURES = []
 

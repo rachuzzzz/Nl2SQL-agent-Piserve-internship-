@@ -1,6 +1,6 @@
 """
 Deterministic regression tests for the validator <-> business_rules registry
-consumption refactor (see core/validator.py::_CONSUMED_RULE_IDS).
+consumption refactor (see sql/validation/engine.py::_CONSUMED_RULE_IDS).
 
 No LLM, no live DB — pure regex/string matching against fixture SQL. Run
 directly (`python tests/test_business_rules_consumption.py`) or via pytest
@@ -15,7 +15,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from src.core.validator import SQLValidator
+from src.sql.validation import SQLValidator
 
 validator = SQLValidator()
 

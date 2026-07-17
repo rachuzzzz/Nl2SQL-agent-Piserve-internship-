@@ -41,5 +41,5 @@ async def validator_stats():
     start. In-memory only (resets on restart, same as _sessions) — enough to
     notice a SOFT_WARN firing constantly without needing to grep debug logs.
     """
-    from src.core.validator import ValidatorStats
+    from src.sql.validation import ValidatorStats
     return ValidatorStats.snapshot()

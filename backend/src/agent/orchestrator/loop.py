@@ -21,14 +21,15 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from src.llm.factory import get_reasoning_llm, get_sql_llm
 from src.core.retrieval import SemanticQuestionIndex, SeedExampleIndex, text_similarity
-from src.core.validator import SQLValidator
+from src.sql.validation import SQLValidator
 from src.core.schema_introspector import introspect_schema, BUSINESS_RULES, TABLE_RELATIONSHIPS
-from src.agent.prompts import SYSTEM_PROMPT, SQL_GENERATION_PROMPT, FORCE_SUMMARY_PROMPT, build_dynamic_prompt_additions
+from src.agent.prompts import SYSTEM_PROMPT, FORCE_SUMMARY_PROMPT, build_dynamic_prompt_additions
+from src.sql.prompts import SQL_GENERATION_PROMPT
 from src.agent.tools import ToolRegistry
 from src.agent.tool_dispatcher import parse_tool_call, dispatch
-from src.core.business_rules import get_engine as get_rules_engine
+from src.sql.rules import get_engine as get_rules_engine
 from src.core.rbac import build_scope_filter
-from src.core.disambiguation import is_disambiguation_result, is_entity_disambiguation_result
+from src.sql.result_shape import is_disambiguation_result, is_entity_disambiguation_result
 
 from src.agent.orchestrator.models import AgentStep, QueryStats, ConversationTurn, AgentResult
 from src.agent.orchestrator.debug import _make_debug_logger, _dbg, _build_constraint_notes, _CONSTRAINT_NOTE_MAP
@@ -83,7 +84,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         self.validator = SQLValidator()
 
         # Build seed example index — embeds NL questions for retrieval-based injection
-        from src.agent.examples import SEED_EXAMPLES
+        from src.sql.examples import SEED_EXAMPLES
         self.seed_index = SeedExampleIndex(
             embed_model=embed_model,
             examples=SEED_EXAMPLES,
@@ -119,7 +120,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # at startup rather than silently failing at query time.
         # Errors are logged as warnings — they don't prevent startup.
         try:
-            from src.agent.join_graph import validate_join_graph
+            from src.sql.join_graph import validate_join_graph
             jg_errors = validate_join_graph(self.db_engine)
             if jg_errors:
                 print(f"  ⚠ JOIN_GRAPH validation ({len(jg_errors)} issues):")

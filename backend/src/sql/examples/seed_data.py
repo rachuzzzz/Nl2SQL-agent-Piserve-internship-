@@ -1,7 +1,7 @@
 """
 Seed examples for NL->SQL retrieval -- extracted verbatim from the original
-agent/seed_examples.py. See src.agent.examples.builder for CORE_CONTEXT
-and the field documentation.
+agent/seed_examples.py. See src.sql.prompts for CORE_CONTEXT and the field
+documentation.
 """
 
 SEED_EXAMPLES: list[dict] = [

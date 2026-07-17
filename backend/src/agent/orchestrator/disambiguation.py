@@ -1,6 +1,6 @@
 """
 DisambiguationMixin: orchestrator-specific extraction/messaging glue
-built on top of core.disambiguation's generic shape-detection utilities
+built on top of sql.result_shape's generic shape-detection utilities
 -- tied to ConversationTurn and LLM prompt strings, so it stays separate
 from that dependency-free module. Extracted verbatim from the original
 agent/orchestrator.py.
@@ -8,7 +8,7 @@ agent/orchestrator.py.
 
 import re
 
-from src.core.disambiguation import is_disambiguation_result, is_entity_disambiguation_result
+from src.sql.result_shape import is_disambiguation_result, is_entity_disambiguation_result
 
 from src.agent.orchestrator.debug import _ilike_escape, _UUID_RE
 

@@ -5,8 +5,8 @@ in original relative order). See core.business_rules.engine for how
 these are aggregated and consumed.
 """
 
-from src.core.business_rules._types import INJECT
-from src.core.business_rules.engine import _STATUS_HINT, _FINANCIAL_HINT, _DRAFT_EXCLUSION
+from src.sql.rules._types import INJECT
+from src.sql.rules.engine import _STATUS_HINT, _FINANCIAL_HINT, _DRAFT_EXCLUSION
 from src.core.question_patterns import MA_APPROVAL_WORKFLOW_TOPIC, FINANCIAL_ROUTING_TOPIC
 
 INJECT_RULES: list[dict] = [

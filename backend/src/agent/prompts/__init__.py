@@ -1,6 +1,5 @@
 from src.agent.prompts.builder import (
     SYSTEM_PROMPT,
-    SQL_GENERATION_PROMPT,
     FORCE_SUMMARY_PROMPT,
     CONDITIONAL_BLOCKS,
     build_worked_examples,
@@ -11,7 +10,6 @@ from src.agent.prompts.examples_tier2 import EXAMPLES_TIER2
 
 __all__ = [
     "SYSTEM_PROMPT",
-    "SQL_GENERATION_PROMPT",
     "FORCE_SUMMARY_PROMPT",
     "CONDITIONAL_BLOCKS",
     "EXAMPLES_TIER2",

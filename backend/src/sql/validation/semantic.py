@@ -18,8 +18,8 @@ try:
 except ImportError:
     _HAS_GLOSSARY = False
 
-from src.core.validator.models import ValidationIssue, ValidatorStats
-from src.core.validator.ast_checks import _check_uuid_leaks_ast, _check_uuid_leaks_regex
+from src.sql.validation.models import ValidationIssue, ValidatorStats
+from src.sql.validation.ast_checks import _check_uuid_leaks_ast, _check_uuid_leaks_regex
 
 
 class SemanticMixin:

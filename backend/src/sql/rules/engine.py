@@ -22,7 +22,7 @@ Adding a new rule
   3. Fill in the required fields for that type (see schema below).
   4. Add it to the matching file under rules/ (block_rules.py, warn_rules.py,
      autocorrect_rules.py, or inject_rules.py).
-  5. Run:  python -c "from src.core.business_rules import RulesEngine; RulesEngine()"
+  5. Run:  python -c "from src.sql.rules import RulesEngine; RulesEngine()"
      A conflict check runs at import time — fix any warnings it reports.
 
 Conflict detection
@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import re
 
-from src.core.business_rules._types import BLOCK, WARN, AUTOCORRECT, INJECT
+from src.sql.rules._types import BLOCK, WARN, AUTOCORRECT, INJECT
 
 
 # ── Semantics registry (single source of truth for status/cast rules) ─────────
@@ -95,10 +95,10 @@ except ImportError:
 # below filters by type via list comprehension, which preserves each type's
 # own within-type relative order regardless of how the 4 lists are joined.
 
-from src.core.business_rules.rules.block_rules import BLOCK_RULES
-from src.core.business_rules.rules.warn_rules import WARN_RULES
-from src.core.business_rules.rules.autocorrect_rules import AUTOCORRECT_RULES
-from src.core.business_rules.rules.inject_rules import INJECT_RULES
+from src.sql.rules.block_rules import BLOCK_RULES
+from src.sql.rules.warn_rules import WARN_RULES
+from src.sql.rules.autocorrect_rules import AUTOCORRECT_RULES
+from src.sql.rules.inject_rules import INJECT_RULES
 
 REGISTRY: list[dict] = BLOCK_RULES + WARN_RULES + AUTOCORRECT_RULES + INJECT_RULES
 

@@ -1,16 +1,19 @@
 """
-Prompt templates for the agentic NL2SQL system.
+Prompt templates for the reasoning ("Llama-side") half of the agentic NL2SQL
+system. The SQL-generation ("Deepseek-side") prompt, SQL_GENERATION_PROMPT,
+lives in src.sql.prompts instead — a different prompt for a different model,
+consumed by sql/generation.py, not by the orchestrator directly.
 
 STATUS GROUPINGS come from src.core.semantics_registry — the single source of
 truth. Edit there, not here.
 
-The large prompt bodies (SYSTEM_PROMPT, SQL_GENERATION_PROMPT,
-FORCE_SUMMARY_PROMPT) live as plain text in templates/*.txt rather than
-Python triple-quoted strings — same content, easier to review/diff as
-prose. SYSTEM_PROMPT's template has <<<STATUS_BLOCK>>> / <<<COLUMNS_BLOCK>>>
-sentinels marking where the registry-generated blocks below get spliced in.
-EXAMPLES_TIER2 (worked examples, ~550 lines) is pure Python data (regex
-question_patterns + text) and lives in examples_tier2.py instead.
+The large prompt bodies (SYSTEM_PROMPT, FORCE_SUMMARY_PROMPT) live as plain
+text in templates/*.txt rather than Python triple-quoted strings — same
+content, easier to review/diff as prose. SYSTEM_PROMPT's template has
+<<<STATUS_BLOCK>>> / <<<COLUMNS_BLOCK>>> sentinels marking where the
+registry-generated blocks below get spliced in. EXAMPLES_TIER2 (worked
+examples, ~550 lines) is pure Python data (regex question_patterns + text)
+and lives in examples_tier2.py instead.
 """
 
 import re
@@ -46,8 +49,6 @@ SYSTEM_PROMPT = (
     .replace("<<<STATUS_BLOCK>>>", _STATUS_BLOCK)
     .replace("<<<COLUMNS_BLOCK>>>", _COLUMNS_BLOCK)
 )
-
-SQL_GENERATION_PROMPT = _read_template("sql_generation_prompt.txt")
 
 FORCE_SUMMARY_PROMPT = _read_template("force_summary_prompt.txt")
 
