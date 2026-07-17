@@ -7,8 +7,8 @@ topic-detection regex — e.g. whether a question is "about mitigative
 actions" — so that they fire together on the same questions:
   1. agent/prompts/builder.py            → CONDITIONAL_BLOCKS (Llama-side facts)
   2. agent/prompts/examples_tier2.py     → EXAMPLES_TIER2 (Llama-side few-shots)
-  3. agent/examples/builder.py           → CORE_CONTEXT_CONDITIONAL (Deepseek-side)
-  4. core/business_rules/rules/inject_rules.py → INJECT hints (SQL-gen routing)
+  3. sql/prompts.py                      → CORE_CONTEXT_CONDITIONAL (Deepseek-side)
+  4. sql/rules/inject_rules.py           → INJECT hints (SQL-gen routing)
 
 Before this module existed these regexes were hand-copied between files
 with a "KEPT IN SYNC — if you edit one, edit the other" comment and no
