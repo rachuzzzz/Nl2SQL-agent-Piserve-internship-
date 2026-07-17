@@ -114,10 +114,10 @@ _llm_client = None
 def _get_llm():
     global _llm_client
     if _llm_client is None:
-        from llama_index.llms.ollama import Ollama
+        from src.llm.factory import get_chart_llm
         from src.config.settings import get_settings
         settings = get_settings()
-        _llm_client = Ollama(model=settings.ollama_chat_model, base_url=settings.ollama_url, request_timeout=15.0)
+        _llm_client = get_chart_llm(settings.ollama_chat_model, settings.ollama_url)
     return _llm_client
 
 

@@ -17,9 +17,9 @@ from sqlalchemy import create_engine, text as sql_text
 
 from llama_index.core import Settings
 from llama_index.core.llms import ChatMessage, MessageRole
-from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
+from src.llm.factory import get_reasoning_llm, get_sql_llm
 from src.core.retrieval import SemanticQuestionIndex, SeedExampleIndex, text_similarity
 from src.core.validator import SQLValidator
 from src.core.schema_introspector import introspect_schema, BUSINESS_RULES, TABLE_RELATIONSHIPS
@@ -93,26 +93,11 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         self.sql_model_name  = sql_model
 
         print(f"  Configuring reasoning LLM: {chat_model}...")
-        self.reasoning_llm = Ollama(model=chat_model, base_url=ollama_url,
-            temperature=0.2, request_timeout=120.0,
-            additional_kwargs={
-                "num_predict": 1024,
-                "num_ctx": 20000,
-                "think": False,   # Disable Qwen3 internal chain-of-thought — saves 8-15s per call
-            })
+        self.reasoning_llm = get_reasoning_llm(chat_model, ollama_url)
         print(f"  ✓ Reasoning LLM ({chat_model})")
 
         print(f"  Configuring SQL LLM: {sql_model}...")
-        self.sql_llm = Ollama(model=sql_model, base_url=ollama_url,
-            temperature=0.0, request_timeout=120.0,
-            additional_kwargs={
-                "num_predict": 1024,
-                "num_ctx": 16384,
-                "top_p": 0.9,
-                # Stop tokens prevent deepseek adding explanation text after SQL
-                # ";" must be first — stops generation immediately after the query ends
-                "stop": [";", "[/SQL]", "This query", "Note:", "-- Note", "/*"],
-            })
+        self.sql_llm = get_sql_llm(sql_model, ollama_url)
         print(f"  ✓ SQL LLM ({sql_model})")
 
         self._debug = _make_debug_logger()
