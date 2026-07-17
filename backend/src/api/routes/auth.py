@@ -22,8 +22,8 @@ from pydantic import BaseModel
 
 from src.api.deps import get_orch
 from src.config.settings import get_settings
-from src.core.auth import _bearer_scheme, _decode_jwt_payload, _register_token, _valid_tokens, require_auth
-from src.core.rbac import DATA_VISIBILITY_PERMS
+from src.security.auth import _bearer_scheme, _decode_jwt_payload, _register_token, _valid_tokens, require_auth
+from src.security.rbac import DATA_VISIBILITY_PERMS
 
 log_auth = logging.getLogger("inspectai.auth")
 

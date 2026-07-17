@@ -44,7 +44,7 @@ from src.sql.rules._types import BLOCK, WARN, AUTOCORRECT, INJECT
 
 # ── Semantics registry (single source of truth for status/cast rules) ─────────
 try:
-    from src.core.semantics_registry import (
+    from src.knowledge.semantics_registry import (
         inject_hint_status as _inject_hint_status,
         inject_hint_financial as _inject_hint_financial,
         draft_exclusion_filter as _draft_exclusion_filter,
@@ -53,7 +53,7 @@ try:
     _FINANCIAL_HINT = _inject_hint_financial()
     _DRAFT_EXCLUSION = _draft_exclusion_filter()
 except ImportError:
-    # Fallback — keep in sync with core/semantics_registry.py
+    # Fallback — keep in sync with knowledge/semantics_registry.py
     _DRAFT_EXCLUSION = "status != 'DRAFT'"
     _STATUS_HINT = (
         "\nSTATUS GROUPINGS — always show as TWO categories, never raw status values:\n"

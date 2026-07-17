@@ -26,7 +26,7 @@ from typing import Optional
 
 # ── Semantics registry (single source of truth for status definitions) ───────
 try:
-    from src.core.semantics_registry import (
+    from src.knowledge.semantics_registry import (
         completed_required_regex as _completed_required_regex,
         conducted_required_regex as _conducted_required_regex,
         old_completed_forbidden_regex as _old_completed_forbidden_regex,
@@ -39,7 +39,7 @@ try:
     _COMPLETED_SQL       = f"status {_completed_filter()}"
     _CONDUCTED_SQL       = f"status IN {_conducted_in_list()}"
 except ImportError:
-    # Fallback — keep in sync with core/semantics_registry.py
+    # Fallback — keep in sync with knowledge/semantics_registry.py
     _COMPLETED_REQUIRED = r"status\s*=\s*'CLOSED'"
     _CONDUCTED_REQUIRED = (
         r"status\s*IN\s*\([^)]*(?:'SUBMITTED'|'UNDER_REVIEW'|'RETURN_FOR_MODIFICATION')[^)]*\)"

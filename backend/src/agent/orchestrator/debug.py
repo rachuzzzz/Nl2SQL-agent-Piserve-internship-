@@ -42,7 +42,7 @@ def _make_debug_logger() -> logging.Logger | None:
 
     # Find the file path already opened by setup_logging() on the inspectai logger.
     # Fall back to a fresh timestamped file if setup_logging() hasn't run yet.
-    from src.core.logging_config import get_log_file
+    from src.config.logging import get_log_file
     log_path = get_log_file()
 
     logger = logging.getLogger("debug_llm_raw")
@@ -140,14 +140,14 @@ def _has_uuid_leak(rows: list, columns: list) -> list[str]:
 # Qwen's message (not in schema_hint which deepseek may override with seeds).
 # Rule: give the exact fix as a constraint, never a full replacement SQL.
 #
-# STATUS + CAST notes are generated from src.core.semantics_registry — the single
+# STATUS + CAST notes are generated from src.knowledge.semantics_registry — the single
 # source of truth. Never hardcode status groupings or cast directions here.
 try:
-    from src.core.semantics_registry import constraint_note_status, constraint_note_cast
+    from src.knowledge.semantics_registry import constraint_note_status, constraint_note_cast
     _NOTE_STATUS = constraint_note_status()
     _NOTE_CAST = constraint_note_cast()
 except ImportError:
-    # Fallback literals — keep in sync with core/semantics_registry.py
+    # Fallback literals — keep in sync with knowledge/semantics_registry.py
     _NOTE_STATUS = (
         "-- completed = status = 'CLOSED' | conducted = status IN "
         "('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION') | always exclude DRAFT"

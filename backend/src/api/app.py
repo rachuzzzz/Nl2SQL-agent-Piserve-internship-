@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.core.logging_config import setup_logging
+from src.config.logging import setup_logging
 from src.api.deps import REPO_ROOT
 
 log = logging.getLogger("inspectai")
@@ -36,12 +36,13 @@ async def lifespan(app: FastAPI):
     app.state.orch = AgentOrchestrator.from_env()
     log.info("[SERVER] Orchestrator ready in %.1fs", time.time() - t0)
 
-    # Catch definition desyncs between core/semantics_registry.py (the declared
-    # single source of truth) and the prompt/example files that actually feed
-    # the SQL-generating LLM. This previously existed as a CLI-only tool nobody
-    # ran automatically — the "overdue" bug (fixed 2026-07-07) sat undetected
-    # for an unknown period because of exactly that gap.
-    from src.core.semantics_registry import verify_consistency
+    # Catch definition desyncs between knowledge/semantics_registry.py (the
+    # declared single source of truth) and the prompt/example files that
+    # actually feed the SQL-generating LLM. This previously existed as a
+    # CLI-only tool nobody ran automatically — the "overdue" bug (fixed
+    # 2026-07-07) sat undetected for an unknown period because of exactly
+    # that gap.
+    from src.knowledge.semantics_registry import verify_consistency
     _src_dir = os.path.join(REPO_ROOT, "backend", "src")
     # prompts.py/seed_examples.py/business_rules.py/orchestrator.py are now
     # packages (see the restructure) — check every file that can actually
@@ -49,20 +50,20 @@ async def lifespan(app: FastAPI):
     # former module.
     _desyncs = verify_consistency([
         os.path.join(_src_dir, "agent", "prompts", "templates", "system_prompt.txt"),
-        os.path.join(_src_dir, "agent", "prompts", "templates", "sql_generation_prompt.txt"),
+        os.path.join(_src_dir, "sql", "examples", "templates", "sql_generation_prompt.txt"),
         os.path.join(_src_dir, "agent", "prompts", "templates", "force_summary_prompt.txt"),
         os.path.join(_src_dir, "agent", "prompts", "examples_tier2.py"),
-        os.path.join(_src_dir, "agent", "examples", "templates", "core_context.txt"),
-        os.path.join(_src_dir, "agent", "examples", "seed_data.py"),
-        os.path.join(_src_dir, "core", "business_rules", "rules", "block_rules.py"),
-        os.path.join(_src_dir, "core", "business_rules", "rules", "warn_rules.py"),
-        os.path.join(_src_dir, "core", "business_rules", "rules", "autocorrect_rules.py"),
-        os.path.join(_src_dir, "core", "business_rules", "rules", "inject_rules.py"),
+        os.path.join(_src_dir, "sql", "examples", "templates", "core_context.txt"),
+        os.path.join(_src_dir, "sql", "examples", "seed_data.py"),
+        os.path.join(_src_dir, "sql", "rules", "block_rules.py"),
+        os.path.join(_src_dir, "sql", "rules", "warn_rules.py"),
+        os.path.join(_src_dir, "sql", "rules", "autocorrect_rules.py"),
+        os.path.join(_src_dir, "sql", "rules", "inject_rules.py"),
         os.path.join(_src_dir, "agent", "orchestrator", "loop.py"),
         os.path.join(_src_dir, "agent", "orchestrator", "synthesis.py"),
     ])
     if _desyncs:
-        log.warning("[SERVER] %d semantics desync(s) detected — see core.semantics_registry:", len(_desyncs))
+        log.warning("[SERVER] %d semantics desync(s) detected — see knowledge.semantics_registry:", len(_desyncs))
         for _d in _desyncs:
             log.warning("[SERVER]   %s", _d)
     else:

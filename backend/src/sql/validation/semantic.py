@@ -13,7 +13,7 @@ except ImportError:
     _HAS_SQLGLOT = False
 
 try:
-    from src.core.business_glossary import check_glossary as _check_glossary
+    from src.knowledge.business_glossary import check_glossary as _check_glossary
     _HAS_GLOSSARY = True
 except ImportError:
     _HAS_GLOSSARY = False

@@ -7,7 +7,7 @@ this just reads the sub claim), the in-memory token store, and the
 `require_auth` FastAPI dependency every protected route depends on.
 
 Not concerned with *what* an authenticated user is allowed to see — that's
-core/rbac.py.
+security/rbac.py.
 """
 
 import time as _time

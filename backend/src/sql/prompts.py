@@ -8,14 +8,14 @@ and SQL_GENERATION_PROMPT are different prompts for different models and
 were merged from two separate builder.py files (agent/prompts,
 former agent/examples) that used to live in the agent package.
 
-STATUS GROUPINGS + CAST RULES come from src.core.semantics_registry -- the
+STATUS GROUPINGS + CAST RULES come from src.knowledge.semantics_registry -- the
 single source of truth. Edit there, not here.
 """
 
 import re
 from pathlib import Path
 
-from src.core.question_patterns import MA_WORKFLOW_TOPIC
+from src.knowledge.question_patterns import MA_WORKFLOW_TOPIC
 
 _TEMPLATES_DIR = Path(__file__).parent / "examples" / "templates"
 
@@ -29,7 +29,7 @@ SQL_GENERATION_PROMPT = _read_template("sql_generation_prompt.txt")
 
 # ── Registry-generated blocks (single source of truth) ──────────────────────
 try:
-    from src.core.semantics_registry import (
+    from src.knowledge.semantics_registry import (
         core_context_status_block as _status_block,
         core_context_cast_block as _cast_block,
         core_context_counting_block as _counting_block,
@@ -42,7 +42,7 @@ try:
     _COLUMNS_BLOCK = _columns_block()
     _MA_WORKFLOW_BLOCK = _ma_workflow_block()
 except ImportError:
-    # Fallback — keep in sync with core/semantics_registry.py
+    # Fallback — keep in sync with knowledge/semantics_registry.py
     _STATUS_BLOCK = _read_template("status_block_fallback.txt")
     _CAST_BLOCK = _read_template("cast_block_fallback.txt")
     _COUNTING_BLOCK = _read_template("counting_block_fallback.txt")
@@ -66,7 +66,7 @@ CORE_CONTEXT = (
 # columns"] and the FORM-pattern Tier-2 examples in agent/prompts/builder.py).
 #
 # The MA pattern is shared with agent/prompts/builder.py's CONDITIONAL_BLOCKS
-# via src.core.question_patterns.MA_WORKFLOW_TOPIC (single source of truth --
+# via src.knowledge.question_patterns.MA_WORKFLOW_TOPIC (single source of truth --
 # edit there, not here) so both sides treat "is this question about
 # mitigative actions" the same way. The counting pattern below has no
 # cross-file counterpart today and stays defined inline.

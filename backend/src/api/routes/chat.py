@@ -11,9 +11,9 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 
 from src.charts.advisor import advise, force_config, classify_columns, build_kpi_cards, should_show_dashboard
-from src.core.auth import require_auth
+from src.security.auth import require_auth
 from src.sql.result_shape import is_disambiguation_result, is_entity_disambiguation_result, extract_search_term
-from src.core.rbac import DATA_VISIBILITY_PERMS, build_scope_filter
+from src.security.rbac import DATA_VISIBILITY_PERMS, build_scope_filter
 from src.api.deps import get_orch, get_or_create_session, refetch_for_calendar, _sessions
 from src.api.response_formatting import (
     is_chart_followup, extract_requested_type, strip_uuid_columns,

@@ -11,7 +11,7 @@ import tempfile
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
-from src.core.auth import require_auth
+from src.security.auth import require_auth
 from src.api.deps import REPO_ROOT
 from src.api.schemas import TTSRequest
 

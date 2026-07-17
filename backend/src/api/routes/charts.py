@@ -7,7 +7,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from src.charts.advisor import advise, force_config, get_alternatives
-from src.core.auth import require_auth
+from src.security.auth import require_auth
 from src.api.deps import get_orch_optional, refetch_for_calendar, _sessions
 from src.api.schemas import ChartRequest, ChartConfig
 

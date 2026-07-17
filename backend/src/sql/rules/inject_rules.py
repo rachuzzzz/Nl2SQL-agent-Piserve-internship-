@@ -7,7 +7,7 @@ these are aggregated and consumed.
 
 from src.sql.rules._types import INJECT
 from src.sql.rules.engine import _STATUS_HINT, _FINANCIAL_HINT, _DRAFT_EXCLUSION
-from src.core.question_patterns import MA_APPROVAL_WORKFLOW_TOPIC, FINANCIAL_ROUTING_TOPIC
+from src.knowledge.question_patterns import MA_APPROVAL_WORKFLOW_TOPIC, FINANCIAL_ROUTING_TOPIC
 
 INJECT_RULES: list[dict] = [
 
@@ -626,7 +626,7 @@ INJECT_RULES: list[dict] = [
     },
 
     # Fault 1 — "completed/conducted/total" semantic mapping
-    # hint comes from src.core.semantics_registry — edit there, not here
+    # hint comes from src.knowledge.semantics_registry — edit there, not here
     # SCOPE LIMIT (eval regression FREQ-05): excludes schedule-context questions —
     # "completed vs overdue in the SCHEDULE" is an inspection_schedule question with
     # different status enums (COMPLETED/OVERDUE/PENDING), handled by the rule below.

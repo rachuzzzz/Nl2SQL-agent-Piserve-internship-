@@ -1,6 +1,6 @@
 """
 Deterministic tests for agent/tools.py::_select_schema_block() — the
-relevant_tables wiring for core/schema_introspector.py::for_schema_hint().
+relevant_tables wiring for knowledge/schema_introspector.py::for_schema_hint().
 
 No LLM, no live DB — DatabaseSchema is constructed directly with fake table
 data. Run directly (`python tests/test_schema_hint_selection.py`) or via
@@ -12,7 +12,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from src.core.schema_introspector import DatabaseSchema, TableSchema
+from src.knowledge.schema_introspector import DatabaseSchema, TableSchema
 from src.sql.generation import _select_schema_block, _join_path_hints, _join_graph_source
 
 FAILURES = []

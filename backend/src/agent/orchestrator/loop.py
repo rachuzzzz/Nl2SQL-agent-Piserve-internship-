@@ -22,13 +22,13 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from src.llm.factory import get_reasoning_llm, get_sql_llm
 from src.retrieval import SemanticQuestionIndex, SeedExampleIndex, text_similarity
 from src.sql.validation import SQLValidator
-from src.core.schema_introspector import introspect_schema, BUSINESS_RULES, TABLE_RELATIONSHIPS
+from src.knowledge.schema_introspector import introspect_schema, BUSINESS_RULES, TABLE_RELATIONSHIPS
 from src.agent.prompts import SYSTEM_PROMPT, FORCE_SUMMARY_PROMPT, build_dynamic_prompt_additions
 from src.sql.prompts import SQL_GENERATION_PROMPT
 from src.agent.tools import ToolRegistry
 from src.agent.tool_dispatcher import parse_tool_call, dispatch
 from src.sql.rules import get_engine as get_rules_engine
-from src.core.rbac import build_scope_filter
+from src.security.rbac import build_scope_filter
 from src.sql.result_shape import is_disambiguation_result, is_entity_disambiguation_result
 
 from src.agent.orchestrator.models import AgentStep, QueryStats, ConversationTurn, AgentResult

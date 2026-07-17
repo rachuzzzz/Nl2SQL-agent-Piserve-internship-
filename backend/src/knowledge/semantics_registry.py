@@ -683,19 +683,19 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) > 1 and sys.argv[1] == "check":
-        # python -m src.core.semantics_registry check file1.py file2.py ...
+        # python -m src.knowledge.semantics_registry check file1.py file2.py ...
         _src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         targets = sys.argv[2:] or [
             os.path.join(_src_dir, "agent", "prompts", "templates", "system_prompt.txt"),
-            os.path.join(_src_dir, "agent", "prompts", "templates", "sql_generation_prompt.txt"),
+            os.path.join(_src_dir, "sql", "examples", "templates", "sql_generation_prompt.txt"),
             os.path.join(_src_dir, "agent", "prompts", "templates", "force_summary_prompt.txt"),
             os.path.join(_src_dir, "agent", "prompts", "examples_tier2.py"),
-            os.path.join(_src_dir, "agent", "examples", "templates", "core_context.txt"),
-            os.path.join(_src_dir, "agent", "examples", "seed_data.py"),
-            os.path.join(_src_dir, "core", "business_rules", "rules", "block_rules.py"),
-            os.path.join(_src_dir, "core", "business_rules", "rules", "warn_rules.py"),
-            os.path.join(_src_dir, "core", "business_rules", "rules", "autocorrect_rules.py"),
-            os.path.join(_src_dir, "core", "business_rules", "rules", "inject_rules.py"),
+            os.path.join(_src_dir, "sql", "examples", "templates", "core_context.txt"),
+            os.path.join(_src_dir, "sql", "examples", "seed_data.py"),
+            os.path.join(_src_dir, "sql", "rules", "block_rules.py"),
+            os.path.join(_src_dir, "sql", "rules", "warn_rules.py"),
+            os.path.join(_src_dir, "sql", "rules", "autocorrect_rules.py"),
+            os.path.join(_src_dir, "sql", "rules", "inject_rules.py"),
             os.path.join(_src_dir, "agent", "orchestrator", "loop.py"),
             os.path.join(_src_dir, "agent", "orchestrator", "synthesis.py"),
         ]

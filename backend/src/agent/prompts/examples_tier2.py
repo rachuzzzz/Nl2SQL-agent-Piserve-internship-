@@ -4,7 +4,7 @@ agent/prompts.py. See src.agent.prompts.builder for how these are
 matched against a question and budget-capped.
 """
 
-from src.core.question_patterns import (
+from src.knowledge.question_patterns import (
     MA_WORKFLOW_TOPIC,
     MA_APPROVAL_WORKFLOW_TOPIC,
     FINANCIAL_ROUTING_TOPIC,

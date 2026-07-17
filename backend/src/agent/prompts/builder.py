@@ -4,7 +4,7 @@ system. The SQL-generation ("Deepseek-side") prompt, SQL_GENERATION_PROMPT,
 lives in src.sql.prompts instead — a different prompt for a different model,
 consumed by sql/generation.py, not by the orchestrator directly.
 
-STATUS GROUPINGS come from src.core.semantics_registry — the single source of
+STATUS GROUPINGS come from src.knowledge.semantics_registry — the single source of
 truth. Edit there, not here.
 
 The large prompt bodies (SYSTEM_PROMPT, FORCE_SUMMARY_PROMPT) live as plain
@@ -19,7 +19,7 @@ and lives in examples_tier2.py instead.
 import re
 from pathlib import Path
 
-from src.core.question_patterns import MA_WORKFLOW_TOPIC
+from src.knowledge.question_patterns import MA_WORKFLOW_TOPIC
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
@@ -30,7 +30,7 @@ def _read_template(name: str) -> str:
 
 # ── Registry-generated status block (single source of truth) ─────────────────
 try:
-    from src.core.semantics_registry import (
+    from src.knowledge.semantics_registry import (
         llama_status_block as _llama_status_block,
         llama_ma_workflow_block as _llama_ma_workflow_block,
         llama_columns_block as _llama_columns_block,
@@ -39,7 +39,7 @@ try:
     _MA_WORKFLOW_BLOCK = _llama_ma_workflow_block()
     _COLUMNS_BLOCK = _llama_columns_block()
 except ImportError:
-    # Fallback — keep in sync with core/semantics_registry.py
+    # Fallback — keep in sync with knowledge/semantics_registry.py
     _STATUS_BLOCK = _read_template("status_block_fallback.txt")
     _MA_WORKFLOW_BLOCK = _read_template("ma_workflow_block_fallback.txt")
     _COLUMNS_BLOCK = _read_template("columns_block_fallback.txt")
