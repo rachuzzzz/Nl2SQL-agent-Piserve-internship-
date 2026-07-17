@@ -5,8 +5,6 @@ charts/advisor.py.
 """
 
 from __future__ import annotations
-import json
-import re
 
 from src.charts.advisor.classify import _classify, _coerce, _VALID_TYPES, _TYPE_LABELS, _ALT_MAP
 from src.charts.advisor.common import _result, _no_chart, _lbl
@@ -106,75 +104,6 @@ def get_alternatives(columns, rows, n=3):
 
 
 
-# ── LLM advisor ───────────────────────────────────────────────────────────────
-
-_llm_client = None
-
-
-def _get_llm():
-    global _llm_client
-    if _llm_client is None:
-        from src.llm.factory import get_chart_llm
-        from src.config.settings import get_settings
-        settings = get_settings()
-        _llm_client = get_chart_llm(settings.ollama_chat_model, settings.ollama_url)
-    return _llm_client
-
-
-def _llm_advise(columns, rows):
-    try:
-        sample = rows[:5]
-        prompt = f"""You are a data visualization expert. Given this dataset, choose the BEST chart type.
-
-Columns: {json.dumps(columns)}
-Sample rows (first 5 of {len(rows)}): {json.dumps(sample, default=str)}
-
-Available chart types: bar, horizontal_bar, stacked_bar, line, area, pie, doughnut, scatter, radar, heatmap, waterfall, gauge
-
-Rules:
-- line/area: time-series. area for cumulative/volume metrics.
-- bar: comparisons with 1-2 metrics. horizontal_bar when >10 rows or long labels.
-- stacked_bar: multiple metrics composing a total (capex+opex, pass+fail).
-- pie/doughnut: part-of-whole, ≤8 categories. Prefer doughnut.
-- scatter: correlation between exactly two numerics.
-- radar: compare 3+ metrics across ≤8 entities.
-- heatmap: two categorical dimensions × one numeric.
-- waterfall: sequential P&L, or mixed positive/negative values.
-- gauge: for a single scalar KPI (score, rate, percentage) with a value in 0-100 range.
-- Default to bar or horizontal_bar when unsure.
-
-Respond ONLY with JSON: {{"chart_type":"line","reason":"monthly trend","confidence":"high"}}"""
-
-        raw = str(_get_llm().complete(prompt)).strip()
-        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
-        raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
-        m = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
-        if not m: raise ValueError("No JSON")
-
-        parsed = json.loads(m.group(0))
-        ct     = parsed.get("chart_type","").lower().strip()
-        reason = parsed.get("reason","LLM recommendation")
-        conf   = parsed.get("confidence","medium")
-
-        if ct not in _VALID_TYPES: raise ValueError(f"Invalid: {ct}")
-        if conf not in ("high","medium","low"): conf = "medium"
-
-        rule = _rules_advise(columns, rows)
-        t    = _classify(columns, rows)
-        lc   = t["category"][0] if t["category"] else (t["date"][0] if t["date"] else columns[0])
-        nc   = t["numeric"] or [columns[-1]]
-        lbls = [str(r.get(lc)) for r in rows]
-
-        cfg = _build_config(ct, lc, nc, lbls, rows)
-        if cfg is None: cfg = rule.get("config")
-
-        return {"chart_type":ct,"reason":reason,"confidence":conf,
-                "labels_column":lc,"values_columns":nc,"config":cfg}
-    except Exception:
-        return _rules_advise(columns, rows)
-
-
-
 def advise(columns, rows):
     """
     Primary entry point. Returns recommendation + alternatives.
@@ -184,11 +113,9 @@ def advise(columns, rows):
       labels_column, values_columns,
       alternatives: list of {chart_type, label, config}
     """
-    from src.config.settings import get_settings
-    use_llm = get_settings().use_llm_chart_advisor
-    result  = _llm_advise(columns, rows) if use_llm else _rules_advise(columns, rows)
+    result = _rules_advise(columns, rows)
 
-    # Always attach alternatives (built from rules regardless of llm/rules mode)
+    # Always attach alternatives (built from rules)
     result["alternatives"] = get_alternatives(columns, rows, n=3)
     return result
 

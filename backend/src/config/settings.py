@@ -48,9 +48,6 @@ class Settings:
     oauth_skip_tls_verify: bool
     permissions_api_url: str
 
-    # Chart advisor
-    use_llm_chart_advisor: bool
-
     # Semantic reranker
     reranker_model: str
     reranker_device: str
@@ -78,7 +75,6 @@ def get_settings() -> Settings:
         oauth_ca_cert=g("OAUTH_CA_CERT", "").strip(),
         oauth_skip_tls_verify=g("OAUTH_SKIP_TLS_VERIFY", "").strip().lower() in ("1", "true", "yes"),
         permissions_api_url=g("PERMISSIONS_API_URL", "http://10.77.20.54:8083"),
-        use_llm_chart_advisor=g("USE_LLM_CHART_ADVISOR", "false").lower() in ("1", "true", "yes"),
         reranker_model=g("RERANKER_MODEL", "").strip(),
         reranker_device=g("RERANKER_DEVICE", "cpu"),
     )

@@ -3,9 +3,9 @@ Role-based LLM client construction.
 
 Each role's tuning (context window, stop tokens, timeout, temperature) is
 load-bearing — see inline comments — so this factory keeps per-role presets
-rather than exposing one generic client. Consumers (agent/orchestrator,
-charts/advisor) ask for a role, not a provider; swapping Ollama for another
-provider later means changing the three functions below, not every call site.
+rather than exposing one generic client. Consumers (agent/orchestrator) ask
+for a role, not a provider; swapping Ollama for another provider later means
+changing the functions below, not every call site.
 """
 
 from __future__ import annotations
@@ -51,19 +51,9 @@ def get_sql_llm(model: str, base_url: str):
     )
 
 
-def get_chart_llm(model: str, base_url: str):
-    """
-    Chart-type advisor LLM. Short timeout and no special tuning — this path
-    always has a rules-based fallback (_rules_advise) on failure or timeout,
-    so it's deliberately low-stakes.
-    """
-    return build_ollama_client(model=model, base_url=base_url, request_timeout=15.0)
-
-
 _ROLE_FACTORIES = {
     "reasoning": get_reasoning_llm,
     "sql": get_sql_llm,
-    "chart": get_chart_llm,
 }
 
 
