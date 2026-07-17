@@ -20,7 +20,7 @@ from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from src.llm.factory import get_reasoning_llm, get_sql_llm
-from src.core.retrieval import SemanticQuestionIndex, SeedExampleIndex, text_similarity
+from src.retrieval import SemanticQuestionIndex, SeedExampleIndex, text_similarity
 from src.sql.validation import SQLValidator
 from src.core.schema_introspector import introspect_schema, BUSINESS_RULES, TABLE_RELATIONSHIPS
 from src.agent.prompts import SYSTEM_PROMPT, FORCE_SUMMARY_PROMPT, build_dynamic_prompt_additions
@@ -188,7 +188,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # 2+ match the same question, instead of concatenating every match
         # unconditionally — see agent/prompts.py's _select_within_budget.
         # Reuses the same embed_model already loaded for seed-example
-        # retrieval, via the shared core.retrieval.text_similarity scorer.
+        # retrieval, via the shared retrieval.text_similarity scorer.
         _tier2_score_fn = lambda q, title: text_similarity(self.embed_model, q, title)
         system_content = self._system_prompt + build_dynamic_prompt_additions(
             question, score_fn=_tier2_score_fn

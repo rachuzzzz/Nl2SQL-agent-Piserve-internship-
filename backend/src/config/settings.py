@@ -3,7 +3,7 @@ Centralized environment-variable configuration.
 
 Declares every environment variable this backend reads and its default, in
 one place, instead of scattered `os.getenv(...)` calls across api/app.py,
-api/auth_routes.py, charts/advisor.py, core/retrieval.py, and
+api/auth_routes.py, charts/advisor.py, retrieval/, and
 agent/orchestrator.py.
 
 This module does NOT call load_dotenv() itself. The existing load_dotenv()

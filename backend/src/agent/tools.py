@@ -14,7 +14,7 @@ from typing import Any, Optional
 from sqlalchemy import inspect as sa_inspect, text as sql_text
 from sqlalchemy.engine import Engine
 
-from src.core.retrieval import SemanticQuestionIndex
+from src.retrieval import SemanticQuestionIndex
 from src.sql.validation import SQLValidator
 from src.sql.generation import generate_sql
 from src.sql.execution import execute_sql
