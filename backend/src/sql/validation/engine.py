@@ -1,0 +1,677 @@
+"""
+SQL Validator — production-grade refactor.
+
+Architecture
+============
+  clean_sql()         — formatting normalization only; minimal semantic mutation
+  validate()          — returns ValidationResult; HARD_FAIL vs SOFT_WARN separated
+  validate_semantic() — SOFT_WARN only; NEVER blocks execution; NEVER in retry prompts
+  ValidatorStats      — lightweight rule-hit counters for observability
+
+Hard fails block execution and appear in retry prompts (concise codes only).
+Soft warns are logged for observability but are NEVER sent to the LLM.
+
+This separation eliminates:
+  - validator-induced semantic drift on retries
+  - verbose warning prose polluting retry prompts
+  - false-positive blocks on valid complex SQL patterns
+
+SQLValidator itself is composed from CleanerMixin/ShapeMixin/SemanticMixin/
+ScopeMixin (see cleaner.py/shape.py/semantic.py/scope.py) -- this file has
+__init__, the registry-consumption glue, and validate() (the main HARD_FAIL
+entry point, which stays whole rather than being split further).
+"""
+
+import re
+import logging
+
+try:
+    import sqlglot
+    import sqlglot.expressions as exp
+    _HAS_SQLGLOT = True
+except ImportError:
+    _HAS_SQLGLOT = False
+
+logger = logging.getLogger("inspectai.sql")
+
+from src.sql.validation.models import ValidationIssue, ValidationResult, ValidatorStats
+from src.sql.validation.ast_checks import (
+    _strip_nested_parens,
+    _check_undefined_table_aliases,
+    _check_ir_id_in_select_ast,
+    _check_uuid_leaks_ast,
+    _check_uuid_leaks_regex,
+)
+from src.sql.validation.cleaner import CleanerMixin
+from src.sql.validation.shape import ShapeMixin
+from src.sql.validation.semantic import SemanticMixin
+from src.sql.validation.scope import ScopeMixin
+
+
+class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
+    """
+    Two-tier SQL validation.
+
+    HARD_FAIL: blocks execution + concise code in retry prompt
+    SOFT_WARN: logged only, invisible to LLM
+
+    Clean separation means:
+      - LLM retries get one focused error, not a wall of mixed warnings
+      - Soft heuristics cannot cause retry cascades
+      - Aggregation/window function SQL is never blocked by routing heuristics
+    """
+
+
+    # Columns that do not exist on ai_* tables — keyed by table → {col: hint}
+    HALLUCINATED_AI_COLUMNS: dict[str, dict[str, str]] = {
+        "ai_questions": {
+            "question_label": "use aq.label instead",
+            "form_name":      "use module_name (ai_questions has no form_name column)",
+            "question_type":  "use entity_type instead",
+            "page_name":      "column does not exist on ai_questions",
+            "required":       "column does not exist on ai_questions",
+            "active":         "ai_questions has no active column — no soft-delete on this table",
+        },
+        "ai_answers": {
+            "answer_value":  "use answer_text (text) or answer_numeric (numeric)",
+            "form_name":     "use module_name (ai_answers has no form_name column)",
+            "label":         "ai_answers has no label column — JOIN ai_questions aq ON aa.element_id = aq.element_id, then filter aq.label = '...'",
+            "active":        "ai_answers has no active column — filter via inspection_report: ir.active = true AND ir.status != 'DRAFT'",
+        },
+        "inspection_schedule": {
+            # deepseek training bias: uses scheduled_date (past participle) instead of schedule_date
+            "scheduled_date": "column is 'schedule_date' not 'scheduled_date' on inspection_schedule",
+            # inspection_id/inspection_report_id do not exist on inspection_schedule — the FK lives
+            # on the report instead: inspection_report.schedule_id = isched.id
+            "inspection_id":         "inspection_schedule has no inspection_id — reach the report via "
+                                      "inspection_report.schedule_id = isched.id",
+            "inspection_report_id":  "inspection_schedule has no inspection_report_id — reach the report via "
+                                      "inspection_report.schedule_id = isched.id",
+        },
+    }
+
+
+    # Columns that do not exist on inspection_report — must be resolved via JOIN
+    # col → join hint (for logs only, not retry prompts)
+    HALLUCINATED_IR_COLUMNS: dict[str, str] = {
+        "facility_name":   "JOIN facility fac ON ir.facility_id = fac.id → fac.name",
+        "inspector_name":  "JOIN users u ON ir.inspector_user_id = u.id → u.first_name || ' ' || u.last_name",
+        "inspectee_name":  "JOIN users u ON ir.inspectee_user_id = u.id → u.first_name || ' ' || u.last_name",
+        "client_name":     "JOIN client cl ON ir.client_id = cl.id → cl.name",
+        "project_name":    "JOIN project proj ON ir.project_id = proj.id → proj.name",
+        "type_name":       "JOIN inspection_type it ON ir.inspection_type_id = it.id → it.name",
+        "inspection_type": "JOIN inspection_type it ON ir.inspection_type_id = it.id → it.name",
+        # Quarter-comparison ghost columns — deepseek hallucinates these when
+        # Qwen writes bad schema_hints like AVG(ir.current_qtr_score)
+        "current_qtr_score": "does not exist — compute with CASE WHEN ir.submitted_on >= date_trunc('quarter', NOW()) THEN ir.inspection_score END",
+        "last_qtr_score":    "does not exist — compute with CASE WHEN ir.submitted_on >= date_trunc('quarter', NOW()-INTERVAL '3 months') AND ir.submitted_on < date_trunc('quarter', NOW()) THEN ir.inspection_score END",
+        "score_improvement": "does not exist as a column — compute as this_q - last_q in a CTE",
+    }
+
+
+    # Columns that do not exist on inspection_corrective_action.
+    # deepseek hallucinates these when given vague schema_hints about risk/deferral.
+    HALLUCINATED_ICA_COLUMNS: dict[str, str] = {
+        # Deferral ghost columns — 'times_deferred' was seen in ORDER BY in trace
+        "times_deferred":     "does not exist — use COUNT(*) GROUP BY cause or fac.name to count deferrals",
+        # Risk-level ghost columns — risk is via risk_level_id FK, not a direct column.
+        # NOTE: risk_level and impact are also TABLE names — only catch qualified refs (ica.risk_level)
+        # capex_status DOES exist (unsuppressed) — do not flag it
+        "adequacy_status":    "does not exist — adequacy workflow not active",
+        "risk_level":         "does not exist as a column — risk_level_id is a UUID FK; JOIN risk_level rl ON ica.risk_level_id = rl.id → rl.name",
+        # ICA columns that do not exist — common hallucinations
+        "due_date":           "does not exist on inspection_corrective_action — use target_close_out_date",
+        "actual_date":        "does not exist on inspection_corrective_action — use completed_on (for closed rows) or target_close_out_date (for deadline)",
+        # mitigative_action_uuid is on po_details/pr_details — only block if qualified as ica.mitigative_action_uuid
+        # "po.mitigative_action_uuid = ica.id" is CORRECT and must NOT be blocked
+        "ica.mitigative_action_uuid": "does not exist on inspection_corrective_action — use po_details.mitigative_action_uuid = ica.id",
+        "completion_date":    "does not exist on inspection_corrective_action — use completed_on (actual closure timestamp, populated for CLOSED rows)",
+        "resolution_date":    "does not exist on inspection_corrective_action — use completed_on (actual closure timestamp for CLOSED rows)",
+        "impact":             "does not exist as a column on ica — impact data is in ai_answers: JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aq.label = 'Impact'",
+        # Other ghost columns seen in traces
+        "corrective_action_description": "does not exist — use ica.corrective_action (the text field)",
+    }
+
+
+    # Subset of ICA ghost columns that are also table names — only check qualified refs.
+    # If we check unqualified, we'd false-positive on "JOIN risk_level rl" clauses.
+    _ICA_QUALIFIED_ONLY_COLS: frozenset = frozenset({"risk_level", "impact"})
+
+
+    # Columns that do not exist on inspection_cycle. It has NO human-readable
+    # name column — confirmed 2026-06-12 after a real DB error (see
+    # core/business_rules.py block_inspection_cycle_name, which documents the
+    # same fact but is never invoked at runtime — this is the live check).
+    # inspection_cycle columns: id, status, start_date, end_date, due_date,
+    # send_notification_to_inspectors, created_on, modified_on.
+    HALLUCINATED_IC_COLUMNS: dict[str, str] = {
+        "name":       "does not exist on inspection_cycle — cycles have no name, identify them by "
+                       "ic.start_date / ic.end_date / ic.status instead (e.g. 'Jan 2026 cycle')",
+        "cycle_name": "does not exist on inspection_cycle — cycles have no name, identify them by "
+                       "ic.start_date / ic.end_date / ic.status instead (e.g. 'Jan 2026 cycle')",
+        "title":      "does not exist on inspection_cycle — cycles have no name, identify them by "
+                       "ic.start_date / ic.end_date / ic.status instead (e.g. 'Jan 2026 cycle')",
+        "code":       "does not exist on inspection_cycle — cycles have no name, identify them by "
+                       "ic.start_date / ic.end_date / ic.status instead (e.g. 'Jan 2026 cycle')",
+    }
+
+
+    # Impossible JOIN conditions derived from join_graph — these columns
+    # do not exist so the join can never be correct. Keyed by the bad pattern
+    # (regex), value is the correct path.
+    IMPOSSIBLE_JOIN_PATTERNS: list[tuple] = [
+        # ipd.cycle_id — column does not exist on inspector_portfolio_details
+        (r'\bipd\.cycle_id\b',
+         'ipd.cycle_id does not exist. Correct path: '
+         'ic→ip(ip.cycle_id=ic.id)→ipd(ipd.portfolio_id=ip.id)→fd'),
+        # ic.inspection_cycle_id — column does not exist on inspection_cycle
+        (r'\bic\.inspection_cycle_id\b',
+         'ic.inspection_cycle_id does not exist on inspection_cycle'),
+        # ir.cycle_id used as a join target on inspector_portfolio
+        (r'\bipd\.id\s*=\s*ic\.id\b',
+         'inspector_portfolio_details does not join directly to inspection_cycle. '
+         'Use: ip.cycle_id = ic.id, then ipd.portfolio_id = ip.id'),
+        # inspection_schedule.inspection_id / inspection_report_id — neither exists
+        (r'\bisched\.inspection_id\b|\binspection_schedule\.inspection_id\b'
+         r'|\bisched\.inspection_report_id\b|\binspection_schedule\.inspection_report_id\b',
+         'inspection_schedule has no inspection_id or inspection_report_id column. '
+         'The FK lives on the report instead: inspection_report.schedule_id = isched.id'),
+        # ── observation → ai_answers cast direction ───────────────────────────
+        # CORRECT cast: aa.submission_id = ica.observation_id::varchar
+        #   (ica.observation_id is uuid, aa.submission_id is varchar — cast uuid to varchar)
+        #   Verified in pgAdmin: aa.submission_id = ica.observation_id::varchar works correctly
+        # WRONG cast caught below:
+        #   ica.observation_id::text = aa.submission_id  (wrong side assignment)
+        (r'\bica\.observation_id\s*::\s*text\s*=\s*aa\.submission_id\b',
+         'Wrong cast — use: aa.submission_id = ica.observation_id::varchar'),
+    ]
+
+
+    # UUID FK columns — SOFT_WARN if selected without their lookup JOIN
+    UUID_FK_COLUMNS: dict[str, tuple] = {
+        "facility_id":            ("facility",           "fac",  "fac.name AS facility_name"),
+        "inspector_user_id":      ("users",              "u",    "u.first_name || ' ' || u.last_name AS inspector_name"),
+        "inspectee_user_id":      ("users",              "insp", "insp.first_name || ' ' || insp.last_name AS inspectee_name"),
+        "client_id":              ("client",             "cl",   "cl.name AS client_name"),
+        "project_id":             ("project",            "proj", "proj.name AS project_name"),
+        "inspection_type_id":     ("inspection_type",    "it",   "it.name AS inspection_type_name"),
+        "inspection_sub_type_id": ("inspection_sub_type","ist",  "ist.name AS subtype_name"),
+        "module_id":              ("fb_modules",         "mod",  "mod.name AS module_name"),
+        # inspection_cycle has no human-readable name — its "identity" for display
+        # purposes is its date span + status, not a derived label from an unrelated
+        # date column (e.g. TO_CHAR of an individual inspection's submitted_on).
+        "cycle_id":               ("inspection_cycle",   "ic",   "ic.start_date, ic.end_date, ic.status AS cycle_status"),
+    }
+
+
+    # Rule ids from core/business_rules.py's REGISTRY that validate()/clean_sql()
+    # actually consume — an explicit allowlist so a new registry rule never
+    # silently starts firing in production without deliberate opt-in here.
+    #   Group A — pure consolidation of checks that used to be hand-written
+    #             duplicates in this file (DML block, hallucinated-table names,
+    #             dynamic fb_ tables, responsible/pending_with join, close_on
+    #             arithmetic, missing-limit warn, hardcoded-year warn, plus the
+    #             ICA/IR join and reserved-alias autocorrects).
+    #   Group B — new enforcement: dormant registry-only rules turned on for
+    #             the first time. block_po_pr_double_direct_join and
+    #             block_capex_left_join_multiplication guard a confirmed
+    #             production incident (2026-06-15, silent CAPEX/OPEX corruption
+    #             via row fan-out) that had no guard anywhere until now.
+    _CONSUMED_RULE_IDS: frozenset = frozenset({
+        # Group A
+        "block_dml", "block_table_ai_question_singular", "block_table_ai_answer_singular",
+        "block_table_fb_users", "block_table_fb_submissions", "block_table_fb_answers",
+        "block_table_fb_responses", "block_table_dynamic_fb", "block_responsible_fk_join",
+        "block_close_on_arithmetic", "warn_no_limit", "block_hardcoded_year",
+        "autocorrect_ica_ir_join_varchar_uuid", "autocorrect_ica_ir_join_reversed",
+        "autocorrect_ica_ir_join_cast", "autocorrect_ica_ir_join_cast_typecast",
+        "autocorrect_reserved_alias_is",
+        # Group B
+        "block_po_pr_double_direct_join", "block_capex_left_join_multiplication",
+        "block_po_pr_join_to_ir", "block_mitigative_uuid_wrong_target",
+        "block_expenditure_as_conversion", "block_inspector_not_in_pattern",
+    })
+
+
+    # block_dml used to early-return non-retryable, before any other check ran.
+    # Folding it into the generic registry-issue pass changes that control flow
+    # (other checks can now also fire on the same SQL), but this keeps its
+    # ValidatorStats/ValidationIssue observability semantics identical.
+    _NON_RETRYABLE_CODES: frozenset = frozenset({"DML_BLOCKED"})
+
+
+    def __init__(self):
+        from src.sql.rules import get_engine
+        self._rules = get_engine()
+
+
+    def _registry_block_warn_issues(self, sql: str, question: str = "") -> list:
+        """
+        Consume business_rules.py's BLOCK/WARN registry rules, restricted to
+        _CONSUMED_RULE_IDS. Applies the same table_guard / question_pattern
+        gating RulesEngine precompiles onto each rule, but yields
+        ValidationIssue objects so results slot into this class's existing
+        pipeline (ValidatorStats, retry_message(), ...) unchanged.
+        """
+        issues: list[ValidationIssue] = []
+        for rule in self._rules._block_rules:
+            if rule["id"] not in self._CONSUMED_RULE_IDS:
+                continue
+            guard = rule.get("table_guard")
+            if guard and not re.search(rf"\b{re.escape(guard)}\b", sql, re.IGNORECASE):
+                continue
+            q_re = rule.get("_q_re")
+            if q_re and not (question and q_re.search(question)):
+                continue
+            if rule["_sql_re"].search(sql):
+                code = rule["code"]
+                retryable = code not in self._NON_RETRYABLE_CODES
+                issues.append(ValidationIssue("HARD_FAIL", code, rule["message"], retryable=retryable))
+                ValidatorStats.record(code, is_retry_trigger=retryable)
+        for rule in self._rules._warn_rules:
+            if rule["id"] not in self._CONSUMED_RULE_IDS:
+                continue
+            guard = rule.get("table_guard")
+            if guard and not re.search(rf"\b{re.escape(guard)}\b", sql, re.IGNORECASE):
+                continue
+            if rule["_sql_re"].search(sql):
+                code = rule["code"]
+                issues.append(ValidationIssue("SOFT_WARN", code, rule["message"], retryable=False))
+                ValidatorStats.record(code, is_retry_trigger=False)
+        return issues
+
+
+    def _registry_autocorrects(self, sql: str) -> str:
+        """Consume business_rules.py's AUTOCORRECT registry rules, restricted to _CONSUMED_RULE_IDS."""
+        for rule in self._rules._autocorr_rules:
+            if rule["id"] not in self._CONSUMED_RULE_IDS:
+                continue
+            sql = rule["_sql_re"].sub(rule["replacement"], sql)
+        return sql
+
+
+    # ------------------------------------------------------------------ #
+    # Primary validation — HARD_FAIL vs SOFT_WARN separation
+    # ------------------------------------------------------------------ #
+
+    def validate(self, sql: str, question: str = "") -> ValidationResult:
+        """
+        Validate SQL. Returns ValidationResult.
+
+        Hard fails block execution and produce concise retry codes.
+        Soft warns are advisory only and are NEVER forwarded to the LLM.
+
+        Design rules:
+          1. Early-return on non-retryable catastrophic failures (DML, empty)
+          2. Accumulate hard fails — up to 3 before returning
+          3. Soft warns accumulate separately, never mixed into retry message
+          4. No extended hint prose in ValidationIssue.message — only in .detail
+        """
+        issues: list[ValidationIssue] = []
+
+        # ── 1. Empty / error marker ───────────────────────────────────────
+        if not sql or sql.startswith("-- ERROR:"):
+            issue = ValidationIssue(
+                "HARD_FAIL", "EMPTY_SQL",
+                sql or "Empty SQL generated",
+                retryable=False,
+            )
+            ValidatorStats.record("EMPTY_SQL", is_retry_trigger=True)
+            return ValidationResult(passed=False, issues=[issue])
+
+        sql_lower = sql.lower()
+
+        # ── 2. Registry-driven BLOCK/WARN rules (core/business_rules.py) ──
+        # DML block, hallucinated table names, dynamic fb_ tables, responsible/
+        # pending_with join, close_on arithmetic, missing-limit, hardcoded-year,
+        # plus the Group-B financial-integrity guards — see _CONSUMED_RULE_IDS.
+        issues.extend(self._registry_block_warn_issues(sql, question))
+
+        # ── 4. Hallucinated columns on ai_* tables ────────────────────────
+        for table, col_hints in self.HALLUCINATED_AI_COLUMNS.items():
+            if not re.search(rf"\b{re.escape(table)}\b", sql_lower):
+                continue
+            # Collect the aliases used for this table in FROM/JOIN clauses
+            # e.g. "FROM ai_answers aa" → alias "aa"
+            # e.g. "JOIN ai_answers ans" → alias "ans"
+            # We only flag qualified refs where the alias maps to THIS table.
+            table_aliases: set[str] = set()
+            for m in re.finditer(
+                rf'\b{re.escape(table)}\s+(\w+)\b', sql_lower
+            ):
+                table_aliases.add(m.group(1))
+            # Also include the bare table name itself as a possible qualifier
+            table_aliases.add(table)
+
+            for col, hint in col_hints.items():
+                # Only match qualified references (alias.col) where alias ∈ table_aliases
+                found = False
+                for alias in table_aliases:
+                    if re.search(rf'\b{re.escape(alias)}\.{re.escape(col)}\b', sql_lower):
+                        found = True
+                        break
+                if found:
+                    issues.append(ValidationIssue(
+                        "HARD_FAIL", "WRONG_COLUMN",
+                        f"Column '{col}' does not exist on {table} — {hint}",
+                        detail=f"Hallucinated column: {table}.{col}",
+                    ))
+                    ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+
+        # ── 5. Hallucinated columns on inspection_report ──────────────────
+        ir_used = bool(re.search(r'\b(inspection_report|ir)\b', sql_lower))
+        if ir_used:
+            for col, join_hint in self.HALLUCINATED_IR_COLUMNS.items():
+                for alias in ("ir", "inspection_report"):
+                    if re.search(rf"\b{re.escape(alias)}\.{re.escape(col)}\b", sql_lower):
+                        issues.append(ValidationIssue(
+                            "HARD_FAIL", "WRONG_COLUMN",
+                            f"Column '{alias}.{col}' does not exist on inspection_report",
+                            detail=f"Requires JOIN: {join_hint}",
+                        ))
+                        ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+                        break
+
+        # ── 5b. Hallucinated columns on inspection_corrective_action ──────
+        # deepseek confabulates risk/deferral columns that don't exist on ICA.
+        # Proven in traces: capex_status, adequacy_status, times_deferred.
+        # Also guards ir.current_qtr_score / ir.last_qtr_score ghost columns.
+        #
+        # ALIAS AMBIGUITY (fixed 2026-06-11): "ic" is ALSO the conventional
+        # alias for inspection_cycle (e.g. "JOIN inspection_cycle ic ON ...").
+        # A bare \bic\b match previously activated this whole section for
+        # queries that have NO inspection_corrective_action table at all —
+        # then a query selecting isched.due_date (valid — inspection_schedule
+        # HAS a due_date column) was wrongly flagged as a hallucinated ICA
+        # column. Fix: only treat "ica"/"ic" as ICA aliases if
+        # inspection_corrective_action actually appears in FROM/JOIN; extract
+        # its real alias(es) from there instead of guessing.
+        _ica_table_used = bool(re.search(r'\binspection_corrective_action\b', sql_lower))
+        _ica_aliases: set[str] = {"ica", "inspection_corrective_action"}
+        for _m in re.finditer(r'\binspection_corrective_action\s+(?:as\s+)?(\w+)', sql_lower):
+            _ica_aliases.add(_m.group(1))
+        ica_used = _ica_table_used or bool(re.search(r'\bica\b', sql_lower))
+        if ica_used:
+            for col, hint in self.HALLUCINATED_ICA_COLUMNS.items():
+                qualified_only = col in self._ICA_QUALIFIED_ONLY_COLS
+                hit = False
+                for alias in _ica_aliases:
+                    if re.search(rf"\b{re.escape(alias)}\.{re.escape(col)}\b", sql_lower):
+                        hit = True
+                        break
+                if not hit and not qualified_only:
+                    # Unqualified bare reference — only flag in clause positions
+                    # (ORDER BY, WHERE, SELECT column list) to avoid matching aliases/comments.
+                    # (?<![\w.]) excludes BOTH "foo_due_date" (different identifier) AND
+                    # "isched.due_date" (validly qualified to a DIFFERENT table that
+                    # legitimately has this column, e.g. inspection_schedule.due_date).
+                    if re.search(
+                        rf"(?:order\s+by|where\s|select\s)[^;]*(?<![\w.]){re.escape(col)}\b",
+                        sql_lower, re.DOTALL
+                    ) and not re.search(
+                        rf"\bAS\s+{re.escape(col)}\b",
+                        sql, re.IGNORECASE
+                    ):
+                        hit = True
+                if hit:
+                    issues.append(ValidationIssue(
+                        "HARD_FAIL", "WRONG_COLUMN",
+                        f"Column '{col}' does not exist on inspection_corrective_action — {hint}",
+                        detail=f"Hallucinated ICA column: {col}",
+                    ))
+                    ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+
+        # ── 5b2. Hallucinated columns on inspection_cycle ─────────────────
+        # deepseek/llama repeatedly confabulate a display-name column on
+        # inspection_cycle (ic.name, ic.cycle_name, ...) even after get_schema
+        # returns the real column list — seen looping for 5 straight retries
+        # in production traces (2026-07-08). Only flag when inspection_cycle
+        # is actually joined, using its real alias(es) from FROM/JOIN, so we
+        # don't false-positive on unrelated tables that legitimately have a
+        # "name" column (facility.name, project.name, etc.).
+        _ic_table_used = bool(re.search(r'\binspection_cycle\b', sql_lower))
+        if _ic_table_used:
+            _ic_aliases: set[str] = {"inspection_cycle"}
+            for _m in re.finditer(r'\binspection_cycle\s+(?:as\s+)?(\w+)', sql_lower):
+                _ic_aliases.add(_m.group(1))
+            for col, hint in self.HALLUCINATED_IC_COLUMNS.items():
+                for alias in _ic_aliases:
+                    if re.search(rf"\b{re.escape(alias)}\.{re.escape(col)}\b", sql_lower):
+                        issues.append(ValidationIssue(
+                            "HARD_FAIL", "WRONG_COLUMN",
+                            f"Column '{alias}.{col}' does not exist on inspection_cycle — {hint}",
+                            detail=f"Hallucinated IC column: {col}",
+                        ))
+                        ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+                        break
+
+        # ── 5c. Impossible JOIN conditions (from join graph) ─────────────
+        for _pattern, _correct in self.IMPOSSIBLE_JOIN_PATTERNS:
+            if re.search(_pattern, sql_lower):
+                # Distinguish cast-direction errors with a dedicated code
+                # so the retry message is specific, not generic IMPOSSIBLE_JOIN.
+                _code = "WRONG_CAST_DIR" if "cast" in _correct.lower() or "submission_id" in _pattern else "IMPOSSIBLE_JOIN"
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", _code,
+                    f"{'Wrong cast direction' if _code == 'WRONG_CAST_DIR' else 'Impossible join'} — {_correct}",
+                    detail=f"Pattern matched: {_pattern}",
+                ))
+                ValidatorStats.record(_code, is_retry_trigger=True)
+
+        # ── 6. ir.id in SELECT clause (UUID PK exposed for display) ───────
+        # IMPORTANT: ir.id is CORRECT and required as a JOIN key, e.g.:
+        #   WHERE aa.inspection_report_id = (SELECT ir.id FROM ...)  ← valid
+        #   JOIN ica ON ica.inspection_id = ir.id                    ← valid
+        # Only flag ir.id when it appears in the OUTERMOST SELECT column list
+        # (where it would be displayed as UUID garbage instead of inspection_id).
+        if ir_used:
+            if _HAS_SQLGLOT:
+                _check_ir_id_in_select_ast(sql, issues)
+            else:
+                # Regex fallback: strip subquery content first to avoid matching
+                # ir.id that lives inside a WHERE (SELECT ir.id ...) subquery.
+                outermost = _strip_nested_parens(sql)
+                m = re.search(r'\bSELECT\b(.*?)\bFROM\b',
+                              outermost, re.IGNORECASE | re.DOTALL)
+                if m and re.search(r'\bir\.id\b', m.group(1), re.IGNORECASE):
+                    issues.append(ValidationIssue(
+                        "HARD_FAIL", "UUID_IN_SELECT",
+                        "ir.id is the UUID primary key — use ir.inspection_id for display",
+                        detail="ir.inspection_id is the human-readable varchar '2026/04/ST001/INS001'",
+                    ))
+                    ValidatorStats.record("UUID_IN_SELECT", is_retry_trigger=True)
+
+        # ── 6b. Undefined table aliases — column refs to aliases not in FROM/JOIN ──
+        # Catches: SELECT ... WHERE ir.active = true  with NO "FROM/JOIN ... ir"
+        # anywhere in the query. Postgres rejects this at execution time with
+        # 'missing FROM-clause entry for table "ir"', but plain-regex validation
+        # passes it since 'ir.active' LOOKS like a valid qualified column.
+        # Observed 2026-06-11: this exact pattern passed validation twice in a
+        # row (Deepseek kept dropping the JOIN while keeping ir.active in WHERE),
+        # burning 3 retries before Llama finally added the missing JOIN.
+        if _HAS_SQLGLOT:
+            _check_undefined_table_aliases(sql, issues)
+
+        # ── 9b. Stale hardcoded date literal — HARD_FAIL ─────────────────
+        # deepseek hallucinates DATE '2023-01-01' or '2022-...' from training data
+        # when generating date range filters. These are always wrong — the data is
+        # from 2025/2026. Only fire for years clearly in the past (≤ current year - 2)
+        # to avoid blocking intentional historical queries like "inspections in 2024".
+        _stale_date_re = re.compile(
+            r"""(?:date\s+['"]|['"])(20(?:2[0-4]|1\d))-\d{2}-\d{2}['"]""",
+            re.IGNORECASE,
+        )
+        for m in _stale_date_re.finditer(sql_lower):
+            stale_year = m.group(0)
+            issues.append(ValidationIssue(
+                "HARD_FAIL", "STALE_DATE_LITERAL",
+                f"Hardcoded stale date literal detected — use EXTRACT(MONTH/YEAR FROM CURRENT_DATE) "
+                f"or pass the year from context instead of a fixed past date",
+                detail=f"Matched: {stale_year}",
+            ))
+            ValidatorStats.record("STALE_DATE_LITERAL", is_retry_trigger=True)
+            break  # one report is enough
+
+        # ── 10b. TO_CHAR used as a WHERE filter — HARD_FAIL ───────────────
+        # TO_CHAR(col, 'Month YYYY') = 'January 2026' silently returns 0 rows
+        # because PostgreSQL pads month names: 'January   2026' ≠ 'January 2026'.
+        # This pattern is ONLY valid for GROUP BY labels / SELECT display.
+        if re.search(r'\bto_char\b', sql_lower):
+            # Detect: to_char(..., 'Month YYYY') = '...' — the = must immediately follow
+            # the closing ) of the to_char() call to avoid false positives where a distant
+            # = ' later in the query (e.g. ir.status != 'DRAFT') is incorrectly matched.
+            tochar_month_eq = re.search(
+                r"\bto_char\b[^;]*'month\s+yyyy'\s*\)\s*=\s*'",
+                sql_lower, re.IGNORECASE | re.DOTALL,
+            )
+            if tochar_month_eq:
+                # Confirm a WHERE keyword precedes this pattern (not just SELECT/GROUP BY).
+                # Only look for WHERE after the last SELECT to avoid matching CTE WHERE clauses.
+                before = sql_lower[:tochar_month_eq.start()]
+                last_select = max((m.end() for m in re.finditer(r'\bselect\b', before)), default=0)
+                in_where = bool(re.search(r'\bwhere\b', before[last_select:]))
+                if in_where:
+                    issues.append(ValidationIssue(
+                        "HARD_FAIL", "TOCHAR_WHERE_FILTER",
+                        "TO_CHAR(..., 'Month YYYY') = '...' in WHERE always returns 0 rows — "
+                        "use submitted_on >= 'YYYY-MM-01' AND < next month instead",
+                        detail="PostgreSQL pads month names with spaces: 'January   2026' != 'January 2026'",
+                    ))
+                    ValidatorStats.record("TOCHAR_WHERE_FILTER", is_retry_trigger=True)
+
+        # ── 10c. Truncated inspection_id — HARD_FAIL ──────────────────────
+        # inspection_id is always 'YYYY/MM/STXXX/INSXXX' (full VARCHAR).
+        # deepseek sometimes drops the 'YYYY/MM/' prefix, producing 'STXXX/INSXXX'.
+        # Detect: inspection_id = 'STXXX/INSXXX' (missing year/month prefix).
+        _trunc_id = re.search(
+            r"""inspection_id\s*=\s*['"](?!\d{4}/)(st\d+/ins\d+)['"]""",
+            sql_lower, re.IGNORECASE,
+        )
+        if _trunc_id:
+            issues.append(ValidationIssue(
+                "HARD_FAIL", "TRUNCATED_INSPECTION_ID",
+                f"Truncated inspection_id '{_trunc_id.group(1)}' — full format is 'YYYY/MM/STXXX/INSXXX'",
+                detail="Use the full inspection_id string as provided by the user",
+            ))
+            ValidatorStats.record("TRUNCATED_INSPECTION_ID", is_retry_trigger=True)
+        # ── 10d. Mismatched first/last name OR-split — HARD_FAIL ──────────
+        # WHERE (x.first_name ILIKE '%George%' OR x.last_name ILIKE '%Auditor%')
+        # matches anyone named George OR anyone surnamed Auditor — not people
+        # named "George Auditor". A same-literal OR split (both '%george%') is
+        # the correct single-word check and is NOT flagged. Two-word full names
+        # must use the concatenated form instead:
+        #   (x.first_name || ' ' || x.last_name) ILIKE '%George Auditor%'
+        _name_or_pat = re.compile(
+            r"(\w+)\.first_name\s+ILIKE\s+'%([^%']+)%'\s+OR\s+\1\.last_name\s+ILIKE\s+'%([^%']+)%'"
+            r"|(\w+)\.last_name\s+ILIKE\s+'%([^%']+)%'\s+OR\s+\4\.first_name\s+ILIKE\s+'%([^%']+)%'",
+            re.IGNORECASE,
+        )
+        _name_or_match = _name_or_pat.search(sql)
+        if _name_or_match:
+            g = _name_or_match.groups()
+            first_val, last_val = (g[1], g[2]) if g[0] else (g[5], g[4])
+            if first_val.strip().lower() != last_val.strip().lower():
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "SPLIT_NAME_MISMATCH",
+                    f"first_name/last_name OR-split uses different literals "
+                    f"('{first_val}' vs '{last_val}') — matches wrong people",
+                    detail=(
+                        "Use the concatenated form for a full name: "
+                        f"(alias.first_name || ' ' || alias.last_name) ILIKE "
+                        f"'%{first_val} {last_val}%'"
+                    ),
+                ))
+                ValidatorStats.record("SPLIT_NAME_MISMATCH", is_retry_trigger=True)
+
+        # ── 10e. "overdue" mitigative actions via date arithmetic — HARD_FAIL ──
+        # status='OVERDUE' is the authoritative, maintained field. Reconstructing
+        # it via `NOT status IN (...) AND target_close_out_date < CURRENT_DATE`
+        # silently diverges from that field's business rule (grace periods,
+        # deferrals, etc. are baked into the maintained status, not the raw date
+        # comparison) — both 3B and 7B were observed doing this identically in
+        # eval, always without error, so it was invisible until the SQL was
+        # read by hand. Scoped tightly to "overdue" + mitigative/action to avoid
+        # over-firing on unrelated "active"/"status" questions.
+        _overdue_ca_q = re.compile(
+            r"\boverdue\b.{0,25}\b(?:mitigative|actions?)\b"
+            r"|\b(?:mitigative|actions?)\b.{0,25}\boverdue\b",
+            re.IGNORECASE,
+        )
+        if question and _overdue_ca_q.search(question):
+            uses_overdue_status = "'OVERDUE'" in sql.upper()
+            uses_date_compare = bool(re.search(
+                r"target_close_out_date\s*<\s*(?:now|current_date)", sql_lower, re.IGNORECASE))
+            if not uses_overdue_status and uses_date_compare:
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "OVERDUE_DATE_ARITHMETIC",
+                    "Overdue mitigative actions must use status='OVERDUE', not date arithmetic",
+                    detail="status='OVERDUE' is the authoritative field — do not recompute "
+                           "overdue from target_close_out_date/CLOSED/CLOSE_WITH_DEFERRED",
+                ))
+                ValidatorStats.record("OVERDUE_DATE_ARITHMETIC", is_retry_trigger=True)
+
+        # ── 10f. "which cycle" returning a bare cycle_id — HARD_FAIL ────────────
+        # inspection_cycle has no human-readable name — its only identity is
+        # start_date/end_date/status. A query that answers "which cycle ..." by
+        # selecting/grouping on the raw cycle_id UUID without joining
+        # inspection_cycle is unusable in the UI and easily read as duplicate
+        # rows when unrelated derived labels (e.g. month of an individual
+        # inspection's submitted_on) coincide across several distinct cycles.
+        # Reuses the precise AST-based SELECT/GROUP BY leak detector (not a
+        # blind substring match) so a legitimate `WHERE cycle_id = '<uuid>'`
+        # scoping filter is never flagged.
+        if question and re.search(r"\bcycle\b", question, re.IGNORECASE):
+            _cycle_leak: list[ValidationIssue] = []
+            _cycle_fk = {"cycle_id": self.UUID_FK_COLUMNS["cycle_id"]}
+            if _HAS_SQLGLOT:
+                _check_uuid_leaks_ast(sql, _cycle_fk, _cycle_leak)
+            else:
+                _check_uuid_leaks_regex(sql_lower, _cycle_fk, _cycle_leak)
+            if _cycle_leak:
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "CYCLE_UUID_NO_JOIN",
+                    "Question asks about a cycle but SQL exposes cycle_id without "
+                    "joining inspection_cycle for its date span/status",
+                    detail=_cycle_leak[0].detail,
+                ))
+                ValidatorStats.record("CYCLE_UUID_NO_JOIN", is_retry_trigger=True)
+
+        # ── 10g. "opex incurred/converted" answered via po_details — HARD_FAIL ──
+        # po_details (Purchase Orders) is the CAPEX conversion table; pr_details
+        # (Purchase Requisitions) is the OPEX one. Both share the same
+        # mitigative_action_uuid join shape, so joining the wrong one produces
+        # a plausible, non-erroring result that is actually measuring CAPEX
+        # data under an "opex" label — observed live 2026-07-07: a query asking
+        # for "opex generated and converted" joined po_details for the
+        # "converted" figure instead of pr_details.
+        _opex_convert_q = re.compile(
+            r"\bopex\b.{0,25}\b(?:converted|incurred|spend|spent)\b"
+            r"|\b(?:converted|incurred|spend|spent)\b.{0,25}\bopex\b",
+            re.IGNORECASE,
+        )
+        if question and _opex_convert_q.search(question):
+            uses_po = bool(re.search(r"\bpo_details\b|\bpo\.po_amount\b", sql_lower))
+            uses_pr = bool(re.search(r"\bpr_details\b|\bpr\.pr_amount\b", sql_lower))
+            if uses_po and not uses_pr:
+                issues.append(ValidationIssue(
+                    "HARD_FAIL", "OPEX_WRONG_TABLE",
+                    "OPEX incurred/converted must come from pr_details (Purchase "
+                    "Requisitions), not po_details (that's the CAPEX conversion table)",
+                    detail="JOIN pr_details pr ON pr.mitigative_action_uuid = ica.id, "
+                           "SELECT SUM(pr.pr_amount)",
+                ))
+                ValidatorStats.record("OPEX_WRONG_TABLE", is_retry_trigger=True)
+
+        hard_fails = [i for i in issues if i.severity == "HARD_FAIL"]
+        passed = len(hard_fails) == 0
+
+        if hard_fails:
+            logger.info("[VALID] HARD_FAIL (%d): %s",
+                        len(hard_fails), "; ".join(str(f) for f in hard_fails))
+        soft = [i for i in issues if i.severity == "SOFT_WARN"]
+        if soft:
+            logger.debug("[VALID] SOFT_WARN (%d, not sent to LLM): %s",
+                         len(soft), "; ".join(str(w) for w in soft))
+
+        return ValidationResult(passed=passed, issues=issues)
+
