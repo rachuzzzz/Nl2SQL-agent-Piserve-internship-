@@ -25,16 +25,39 @@ log = logging.getLogger("inspectai")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Warm up the orchestrator at server start so the first request is instant."""
+    """Warm up both domain orchestrators + the domain router at server start
+    so the first request is instant. The audit instance shares the
+    inspection instance's DB connection pool, embedding model, and reasoning
+    LLM client rather than building its own (one pool/model/client for both
+    domains — see agent/domains.py's DOMAIN_REGISTRY and the domain-router
+    plan's §3/§6)."""
     app.state.orch = None
+    app.state.orch_inspection = None
+    app.state.orch_audit = None
+    app.state.router = None
     from dotenv import load_dotenv
     load_dotenv()
     setup_logging(log_level="INFO")
-    log.info("[SERVER] Starting InspectAI — loading orchestrator (LLM + embeddings + schema)…")
+    log.info("[SERVER] Starting InspectAI — loading orchestrators (LLM + embeddings + schema)…")
     t0 = time.time()
     from src.agent.orchestrator import AgentOrchestrator
-    app.state.orch = AgentOrchestrator.from_env()
-    log.info("[SERVER] Orchestrator ready in %.1fs", time.time() - t0)
+    from src.agent.domain_router import DomainRouter
+    app.state.orch_inspection = AgentOrchestrator.from_env(domain="inspection")
+    app.state.orch_audit = AgentOrchestrator.from_env(
+        domain="audit",
+        db_engine=app.state.orch_inspection.db_engine,
+        embed_model=app.state.orch_inspection.embed_model,
+        reasoning_llm=app.state.orch_inspection.reasoning_llm,
+    )
+    # Back-compat alias — the ~5 call sites that aren't domain-aware yet
+    # (get_page()'s best-effort calendar refetch, health/chart-advisor spots)
+    # keep working against the inspection instance unchanged.
+    app.state.orch = app.state.orch_inspection
+    app.state.router = DomainRouter(
+        reasoning_llm=app.state.orch_inspection.reasoning_llm,
+        debug_logger=app.state.orch_inspection._debug,
+    )
+    log.info("[SERVER] Orchestrators ready in %.1fs", time.time() - t0)
 
     # Catch definition desyncs between knowledge/semantics_registry.py (the
     # declared single source of truth) and the prompt/example files that

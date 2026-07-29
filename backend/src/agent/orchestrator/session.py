@@ -14,22 +14,80 @@ from src.agent.orchestrator.debug import _ilike_escape
 
 
 
+# Domain-exclusive active_subject_type values — the underlying ID only means
+# something in ONE domain's schema (inspection_id/audit_id/inspection_cycle vs
+# audit_cycle are different tables entirely, not shared). "facility"/
+# "inspector"/"entity" are deliberately NOT in this set — both domains query
+# the same facility/users/project/client/entity/organisation tables, so those
+# carry across a domain switch safely. Used by build_context_block()'s domain
+# gate and by the entity_memory recall check below.
+_DOMAIN_EXCLUSIVE = frozenset({"inspection", "audit", "cycle"})
+
+# entity_memory cap — deliberately much larger than MAX_TURNS since these are
+# small labeled records (no raw text), not full turns. Bounds a very long
+# session without limiting name-based recall to only the last few messages.
+_ENTITY_MEMORY_CAP = 30
+
+
 class ConversationSession:
-    MAX_TURNS = 5
+    MAX_TURNS = 8
 
     def __init__(self):
         self.turns: list[ConversationTurn] = []
+        # Persists the MOST RECENT active_subject_type/value regardless of
+        # MAX_TURNS eviction — decouples "how much raw history to show" from
+        # "what are we currently focused on". Never explicitly cleared on a
+        # domain switch; build_context_block() simply won't use a
+        # domain-exclusive entry when it doesn't match the current domain.
+        self.current_scope: Optional[dict] = None
+        # Append-only record of every distinct entity resolved this session
+        # (same shape as current_scope), capped at _ENTITY_MEMORY_CAP. Lets a
+        # later turn that explicitly re-names something from several turns
+        # back ("what about Facility A again") get it back even though it's
+        # no longer the current_scope and long since evicted from self.turns.
+        self.entity_memory: list[dict] = []
 
     def add_turn(self, turn: ConversationTurn):
         self.turns.append(turn)
         if len(self.turns) > self.MAX_TURNS:
             self.turns = self.turns[-self.MAX_TURNS:]
+        if turn.active_subject_type and turn.active_subject_value:
+            scope = {
+                "type": turn.active_subject_type,
+                "value": turn.active_subject_value,
+                "label": turn.active_subject_label,
+                "table": turn.active_subject_table,
+                "alias": turn.active_subject_alias,
+                "domain": turn.active_subject_domain,
+            }
+            self.current_scope = scope
+            _dup = (
+                self.entity_memory
+                and self.entity_memory[-1]["type"] == scope["type"]
+                and self.entity_memory[-1]["value"] == scope["value"]
+            )
+            if not _dup:
+                self.entity_memory.append(scope)
+                if len(self.entity_memory) > _ENTITY_MEMORY_CAP:
+                    self.entity_memory = self.entity_memory[-_ENTITY_MEMORY_CAP:]
 
     @property
     def last_turn(self) -> Optional[ConversationTurn]:
         return self.turns[-1] if self.turns else None
 
-    def build_context_block(self, current_question: str = "") -> str:
+    @property
+    def last_domain(self) -> str:
+        """Most recent turn's resolved domain, walking backwards — "" if no
+        turn has one yet (fresh session, or every turn so far was a parse
+        error). This is what DomainRouter's Tier 2 (stickiness) reads: a
+        follow-up with no domain keyword stays in whatever domain the last
+        resolved turn used."""
+        for t in reversed(self.turns):
+            if t.domain:
+                return t.domain
+        return ""
+
+    def build_context_block(self, current_question: str = "", current_domain: str = "") -> str:
         if not self.turns:
             return ""
 
@@ -39,8 +97,11 @@ class ConversationSession:
         # active-context gate below to false-positive-match plain global questions.
         # Demonstrative reference to a specific entity is still caught via the
         # explicit "that/this <entity>" phrases.
+        # "here" IS included unconditionally (unlike bare "there", left out below) —
+        # "here" is almost never anything but a location follow-up in this app's
+        # question shapes ("was any audit conducted here last month").
         _FOLLOWUP_RE = re.compile(
-            r"\b(it|its|them|they|she|he|her|his|their|"
+            r"\b(it|its|them|they|she|he|her|his|their|here|"
             r"(?:that|this)\s+(?:inspection|site|facility|form|inspector|cycle|"
             r"person|project|client|action|schedule)|"
             r"the\s+same|the\s+above|from\s+there|more|rest|remaining|"
@@ -64,6 +125,8 @@ class ConversationSession:
         lines = ["━━━ CONVERSATION HISTORY ━━━"]
         for i, t in enumerate(self.turns, 1):
             lines.append(f"Turn {i}:")
+            if t.domain:
+                lines.append(f"  Domain: {t.domain}")
             lines.append(f"  User: {t.question}")
             short = t.answer[:200] + ("..." if len(t.answer) > 200 else "")
             lines.append(f"  Answer: {short}")
@@ -75,6 +138,8 @@ class ConversationSession:
                 lines.append(f"  Columns: {t.columns}")
             if t.inspection_ids:
                 lines.append(f"  ★ inspection_id(s) from this result: {t.inspection_ids[:5]}")
+            if t.audit_ids:
+                lines.append(f"  ★ audit_id(s) from this result: {t.audit_ids[:5]}")
             if t.cycle_ids:
                 lines.append(f"  ★ cycle_id(s) from this result: {t.cycle_ids[:3]}")
             if t.facility_names:
@@ -93,20 +158,39 @@ class ConversationSession:
         lines.append("")
 
         # ── Resolve active subject across all turns ──────────────────────────
-        # Walk backwards through turns to find the most recent active subject.
         # "go back to that inspector" can re-anchor to an earlier turn's subject.
+        # Domain-exclusive types (inspection/audit/cycle — see _DOMAIN_EXCLUSIVE)
+        # are only usable when they originated in the domain we're currently
+        # answering in; "facility"/"inspector"/"entity" are always usable.
+        # Confirmed live: without this gate, an inspection-scoped subject got
+        # handed to the audit LLM as "use WHERE ir.inspection_id = ..." —
+        # ir/inspection_report doesn't exist in the audit schema at all.
         active_type = ""
         active_value = ""
         active_label = ""
         active_table = ""
         active_alias = ""
 
+        def _domain_ok(scope: dict) -> bool:
+            return (
+                scope["type"] not in _DOMAIN_EXCLUSIVE
+                or not current_domain
+                or scope["domain"] == current_domain
+            )
+
         # "go back" or "back to" signals: re-anchor to the earliest matching subject
         _BACK_RE = re.compile(r"\b(go\s+back|back\s+to|return\s+to)\b", re.IGNORECASE)
         if _BACK_RE.search(current_question):
-            # Look for the first (oldest) active subject in history
+            # Look for the first (oldest) DOMAIN-COMPATIBLE active subject in
+            # history — skip past an incompatible one rather than stopping dead,
+            # so "go back" can still find an earlier, still-usable subject.
             for t in self.turns:
                 if t.active_subject_type and t.active_subject_value:
+                    _cand = {
+                        "type": t.active_subject_type, "domain": t.active_subject_domain,
+                    }
+                    if not _domain_ok(_cand):
+                        continue
                     active_type = t.active_subject_type
                     active_value = t.active_subject_value
                     active_label = t.active_subject_label
@@ -114,15 +198,15 @@ class ConversationSession:
                     active_alias = t.active_subject_alias
                     break
         else:
-            # Normal: use the most recent active subject
-            for t in reversed(self.turns):
-                if t.active_subject_type and t.active_subject_value:
-                    active_type = t.active_subject_type
-                    active_value = t.active_subject_value
-                    active_label = t.active_subject_label
-                    active_table = t.active_subject_table
-                    active_alias = t.active_subject_alias
-                    break
+            # Normal: use the persistent current_scope pointer (survives turns
+            # aging out of MAX_TURNS — see ConversationSession.add_turn), not a
+            # walk over self.turns.
+            if self.current_scope and _domain_ok(self.current_scope):
+                active_type = self.current_scope["type"]
+                active_value = self.current_scope["value"]
+                active_label = self.current_scope["label"]
+                active_table = self.current_scope["table"]
+                active_alias = self.current_scope["alias"]
 
         # self.turns is guaranteed non-empty (early-return above), so `last` is
         # always defined for both the fallback block and the disambiguation
@@ -196,6 +280,13 @@ class ConversationSession:
                     f" — use WHERE ir.inspection_id = '{active_value}'"
                     f" (or aa.inspection_id = '{active_value}' for form answers)."
                 )
+            elif active_type == "audit":
+                lines.append(
+                    f"ACTIVE CONTEXT — The conversation is about audit '{active_value}'."
+                    f" When the user says 'it', 'that audit', 'this audit'"
+                    f" — use WHERE arep.audit_id = '{active_value}'"
+                    f" (join audit_report arep as needed for the target table)."
+                )
             elif active_type == "facility":
                 # Prefer an exact id filter if one is available. Two sources,
                 # checked in order: (1) a facility_id/fac_id column captured
@@ -263,14 +354,22 @@ class ConversationSession:
             # Fallback: legacy single-entity context. Same fix as the primary
             # gate above — only carry this forward on an actual detected
             # follow-up, not merely whenever the question isn't "clearly fresh".
-            if last.inspection_ids and len(last.inspection_ids) == 1:
+            # inspection_ids/audit_ids are domain-exclusive (same reasoning as
+            # _DOMAIN_EXCLUSIVE above — only gate THESE, not facility_names/
+            # single_row_values below, which are safe regardless of domain).
+            # Confirmed live: this fallback reads last.inspection_ids/audit_ids
+            # off self.turns[-1] unconditionally — a second, independent leak
+            # path from the primary gate above, since `last` isn't necessarily
+            # in the domain we're currently answering in.
+            _domain_compat = (not current_domain) or (last.domain == current_domain)
+            if _domain_compat and last.inspection_ids and len(last.inspection_ids) == 1:
                 lines.append(
                     f"CONTEXT — The conversation is about inspection '{last.inspection_ids[0]}'."
                     f" When the user says 'that inspection', 'it', 'that site' — use"
                     f" WHERE ir.inspection_id = '{last.inspection_ids[0]}'"
                     f" as an exact filter."
                 )
-            elif last.inspection_ids:
+            elif _domain_compat and last.inspection_ids:
                 ids_str = ", ".join(f"\'{i}\'" for i in last.inspection_ids[:5])
                 if last.total_count > len(last.inspection_ids):
                     # The captured IDs are only a SAMPLE of a larger result set
@@ -301,13 +400,111 @@ class ConversationSession:
                         f" (this is the COMPLETE result set, {last.total_count or len(last.inspection_ids)} total)."
                         f" Filter by inspection_id IN ({ids_str}) when user references 'those'."
                     )
+            elif _domain_compat and last.audit_ids and len(last.audit_ids) == 1:
+                lines.append(
+                    f"CONTEXT — The conversation is about audit '{last.audit_ids[0]}'."
+                    f" When the user says 'that audit', 'it', 'this audit' — use"
+                    f" WHERE arep.audit_id = '{last.audit_ids[0]}'"
+                    f" as an exact filter."
+                )
+            elif _domain_compat and last.audit_ids:
+                ids_str = ", ".join(f"\'{i}\'" for i in last.audit_ids[:5])
+                if last.total_count > len(last.audit_ids):
+                    # Same "sample vs complete set" distinction as inspection_ids
+                    # above — the captured IDs may only be a slice of a larger
+                    # result, so an IN-list can't stand in for "all"/"those".
+                    prev_sql_snippet = " ".join(last.sql.split())[:500] if last.sql else "(not available)"
+                    lines.append(
+                        f"CONTEXT — The previous result had {last.total_count} total rows; "
+                        f"only {len(last.audit_ids)} sample IDs were captured ({ids_str})."
+                        f" These {len(last.audit_ids)} IDs are NOT the full set.\n"
+                        f"  If the user asks 'how many of these/those/them are X' (an aggregate"
+                        f" over the FULL {last.total_count}-row result), do NOT filter by"
+                        f" audit_id IN (...) — that covers only"
+                        f" {len(last.audit_ids)} of {last.total_count} rows.\n"
+                        f"  INSTEAD: reuse the SAME FROM/JOIN/WHERE filters as the previous"
+                        f" query below, add the new condition, and"
+                        f" return a fresh COUNT(*) — a complete recount, not a sample filter.\n"
+                        f"  Previous SQL: {prev_sql_snippet}"
+                    )
+                else:
+                    # The captured IDs ARE the complete result set — IN-list is
+                    # valid here. This is the exact scenario that broke: 2
+                    # audit_ids captured, question says "across the above two
+                    # audits" — the model must reuse THESE real IDs, not invent
+                    # a plausible-looking one.
+                    lines.append(
+                        f"CONTEXT — The conversation involves audits: {ids_str}"
+                        f" (this is the COMPLETE result set, {last.total_count or len(last.audit_ids)} total)."
+                        f" Filter by arep.audit_id IN ({ids_str}) when user references 'those'/'the above'."
+                    )
             elif last.facility_names and len(last.facility_names) == 1:
                 lines.append(
                     f"CONTEXT — The conversation is about facility '{last.facility_names[0]}'."
                     f" Filter by fac.name ILIKE '%{_ilike_escape(last.facility_names[0])}%'."
                 )
             elif last.single_row_values:
-                lines.append(f"CONTEXT — Last query returned a single result: {last.single_row_values}")
+                # A single-row result is EITHER a genuine specific-record lookup OR a
+                # scalar aggregate (COUNT/SUM/AVG/...) summarizing many underlying rows —
+                # these need completely different follow-up handling, and the generic
+                # message below used to conflate them. Confirmed live: "how many
+                # corrective actions have not got adequacy approval" (a COUNT) followed
+                # by "show more details regarding those" — with no distinguishing hint,
+                # the model ignored the count entirely and drilled into a DIFFERENT,
+                # older turn's named corrective action instead, because a bare number
+                # has nothing to "show details about" but an earlier specific ID does.
+                _is_aggregate = bool(
+                    last.sql
+                    and re.search(r'\b(COUNT|SUM|AVG|MAX|MIN)\s*\(', last.sql, re.IGNORECASE)
+                    and not re.search(r'\bGROUP\s+BY\b', last.sql, re.IGNORECASE)
+                )
+                if _is_aggregate and last.sql:
+                    _agg_sql_snippet = " ".join(last.sql.split())[:500]
+                    lines.append(
+                        f"CONTEXT — The last query was a SCALAR AGGREGATE (a count/sum/average "
+                        f"computed over many underlying rows, NOT a single specific record): "
+                        f"{last.single_row_values}.\n"
+                        f"  Previous SQL: {_agg_sql_snippet}\n"
+                        f"  If the user now says 'show more details', 'show them', 'list those', "
+                        f"'which ones' — they mean the INDIVIDUAL ROWS behind THIS aggregate. "
+                        f"Reuse the SAME FROM/JOIN/WHERE filters as the previous SQL above, but "
+                        f"SELECT the actual row-level columns instead of the aggregate function. "
+                        f"Do NOT go back to an earlier, unrelated turn's specific entity just "
+                        f"because it had a nameable ID — this aggregate is the most recent turn "
+                        f"and is what 'those'/'them' refers to."
+                    )
+                else:
+                    lines.append(f"CONTEXT — Last query returned a single result: {last.single_row_values}")
+
+        # ── Explicit-name recall — reaches further back than current_scope ──
+        # current_scope (above) only ever holds the MOST RECENT focus, so it
+        # can't answer "wait, what about Facility A again" once the
+        # conversation has since moved on to Facility B and Facility C — this
+        # is a genuinely different case from the pronoun-based ACTIVE CONTEXT
+        # above: the user is explicitly re-NAMING something from earlier, not
+        # implicitly referring to "whatever we're currently on". Search the
+        # full entity_memory (much larger than MAX_TURNS — see
+        # ConversationSession.add_turn) for any label the user's question
+        # names directly, same domain-compatibility rule as everywhere else.
+        _recalled = []
+        for _ent in self.entity_memory:
+            if not _ent["label"] or len(_ent["label"]) < 3:
+                continue  # too short — avoid noisy substring-style false matches
+            if _ent["type"] == active_type and _ent["value"] == active_value:
+                continue  # already surfaced via ACTIVE CONTEXT above — don't double-print
+            if not _domain_ok(_ent):
+                continue
+            if re.search(rf"\b{re.escape(_ent['label'])}\b", current_question, re.IGNORECASE):
+                _recalled.append(_ent)
+        if _recalled:
+            lines.append("RECALLED FROM EARLIER IN THIS CONVERSATION:")
+            for _ent in _recalled:
+                lines.append(
+                    f"  • {_ent['type']} '{_ent['label']}' (exact value: {_ent['value']})"
+                    f" — matches a name in your current question, even though it's not"
+                    f" the most recent topic. Use it if relevant to this question."
+                )
+            lines.append("")
 
         # Disambiguation context — stop the model re-running the same check
         if not is_clearly_fresh and last.disambiguation_name:

@@ -116,9 +116,27 @@ def _check_undefined_table_aliases(sql: str, issues: list[ValidationIssue]) -> N
 
 
 
-def _check_ir_id_in_select_ast(sql: str, issues: list[ValidationIssue]) -> None:
+def _check_uuid_pk_in_select_ast(
+    sql: str,
+    issues: list[ValidationIssue],
+    pk_display_map: dict,
+) -> None:
     """
-    Use sqlglot AST to detect ir.id in the OUTERMOST SELECT column list only.
+    Use sqlglot AST to detect <alias>.id in the OUTERMOST SELECT column list
+    only, for any alias in pk_display_map. Generalizes what was originally a
+    single hardcoded ir.id-only check (see _check_ir_id_in_select_ast below)
+    — confirmed live 2026-07-28 that the SAME "bare UUID PK leaked into the
+    display columns" failure happens routinely in the audit domain too
+    (acyc.id/audit_cycle, po.id/auditor_portfolio, ap.id/audit_plan — the
+    reasoning model habitually adds `.id` to its schema_hint "just in case"
+    even when a proper display column/seed example is right in front of it).
+
+    pk_display_map: {alias: display_expr_or_None}. display_expr_or_None is a
+    human-readable suggestion for the error message (e.g. "ap.title") — pass
+    None for tables with NO display substitute at all (e.g. audit_cycle,
+    auditor_portfolio — confirmed live neither has a name/code column; the
+    row must be identified by its other columns instead, not by inventing an
+    id-based label).
 
     CRITICAL: only check the top-level Select node's direct expressions.
     find_all(exp.Select) walks ALL Select nodes including subqueries — if we
@@ -129,6 +147,8 @@ def _check_ir_id_in_select_ast(sql: str, issues: list[ValidationIssue]) -> None:
     CTE structure: With → this (the final SELECT after WITH definitions).
     Simple query: Select directly.
     """
+    if not pk_display_map:
+        return
     try:
         tree = sqlglot.parse_one(sql, dialect="postgres")
 
@@ -154,13 +174,19 @@ def _check_ir_id_in_select_ast(sql: str, issues: list[ValidationIssue]) -> None:
         for col_expr in top_select.expressions:
             # Unwrap alias: SELECT ir.id AS something → col_expr is Alias, col_expr.this is Column
             col = col_expr.this if isinstance(col_expr, exp.Alias) else col_expr
-            if isinstance(col, exp.Column):
-                if (col.table and col.table.lower() == "ir"
-                        and col.name.lower() == "id"):
+            if isinstance(col, exp.Column) and col.name.lower() == "id":
+                alias = (col.table or "").lower()
+                if alias in pk_display_map:
+                    display = pk_display_map[alias]
+                    if display:
+                        message = f"{alias}.id is the UUID primary key — use {display} for display instead"
+                    else:
+                        message = (
+                            f"{alias}.id is the UUID primary key with no display substitute — "
+                            f"identify this row by its other columns instead, do not select the raw id"
+                        )
                     issues.append(ValidationIssue(
-                        "HARD_FAIL", "UUID_IN_SELECT",
-                        "ir.id is the UUID primary key — use ir.inspection_id for display",
-                        detail="ir.inspection_id is the human-readable varchar '2026/04/ST001/INS001'",
+                        "HARD_FAIL", "UUID_IN_SELECT", message,
                     ))
                     ValidatorStats.record("UUID_IN_SELECT", is_retry_trigger=True)
                     return  # one report is enough
@@ -168,6 +194,15 @@ def _check_ir_id_in_select_ast(sql: str, issues: list[ValidationIssue]) -> None:
     except Exception:
         # AST parse failed — fail safe: do not block on uncertainty
         pass
+
+
+def _check_ir_id_in_select_ast(sql: str, issues: list[ValidationIssue]) -> None:
+    """Inspection-domain wrapper — kept for backward-compatible callers.
+    See _check_uuid_pk_in_select_ast for the general implementation."""
+    _check_uuid_pk_in_select_ast(
+        sql, issues,
+        {"ir": "ir.inspection_id (the human-readable varchar '2026/04/ST001/INS001')"},
+    )
 
 
 

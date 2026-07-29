@@ -55,11 +55,17 @@ class DisambiguationMixin:
     def _extract_entity_disambiguation(sql: str, rows: list, columns: list[str]) -> tuple[str, list[dict], str, str]:
         """
         If `columns`/`sql` match the STEP 1 entity count-check shape (id +
-        name + inspection_count, ILIKE on a known entity table — see
+        name + a count column, ILIKE on a known entity table — see
         is_entity_disambiguation_result) produced by the AMBIGUOUS REFERENCE
         RULE for "at <facility/project/client/organisation>"-style queries,
-        extract the searched name, the (name, inspection_count) candidate
-        rows, and the table/alias that was searched.
+        extract the searched name, the (name, count) candidate rows, and the
+        table/alias that was searched.
+
+        Domain-neutral: is_entity_disambiguation_result() returns whichever
+        count column the query actually used (inspection_count for
+        inspection, schedule_count/audit_count for audit — see that
+        function's docstring), stored here under the neutral key "count" so
+        this works for either domain rather than assuming inspection's name.
 
         Without this, an entity disambiguation list ("4 facilities match
         'adnoc'") is never remembered: the generic facility_names extraction
@@ -72,7 +78,7 @@ class DisambiguationMixin:
         entity = is_entity_disambiguation_result(columns, sql)
         if entity is None:
             return "", [], "", ""
-        table, alias = entity
+        table, alias, count_col = entity
 
         m = re.search(rf"{re.escape(alias)}\.name\s+ilike\s+'%([^%]+)%'", sql, re.IGNORECASE)
         name = m.group(1).strip() if m else "?"
@@ -85,7 +91,7 @@ class DisambiguationMixin:
             if nm:
                 candidates.append({
                     "name": str(nm).strip(),
-                    "inspection_count": row.get("inspection_count") or 0,
+                    "count": row.get(count_col) or 0,
                     "id": str(row.get("id")).strip() if row.get("id") else "",
                 })
         return name, candidates, table, alias
@@ -113,27 +119,40 @@ class DisambiguationMixin:
 
         if not is_disambiguation_result(columns, sql):
             # Entity template (facility/project/client/organisation) — only
-            # candidates with inspections > 0 are useful answers to "show
-            # inspections at X"; zero-inspection entities are real matches
-            # but not relevant choices.
+            # candidates with a non-zero count are useful answers to "show
+            # <records> at X"; zero-count entities are real name matches but
+            # not relevant choices. Domain-neutral wording ("records") since
+            # what's being counted varies (inspections for the inspection
+            # domain, schedules/audits for the audit domain) — see
+            # _extract_entity_disambiguation's docstring for the count-column
+            # generalization this relies on.
+            # IMPORTANT: `rows` here are the RAW execute_sql result rows, keyed
+            # by whatever column name the SQL itself used (schedule_count,
+            # audit_count, inspection_count, ...) — NOT the "count" key that
+            # only exists in the already-normalized entity_disambiguation_candidates
+            # dicts _extract_entity_disambiguation builds. Must read via the
+            # actual count_col name, not a hardcoded literal.
             _entity = is_entity_disambiguation_result(columns, sql)
-            table, alias = _entity if _entity else ("facility", "fac")
+            if _entity:
+                table, alias, count_col = _entity
+            else:
+                table, alias, count_col = "facility", "fac", "count"
             table_plural = table[:-1] + "ies" if table.endswith("y") else table + "s"
-            nonzero = [r for r in rows if (r.get("inspection_count") or 0) > 0]
+            nonzero = [r for r in rows if (r.get(count_col) or 0) > 0]
             if len(nonzero) == 0:
                 return (
                     f"STEP 1 disambiguation check found {len(rows)} {table_plural} matching "
-                    f"'{name_filter}', but NONE have any inspections.\n"
+                    f"'{name_filter}', but NONE have any related records.\n"
                     f"Original question: \"{question}\"\n"
-                    f"Call final_answer stating no inspections were found at any {table} "
+                    f"Call final_answer stating no matching records were found at any {table} "
                     f"matching '{name_filter}'."
                 )
             elif len(nonzero) == 1:
                 r = nonzero[0]
                 return (
                     f"STEP 1 disambiguation check: exactly ONE {table} matching "
-                    f"'{name_filter}' has inspections — '{r.get('name')}' "
-                    f"({r.get('inspection_count')} inspections).\n"
+                    f"'{name_filter}' has related records — '{r.get('name')}' "
+                    f"({r.get(count_col)} records).\n"
                     f"Original question: \"{question}\"\n"
                     f"This is STEP 2a — call generate_sql again using "
                     f"{alias}.name ILIKE '%{_ilike_escape(str(r.get('name') or ''))}%' to filter by this {table}. "
@@ -142,12 +161,12 @@ class DisambiguationMixin:
                 )
             else:
                 options = "\n".join(
-                    f"  • {r.get('name')} ({r.get('inspection_count')} inspections)"
+                    f"  • {r.get('name')} ({r.get(count_col)} records)"
                     for r in nonzero
                 )
                 return (
                     f"STEP 1 disambiguation check: {len(nonzero)} {table_plural} matching "
-                    f"'{name_filter}' have inspections (out of {len(rows)} total matches).\n"
+                    f"'{name_filter}' have related records (out of {len(rows)} total matches).\n"
                     f"Original question: \"{question}\"\n"
                     f"This is STEP 2b — call final_answer NOW with EXACTLY this format "
                     f"(do not compute totals, leaders, sums, or any other statistic; do "
@@ -211,7 +230,11 @@ class DisambiguationMixin:
         wants_content = bool(re.search(
             r'\b(question|label|answer|response|what.*in)\b', q_lower))
         has_content = any(c in columns for c in [
-            # Actual DB column names
+            # Actual DB column names — cause/correction/status/progress_stage/
+            # responsible/target_close_out_date are shared literally between
+            # inspection_corrective_action and audit_corrective_action, so
+            # this list already covers most audit CA results without a
+            # separate audit branch.
             "label", "answer_text", "answer_numeric",
             "inspection_score", "total_inspection_hours",
             "cause", "correction", "corrective_action", "responsible",
@@ -221,6 +244,9 @@ class DisambiguationMixin:
             "question", "answer", "question_label", "answer_value",
             "observation", "finding", "score", "risk_level",
             "inspector_name", "facility_name", "inspection_type_name",
+            # Audit-domain equivalents without an inspection-side namesake
+            "audit_score", "schedule_status", "auditor_name", "auditee_name",
+            "compliance_name", "impact_name", "audit_type_name",
         ])
 
         if wants_content and not has_content and row_count > 0:

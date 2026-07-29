@@ -10,7 +10,7 @@ Consumers (all import from this module — never hardcode these rules):
   1. agent/prompts.py          → SYSTEM_PROMPT status section   (llama_status_block)
   2. agent/seed_examples.py    → CORE_CONTEXT                   (core_context_blocks)
   3. core/business_rules.py    → INJECT rule hints              (inject_hint_*)
-  4. agent/orchestrator.py     → _CONSTRAINT_NOTE_MAP           (constraint_note_*)
+  4. agent/orchestrator/debug.py → _CONSTRAINT_NOTE_MAP_*       (constraint_note_*)
   5. core/validator.py         → (rules reference SEMANTICS for value lists)
 
 To change a definition: edit SEMANTICS below, restart. All layers update together.
@@ -18,6 +18,19 @@ Run `python -m core.semantics_registry` to print all generated blocks for review
 
 History: before this module existed the conducted/completed definition was
 hardcoded in 5 places and they desynced 3 times in one day (2026-06-10).
+
+AUDIT DOMAIN — SEMANTICS/AUDIT_SEMANTICS are a same-file paired-constant pair,
+the same pattern schema_introspector.py uses for BUSINESS_RULES/AUDIT_BUSINESS_RULES.
+Functions that are genuinely data-driven (constraint_note_status, constraint_note_cast,
+conducted_statuses, completed_statuses, etc.) take an optional `semantics: dict = SEMANTICS`
+argument so callers pass AUDIT_SEMANTICS to get the audit-domain equivalent — same
+rendering logic, two data sources. Functions whose inspection wording is not
+data-driven (llama_ma_workflow_block, inject_hint_financial — capex/opex/mitigative-
+action prose baked into the f-string) are NOT reused for audit; instead this module
+defines dedicated audit_* functions (audit_status_block, audit_ca_workflow_block,
+audit_columns_block) that read AUDIT_SEMANTICS directly. Both are legitimate — the
+first is real code reuse, the second is because the underlying workflows genuinely
+differ and forcing a shared template would produce misleading text.
 """
 
 from __future__ import annotations
@@ -30,6 +43,9 @@ SEMANTICS: dict = {
 
     # ── inspection_report.status lifecycle ─────────────────────────────────
     "status": {
+        "label": "inspection_report.status",
+        "record_noun": "inspections",
+        "table_alias": "ir",
         "all_values": [
             "DRAFT", "SUBMITTED", "UNDER_REVIEW",
             "RETURN_FOR_MODIFICATION", "CLOSED",
@@ -71,6 +87,7 @@ SEMANTICS: dict = {
     # ── Join paths with non-obvious cast directions ─────────────────────────
     "joins": {
         "observation_to_ma": {
+            "title": "OBSERVATION → MA JOIN",
             "sql":   "aa.submission_id = ica.observation_id::varchar",
             "left":  ("ai_answers.submission_id", "varchar"),
             "right": ("inspection_corrective_action.observation_id", "uuid"),
@@ -280,60 +297,286 @@ SEMANTICS: dict = {
     },
 }
 
+# "primary" is a stable alias to whichever join the generic cast-rule renderers
+# (core_context_cast_block / constraint_note_cast) should surface — lets those
+# functions stay data-driven across domains without hardcoding a specific key name.
+SEMANTICS["joins"]["primary"] = SEMANTICS["joins"]["observation_to_ma"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AUDIT DOMAIN — same-file paired constant, see module docstring
+# ═══════════════════════════════════════════════════════════════════════════
+
+AUDIT_SEMANTICS: dict = {
+
+    # ── audit_plan.status lifecycle ─────────────────────────────────────────
+    "status": {
+        "label": "audit_plan.status",
+        "record_noun": "audit plans",
+        "table_alias": "ap",
+        "all_values": ["DRAFT", "SUBMITTED", "APPROVED", "RETURNED_FOR_MODIFICATION"],
+        "lifecycle": (
+            "DRAFT → SUBMITTED → APPROVED, "
+            "with SUBMITTED → RETURNED_FOR_MODIFICATION → SUBMITTED (re-filed)"
+        ),
+        "groupings": {
+            "conducted": {
+                "statuses": ["SUBMITTED", "RETURNED_FOR_MODIFICATION"],
+                "meaning":  "in-flight — proposed, not yet fully approved",
+            },
+            "completed": {
+                "statuses": ["APPROVED"],
+                "meaning":  "fully reviewed and approved (final)",
+            },
+        },
+        "never_counted": ["DRAFT"],
+        "forbidden_filters": [
+            {
+                "pattern": "status IN ('APPROVED','SUBMITTED')",
+                "why":     "mixes conducted and completed — has no domain meaning",
+            },
+            {
+                "pattern": "status != 'DRAFT' as the only filter for conducted",
+                "why":     "includes APPROVED, which is completed not conducted",
+            },
+        ],
+    },
+
+    # ── Join paths with non-obvious traps ────────────────────────────────────
+    "joins": {
+        "review_to_ca": {
+            "title": "REVIEW → AUDIT_CORRECTIVE_ACTION JOIN",
+            "sql":   "rev.entity_id = aca.id AND rev.entity_type = 'AUDIT_CORRECTIVE_ACTION'",
+            "rule":  ("entity_id must join to aca.id (the UUID primary key) — never "
+                      "aca.corrective_action_id (a VARCHAR display code, never UUID-shaped; "
+                      "casting it to uuid will fail)"),
+            "never": [
+                "rev.entity_id = aca.corrective_action_id",
+                "rev.entity_id::text = aca.corrective_action_id",
+            ],
+        },
+        # Audit's equivalent of inspection's observation_to_ma (SEMANTICS["joins"]
+        # above) — same underlying pattern, confirmed live 2026-07-29 once
+        # ai_audit_answers (audit's own flat answer table, previously assumed
+        # empty — see the now-corrected AUDIT_BUSINESS_RULES "NO FORM-ANSWER
+        # LAYER" entry in schema_introspector.py) was found to be populated
+        # (445 rows) and its inspection-flavored columns renamed:
+        # inspection_report_id -> audit_report_id, inspection_id -> audit_id,
+        # inspector_user_id -> auditor_user_id.
+        "observation_to_ca": {
+            "title": "OBSERVATION → AUDIT CORRECTIVE ACTION JOIN",
+            "sql":   "aaa.submission_id = aca.observation_id::varchar",
+            "left":  ("ai_audit_answers.submission_id", "varchar"),
+            "right": ("audit_corrective_action.observation_id", "uuid"),
+            "rule":  "cast the UUID side to varchar — mirrors inspection's ica.observation_id/ai_answers pattern",
+            "never": [
+                "aaa.submission_id::uuid = aca.observation_id",
+                "aca.observation_id::text = aaa.submission_id",
+            ],
+        },
+    },
+
+    # ── Corrective-action workflow — audit's equivalent of inspection's MA
+    # workflow, but with an EXTRA independent track (adequacy_status) instead
+    # of a financial one (audit has no capex/opex equivalent). ────────────────
+    "ca_workflow": {
+        "status": {
+            "values": ["DRAFT", "SUBMITTED", "OPEN", "OVERDUE", "CLOSED", "CLOSE_WITH_DEFERRED"],
+        },
+        "progress_stage": {
+            "values": {
+                "NOT_STARTED":         "Not Started",
+                "ON_TRACK":            "On Track",
+                "BEHIND":              "Behind",
+                "AT_RISK":             "At Risk",
+                "COMPLETED":           "Completed",
+                "CLOSE_WITH_DEFERRED": "Close with deferred — carried to next cycle",
+            },
+            # Corrected 2026-07-28 (confirmed live) — previously said "auditee —
+            # only they update this", which is wrong. The INTERNAL STAKEHOLDER
+            # (FM manager / whoever aca.internal_stakeholder_id points to) is
+            # who actually carries out the corrective action and whose progress
+            # this tracks. The auditee's role is downstream of this: they VERIFY
+            # the work as their side of the two-level implementation_status
+            # approval below — they don't update progress_stage directly.
+            "owner": "internal stakeholder (FM manager) — the person doing the work",
+        },
+        "implementation_status": {
+            "values": {
+                None:                      "work not yet submitted for sign-off",
+                "PENDING_FOR_REVIEW":      "auditee has VERIFIED the internal stakeholder's work as complete, awaiting auditor sign-off",
+                "APPROVE":                 "auditor accepted the implementation",
+                "RETURN_FOR_MODIFICATION": "auditor sent it back",
+            },
+            # Two-level approval: auditee verifies first (their side of the
+            # check — confirming the internal stakeholder's work is actually
+            # done), then the auditor gives final sign-off. Neither level does
+            # the underlying work — see progress_stage.owner above for who does.
+            "owner": "two-level: auditee verifies, then auditor approves",
+            "traps": ["exact string is 'APPROVE' — NOT 'APPROVED'"],
+        },
+        "adequacy_status": {
+            "values": {
+                None:                      "not yet submitted for adequacy review",
+                "PENDING_FOR_REVIEW":      "awaiting auditor adequacy sign-off",
+                "APPROVE":                 "auditor accepted the CA as adequate",
+                "RETURN_FOR_MODIFICATION": "auditor sent it back as inadequate",
+            },
+            "owner": "auditor (auditor-side adequacy check — has NO inspection equivalent)",
+            "traps": [
+                "exact string is 'APPROVE' — NOT 'APPROVED'",
+                # Confirmed live 2026-07-28 — reconciles the apparent
+                # contradiction between "adequacy is a single auditor level"
+                # (most sources) and a validator rule that flags a 2nd
+                # adequacy review level as "confirmed live": it's not random
+                # or a data-quality issue — the auditor explicitly escalates by
+                # checking a "needs further approval" option in the frontend.
+                # No dedicated schema column tracks this trigger; a genuine
+                # 2-level adequacy review is a normal, auditor-initiated case,
+                # not something to flag as an anomaly.
+                "a 2nd adequacy review level is a real, intentional case — the "
+                "auditor explicitly requested further approval, not a data error",
+            ],
+        },
+        "invariants": [
+            "status = 'CLOSED' or 'CLOSE_WITH_DEFERRED' co-occurs with "
+            "implementation_status = 'APPROVE' AND adequacy_status = 'APPROVE' "
+            "(both tracks must clear) — but reaching that state does NOT close "
+            "the CA automatically: the auditor manually sets status to CLOSED "
+            "or CLOSE_WITH_DEFERRED as a separate, distinct action afterward "
+            "(confirmed live 2026-07-28 — no automatic-closure trigger exists)",
+            "review.status = 'COMPLETED' does NOT mean approved — check "
+            "review.action = 'APPROVE' too (28% of completed reviews are RETURN_FOR_MODIFICATION)",
+            "corrective_action_id displays as literal 'CA_DRAFT' until adequacy_status = 'APPROVE' "
+            "— a CA_DRAFT row is still a real, existing corrective action, just not yet approved",
+        ],
+        "vocabulary": {
+            "pending approval / awaiting review": "implementation_status = 'PENDING_FOR_REVIEW' "
+                                                    "or adequacy_status = 'PENDING_FOR_REVIEW' — ask which track",
+            "approved":                           "implementation_status = 'APPROVE' AND "
+                                                    "adequacy_status = 'APPROVE' unless the question names one track",
+            "sent back / returned":               "RETURN_FOR_MODIFICATION on either track",
+            "at risk / behind / on track":        "progress_stage (schedule health)",
+            "not started":                        "progress_stage = 'NOT_STARTED' OR progress_stage IS NULL",
+            "overdue":                            "status = 'OVERDUE'",
+        },
+    },
+
+    # ── Column existence facts ────────────────────────────────────────────────
+    "columns": {
+        "active_column_rule": "universal",
+        "note": (
+            "Every audit_* table (audit_plan, audit_schedule, audit_report, "
+            "audit_corrective_action, audit_cycle, auditor_portfolio, audit_universe, "
+            "audit_category, audit_sub_category, audit_type) has an active boolean column — "
+            "always filter WHERE <alias>.active = true unless the question is specifically "
+            "about deleted/archived records."
+        ),
+    },
+}
+
+AUDIT_SEMANTICS["joins"]["primary"] = AUDIT_SEMANTICS["joins"]["review_to_ca"]
+
+
+# audit_report.status — a SEPARATE status/dict from AUDIT_SEMANTICS's
+# audit_plan.status above. Confirmed live: when a user says "completed
+# audits" / "conducted audits" with no other qualifier, they almost always
+# mean the ACTUAL AUDIT (audit_report — did it happen, is it closed out),
+# not whether its PLAN document was approved. "Completed/conducted audit
+# PLANS" (the word "plan" said explicitly) is the rarer, genuinely-different
+# question that AUDIT_SEMANTICS above answers. Kept as its own dict (not a
+# second key inside AUDIT_SEMANTICS) because every accessor below reads a
+# fixed "status" key — this shape lets audit_report reuse every one of them
+# (conducted_statuses, completed_filter, completed_required_regex, ...)
+# unchanged, just called with AUDIT_REPORT_SEMANTICS instead.
+AUDIT_REPORT_SEMANTICS: dict = {
+    "status": {
+        "label": "audit_report.status",
+        "record_noun": "audits",
+        "table_alias": "arep",
+        "all_values": ["DRAFT", "SUBMITTED", "CLOSED", "CLOSED_WITH_EXCEPTION"],
+        "lifecycle": (
+            "DRAFT → SUBMITTED → CLOSED (or CLOSED_WITH_EXCEPTION) — unlike "
+            "audit_plan, audit_report is not reviewed via the polymorphic "
+            "review table; it moves DRAFT → SUBMITTED directly."
+        ),
+        "groupings": {
+            "conducted": {
+                "statuses": ["SUBMITTED"],
+                "meaning":  "in-flight — the audit was carried out and the report submitted, not yet closed out",
+            },
+            "completed": {
+                "statuses": ["CLOSED", "CLOSED_WITH_EXCEPTION"],
+                "meaning":  "fully closed out (with or without exceptions noted) — CLOSED_WITH_EXCEPTION is still completed, not a separate 'in-flight' bucket",
+            },
+        },
+        "never_counted": ["DRAFT"],
+    },
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Convenience accessors
 # ═══════════════════════════════════════════════════════════════════════════
 
-def conducted_statuses() -> list[str]:
-    return SEMANTICS["status"]["groupings"]["conducted"]["statuses"]
+def conducted_statuses(semantics: dict = SEMANTICS) -> list[str]:
+    return semantics["status"]["groupings"]["conducted"]["statuses"]
 
 
-def completed_statuses() -> list[str]:
-    return SEMANTICS["status"]["groupings"]["completed"]["statuses"]
+def completed_statuses(semantics: dict = SEMANTICS) -> list[str]:
+    return semantics["status"]["groupings"]["completed"]["statuses"]
 
 
-def conducted_in_list() -> str:
+def conducted_in_list(semantics: dict = SEMANTICS) -> str:
     """SQL IN-list literal: ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')"""
-    return "(" + ",".join(f"'{s}'" for s in conducted_statuses()) + ")"
+    return "(" + ",".join(f"'{s}'" for s in conducted_statuses(semantics)) + ")"
 
 
-def completed_filter() -> str:
+def completed_filter(semantics: dict = SEMANTICS) -> str:
     """SQL equality/IN filter for completed. Single status → '= X', else IN-list."""
-    sts = completed_statuses()
+    sts = completed_statuses(semantics)
     if len(sts) == 1:
         return f"= '{sts[0]}'"
     return "IN (" + ",".join(f"'{s}'" for s in sts) + ")"
 
 
-def case_category_expr() -> str:
+def case_category_expr(semantics: dict = SEMANTICS, alias: str = "ir") -> str:
     """The canonical two-row summary CASE expression."""
-    sts = completed_statuses()
+    sts = completed_statuses(semantics)
     if len(sts) == 1:
-        cond = f"ir.status = '{sts[0]}'"
+        cond = f"{alias}.status = '{sts[0]}'"
     else:
-        cond = "ir.status IN (" + ",".join(f"'{s}'" for s in sts) + ")"
+        cond = f"{alias}.status IN (" + ",".join(f"'{s}'" for s in sts) + ")"
     return f"CASE WHEN {cond} THEN 'completed' ELSE 'conducted' END"
 
 
-def draft_exclusion_filter() -> str:
+def draft_exclusion_filter(semantics: dict = SEMANTICS) -> str:
     """SQL filter excluding globally-never-counted statuses (e.g. 'status != \\'DRAFT\\'')."""
-    excluded = SEMANTICS["status"]["never_counted"]
+    excluded = semantics["status"]["never_counted"]
     return " AND ".join(f"status != '{s}'" for s in excluded)
 
 
-def completed_required_regex() -> str:
-    """Regex matching the correct 'completed' filter form: status = 'CLOSED'."""
-    sts = completed_statuses()
+def completed_required_regex(semantics: dict = SEMANTICS) -> str:
+    """Regex matching the correct 'completed' filter form: status = 'CLOSED'
+    (or AUDIT_SEMANTICS's status = 'APPROVED', etc.)."""
+    sts = completed_statuses(semantics)
     if len(sts) == 1:
         return rf"status\s*=\s*'{sts[0]}'"
     in_list = "|".join(f"'{s}'" for s in sts)
     return rf"status\s*IN\s*\([^)]*(?:{in_list})[^)]*\)"
 
 
-def conducted_required_regex() -> str:
-    """Regex matching the correct 'conducted' filter form: status IN (...)."""
-    in_list = "|".join(f"'{s}'" for s in conducted_statuses())
+def conducted_required_regex(semantics: dict = SEMANTICS) -> str:
+    """Regex matching the correct 'conducted' filter form: status IN (...) for
+    2+ statuses, or status = 'X' for exactly one (e.g. AUDIT_REPORT_SEMANTICS's
+    single-status 'conducted' bucket) — a naturally-written single-status
+    filter uses '=', not 'IN (single_value)', so without this branch the
+    regex would never match real single-status SQL. Mirrors
+    completed_required_regex()'s existing len==1 branch above."""
+    sts = conducted_statuses(semantics)
+    if len(sts) == 1:
+        return rf"status\s*=\s*'{sts[0]}'"
+    in_list = "|".join(f"'{s}'" for s in sts)
     return rf"status\s*IN\s*\([^)]*(?:{in_list})[^)]*\)"
 
 
@@ -387,11 +630,17 @@ def core_context_status_block() -> str:
 --   NEVER use status != 'DRAFT' alone for conducted — CLOSED is not conducted"""
 
 
-def core_context_cast_block() -> str:
-    """For agent/seed_examples.py CORE_CONTEXT — the observation↔MA cast rule."""
-    j = SEMANTICS["joins"]["observation_to_ma"]
+def core_context_cast_block(semantics: dict = SEMANTICS, join_key: str = "primary") -> str:
+    """For agent/seed_examples.py CORE_CONTEXT — a join's exact cast/column form.
+
+    Fully data-driven — pass semantics=AUDIT_SEMANTICS for the audit equivalent.
+    join_key defaults to "primary" (unchanged behavior for every existing
+    caller); pass e.g. "observation_to_ca" to render a second, non-primary
+    join entry from the same semantics["joins"] dict.
+    """
+    j = semantics["joins"][join_key]
     nevers = "\n".join(f"--   NEVER: {n}" for n in j["never"])
-    return f"""-- OBSERVATION → MA JOIN — exact form:
+    return f"""-- {j['title']} — exact form:
 --   {j['sql']}
 --   ({j['rule']})
 {nevers}"""
@@ -421,25 +670,36 @@ If user asks ONLY for conducted: WHERE ir.status IN {conducted_in_list()}
 """
 
 
-def constraint_note_status() -> str:
-    """For agent/orchestrator.py _CONSTRAINT_NOTE_MAP['MISSING_COMPLETED_STATUS']."""
+def constraint_note_status(semantics: dict = SEMANTICS) -> str:
+    """For agent/orchestrator/debug.py _CONSTRAINT_NOTE_MAP['MISSING_COMPLETED_STATUS'].
+
+    Fully data-driven — pass semantics=AUDIT_SEMANTICS for the audit equivalent.
+    """
+    bad = semantics["status"]["forbidden_filters"][0]["pattern"]
+    noun = semantics["status"].get("record_noun", "records")
+    alias = semantics["status"].get("table_alias", "ir")
     return (
         "-- STATUS GROUPINGS (never conflate):\n"
-        f"--   completed  = status {completed_filter()} (fully reviewed and approved)\n"
-        f"--   conducted  = status IN {conducted_in_list()} (in-flight)\n"
-        "--   NEVER: status IN ('CLOSED','SUBMITTED') — mixes conducted and completed\n"
-        "--   'total inspections' = two-row CASE summary:\n"
-        f"--     {case_category_expr()} AS category\n"
+        f"--   completed  = status {completed_filter(semantics)} (fully reviewed and approved)\n"
+        f"--   conducted  = status IN {conducted_in_list(semantics)} (in-flight)\n"
+        f"--   NEVER: {bad} — mixes conducted and completed\n"
+        f"--   'total {noun}' = two-row CASE summary:\n"
+        f"--     {case_category_expr(semantics, alias=alias)} AS category\n"
         "--   ALWAYS exclude DRAFT: add status != 'DRAFT' (or a stricter status filter)"
     )
 
 
-def constraint_note_cast() -> str:
-    """For agent/orchestrator.py _CONSTRAINT_NOTE_MAP['WRONG_CAST_DIR']."""
-    j = SEMANTICS["joins"]["observation_to_ma"]
+def constraint_note_cast(semantics: dict = SEMANTICS, join_key: str = "primary") -> str:
+    """For agent/orchestrator/debug.py _CONSTRAINT_NOTE_MAP['WRONG_CAST_DIR'].
+
+    Fully data-driven — pass semantics=AUDIT_SEMANTICS for the audit equivalent.
+    join_key defaults to "primary" (unchanged behavior for every existing
+    caller); pass e.g. "observation_to_ca" for a second, non-primary join.
+    """
+    j = semantics["joins"][join_key]
     nevers = "\n".join(f"--   NEVER: {n}" for n in j["never"])
     return (
-        f"-- CAST RULE: JOIN ON {j['sql']}\n"
+        f"-- {j['title']}: JOIN ON {j['sql']}\n"
         f"--   {j['rule']}\n"
         f"{nevers}"
     )
@@ -604,6 +864,99 @@ def llama_ma_workflow_block() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# AUDIT DOMAIN — dedicated block renderers (not reused from the inspection
+# functions above: those bake inspection-specific prose — capex/opex,
+# "mitigative action", ica's literal status values — directly into the
+# f-string, not just via SEMANTICS lookups, so a blind semantics= swap would
+# render text that's actively wrong for audit. See module docstring.)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def audit_status_block() -> str:
+    """For sql/prompts_audit.py CORE_CONTEXT_AUDIT — audit_plan.status groupings."""
+    return f"""IMPORTANT — audit_plan.status values and groupings:
+  DRAFT                    → not yet submitted — NEVER count or show
+  SUBMITTED                → proposed, awaiting approval (in-flight)
+  RETURNED_FOR_MODIFICATION → sent back for changes (in-flight)
+  APPROVED                 → fully reviewed and approved (final)
+
+  STATUS GROUPINGS — always bucket into two categories for reporting:
+    conducted = IN {conducted_in_list(AUDIT_SEMANTICS)}
+    completed {completed_filter(AUDIT_SEMANTICS)}
+
+  DEFAULT for "total / how many / count audit plans":
+    Show as TWO-ROW summary using CASE grouping:
+      {case_category_expr(AUDIT_SEMANTICS, alias='ap')} AS category
+
+  NEVER: status IN ('APPROVED','SUBMITTED') — mixes conducted and completed
+  ALWAYS exclude DRAFT — add ap.status != 'DRAFT' on all audit_plan queries"""
+
+
+def audit_report_status_block() -> str:
+    """For sql/prompts_audit.py CORE_CONTEXT_AUDIT — audit_report.status groupings.
+
+    Added 2026-07-29 alongside audit_status_block() above (audit_plan) — before
+    this, Llama's reasoning-stage prompt only ever saw audit_plan's conducted/
+    completed groupings (rendered by audit_status_block()), never audit_report's
+    separate ones (AUDIT_REPORT_SEMANTICS, previously only consumed by SOFT_WARN
+    glossary/validator checks that run AFTER SQL generation — too late to steer
+    which table the reasoning model reaches for in the first place). Caught live:
+    "show the most recently conducted audit" queried audit_plan (a still-pending
+    proposal) instead of audit_report (an actual audit event/visit with a
+    report and form answers) — confirmed wrong by the user's own immediate
+    follow-up asking what the auditor filled out for that "audit".
+    """
+    return f"""IMPORTANT — audit_report.status values and groupings (a SEPARATE
+  lifecycle from audit_plan.status above — do not conflate them):
+  DRAFT                  → not yet submitted — NEVER count or show
+  SUBMITTED               → the audit was carried out, report filed (in-flight)
+  CLOSED / CLOSED_WITH_EXCEPTION → fully closed out (final)
+
+  STATUS GROUPINGS — always bucket into two categories for reporting:
+    conducted = IN {conducted_in_list(AUDIT_REPORT_SEMANTICS)}
+    completed {completed_filter(AUDIT_REPORT_SEMANTICS)}
+
+  CRITICAL DISAMBIGUATION — a BARE, unqualified "audit" / "the audit" (no
+  "plan" qualifier) means audit_report — an actual audit EVENT that was
+  carried out, with a report, form answers (ai_audit_answers), corrective
+  actions, a facility, an auditor. It does NOT mean audit_plan, which is
+  only the proposal/authorization stage BEFORE any audit happens and has no
+  form answers, findings, or facility visit attached to it at all.
+  "audit plan" (explicit) → audit_plan.status groupings above.
+  "the [most recent/latest/conducted/completed] audit" (no "plan") → THIS
+  block, audit_report.status. When in doubt and the question could plausibly
+  lead to a follow-up about findings/answers/facility, use audit_report."""
+
+
+def audit_ca_workflow_block() -> str:
+    """For sql/prompts_audit.py CORE_CONTEXT_AUDIT — the corrective-action approval workflow."""
+    w = AUDIT_SEMANTICS["ca_workflow"]
+    ps_list = ", ".join(w["progress_stage"]["values"])
+    inv = "\n".join(f"--   {i}" for i in w["invariants"])
+    vocab = "\n".join(f"--   '{k}' → {v}" for k, v in w["vocabulary"].items())
+    return f"""-- AUDIT CORRECTIVE ACTION WORKFLOW — four independent tracks on aca:
+--   status (system):                    {' | '.join(w['status']['values'])}
+--   progress_stage (internal stakeholder / FM manager — the person doing the work):
+--                                        {ps_list}
+--   implementation_status (two-level: auditee verifies the work, then auditor approves):
+--                                        NULL | PENDING_FOR_REVIEW | APPROVE | RETURN_FOR_MODIFICATION
+--   adequacy_status (auditor, adequacy check — NO inspection equivalent; occasionally a
+--     2nd review level when the auditor explicitly requests further approval, not an error):
+--                                        same 4 values as implementation_status
+--     EXACT STRINGS for both: 'APPROVE' not 'APPROVED' — 'PENDING_FOR_REVIEW' not 'PENDING'
+--   Closing (status = CLOSED or CLOSE_WITH_DEFERRED) is a SEPARATE manual auditor action
+--     taken after both tracks approve — not an automatic side effect of approval.
+-- INVARIANTS:
+{inv}
+-- VOCABULARY:
+{vocab}"""
+
+
+def audit_columns_block() -> str:
+    """For sql/prompts_audit.py CORE_CONTEXT_AUDIT — soft-delete / active-column facts."""
+    return f"-- SOFT-DELETE: {AUDIT_SEMANTICS['columns']['note']}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Consistency checker — catches stale hardcoded copies in consumer files
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -720,6 +1073,11 @@ if __name__ == "__main__":
         ("INJECT HINT FINANCIAL (business_rules.py)",  inject_hint_financial()),
         ("CONSTRAINT NOTE STATUS (orchestrator.py)",   constraint_note_status()),
         ("CONSTRAINT NOTE CAST (orchestrator.py)",     constraint_note_cast()),
+        ("AUDIT STATUS BLOCK (prompts_audit.py)",       audit_status_block()),
+        ("AUDIT CA WORKFLOW BLOCK (prompts_audit.py)",  audit_ca_workflow_block()),
+        ("AUDIT COLUMNS BLOCK (prompts_audit.py)",      audit_columns_block()),
+        ("AUDIT CONSTRAINT NOTE STATUS (debug.py)",     constraint_note_status(AUDIT_SEMANTICS)),
+        ("AUDIT CONSTRAINT NOTE CAST (debug.py)",       constraint_note_cast(AUDIT_SEMANTICS)),
     ]
     for title, block in sections:
         print(f"\n{'═'*70}\n  {title}\n{'═'*70}\n{block}")

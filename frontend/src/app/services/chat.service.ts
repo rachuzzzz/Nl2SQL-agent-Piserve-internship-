@@ -94,6 +94,13 @@ export class ChatService {
   clearConversation(): void {
     const conv = this.activeConversation$.value;
     if (!conv) return;
+    // Also wipe the backend ConversationSession (scope/entity memory, raw
+    // turn history) — without this, /clear only wiped what's shown on
+    // screen while the server-side session (including cross-domain scope
+    // tracking) silently survived and could leak into what looks like a
+    // brand-new chat. Best-effort: a failed delete shouldn't block the
+    // visible clear the user is expecting.
+    this.http.delete(this.API + '/sessions/' + conv.id).subscribe({ error: () => {} });
     conv.messages = [];
     conv.title    = 'New conversation';
     this.activeConversation$.next({ ...conv });

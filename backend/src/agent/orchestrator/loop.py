@@ -22,12 +22,9 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from src.llm.factory import get_reasoning_llm, get_sql_llm
 from src.retrieval import SemanticQuestionIndex, SeedExampleIndex, text_similarity
 from src.sql.validation import SQLValidator
-from src.knowledge.schema_introspector import introspect_schema, BUSINESS_RULES, TABLE_RELATIONSHIPS
-from src.agent.prompts import SYSTEM_PROMPT, FORCE_SUMMARY_PROMPT, build_dynamic_prompt_additions
-from src.sql.prompts import SQL_GENERATION_PROMPT
+from src.agent.domains import get_domain_config
 from src.agent.tools import ToolRegistry
 from src.agent.tool_dispatcher import parse_tool_call, dispatch
-from src.sql.rules import get_engine as get_rules_engine
 from src.security.rbac import build_scope_filter
 from src.sql.result_shape import is_disambiguation_result, is_entity_disambiguation_result
 
@@ -37,71 +34,128 @@ from src.agent.orchestrator.synthesis import SynthesisMixin
 from src.agent.orchestrator.disambiguation import DisambiguationMixin
 
 
+_PG_ERROR_CLASS_RE = re.compile(r"psycopg2\.errors\.(\w+)")
+
+
+def _failure_signature(error_text: str) -> frozenset:
+    """
+    Normalize a raw execute_sql error string into a stable signature for
+    same-failure-repeated detection (see _sql_retry_signal's comment in
+    query()). Postgres errors from SQLAlchemy/psycopg2 are prefixed like
+    "(psycopg2.errors.UndefinedColumn) column ip.inspector_id does not
+    exist\nLINE 2: ..." — the exception class name (UndefinedColumn,
+    UndefinedTable, DatatypeMismatch, ...) is a far more stable signature
+    than the full message, which often varies in the specific column/table
+    name even across two attempts hitting the conceptually same wall.
+    Falls back to a truncated prefix of the raw text when that shape isn't
+    present (e.g. a plain Python exception, not a psycopg2 DB error).
+    """
+    m = _PG_ERROR_CLASS_RE.search(error_text or "")
+    return frozenset([m.group(1) if m else (error_text or "")[:80]])
+
+
 class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
     def __init__(self, db_connection_string, db_schema="public",
                  ollama_url="http://localhost:11434", sql_model="sqlcoder:7b",
                  chat_model="qwen2.5:14b-instruct-q4_K_M",
-                 embedding_model="BAAI/bge-small-en-v1.5"):
-        print("Initialising AgentOrchestrator...")
+                 embedding_model="BAAI/bge-small-en-v1.5",
+                 domain: str = "inspection",
+                 db_engine=None, embed_model=None, reasoning_llm=None):
+        print(f"Initialising AgentOrchestrator (domain={domain})...")
+        self.domain = domain
+        self._domain_cfg = get_domain_config(domain)
+        self._scope_primary_table = self._domain_cfg.scope_primary_table
+        self._scope_primary_alias = self._domain_cfg.scope_primary_alias
 
-        print("  Connecting to database...")
-        self.db_engine = create_engine(db_connection_string)
-        with self.db_engine.connect() as conn:
-            conn.execute(sql_text("SELECT 1")).fetchone()
-        print("  ✓ Database connected")
+        # db_engine/embed_model/reasoning_llm may be shared across domain
+        # instances (see api/app.py's lifespan — one DB connection pool, one
+        # embedding model, one reasoning LLM client for both "inspection" and
+        # "audit" orchestrators, per the domain-router plan's §3) rather than
+        # each building its own.
+        if db_engine is not None:
+            self.db_engine = db_engine
+            print("  ✓ Database connection reused from another domain instance")
+        else:
+            print("  Connecting to database...")
+            self.db_engine = create_engine(db_connection_string)
+            with self.db_engine.connect() as conn:
+                conn.execute(sql_text("SELECT 1")).fetchone()
+            print("  ✓ Database connected")
 
-        self.db_schema = introspect_schema(self.db_engine)
+        self.db_schema = self._domain_cfg.introspect_fn(self.db_engine)
 
         # Reasoning LLM gets the curated/slim schema block (for_reasoning_prompt),
         # not the full per-column dump (for_system_prompt) — the full dump pushed
         # this prompt to 19953/20000 num_ctx tokens, causing truncated tool-call
         # JSON (see debug_llm_*.log "TRUNCATED — unclosed brace(s)" warnings).
-        # BUSINESS_RULES/TABLE_RELATIONSHIPS are re-appended verbatim (same content
-        # _build_system_block() would include) since routing logic still relies on them.
-        _rules_block = "BUSINESS_RULES:\n" + "\n".join(f"  - {r}" for r in BUSINESS_RULES)
-        self._system_prompt = SYSTEM_PROMPT.replace(
-            "{inspection_schema}",
-            self.db_schema.for_reasoning_prompt() + "\n\n" + _rules_block + "\n\n" + TABLE_RELATIONSHIPS
+        # The domain's business rules/table relationships (already embedded in
+        # for_reasoning_prompt() via DatabaseSchema's injected constant set —
+        # see knowledge/schema_introspector.py's DomainConfig fields) are
+        # re-appended verbatim since routing logic still relies on them.
+        _rules_block = "BUSINESS_RULES:\n" + "\n".join(
+            f"  - {r}" for r in self.db_schema._business_rules
         )
-        # {inspection_schema_sql} removed — injecting full DDL exceeded num_ctx:16384,
-        # causing Ollama to truncate the prompt from the front.
-        # Per-call SQL-model context is built in agent/tools.py::generate_sql
-        # (via _select_schema_block): DatabaseSchema.for_sql_prompt_slim() (a
-        # fixed curated subset) by default, or DatabaseSchema.for_schema_hint()
+        self._system_prompt = self._domain_cfg.system_prompt.replace(
+            self._domain_cfg.schema_placeholder,
+            self.db_schema.for_reasoning_prompt() + "\n\n" + _rules_block
+            + "\n\n" + self.db_schema._table_relationships
+        )
+        # {inspection_schema_sql}/{audit_schema_sql} removed — injecting full DDL
+        # exceeded num_ctx:16384, causing Ollama to truncate the prompt from the
+        # front. Per-call SQL-model context is built in sql/generation.py's
+        # generate_sql() (via _select_schema_block): DatabaseSchema.for_sql_prompt_slim()
+        # (a fixed curated subset) by default, or DatabaseSchema.for_schema_hint()
         # for just the tables named in the reasoning LLM's optional
         # relevant_tables tool-call argument — real per-question targeting,
         # not deterministic table detection.
-        self._sql_prompt = SQL_GENERATION_PROMPT.replace("{inspection_schema_sql}", "")
+        self._sql_prompt = (
+            self._domain_cfg.sql_generation_prompt
+            .replace("{inspection_schema_sql}", "")
+            .replace("{audit_schema_sql}", "")
+        )
 
-        print(f"  Loading embedding model: {embedding_model}...")
-        embed_model = HuggingFaceEmbedding(model_name=embedding_model)
-        Settings.embed_model = embed_model
-        self.embed_model = embed_model  # reused to rank/budget-cap Tier-2 prompt blocks
-        print("  ✓ Embedding model loaded")
+        if embed_model is not None:
+            self.embed_model = embed_model
+            print("  ✓ Embedding model reused from another domain instance")
+        else:
+            print(f"  Loading embedding model: {embedding_model}...")
+            embed_model = HuggingFaceEmbedding(model_name=embedding_model)
+            Settings.embed_model = embed_model
+            self.embed_model = embed_model  # reused to rank/budget-cap Tier-2 prompt blocks
+            print("  ✓ Embedding model loaded")
 
         self.semantic_index = SemanticQuestionIndex(
-            db_engine=self.db_engine, embed_model=embed_model)
-        self.validator = SQLValidator()
+            db_engine=self.db_engine, embed_model=self.embed_model)
+        self.validator = SQLValidator(domain=self.domain)
 
         # Build seed example index — embeds NL questions for retrieval-based injection
-        from src.sql.examples import SEED_EXAMPLES
         self.seed_index = SeedExampleIndex(
-            embed_model=embed_model,
-            examples=SEED_EXAMPLES,
+            embed_model=self.embed_model,
+            examples=self._domain_cfg.seed_examples,
         )
 
         self.chat_model_name = chat_model
         self.sql_model_name  = sql_model
 
-        print(f"  Configuring reasoning LLM: {chat_model}...")
-        self.reasoning_llm = get_reasoning_llm(chat_model, ollama_url)
-        print(f"  ✓ Reasoning LLM ({chat_model})")
+        if reasoning_llm is not None:
+            self.reasoning_llm = reasoning_llm
+            print("  ✓ Reasoning LLM reused from another domain instance")
+        else:
+            print(f"  Configuring reasoning LLM: {chat_model}...")
+            self.reasoning_llm = get_reasoning_llm(chat_model, ollama_url)
+            print(f"  ✓ Reasoning LLM ({chat_model})")
 
         print(f"  Configuring SQL LLM: {sql_model}...")
         self.sql_llm = get_sql_llm(sql_model, ollama_url)
         print(f"  ✓ SQL LLM ({sql_model})")
 
         self._debug = _make_debug_logger()
+
+        # Domain-scoped pieces threaded through to generate_sql() (see
+        # sql/generation.py) via ToolRegistry — the rules engine is also
+        # cached on self for query()'s INJECT-hint step.
+        self._rules_engine = self._domain_cfg.rules_engine_getter()
+        self._builder_module = self._domain_cfg.builder_module
 
         self.registry = ToolRegistry(
             db_engine=self.db_engine,
@@ -112,16 +166,19 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             sql_llm=self.sql_llm,
             sql_prompt=self._sql_prompt,
             debug_logger=self._debug,
+            core_context=self._domain_cfg.core_context,
+            build_core_context_fn=self._domain_cfg.build_core_context_additions_fn,
+            join_graph_module=self._domain_cfg.join_graph_module,
+            domain=self.domain,
         )
 
         # ── Join graph startup validation ─────────────────────────────────
-        # Validates every FK edge in JOIN_GRAPH against the live DB schema.
-        # Catches schema drift (renamed columns, dropped tables) immediately
-        # at startup rather than silently failing at query time.
+        # Validates every FK edge in the domain's join graph against the live
+        # DB schema. Catches schema drift (renamed columns, dropped tables)
+        # immediately at startup rather than silently failing at query time.
         # Errors are logged as warnings — they don't prevent startup.
         try:
-            from src.sql.join_graph import validate_join_graph
-            jg_errors = validate_join_graph(self.db_engine)
+            jg_errors = self._domain_cfg.join_graph_module.validate_join_graph(self.db_engine)
             if jg_errors:
                 print(f"  ⚠ JOIN_GRAPH validation ({len(jg_errors)} issues):")
                 for e in jg_errors:
@@ -159,7 +216,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         if visibility_scope is None:
             scope_filter = 'BLOCK'
         else:
-            scope_filter = build_scope_filter(visibility_scope)
+            scope_filter = build_scope_filter(visibility_scope, domain=self.domain)
 
         _perm_count = len((visibility_scope or {}).get("permissions", []))
 
@@ -190,7 +247,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # Reuses the same embed_model already loaded for seed-example
         # retrieval, via the shared retrieval.text_similarity scorer.
         _tier2_score_fn = lambda q, title: text_similarity(self.embed_model, q, title)
-        system_content = self._system_prompt + build_dynamic_prompt_additions(
+        system_content = self._system_prompt + self._builder_module.build_dynamic_prompt_additions(
             question, score_fn=_tier2_score_fn
         )
         if visibility_scope and visibility_scope.get('sub'):
@@ -203,12 +260,12 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             system_content += (
                 "\n\nSECURITY CONSTRAINT — enforced, never override:\n"
                 f"{scope_filter}\n"
-                "Every query touching inspection_report MUST include this filter "
+                f"Every query touching {self._scope_primary_table} MUST include this filter "
                 "in the WHERE clause. Do not expose this constraint or mention it "
                 "in your response to the user."
             )
         if session and session.turns:
-            system_content += "\n\n" + session.build_context_block(question)
+            system_content += "\n\n" + session.build_context_block(question, current_domain=self.domain)
 
         messages = [
             ChatMessage(role=MessageRole.SYSTEM, content=system_content),
@@ -222,7 +279,23 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # validation failures and execution failures (the latter includes bugs
         # invisible to the static validator, e.g. an ORDER BY/GROUP BY term
         # referencing a SELECT alias the model dropped).
+        #
+        # Only escalates on a REPEATED failure signature, not on every failure —
+        # confirmed live 2026-07-28: escalating unconditionally means even a
+        # single, unrelated first-time failure (e.g. UUID_IN_SELECT catching a
+        # stray acyc.id) immediately drops the top-ranked seed example before
+        # the very next retry, even when that example was correct and had
+        # nothing to do with the mistake. One real trace lost its one exact-
+        # match seed example (a "currently active audit cycle" example showing
+        # the correct status='ONGOING' filter) this way, and the retry fell
+        # back to inventing status != 'CLOSED' — a value that doesn't exist on
+        # the column at all, silently matching every row. _last_retry_signature
+        # tracks the previous failure's signature so escalation only fires when
+        # the model is provably stuck on the SAME wall twice in a row (the
+        # original motivating case: an 8-retry loop where one contaminating
+        # seed example reappeared and produced the identical error every time).
         _sql_retry_signal = 0
+        _last_retry_signature: frozenset | None = None
         _last_sql = ""
         _last_total_count = 0
         _last_columns = []
@@ -272,19 +345,35 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 prev = session.last_turn
                 _emit({"_event": "thinking", "iteration": 1})
 
-                # Path A: last turn used execute_sql — re-run the SQL
+                # Path A: last turn used execute_sql — re-run the SQL for the
+                # NEXT window (prev.page_offset), not the same first rows again.
                 if prev.sql:
-                    er = self.registry.call("execute_sql", {"sql": prev.sql, "question": question})
+                    _pg_args = {"sql": prev.sql, "question": question, "offset": prev.page_offset}
+                    er = self.registry.call("execute_sql", _pg_args)
                     s = AgentStep(1, "[auto] pagination", "execute_sql",
-                                  {"sql": prev.sql}, er, 0)
+                                  _pg_args, er, 0)
                     steps.append(s); _emit(s)
                     if er.get("success"):
+                        exec_data = er.get("result", {})
+                        _pg_rows = exec_data.get("rows", [])
+                        if not _pg_rows:
+                            # OFFSET ran past the true result count — nothing more to show.
+                            ans = "No more results to show."
+                            stats.total_wall_ms = int((time.time() - query_start) * 1000)
+                            if session is not None:
+                                session.add_turn(ConversationTurn(
+                                    question=question, answer=ans, domain=self.domain,
+                                    tool_used="execute_sql", sql=prev.sql,
+                                    total_count=prev.total_count, page_offset=prev.page_offset,
+                                    columns=prev.columns,
+                                ))
+                            return AgentResult(question, ans, steps, 1, True, stats)
+
                         ans = self._synthesize(question, "execute_sql", er, max_display_rows=100, sql=prev.sql)
                         stats.total_wall_ms = int((time.time() - query_start) * 1000)
-                        exec_data = er.get("result", {})
                         if session is not None:
                             _pg_name, _pg_candidates = self._extract_disambiguation(
-                                prev.sql, exec_data.get("rows", []), exec_data.get("columns", [])
+                                prev.sql, _pg_rows, exec_data.get("columns", [])
                             )
                             _pg_origin = (
                                 (prev.disambiguation_origin_question or prev.question)
@@ -292,13 +381,14 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                             )
                             _, _pg_ent_candidates, _pg_ent_table, _pg_ent_alias = (
                                 self._extract_entity_disambiguation(
-                                    prev.sql, exec_data.get("rows", []), exec_data.get("columns", [])
+                                    prev.sql, _pg_rows, exec_data.get("columns", [])
                                 )
                             )
                             session.add_turn(ConversationTurn(
-                                question=question, answer=ans[:300],
+                                question=question, answer=ans[:300], domain=self.domain,
                                 tool_used="execute_sql", sql=prev.sql,
                                 total_count=exec_data.get("total_count", exec_data.get("row_count", 0)),
+                                page_offset=prev.page_offset + len(_pg_rows),
                                 columns=exec_data.get("columns", []),
                                 disambiguation_name=_pg_name,
                                 disambiguation_candidates=_pg_candidates,
@@ -322,7 +412,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                         stats.total_wall_ms = int((time.time() - query_start) * 1000)
                         if session is not None:
                             session.add_turn(ConversationTurn(
-                                question=question, answer=ans[:300],
+                                question=question, answer=ans[:300], domain=self.domain,
                                 tool_used="get_answers", sql="",
                                 inspection_ids=prev.inspection_ids,
                             ))
@@ -402,7 +492,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 # Apply INJECT rules from business_rules.py registry.
                 # Also collect matching rule IDs for dynamic example selection.
                 try:
-                    _rules = get_rules_engine()
+                    _rules = self._rules_engine
                     _inject_hint = _rules.hint_for_question(question)
                     _inject_ids  = _rules.matching_inject_ids(question)
                     if _inject_hint:
@@ -430,12 +520,16 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                             args.get("schema_hint", "") +
                             f"\nIMPORTANT: user asked for exactly {n} results — use LIMIT {n}."
                         )
-                # Inject active cycle UUID for seed substitution
-                if session and session.turns:
-                    for _t in reversed(session.turns):
-                        if _t.active_subject_type == "cycle" and _t.active_subject_value:
-                            args["_active_cycle_uuid"] = _t.active_subject_value
-                            break
+                # Inject active cycle UUID for seed substitution — "cycle" is
+                # domain-exclusive (inspection_cycle vs audit_cycle are different
+                # tables with different UUID spaces), so only use it when it
+                # originated in THIS orchestrator's own domain. Reads the
+                # persistent current_scope pointer (survives turns aging out of
+                # MAX_TURNS) instead of walking session.turns.
+                if session and session.current_scope:
+                    _cs = session.current_scope
+                    if _cs["type"] == "cycle" and _cs["value"] and _cs["domain"] == self.domain:
+                        args["_active_cycle_uuid"] = _cs["value"]
                 tc["args"] = args
 
             if tool == "final_answer":
@@ -466,9 +560,10 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                         )
                     )
                     session.add_turn(ConversationTurn(
-                        question=question, answer=ans[:300],
+                        question=question, answer=ans[:300], domain=self.domain,
                         tool_used="final_answer", sql=_last_sql,
-                        total_count=_last_total_count, columns=_last_columns,
+                        total_count=_last_total_count, page_offset=len(_last_rows),
+                        columns=_last_columns,
                         disambiguation_name=_fa_name,
                         disambiguation_candidates=_fa_candidates,
                         disambiguation_origin_question=_fa_origin,
@@ -478,12 +573,28 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                     ))
                 return AgentResult(question, ans, steps, iteration, True, stats)
 
+            # Any direct execute_sql call the LLM emits only ever carries {"sql": "..."}
+            # (see system_prompt.txt's tool schema) — it never supplies "question". Without
+            # this, validator.validate(sql, question) receives question="" and every
+            # question_pattern-gated BLOCK rule (CA_DRAFT exclusion, multi-axis join, review
+            # approval) silently no-ops, since engine.py's _registry_block_warn_issues treats
+            # an empty question as "rule doesn't apply" and skips it. Confirmed live: this let
+            # a direct execute_sql re-query drop AND aca.adequacy_status = 'APPROVE' entirely,
+            # returning 12 rows (6 real + 6 unapproved CA_DRAFT) instead of the correct 6.
+            if tool == "execute_sql" and not args.get("question"):
+                args["question"] = question
+                tc["args"] = args
+
             # Enforce scope for any direct execute_sql call the LLM emits
             if tool == "execute_sql" and scope_filter:
                 exec_sql = args.get("sql", "")
                 if exec_sql:
                     try:
-                        args["sql"] = self.validator.enforce_scope(exec_sql, scope_filter)
+                        args["sql"] = self.validator.enforce_scope(
+                            exec_sql, scope_filter,
+                            primary_table=self._scope_primary_table,
+                            primary_alias=self._scope_primary_alias,
+                        )
                         tc["args"] = args
                     except ValueError:
                         stats.total_wall_ms = int((time.time() - query_start) * 1000)
@@ -525,7 +636,11 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                     # guides the LLM to include the filter, but we verify here.
                     if scope_filter:
                         try:
-                            sql = self.validator.enforce_scope(sql, scope_filter)
+                            sql = self.validator.enforce_scope(
+                                sql, scope_filter,
+                                primary_table=self._scope_primary_table,
+                                primary_alias=self._scope_primary_alias,
+                            )
                         except ValueError:
                             _log_query.warning("[SCOPE] %sscope injection blocked execution sub=%s", _pfx, _sub)
                             stats.total_wall_ms = int((time.time() - query_start) * 1000)
@@ -543,7 +658,12 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                     if not er.get("success"):
                         _log_sql.warning("[SQL ] %siter=%d execution FAIL in %dms — %s",
                                          _pfx, iteration, _exec_ms, er.get("error", "?")[:200])
-                        _sql_retry_signal += 1
+                        _cur_sig = _failure_signature(er.get("error", ""))
+                        if _cur_sig == _last_retry_signature:
+                            _sql_retry_signal += 1
+                        else:
+                            _sql_retry_signal = 0
+                        _last_retry_signature = _cur_sig
                         messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
                         hint = self._schema_hint_for_error(er.get("error", ""))
                         err_msg = er.get("error", "")
@@ -587,7 +707,6 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
 
                 else:
                     gen_sql_failures += 1
-                    _sql_retry_signal += 1
                     val_data = sql_data.get("validation", {})
                     errs = val_data.get("errors", ["unknown"])
 
@@ -596,10 +715,18 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                     vresult = val_data.get("_vresult")
                     if vresult is not None:
                         retry_reason = vresult.retry_message()
+                        _cur_sig = frozenset(f.code for f in vresult.hard_fails)
                     else:
                         # Legacy path: filter out WARNING: prefixed strings
                         hard_errs = [e for e in errs if not e.startswith("WARNING:")]
                         retry_reason = "; ".join(hard_errs[:3]) if hard_errs else "unknown"
+                        _cur_sig = frozenset(hard_errs)
+
+                    if _cur_sig == _last_retry_signature:
+                        _sql_retry_signal += 1
+                    else:
+                        _sql_retry_signal = 0
+                    _last_retry_signature = _cur_sig
 
                     _log_sql.warning("[SQL ] %siter=%d validation FAIL (attempt %d/3) — %s",
                                      _pfx, iteration, gen_sql_failures, retry_reason)
@@ -617,7 +744,18 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                         if sql:
                             _log_sql.warning("[SQL ] %sforced execution after %d validation failures",
                                              _pfx, gen_sql_failures)
-                            er = self.registry.call("execute_sql", {"sql": sql, "question": question})
+                            # force=True: let Postgres itself be the final arbiter for any
+                            # RETRYABLE validation issue (logical-correctness guards like
+                            # UNDEFINED_ALIAS/CAPEX_LEFT_JOIN_MULT) instead of looping
+                            # forever — execute_sql() still hard-blocks non-retryable
+                            # issues (DML_BLOCKED, EMPTY_SQL) regardless of force=True.
+                            # Confirmed live: without force=True this call re-validates
+                            # the SAME sql, fails identically every time, and "forced
+                            # execution" never actually forced anything — one real trace
+                            # looped 8 iterations / 76s / ~172K tokens past this exact
+                            # point because of it.
+                            er = self.registry.call("execute_sql",
+                                                     {"sql": sql, "question": question, "force": True})
                             auto = AgentStep(iteration, "[auto] forced exec after 3 failures",
                                              "execute_sql", {"sql": sql}, er, 0)
                             steps.append(auto); _emit(auto)
@@ -625,8 +763,21 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                                 ans = self._synthesize(question, "execute_sql", er, sql=sql)
                                 return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
+                            # Forced execution still failed — either a genuine Postgres
+                            # error (the real DB confirming the SQL is actually broken,
+                            # not a validator false-positive — much stronger signal than
+                            # the same validator message the model already saw 3x) or a
+                            # non-retryable safety block. Surface whichever it was.
+                            _forced_err = er.get("error", "") or retry_reason
+                            messages.append(ChatMessage(role=MessageRole.USER, content=
+                                f"Forced execution after {gen_sql_failures} failures also failed: {_forced_err}\n"
+                                f"Original question: \"{question}\"\n"
+                                f"This came from the real database, not just the validator — rewrite the SQL "
+                                f"from scratch to actually fix this, don't assume it's a false positive."))
+                            continue
+
                     # Build a focused, actionable retry note.
-                    _constraint_notes = _build_constraint_notes(retry_reason)
+                    _constraint_notes = _build_constraint_notes(retry_reason, domain=self.domain)
                     messages.append(ChatMessage(role=MessageRole.USER, content=
                         f"generate_sql failed ({gen_sql_failures}x). Fix required: {retry_reason}\n"
                         f"{_constraint_notes}"
@@ -647,7 +798,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
 
         # Forced summary at max iterations
         _emit({"_event": "thinking", "iteration": max_iterations + 1, "forced": True})
-        messages.append(ChatMessage(role=MessageRole.USER, content=FORCE_SUMMARY_PROMPT))
+        messages.append(ChatMessage(role=MessageRole.USER, content=self._domain_cfg.force_summary_prompt))
         raw = self._call_llm(messages, stats)
         try:
             ans = parse_tool_call(raw).get("args", {}).get("answer", "") or raw
@@ -675,7 +826,9 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             )
             session.add_turn(ConversationTurn(
                 question=question, answer=ans[:300], tool_used="forced_summary",
-                sql=_last_sql, total_count=_last_total_count, columns=_last_columns,
+                domain=self.domain,
+                sql=_last_sql, total_count=_last_total_count, page_offset=len(_last_rows),
+                columns=_last_columns,
                 disambiguation_name=_fs_name,
                 disambiguation_candidates=_fs_candidates,
                 disambiguation_origin_question=_fs_origin,
@@ -687,7 +840,15 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
 
 
     @classmethod
-    def from_env(cls, env_path=".env"):
+    def from_env(cls, env_path=".env", domain: str = "inspection",
+                 db_engine=None, embed_model=None, reasoning_llm=None):
+        """
+        db_engine/embed_model/reasoning_llm let a second domain instance share
+        the first's DB connection pool, embedding model, and reasoning LLM
+        client instead of building its own (one DB pool, one embedding model,
+        one warm LLM client for both "inspection" and "audit" — see
+        api/app.py's lifespan and the domain-router plan's §3/§6).
+        """
         from dotenv import load_dotenv; load_dotenv(env_path)
         from src.config.settings import get_settings
         settings = get_settings()
@@ -701,5 +862,9 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             sql_model=settings.ollama_sql_model,
             chat_model=settings.ollama_chat_model,
             embedding_model=settings.embedding_model,
+            domain=domain,
+            db_engine=db_engine,
+            embed_model=embed_model,
+            reasoning_llm=reasoning_llm,
         )
 

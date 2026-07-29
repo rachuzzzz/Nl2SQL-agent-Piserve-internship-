@@ -6,9 +6,9 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from src.charts.advisor import advise, force_config, get_alternatives
+from src.charts.advisor import advise, advise_full, force_config_full, get_alternatives
 from src.security.auth import require_auth
-from src.api.deps import get_orch_optional, refetch_for_calendar, _sessions
+from src.api.deps import get_orch_optional, _sessions
 from src.api.schemas import ChartRequest, ChartConfig
 
 router = APIRouter()
@@ -33,23 +33,22 @@ async def get_chart(req: ChartRequest, request: Request, token_data: dict = Depe
         )
 
     cols = sess_data["last_cols"]
-    rows = sess_data["last_raw_rows"]
-
-    # Calendar heatmap needs the full date range, not just the cached 50 rows.
-    _cal_needed = (req.chart_type == "calendar_heatmap") or (not req.chart_type and advise(cols, rows).get("chart_type") == "calendar_heatmap")
+    sample_rows = sess_data["last_raw_rows"]
     _chart_orch = get_orch_optional(request)
-    if _cal_needed and sess_data.get("last_sql") and _chart_orch:
-        _full = refetch_for_calendar(sess_data["last_sql"], _chart_orch, params=sess_data.get("last_sql_params", {}))
-        if _full:
-            rows = _full
-            cols = list(_full[0].keys())
+    _sql = sess_data.get("last_sql")
+    _sql_params = sess_data.get("last_sql_params", {})
+    _aggregate = not req.view_all
 
     # Column picker overrides — user explicitly selected which cols to chart
     lc_override = req.x_col
     num_cols_override = req.y_cols
 
     if req.chart_type:
-        cfg = force_config(cols, rows, req.chart_type, lc=lc_override, num_cols=num_cols_override)
+        cfg, rows_total, rows_shown = force_config_full(
+            cols, sample_rows, req.chart_type,
+            sql=_sql, orch=_chart_orch, params=_sql_params,
+            lc=lc_override, num_cols=num_cols_override, aggregate=_aggregate,
+        )
         logging.info(f"Forcing chart {req.chart_type} for lc={lc_override}, nums={num_cols_override}. Config generated: {bool(cfg)}")
         if cfg is None:
             raise HTTPException(
@@ -62,7 +61,7 @@ async def get_chart(req: ChartRequest, request: Request, token_data: dict = Depe
             {"line", "area", "calendar_heatmap"},
             {"pie", "doughnut", "nightingale"},
         ]
-        rec = advise(cols, rows)
+        rec = advise(cols, sample_rows)
         rec_type = rec.get("chart_type")
         if req.chart_type == rec_type:
             forced_confidence = "high"
@@ -71,7 +70,7 @@ async def get_chart(req: ChartRequest, request: Request, token_data: dict = Depe
         else:
             forced_confidence = "low"
 
-        alts = get_alternatives(cols, rows, n=3)
+        alts = get_alternatives(cols, sample_rows, n=3)
         # x_label / y_labels from the advisor rec (covers forced type too)
         _x = rec.get("labels_column") if rec else (lc_override or (cols[0] if cols else None))
         _y = rec.get("values_columns") or (num_cols_override or [])
@@ -86,9 +85,15 @@ async def get_chart(req: ChartRequest, request: Request, token_data: dict = Depe
             alternatives=alts,
             x_label=_x,
             y_labels=_y,
+            rows_shown=rows_shown, rows_total=rows_total,
+            is_aggregated=bool(rows_total and rows_shown and rows_shown < rows_total),
+            can_view_all=bool(rows_total and rows_shown and rows_shown < rows_total),
         )
     else:
-        rec = advise(cols, rows)
+        rec = advise_full(
+            cols, sample_rows,
+            sql=_sql, orch=_chart_orch, params=_sql_params, aggregate=_aggregate,
+        )
         if not rec.get("chart_type"):
             raise HTTPException(
                 status_code=422,
@@ -105,4 +110,7 @@ async def get_chart(req: ChartRequest, request: Request, token_data: dict = Depe
             alternatives=rec.get("alternatives", []),
             x_label=rec.get("labels_column"),
             y_labels=rec.get("values_columns") or [],
+            rows_shown=rec.get("rows_shown"), rows_total=rec.get("rows_total"),
+            is_aggregated=rec.get("is_aggregated", False),
+            can_view_all=rec.get("can_view_all", False),
         )

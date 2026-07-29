@@ -1,0 +1,5 @@
+-- SOFT-DELETE: every audit_* table (audit_plan, audit_schedule, audit_report,
+--   audit_corrective_action, audit_cycle, auditor_portfolio, audit_universe,
+--   audit_category, audit_sub_category, audit_type) has an active boolean column —
+--   always filter WHERE <alias>.active = true unless the question is specifically
+--   about deleted/archived records.

@@ -61,6 +61,7 @@ class SynthesisMixin:
 
         # Extract key entities from result rows for follow-up context
         insp_ids, fac_names, insp_names, cycle_ids, user_ids = [], [], [], [], []
+        audit_ids = []
         facility_ids = []
         single_row_vals = {}
         _UUID_PAT = re.compile(
@@ -75,6 +76,10 @@ class SynthesisMixin:
                 v = row.get(col)
                 if v and str(v) not in insp_ids:
                     insp_ids.append(str(v))
+            for col in ("audit_id",):
+                v = row.get(col)
+                if v and str(v) not in audit_ids:
+                    audit_ids.append(str(v))
             for col in ("facility_name", "facility"):
                 v = row.get(col)
                 if v and str(v) not in fac_names:
@@ -123,29 +128,39 @@ class SynthesisMixin:
                     cycle_ids.append(str(v).strip())
 
         # ── Determine active subject for this turn ───────────────────────────
-        # Priority: cycle > single inspector > single inspection > single facility
+        # Priority: cycle > single inspector > single inspection > single audit > single facility
         active_subject_type = ""
         active_subject_value = ""
         active_subject_label = ""
         active_subject_table = ""
         active_subject_alias = ""
+        active_subject_domain = ""
 
         if len(cycle_ids) == 1:
             active_subject_type = "cycle"
             active_subject_value = cycle_ids[0]
             active_subject_label = cycle_ids[0]
+            active_subject_domain = self.domain
         elif len(insp_names) == 1:
             active_subject_type = "inspector"
             active_subject_value = insp_names[0]
             active_subject_label = insp_names[0]
+            active_subject_domain = self.domain
         elif len(insp_ids) == 1:
             active_subject_type = "inspection"
             active_subject_value = insp_ids[0]
             active_subject_label = insp_ids[0]
+            active_subject_domain = self.domain
+        elif len(audit_ids) == 1:
+            active_subject_type = "audit"
+            active_subject_value = audit_ids[0]
+            active_subject_label = audit_ids[0]
+            active_subject_domain = self.domain
         elif len(fac_names) == 1:
             active_subject_type = "facility"
             active_subject_value = fac_names[0]
             active_subject_label = fac_names[0]
+            active_subject_domain = self.domain
         # If previous turn had a scoped subject (cycle or facility) and this result
         # has no conflicting subject (e.g. a COUNT query with no facility_name column),
         # inherit the scope so it persists across multi-turn drilldowns.
@@ -174,15 +189,25 @@ class SynthesisMixin:
                         active_subject_alias = _prev_turn.entity_disambiguation_alias
                     active_subject_value = _ed_matches[0]["name"]
                     active_subject_label = _ed_matches[0]["name"]
-            if not active_subject_type:
-                for prev_turn in reversed(session.turns):
-                    if prev_turn.active_subject_type and prev_turn.active_subject_value:
-                        active_subject_type = prev_turn.active_subject_type
-                        active_subject_value = prev_turn.active_subject_value
-                        active_subject_label = prev_turn.active_subject_label
-                        active_subject_table = prev_turn.active_subject_table
-                        active_subject_alias = prev_turn.active_subject_alias
-                        break
+                    active_subject_domain = self.domain
+            # Read the persistent scope pointer directly instead of walking
+            # session.turns — this is what makes scope survive a turn aging
+            # out of MAX_TURNS. Copy active_subject_domain VERBATIM from
+            # where the scope actually originated; never recompute it as
+            # self.domain here — this turn may be answering in a different
+            # domain than the one that first resolved the scope, and a
+            # domain-exclusive type (inspection/audit/cycle) must remember
+            # its true origin through any number of these inheritance hops,
+            # not get silently relabeled as belonging to whichever domain
+            # last happened to pass it along.
+            if not active_subject_type and session.current_scope:
+                _cs = session.current_scope
+                active_subject_type = _cs["type"]
+                active_subject_value = _cs["value"]
+                active_subject_label = _cs["label"]
+                active_subject_table = _cs["table"]
+                active_subject_alias = _cs["alias"]
+                active_subject_domain = _cs["domain"]
 
         if session is not None:
             # MT-03 fix: if we have a facility name but no inspection_id (e.g. MT-01
@@ -240,11 +265,14 @@ class SynthesisMixin:
             session.add_turn(ConversationTurn(
                 question=question,
                 answer=answer[:300],
+                domain=self.domain,
                 tool_used=steps[-2].tool if len(steps) >= 2 else "unknown",
                 sql=last_sql,
                 total_count=last_total,
+                page_offset=len(last_rows),
                 columns=last_cols,
                 inspection_ids=insp_ids[:5],
+                audit_ids=audit_ids[:5],
                 facility_names=fac_names[:5],
                 inspector_names=insp_names[:5],
                 cycle_ids=cycle_ids[:3],
@@ -262,6 +290,7 @@ class SynthesisMixin:
                 active_subject_label=active_subject_label,
                 active_subject_table=active_subject_table,
                 active_subject_alias=active_subject_alias,
+                active_subject_domain=active_subject_domain,
             ))
 
         _final_stats = stats or QueryStats()
@@ -424,7 +453,7 @@ class SynthesisMixin:
                     return "No users found matching that name."
                 name_col = next((c for c in cols if c.lower() == "name"), "name")
                 count_col = next((c for c in cols if c.lower() in
-                                  {"inspection_count", "count", "total"}), None)
+                                  {"inspection_count", "audit_count", "schedule_count", "count", "total"}), None)
                 if total_count > 12:
                     return (
                         f"I found {total_count} people matching that name — too many to list. "
@@ -453,7 +482,7 @@ class SynthesisMixin:
             if len(rows) == 1 and len(cols) <= 3:
                 agg_names = {
                     "count", "total", "avg", "sum", "min", "max",
-                    "average", "avg_score", "avg_inspection_score",
+                    "average", "avg_score", "avg_inspection_score", "avg_audit_score",
                     "total_capex", "total_opex", "question_count",
                     "answer_count", "report_count", "frequency",
                 }
@@ -525,7 +554,11 @@ class SynthesisMixin:
                               "inspection_report_id", "question_id",
                               "inspection_type_id", "inspection_sub_type_id",
                               "cycle_id", "schedule_id", "entity_id",
-                              "user_id"}
+                              "user_id",
+                              # audit-domain raw UUID FKs (see schema_introspector.py's
+                              # AUDIT_FK_RESOLUTION) that would otherwise leak as UUIDs
+                              "auditor_id", "auditee_id", "audit_cycle_id",
+                              "internal_stakeholder_id"}
                 displayable_cols = [c for c in rows[0].keys() if c not in _HIDE_COLS]
                 if len(rows) > 1:
                     for col in displayable_cols:

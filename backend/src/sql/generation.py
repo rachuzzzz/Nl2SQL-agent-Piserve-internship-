@@ -41,7 +41,9 @@ def _fetch_key_schemas(db_engine: Engine) -> str:
         return ""
 
 
-def _select_schema_block(db_schema, relevant_tables: list | None, db_engine=None) -> str:
+def _select_schema_block(
+    db_schema, relevant_tables: list | None, db_engine=None, join_graph_module=None,
+) -> str:
     """
     Prefer a targeted, full-column-detail block for the tables the reasoning
     model said are relevant (DatabaseSchema.for_schema_hint) over the static
@@ -53,6 +55,11 @@ def _select_schema_block(db_schema, relevant_tables: list | None, db_engine=None
     instead of a JSON array, since this is the only list-typed tool argument
     in this codebase) — the isinstance guard prevents silently iterating
     individual characters as "table names" if that happens.
+
+    join_graph_module: the domain's join-graph module (sql/join_graph.py for
+    inspection, sql/audit_join_graph.py for audit — see agent/domains.py's
+    DOMAIN_REGISTRY). None defaults to inspection's, preserving behavior for
+    every existing caller.
     """
     if db_schema is not None:
         if isinstance(relevant_tables, list) and relevant_tables:
@@ -60,7 +67,7 @@ def _select_schema_block(db_schema, relevant_tables: list | None, db_engine=None
             if clean:
                 block = db_schema.for_schema_hint(clean)
                 if len(clean) >= 2:
-                    block += _join_path_hints(clean)
+                    block += _join_path_hints(clean, join_graph_module)
                 return block
         return db_schema.for_sql_prompt_slim()
     if db_engine:
@@ -70,21 +77,34 @@ def _select_schema_block(db_schema, relevant_tables: list | None, db_engine=None
 
 def _join_graph_source(table_name: str) -> str:
     """
-    JOIN_GRAPH (sql/join_graph.py) has no "users" key — only role-specific
-    "users_inspector"/"users_inspectee" pseudo-nodes. Default to the inspector
-    role when a caller says "users" with no role context; this is a heuristic,
-    not a real disambiguation — informational hint text only, never used to
-    filter/scope data.
+    Inspection's JOIN_GRAPH (sql/join_graph.py) has no "users" key — only
+    role-specific "users_inspector"/"users_inspectee" pseudo-nodes. Default to
+    the inspector role when a caller says "users" with no role context; this
+    is a heuristic, not a real disambiguation — informational hint text only,
+    never used to filter/scope data. Audit's graph (sql/audit_join_graph.py)
+    similarly has no bare "users" key (users_auditor/users_auditee/
+    users_proposer/users_internal_stakeholder instead) — default to the
+    auditor role there for the same reason.
     """
     return "users_inspector" if table_name == "users" else table_name
 
 
-def _join_path_hints(relevant_tables: list) -> str:
-    """Chain path_as_hint() across consecutive relevant_tables pairs."""
-    from src.sql.join_graph import path_as_hint
+def _join_graph_source_audit(table_name: str) -> str:
+    return "users_auditor" if table_name == "users" else table_name
+
+
+def _join_path_hints(relevant_tables: list, join_graph_module=None) -> str:
+    """Chain path_as_hint() across consecutive relevant_tables pairs, using
+    the given domain's join-graph module (default: inspection's)."""
+    if join_graph_module is not None:
+        path_as_hint = join_graph_module.path_as_hint
+        _source = _join_graph_source_audit if join_graph_module.__name__.endswith("audit_join_graph") else _join_graph_source
+    else:
+        from src.sql.join_graph import path_as_hint
+        _source = _join_graph_source
     hints = []
     for a, b in zip(relevant_tables, relevant_tables[1:]):
-        hint = path_as_hint(_join_graph_source(a), _join_graph_source(b))
+        hint = path_as_hint(_source(a), _source(b))
         if hint:
             hints.append(hint)
     return "".join(hints)
@@ -101,6 +121,9 @@ def generate_sql(
     _active_cycle_uuid: str = "",
     _retry_attempt: int = 0,
     relevant_tables: list | None = None,
+    _core_context: str | None = None,
+    _build_core_context_fn=None,
+    _join_graph_module=None,
 ) -> dict[str, Any]:
     try:
         # Schema block — the slim version keeps context under ~600 tokens.
@@ -108,7 +131,7 @@ def generate_sql(
         # deepseek's context 3x and degrades 7B model generation quality.
         # When the reasoning model supplies relevant_tables, use a targeted
         # full-detail block for just those tables instead (see _select_schema_block).
-        auto_schema = _select_schema_block(_db_schema, relevant_tables, db_engine)
+        auto_schema = _select_schema_block(_db_schema, relevant_tables, db_engine, _join_graph_module)
 
         if auto_schema and not schema_hint.startswith("Use"):
             schema_hint = f"{auto_schema}\n{schema_hint}" if schema_hint else auto_schema
@@ -119,26 +142,47 @@ def generate_sql(
 
         # Retrieval-based example injection via SeedExampleIndex (cosine similarity)
         # Falls back to empty string if index not available or seed_examples not deployed.
-        try:
-            from src.sql.prompts import CORE_CONTEXT, build_core_context_additions
-            _core_ctx = CORE_CONTEXT + build_core_context_additions(question)
-        except ImportError:
-            _core_ctx = (
-                "-- ir.id = UUID (JOIN only, never SELECT), ir.inspection_id = VARCHAR display\n"
-                "-- ICA join: ON ica.inspection_id = ir.id | completed = IN ('CLOSED','SUBMITTED')\n"
-                "-- risk_level_id is UUID FK: JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
-            )
+        # _core_context/_build_core_context_fn let the caller (ToolRegistry, per
+        # domain — see agent/domains.py's DOMAIN_REGISTRY) supply the audit
+        # domain's own vocabulary block instead of inspection's; None means "use
+        # inspection defaults", preserving behavior for every existing caller.
+        if _core_context is not None:
+            _fn = _build_core_context_fn or (lambda q: "")
+            try:
+                _core_ctx = _core_context + _fn(question)
+            except Exception:
+                _core_ctx = _core_context
+        else:
+            try:
+                from src.sql.prompts import CORE_CONTEXT, build_core_context_additions
+                _core_ctx = CORE_CONTEXT + build_core_context_additions(question)
+            except ImportError:
+                _core_ctx = (
+                    "-- ir.id = UUID (JOIN only, never SELECT), ir.inspection_id = VARCHAR display\n"
+                    "-- ICA join: ON ica.inspection_id = ir.id | completed = IN ('CLOSED','SUBMITTED')\n"
+                    "-- risk_level_id is UUID FK: JOIN risk_level rl ON ica.risk_level_id = rl.id\n"
+                )
         if _seed_index is not None:
             try:
-                # On a retry, a weak SQL-gen model tends to reproduce its single
+                # On a retry, a weak SQL-gen model tends to reproduce its
                 # closest seed example almost verbatim — including whatever
                 # fragment triggered the validator failure — ignoring the
-                # planner's corrected schema_hint entirely. Dropping that one
-                # example forces the model to actually use schema_hint instead
-                # of re-copying the same broken pattern (see validator retry
+                # planner's corrected schema_hint entirely. Dropping examples
+                # forces the model to actually use schema_hint instead of
+                # re-copying the same broken pattern (see validator retry
                 # loop in orchestrator.py which increments gen_sql_failures).
+                #
+                # Escalate the drop count with each retry rather than always
+                # dropping just the #1 match — confirmed live: a persistently
+                # contaminating example that happens to rank #2/#3/#4 (never
+                # #1) survives a flat "drop #1" on every single retry, since
+                # that only ever removes whichever example is #1 THAT round.
+                # One real trace burned 8 retries because the same seed
+                # example (missing a JOIN its WHERE clause still referenced)
+                # reappeared in the prompt every time. Capped at 3 so at
+                # least one example always survives at top_k=4.
                 retrieved = _seed_index.format_for_prompt(
-                    question, top_k=4, skip_top_match=bool(_retry_attempt)
+                    question, top_k=4, skip_top_n=min(_retry_attempt, 3)
                 )
             except Exception:
                 retrieved = ""

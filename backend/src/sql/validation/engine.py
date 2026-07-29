@@ -39,6 +39,7 @@ from src.sql.validation.ast_checks import (
     _strip_nested_parens,
     _check_undefined_table_aliases,
     _check_ir_id_in_select_ast,
+    _check_uuid_pk_in_select_ast,
     _check_uuid_leaks_ast,
     _check_uuid_leaks_regex,
 )
@@ -77,6 +78,19 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
             "form_name":     "use module_name (ai_answers has no form_name column)",
             "label":         "ai_answers has no label column — JOIN ai_questions aq ON aa.element_id = aq.element_id, then filter aq.label = '...'",
             "active":        "ai_answers has no active column — filter via inspection_report: ir.active = true AND ir.status != 'DRAFT'",
+        },
+        # ai_audit_answers — audit's own flat answer table (confirmed live and populated
+        # 2026-07-29, 445 rows — supersedes an earlier assumption it was empty). Columns
+        # were renamed from a copy-pasted inspection-flavored schema: inspection_report_id
+        # -> audit_report_id, inspection_id -> audit_id, inspector_user_id -> auditor_user_id.
+        "ai_audit_answers": {
+            "answer_value":       "use answer_text (text) or answer_numeric (numeric)",
+            "form_name":          "use module_name (ai_audit_answers has no form_name column)",
+            "label":              "ai_audit_answers has no label column — JOIN ai_questions aq ON aaa.element_id = aq.element_id, then filter aq.label = '...'",
+            "active":             "ai_audit_answers has no active column — filter via audit_report: arep.active = true AND arep.status != 'DRAFT'",
+            "inspection_report_id": "renamed to audit_report_id (2026-07-29) — use aaa.audit_report_id",
+            "inspection_id":         "renamed to audit_id (2026-07-29) — use aaa.audit_id",
+            "inspector_user_id":     "renamed to auditor_user_id (2026-07-29) — use aaa.auditor_user_id",
         },
         "inspection_schedule": {
             # deepseek training bias: uses scheduled_date (past participle) instead of schedule_date
@@ -156,6 +170,61 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
     }
 
 
+    # audit_cycle's audit-domain counterpart to HALLUCINATED_IC_COLUMNS above —
+    # same underlying fact (no human-readable name column, confirmed live via
+    # SQLAlchemy inspection: id, active, created_by/on, modified_by/on, due_date,
+    # end_date, send_notification_to_auditors, start_date, status), caught live
+    # in eval_audit.py's PLAN-08 run burning 7 LLM calls / 21s repeatedly
+    # confabulating ac.name / acyc.name before finally dropping it.
+    HALLUCINATED_AC_COLUMNS: dict[str, str] = {
+        "name":       "does not exist on audit_cycle — cycles have no name, identify them by "
+                       "acyc.start_date / acyc.end_date / acyc.status instead",
+        "cycle_name": "does not exist on audit_cycle — cycles have no name, identify them by "
+                       "acyc.start_date / acyc.end_date / acyc.status instead",
+        "title":      "does not exist on audit_cycle — cycles have no name, identify them by "
+                       "acyc.start_date / acyc.end_date / acyc.status instead",
+        "code":       "does not exist on audit_cycle — cycles have no name, identify them by "
+                       "acyc.start_date / acyc.end_date / acyc.status instead",
+    }
+
+
+    # audit_plan does NOT have audit_universe_id — that FK only lives on
+    # audit_schedule. Caught live in eval_audit.py's PLAN-02 run: the model
+    # joined audit_universe directly off audit_plan, got a real Postgres
+    # UndefinedColumn error, and needed a get_schema round-trip to recover.
+    HALLUCINATED_AP_COLUMNS: dict[str, str] = {
+        "audit_universe_id": "does not exist on audit_plan — audit_universe_id only lives on "
+                              "audit_schedule. Either join via audit_schedule.audit_plan_id, or "
+                              "(for a plan's subject area) use audit_plan.category_id → "
+                              "audit_category instead.",
+    }
+
+
+    # auditor_portfolio has NO display-name column at all (confirmed live:
+    # id, active, created_by/on, modified_by/on, status, submitted_date,
+    # audit_cycle_id, user_id) — identify a portfolio by its owning auditor
+    # instead (JOIN users on po.user_id). Caught live in eval_audit.py's
+    # PORT-03 run: DeepSeek hallucinated po.portfolio_name TWICE — once before
+    # and once AFTER a get_schema round-trip confirmed the real column list —
+    # despite a correct in-context seed example showing the right pattern.
+    # This is a different trap from PORTFOLIO_AP_ALIAS_COLLISION (audit_rules.py),
+    # which only fires when the alias itself is wrong ('ap' instead of 'po');
+    # this one catches the hallucinated column regardless of alias.
+    HALLUCINATED_PO_COLUMNS: dict[str, str] = {
+        "name":           "does not exist on auditor_portfolio — it has no display-name column at "
+                           "all, identify it by its owning auditor instead (JOIN users u ON "
+                           "po.user_id = u.id)",
+        "portfolio_name": "does not exist on auditor_portfolio — it has no display-name column at "
+                           "all, identify it by its owning auditor instead (JOIN users u ON "
+                           "po.user_id = u.id)",
+        "title":          "does not exist on auditor_portfolio — that's audit_plan.title, a "
+                           "different table. Identify it by its owning auditor instead (JOIN users "
+                           "u ON po.user_id = u.id)",
+        "code":           "does not exist on auditor_portfolio — identify it by its owning auditor "
+                           "instead (JOIN users u ON po.user_id = u.id)",
+    }
+
+
     # Impossible JOIN conditions derived from join_graph — these columns
     # do not exist so the join can never be correct. Keyed by the bad pattern
     # (regex), value is the correct path.
@@ -184,6 +253,12 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
         #   ica.observation_id::text = aa.submission_id  (wrong side assignment)
         (r'\bica\.observation_id\s*::\s*text\s*=\s*aa\.submission_id\b',
          'Wrong cast — use: aa.submission_id = ica.observation_id::varchar'),
+        # Audit's mirror of the observation cast trap above — same wrong-side-assignment shape.
+        (r'\baca\.observation_id\s*::\s*text\s*=\s*aaa\.submission_id\b',
+         'Wrong cast — use: aaa.submission_id = aca.observation_id::varchar'),
+        (r'\baaa\.submission_id\s*::\s*uuid\s*=\s*aca\.observation_id\b',
+         'Wrong cast direction — cast the UUID side, not submission_id: '
+         'use aaa.submission_id = aca.observation_id::varchar'),
     ]
 
 
@@ -201,6 +276,24 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
         # purposes is its date span + status, not a derived label from an unrelated
         # date column (e.g. TO_CHAR of an individual inspection's submitted_on).
         "cycle_id":               ("inspection_cycle",   "ic",   "ic.start_date, ic.end_date, ic.status AS cycle_status"),
+    }
+
+
+    # Audit-domain alias → display-column map for the generalized UUID-PK-in-
+    # SELECT check (see _check_uuid_pk_in_select_ast) — confirmed live
+    # 2026-07-28 that the reasoning model routinely adds bare `.id` to its
+    # schema_hint across MULTIPLE audit tables (acyc.id, po.id, ap.id all
+    # observed leaking into real answers in the same eval run), not just the
+    # single inspection_report case this check originally covered. None
+    # means "no display substitute exists at all" — confirmed live neither
+    # audit_cycle nor auditor_portfolio has a name/code column.
+    AUDIT_UUID_PK_DISPLAY_MAP: dict[str, str | None] = {
+        "acyc": None,  # audit_cycle — identify by start_date/end_date/status, no id/name at all
+        "po":   None,  # auditor_portfolio — identify by its owning auditor (JOIN users on user_id) or cycle+status
+        "ap":   "ap.title",
+        "asch": "asch.schedule_id (the human-readable varchar display code)",
+        "arep": "arep.audit_id (the human-readable varchar display code)",
+        "aca":  "aca.corrective_action_id (the varchar display code — 'CA_DRAFT' pre-approval)",
     }
 
 
@@ -230,6 +323,56 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
         "block_po_pr_double_direct_join", "block_capex_left_join_multiplication",
         "block_po_pr_join_to_ir", "block_mitigative_uuid_wrong_target",
         "block_expenditure_as_conversion", "block_inspector_not_in_pattern",
+        # Group C — audit domain (get_audit_engine()'s registry, only ever
+        # consulted when SQLValidator was constructed with domain="audit").
+        # These existed in audit_rules.py but were never actually wired into
+        # live validation until now — see AgentOrchestrator's SQLValidator
+        # construction in orchestrator/loop.py.
+        "audit_block_dead_schedule_status", "audit_block_dead_report_audit_type",
+        "audit_block_report_missing_facility_project", "audit_block_responsible_join",
+        "audit_block_ca_report_join_wrong_column", "audit_block_ca_schedule_direct_join",
+        "audit_block_dead_portfolio_junctions", "audit_block_ca_draft_not_excluded",
+        "audit_block_ca_existence_check_adequacy_filtered",
+        "audit_block_conformity_spelling",
+        "audit_warn_ca_draft_literal", "audit_warn_role_name_auditor_filter",
+        "audit_block_review_completed_not_approved", "audit_block_portfolio_ap_alias",
+        # Group D — inspection domain's own review-table approval trap (shared
+        # table, same status='COMPLETED' != approved issue as Group C's audit
+        # rule above — see block_rules.py's inspection_block_review_completed_not_approved).
+        "inspection_block_review_completed_not_approved",
+        # Group E — audit domain's first AUTOCORRECT rules (implementation_status/
+        # adequacy_status "APPROVED" -> "APPROVE" typo-class enum fix).
+        "audit_autocorrect_implementation_status_approved",
+        "audit_autocorrect_adequacy_status_approved",
+        # Group F — review.entity_id must join to aca.id, never aca.corrective_action_id.
+        "audit_block_review_entity_id_corrective_action_id",
+        # Group G — a "show details"/follow-up query INNER-joining 2+ of the three
+        # independent classification axes (risk_level/impact/compliance) that the
+        # question didn't ask about silently zeroes the whole result (NULL FK on the
+        # unasked axis) instead of showing the rows' correction/cause text.
+        "audit_block_ca_multi_axis_inner_join",
+        # Group H — ORDER BY <date_col> DESC LIMIT N without NULLS LAST can return a
+        # NULL-dated row as "the most recent" (NULL sorts largest in DESC by default).
+        "audit_block_desc_limit_missing_nulls_last",
+        # Group I — CA-to-observation wrong-path guard, added 2026-07-29 alongside
+        # the ai_audit_answers form-answer capability (see AUDIT_BUSINESS_RULES
+        # "OBSERVATION -> CORRECTIVE ACTION").
+        "audit_block_ca_for_observation_wrong_path",
+        # Group J — GROUP BY aq.label is degenerate when WHERE already pins aq.label
+        # to one literal value (caught live 2026-07-29: "which observation triggered
+        # the most corrective actions" collapsed into one meaningless group instead
+        # of grouping by the actual answer text). Same trap exists for inspection's
+        # ai_answers/aq.label usage — see block_degenerate_label_groupby.
+        "audit_block_degenerate_label_groupby", "block_degenerate_label_groupby",
+        # Group L — mechanical NULLS LAST insertion (AUTOCORRECT), added 2026-07-29
+        # so the fix lands before validate() ever runs, instead of relying on
+        # DeepSeek to comply with the BLOCK rule's retry-prompt message.
+        "audit_autocorrect_desc_limit_nulls_last",
+        # Group K — inspection's own observation->MA wrong-path guard (block_rules.py's
+        # block_ma_for_observation_wrong_path, the audit twin of Group A/audit_block_ca_
+        # for_observation_wrong_path's Group I entry above) was defined but never added
+        # here — silently dead until discovered 2026-07-29 while wiring up its audit twin.
+        "block_ma_for_observation_wrong_path",
     })
 
 
@@ -240,9 +383,10 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
     _NON_RETRYABLE_CODES: frozenset = frozenset({"DML_BLOCKED"})
 
 
-    def __init__(self):
-        from src.sql.rules import get_engine
-        self._rules = get_engine()
+    def __init__(self, domain: str = "inspection"):
+        from src.sql.rules import get_engine, get_audit_engine
+        self.domain = domain
+        self._rules = get_audit_engine() if domain == "audit" else get_engine()
 
 
     def _registry_block_warn_issues(self, sql: str, question: str = "") -> list:
@@ -282,7 +426,12 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
 
 
     def _registry_autocorrects(self, sql: str) -> str:
-        """Consume business_rules.py's AUTOCORRECT registry rules, restricted to _CONSUMED_RULE_IDS."""
+        """Consume business_rules.py's AUTOCORRECT registry rules, restricted to
+        _CONSUMED_RULE_IDS. Called from cleaner.py's clean_sql(), which runs
+        before ast_repair()/validate() in generation.py's pipeline — so a
+        rule registered here (and added to _CONSUMED_RULE_IDS) lands before
+        validation ever sees the SQL, instead of relying on the SQL-gen model
+        to comply with a retry-prompt hint."""
         for rule in self._rules._autocorr_rules:
             if rule["id"] not in self._CONSUMED_RULE_IDS:
                 continue
@@ -445,6 +594,63 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
                         ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
                         break
 
+        # ── 5b3. Hallucinated columns on audit_cycle ──────────────────────
+        # Audit-domain counterpart to 5b2 — see HALLUCINATED_AC_COLUMNS.
+        _ac_table_used = bool(re.search(r'\baudit_cycle\b', sql_lower))
+        if _ac_table_used:
+            _ac_aliases: set[str] = {"audit_cycle"}
+            for _m in re.finditer(r'\baudit_cycle\s+(?:as\s+)?(\w+)', sql_lower):
+                _ac_aliases.add(_m.group(1))
+            for col, hint in self.HALLUCINATED_AC_COLUMNS.items():
+                for alias in _ac_aliases:
+                    if re.search(rf"\b{re.escape(alias)}\.{re.escape(col)}\b", sql_lower):
+                        issues.append(ValidationIssue(
+                            "HARD_FAIL", "WRONG_COLUMN",
+                            f"Column '{alias}.{col}' does not exist on audit_cycle — {hint}",
+                            detail=f"Hallucinated AC column: {col}",
+                        ))
+                        ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+                        break
+
+        # ── 5b4. Hallucinated columns on audit_plan ───────────────────────
+        # See HALLUCINATED_AP_COLUMNS — currently just audit_universe_id,
+        # which only exists on audit_schedule.
+        _ap_table_used = bool(re.search(r'\baudit_plan\b', sql_lower))
+        if _ap_table_used:
+            _ap_aliases: set[str] = {"audit_plan"}
+            for _m in re.finditer(r'\baudit_plan\s+(?:as\s+)?(\w+)', sql_lower):
+                _ap_aliases.add(_m.group(1))
+            for col, hint in self.HALLUCINATED_AP_COLUMNS.items():
+                for alias in _ap_aliases:
+                    if re.search(rf"\b{re.escape(alias)}\.{re.escape(col)}\b", sql_lower):
+                        issues.append(ValidationIssue(
+                            "HARD_FAIL", "WRONG_COLUMN",
+                            f"Column '{alias}.{col}' does not exist on audit_plan — {hint}",
+                            detail=f"Hallucinated AP column: {col}",
+                        ))
+                        ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+                        break
+
+        # ── 5b5. Hallucinated columns on auditor_portfolio ────────────────
+        # See HALLUCINATED_PO_COLUMNS — checks every alias regardless of
+        # whether it's the correct 'po' or the wrong 'ap', since the column
+        # doesn't exist under either name.
+        _po_table_used = bool(re.search(r'\bauditor_portfolio\b', sql_lower))
+        if _po_table_used:
+            _po_aliases: set[str] = {"auditor_portfolio"}
+            for _m in re.finditer(r'\bauditor_portfolio\s+(?:as\s+)?(\w+)', sql_lower):
+                _po_aliases.add(_m.group(1))
+            for col, hint in self.HALLUCINATED_PO_COLUMNS.items():
+                for alias in _po_aliases:
+                    if re.search(rf"\b{re.escape(alias)}\.{re.escape(col)}\b", sql_lower):
+                        issues.append(ValidationIssue(
+                            "HARD_FAIL", "WRONG_COLUMN",
+                            f"Column '{alias}.{col}' does not exist on auditor_portfolio — {hint}",
+                            detail=f"Hallucinated PO column: {col}",
+                        ))
+                        ValidatorStats.record("WRONG_COLUMN", is_retry_trigger=True)
+                        break
+
         # ── 5c. Impossible JOIN conditions (from join graph) ─────────────
         for _pattern, _correct in self.IMPOSSIBLE_JOIN_PATTERNS:
             if re.search(_pattern, sql_lower):
@@ -480,6 +686,13 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
                         detail="ir.inspection_id is the human-readable varchar '2026/04/ST001/INS001'",
                     ))
                     ValidatorStats.record("UUID_IN_SELECT", is_retry_trigger=True)
+
+        # ── 6a. audit-domain UUID PK exposed for display (same trap as #6,
+        # generalized) — confirmed live 2026-07-28 across multiple audit
+        # tables in the same eval run, not just one. AST-only (no regex
+        # fallback needed — sqlglot is a hard dependency of this module).
+        if self.domain == "audit" and _HAS_SQLGLOT:
+            _check_uuid_pk_in_select_ast(sql, issues, self.AUDIT_UUID_PK_DISPLAY_MAP)
 
         # ── 6b. Undefined table aliases — column refs to aliases not in FROM/JOIN ──
         # Catches: SELECT ... WHERE ir.active = true  with NO "FROM/JOIN ... ir"
@@ -622,7 +835,21 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
         # scoping filter is never flagged.
         if question and re.search(r"\bcycle\b", question, re.IGNORECASE):
             _cycle_leak: list[ValidationIssue] = []
-            _cycle_fk = {"cycle_id": self.UUID_FK_COLUMNS["cycle_id"]}
+            # Domain-scoped — audit_plan/audit_schedule's cycle FK is audit_cycle,
+            # not inspection_cycle. Using the inspection tuple unconditionally here
+            # meant `lookup_table.lower() in sql_lower` ("inspection_cycle" in sql)
+            # was ALWAYS False for audit SQL, so this HARD_FAILed every audit-domain
+            # query that selected/grouped cycle_id — even ones that correctly
+            # joined audit_cycle. Caught live via eval_audit.py's PLAN-08 run.
+            if self.domain == "audit":
+                _cycle_table, _cycle_alias = "audit_cycle", "acyc"
+                _cycle_fk = {"cycle_id": (
+                    _cycle_table, _cycle_alias,
+                    "acyc.start_date, acyc.end_date, acyc.status AS cycle_status",
+                )}
+            else:
+                _cycle_table, _cycle_alias = "inspection_cycle", "ic"
+                _cycle_fk = {"cycle_id": self.UUID_FK_COLUMNS["cycle_id"]}
             if _HAS_SQLGLOT:
                 _check_uuid_leaks_ast(sql, _cycle_fk, _cycle_leak)
             else:
@@ -630,8 +857,8 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
             if _cycle_leak:
                 issues.append(ValidationIssue(
                     "HARD_FAIL", "CYCLE_UUID_NO_JOIN",
-                    "Question asks about a cycle but SQL exposes cycle_id without "
-                    "joining inspection_cycle for its date span/status",
+                    f"Question asks about a cycle but SQL exposes cycle_id without "
+                    f"joining {_cycle_table} for its date span/status",
                     detail=_cycle_leak[0].detail,
                 ))
                 ValidatorStats.record("CYCLE_UUID_NO_JOIN", is_retry_trigger=True)
