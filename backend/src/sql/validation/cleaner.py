@@ -103,6 +103,12 @@ class CleanerMixin:
     # ------------------------------------------------------------------ #
 
     # Tables that have an `active` boolean soft-delete column.
+    # Audit-domain tables added per knowledge/semantics_registry.py's
+    # audit_columns_block(), which already documents every audit_* table as
+    # soft-delete-tracked for the LLM's benefit — this set is what actually
+    # activates the deterministic auto-repair (the "[ast-repair] Injected
+    # X.active = true" fix) for them, which previously only fired for
+    # inspection tables despite the fact being known and documented.
     _SOFT_DELETE_TABLES: frozenset = frozenset({
         "inspection_report", "inspection_corrective_action", "facility",
         "users", "inspection_type", "inspection_sub_type",
@@ -110,12 +116,26 @@ class CleanerMixin:
         "frequency_definition", "po_details", "pr_details", "risk_level",
         "client", "project", "country", "region", "entity", "organisation",
         "inspection_schedule", "impact",
+        # Audit domain
+        "audit_plan", "audit_schedule", "audit_report", "audit_corrective_action",
+        "audit_cycle", "auditor_portfolio", "auditor_portfolio_detail",
+        "audit_universe", "audit_category", "audit_sub_category", "audit_type",
+        "audit_forms", "compliance",
     })
 
 
     # Tables that NEVER have an active column — never inject for these.
     _NO_ACTIVE_TABLES: frozenset = frozenset({
-        "ai_answers", "ai_questions", "role", "user_roles",
+        "ai_answers", "ai_questions", "ai_audit_answers", "role", "user_roles",
+        # audit_form_* pure junction tables — bare 2-column mapping tables
+        # (audit_form_id + the other FK only, confirmed live) with no
+        # soft-delete tracking at all. Caught live in eval_audit.py's
+        # FORMS-04 run: the model reflexively added aff.active = true on
+        # audit_form_facilities and got a real Postgres "column does not
+        # exist" error — this set lets the cleaner strip it automatically
+        # instead of relying on the model to remember the exception.
+        "audit_form_facilities", "audit_form_countries", "audit_form_organizations",
+        "audit_form_regions", "audit_form_projects",
     })
 
 

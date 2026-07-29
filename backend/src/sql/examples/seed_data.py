@@ -180,12 +180,16 @@ LIMIT 100;
         'limit':  100,
     },
     {
-        'nl':     'mitigative actions at risk behind schedule on track not started progress breakdown MA progress status',
+        'nl':     'progress stage breakdown distribution all stages how many on track behind not started completed MA progress status counts by stage',
         'sql':    """\
 -- progress_stage = inspectee's self-reported SCHEDULE HEALTH (not severity!)
--- 'at risk' here = progress_stage='AT_RISK' — NOT risk_level='High'
+-- FULL BREAKDOWN across ALL stages — only use this shape when the user wants
+-- the whole distribution, not a filtered list of just one stage.
 -- Values: NOT_STARTED, ON_TRACK, BEHIND, AT_RISK, COMPLETED, CLOSE_WITH_DEFERRED
--- NULL progress_stage = not started yet (fresh MA)
+-- NULL progress_stage = not started yet (fresh MA) — that's why NOT_STARTED
+-- appears via COALESCE here. Do NOT reuse this COALESCE/NULL handling when the
+-- user filters to one specific stage (e.g. "just the at-risk ones") — see the
+-- dedicated 'at risk only' example below for that case.
 SELECT COALESCE(ica.progress_stage, 'NOT_STARTED') AS progress_stage,
        COUNT(*) AS ca_count
 FROM inspection_corrective_action ica
@@ -197,6 +201,27 @@ ORDER BY ca_count DESC;
         'domain': 'corrective_action',
         'intent': 'aggregate',
         'limit':  None,
+    },
+    {
+        'nl':     'list all mitigative actions that are at risk show corrective actions at risk only MAs at risk',
+        'sql':    """\
+-- 'at risk' = progress_stage = 'AT_RISK' ONLY.
+-- Do NOT OR in progress_stage IS NULL — NULL means NOT_STARTED, a separate
+-- bucket from AT_RISK. This is a filtered LIST of rows, not a breakdown.
+SELECT ica.corrective_action_id, ica.cause, ica.corrective_action,
+       ica.responsible, ica.status, ica.progress_stage,
+       fac.name AS facility_name, ir.inspection_id
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE ica.progress_stage = 'AT_RISK'
+  AND ica.active = true AND ir.active = true AND ir.status != 'DRAFT'
+ORDER BY ica.created_on DESC
+LIMIT 100;
+""",
+        'domain': 'corrective_action',
+        'intent': 'filter',
+        'limit':  100,
     },
     {
         'nl':     'income cost and profit by facility P&L per facility revenue spend by facility capex converted vs opex incurred per facility financial data PO PR purchase order purchase requisition by facility show POs and PRs at facility income and cost at specific facility',
@@ -240,7 +265,7 @@ LIMIT 100;
         'limit':  100,
     },
     {
-        'nl':     'financial data for specific facility PO income PR cost profit at one facility show POs and PRs for Al Ghadeer income and cost for facility name',
+        'nl':     'financial data for specific facility PO income PR cost profit at one facility show POs and PRs for a named facility income and cost for facility name',
         'sql':    """\
 -- Financial summary for a SPECIFIC facility by name
 -- CRITICAL: fac.name ILIKE filter goes in OUTER WHERE only — NEVER inside a CTE
@@ -268,7 +293,7 @@ SELECT fac.name AS facility_name,
 FROM facility fac
 LEFT JOIN po_agg po ON po.facility_id = fac.id
 LEFT JOIN pr_agg pr ON pr.facility_id = fac.id
-WHERE fac.name ILIKE '%Al Ghadeer%'
+WHERE fac.name ILIKE '%[FACILITY]%'
   AND fac.active = true;
 """,
         'domain': 'financial',
@@ -1416,7 +1441,7 @@ ORDER BY occurrences DESC LIMIT 20;
         'limit':  20,
     },
     {
-        'nl':     'show me questions with their scores for the last inspection by George',
+        'nl':     'show me questions with their scores for the last inspection by a named inspector',
         'sql':    """\
 SELECT aq.label AS question, aa.answer_text AS answer, aa.score
 FROM ai_answers aa
@@ -1425,7 +1450,7 @@ WHERE aa.inspection_report_id = (
     -- ir.id in subquery WHERE is CORRECT (UUID PK, not displayed)
     SELECT ir.id FROM inspection_report ir
     JOIN users u ON ir.inspector_user_id = u.id
-    WHERE u.first_name || ' ' || u.last_name ILIKE '%George%'
+    WHERE u.first_name || ' ' || u.last_name ILIKE '%[FULL_NAME]%'
       AND ir.status != 'DRAFT'
     ORDER BY ir.submitted_on DESC LIMIT 1
 )
@@ -2548,7 +2573,21 @@ LIMIT 1;
         'limit':  1,
     },
     {
-        'nl':     'capex breakdown for each mitigative action at facility PO PR per mitigative action conversion percentage per MA generated converted by mitigative action',
+        # NARROWED 2026-07-28 — confirmed live: the old keyword-stuffed nl
+        # text ("capex breakdown for each mitigative action at facility PO PR
+        # per mitigative action conversion percentage per MA generated
+        # converted by mitigative action") scored so high on generic "capex
+        # generated/converted per mitigative action" questions (no facility
+        # scoping at all) that it out-competed better-fitting examples on
+        # every single retry — even skip_top_n couldn't drop it because it
+        # was never actually ranked #1. DeepSeek then kept copying this
+        # example's `ir.status != 'DRAFT'` WHERE-clause fragment while
+        # dropping the `JOIN inspection_report ir` it depends on, burning 8
+        # retries / 76s / ~172K tokens on one real trace. Keep this nl text
+        # scoped tightly to what actually makes this example distinct — a
+        # SPECIFIC FACILITY filter — so it stops firing for facility-less
+        # capex/PO/PR questions.
+        'nl':     'capex PO and PR breakdown per mitigative action at one specific named facility, with conversion percentage',
         'sql':    """\
 -- Per-mitigative-action capex/PO/PR breakdown for a facility
 -- CRITICAL: pre-aggregate po_details and pr_details in SEPARATE CTEs before joining to ica.
@@ -2586,6 +2625,46 @@ ORDER BY ica.corrective_action_id;
         'domain': 'financial',
         'intent': 'per_row_breakdown',
         'limit':  None,
+    },
+    {
+        # Added 2026-07-28 alongside narrowing the facility-scoped example
+        # above — this is the actual shape for "list mitigative actions with
+        # capex generated/converted" when the question has NO facility
+        # filter: no inspection_report/facility JOIN needed at all, so there
+        # is no 'ir'/'fac' alias to accidentally leave a dangling reference
+        # to. Confirmed live: without a well-matched non-facility-scoped
+        # example, the model kept reaching for the facility-scoped one above
+        # and copying its ir.status filter without the JOIN it depends on.
+        'nl':     'list mitigative actions filtered by risk level with capex generated and capex converted, no facility filter',
+        'sql':    """\
+-- No facility/inspection_report JOIN needed here — the question doesn't ask
+-- about a facility, so there's nothing to filter or reference. Pre-aggregate
+-- po_details in its own CTE before joining (see the CRITICAL note on the
+-- facility-scoped version of this query above: a direct LEFT JOIN po_details
+-- into a GROUP BY multiplies rows and corrupts every SUM() when a mitigative
+-- action has more than one PO row).
+WITH po_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po
+    FROM po_details WHERE active = true GROUP BY 1
+)
+SELECT
+    ica.corrective_action_id,
+    ica.cause,
+    ica.corrective_action,
+    ica.status,
+    rl.name AS risk_level_name,
+    ica.capex                      AS capex_generated,
+    COALESCE(po.total_po, 0)       AS capex_converted
+FROM inspection_corrective_action ica
+JOIN risk_level rl ON ica.risk_level_id = rl.id
+LEFT JOIN po_agg po ON po.ica_id = ica.id
+WHERE rl.name = 'High' AND ica.active = true
+ORDER BY ica.corrective_action_id
+LIMIT 100;
+""",
+        'domain': 'financial',
+        'intent': 'filter',
+        'limit':  100,
     },
     {
         'nl':     'total capex generated converted lost and opex incurred',
@@ -3868,6 +3947,56 @@ ORDER BY capex_generated DESC;
         'domain': 'financial',
         'intent': 'aggregate',
         'limit':  None,
+    },
+
+    # ── review approval workflow — shared polymorphic table, also used by audit ──
+    {
+        'nl':     'who approved this inspection report',
+        'sql':    """\
+-- review is a shared, polymorphic approval log (entity_type + entity_id, no real FK).
+-- status='COMPLETED' alone is NOT 'approved' — a completed review can be a rejection
+-- (action='RETURN_FOR_MODIFICATION'). Must filter BOTH status AND action.
+SELECT ir.inspection_id, rev.level, rev.reviewed_on,
+       u.first_name || ' ' || u.last_name AS approved_by
+FROM review rev
+JOIN inspection_report ir ON rev.entity_id = ir.id AND rev.entity_type = 'INSPECTION_REPORT'
+JOIN users u ON rev.reviewed_by = u.id
+WHERE rev.status = 'COMPLETED' AND rev.action = 'APPROVE' AND ir.active = true
+ORDER BY rev.reviewed_on DESC
+LIMIT 100;
+""",
+        'domain': 'review',
+        'intent': 'filter',
+        'limit':  100,
+    },
+    {
+        'nl':     'how many levels of review does an inspection report go through',
+        'sql':    """\
+-- review_level table is NOT reliable here — it has NO row for INSPECTION_REPORT at all,
+-- despite INSPECTION_REPORT genuinely using 2 levels in real review data. Compute from
+-- review directly instead of joining/reading review_level.
+SELECT MAX(rev.level) AS max_level_seen, COUNT(DISTINCT rev.level) AS distinct_levels
+FROM review rev
+WHERE rev.entity_type = 'INSPECTION_REPORT';
+""",
+        'domain': 'review',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
+        'nl':     'which inspection reports are pending level 2 review',
+        'sql':    """\
+SELECT ir.inspection_id, ir.status, rev.reviewed_on
+FROM inspection_report ir
+JOIN review rev
+  ON rev.entity_id = ir.id AND rev.entity_type = 'INSPECTION_REPORT'
+WHERE rev.level = 2 AND rev.status = 'PENDING' AND ir.active = true
+ORDER BY ir.submitted_on ASC
+LIMIT 100;
+""",
+        'domain': 'review',
+        'intent': 'filter',
+        'limit':  100,
     },
 
     # ── Gauge seed examples ──────────────────────────────────────────────────

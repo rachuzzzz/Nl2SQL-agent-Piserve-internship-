@@ -47,32 +47,53 @@ def is_disambiguation_result(columns: list, sql: str = "") -> bool:
 # shape (agent/prompts.py: "same shape for client/project/organisation —
 # swap table and the FK"). Restricting to this known list (rather than
 # accepting any table name) avoids false-positives on unrelated 3-column
-# reports that happen to alias their columns id/name/inspection_count.
+# reports that happen to alias their columns id/name/<count>. facility/
+# project/client/organisation are shared tables between inspection and audit
+# (both domains join to them), so this list needs no per-domain entries.
 _ENTITY_DISAMBIGUATION_TABLES = {"facility", "project", "client", "organisation"}
+
+# Acceptable names for the 3rd (count) column — domain-neutral by design, not
+# a single hardcoded "inspection_count": audit's equivalent STEP 1 query
+# naturally aliases this as "schedule_count"/"audit_count" (matching that
+# domain's own vocabulary), never "inspection_count". Mirrors the same
+# small-acceptable-set pattern agent/orchestrator/synthesis.py's execute_sql
+# formatter already uses for the sibling people-disambiguation case
+# (`next((c for c in cols if c.lower() in {"inspection_count","count","total"})...)`)
+# — extended here with audit's own vocabulary. A closed set (not "any 3rd
+# column") keeps the original false-positive protection.
+_COUNT_COLUMN_NAMES = {"inspection_count", "schedule_count", "audit_count", "count", "total", "matches"}
 
 _FROM_TABLE_ALIAS_RE = re.compile(
     r"\bfrom\s+(\w+)\s+(?:as\s+)?(\w+)\b", re.IGNORECASE
 )
 
 
-def is_entity_disambiguation_result(columns: list, sql: str = "") -> tuple[str, str] | None:
+def is_entity_disambiguation_result(columns: list, sql: str = "") -> tuple[str, str, str] | None:
     """
     True-equivalent for the entity/facility-disambiguation shape (id + name +
-    inspection_count) — the sibling check to `is_disambiguation_result` for
+    a count column) — the sibling check to `is_disambiguation_result` for
     non-people STEP 1 count-checks ("4 facilities match 'adnoc'", "2 projects
-    match 'tower'", etc).
+    match 'tower'", etc). Domain-neutral: the count column can be named
+    anything in `_COUNT_COLUMN_NAMES` (inspection_count for the inspection
+    domain, schedule_count/audit_count for audit), not just the literal
+    "inspection_count" — see that constant's comment for why this matters.
 
-    Requires the exact 3-column shape plus an ILIKE filter, and — when `sql`
-    is available — parses the first `FROM <table> <alias>` in the query and
-    confirms `<table>` is one of the entities the AMBIGUOUS REFERENCE RULE
-    documents as using this template. Returns `(table, alias)` on match
-    (e.g. `("facility", "fac")`), `None` otherwise — the table/alias let
-    callers build a correct `{alias}.name ILIKE '%...%'` filter and correct
-    wording for whichever entity was actually searched, instead of assuming
-    facility.
+    Requires the id+name+count 3-column shape plus an ILIKE filter, and —
+    when `sql` is available — parses the first `FROM <table> <alias>` in the
+    query and confirms `<table>` is one of the entities the AMBIGUOUS
+    REFERENCE RULE documents as using this template. Returns
+    `(table, alias, count_col)` on match (e.g. `("facility", "fac",
+    "schedule_count")`), `None` otherwise — the table/alias let callers build
+    a correct `{alias}.name ILIKE '%...%'` filter and correct wording for
+    whichever entity was actually searched, instead of assuming facility;
+    count_col lets callers read the count value under whatever name the
+    query actually used instead of assuming "inspection_count".
     """
     col_set = {c.lower() for c in columns}
-    if col_set != {"id", "name", "inspection_count"}:
+    if not ({"id", "name"} <= col_set) or len(col_set) != 3:
+        return None
+    count_col_lower = next(iter(col_set - {"id", "name"}))
+    if count_col_lower not in _COUNT_COLUMN_NAMES:
         return None
     if not sql or "ilike" not in sql.lower():
         return None
@@ -82,7 +103,11 @@ def is_entity_disambiguation_result(columns: list, sql: str = "") -> tuple[str, 
     table, alias = m.group(1).lower(), m.group(2)
     if table not in _ENTITY_DISAMBIGUATION_TABLES:
         return None
-    return table, alias
+    # Recover the original-case column name (columns preserves SQL aliasing
+    # casing; row dicts are keyed by that same casing) so callers can do
+    # row.get(count_col) directly against execute_sql's result rows.
+    count_col = next(c for c in columns if c.lower() == count_col_lower)
+    return table, alias, count_col
 
 
 _SEARCH_TERM_RE = re.compile(r"ILIKE\s+'%([^%]+)%'", re.IGNORECASE)

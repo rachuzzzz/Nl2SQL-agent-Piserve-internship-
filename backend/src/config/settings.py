@@ -52,6 +52,10 @@ class Settings:
     reranker_model: str
     reranker_device: str
 
+    # Charts — safety cap for the fuller re-fetch charts use instead of the
+    # 50-row execute_sql cache (see charts/data_fetch.py's fetch_chart_data)
+    chart_fetch_cap: int
+
 
 def get_settings() -> Settings:
     g = os.getenv
@@ -77,4 +81,5 @@ def get_settings() -> Settings:
         permissions_api_url=g("PERMISSIONS_API_URL", "http://10.77.20.54:8083"),
         reranker_model=g("RERANKER_MODEL", "").strip(),
         reranker_device=g("RERANKER_DEVICE", "cpu"),
+        chart_fetch_cap=int(g("CHART_FETCH_CAP", "2000")),
     )

@@ -98,7 +98,7 @@ def _rules_advise(columns, rows):
                 reason = (
                     f"Daily {_lbl(vc)} across {len(set(day_like))} days — calendar heatmap"
                     if vc else
-                    f"Inspections per day across {len(set(day_like))} days — calendar heatmap"
+                    f"Entries per day across {len(set(day_like))} days — calendar heatmap"
                 )
                 return _result("calendar_heatmap", reason, "high", dc, nums, cfg)
 

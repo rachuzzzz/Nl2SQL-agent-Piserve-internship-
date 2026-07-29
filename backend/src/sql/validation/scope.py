@@ -49,6 +49,24 @@ class ScopeMixin:
         'users': {
             'mode': 'connected_users', 'own_col': 'id',
         },
+
+        # ── Audit domain — audit_schedule is the primary table (see
+        # AgentOrchestrator's scope_primary_table/scope_primary_alias,
+        # agent/domains.py's DOMAIN_REGISTRY). Mirrors the shapes above.
+        'audit_report': {
+            'mode': 'reverse', 'own_col': 'schedule_id',
+        },
+        'audit_corrective_action': {
+            'mode': 'reverse2', 'own_col': 'audit_id',
+            'mid_table': 'audit_report', 'mid_fk': 'schedule_id',
+        },
+        'auditor_portfolio': {
+            'mode': 'inspector_only', 'own_col': 'user_id', 'scope_col': 'auditor_id',
+        },
+        'auditor_portfolio_detail': {
+            'mode': 'inspector_only_reverse', 'own_col': 'portfolio_id',
+            'mid_table': 'auditor_portfolio', 'mid_col': 'user_id', 'scope_col': 'auditor_id',
+        },
     }
 
 
@@ -59,18 +77,19 @@ class ScopeMixin:
 
     @classmethod
     def _build_secondary_predicate(cls, tbl_name: str, spec: dict, alias: str,
-                                    scope_filter: str, ir_predicate: str) -> str:
+                                    scope_filter: str, ir_predicate: str,
+                                    primary_table: str = 'inspection_report') -> str:
         mode = spec['mode']
 
         if mode == 'forward':
             return (
                 f"{alias}.id IN (SELECT DISTINCT {spec['fk_col']} "
-                f"FROM inspection_report WHERE {ir_predicate} AND active = true)"
+                f"FROM {primary_table} WHERE {ir_predicate} AND active = true)"
             )
 
         if mode == 'reverse':
             return (
-                f"{alias}.{spec['own_col']} IN (SELECT id FROM inspection_report "
+                f"{alias}.{spec['own_col']} IN (SELECT id FROM {primary_table} "
                 f"WHERE {ir_predicate} AND active = true)"
             )
 
@@ -78,25 +97,27 @@ class ScopeMixin:
             return (
                 f"{alias}.{spec['own_col']} IN ("
                 f"SELECT _sc_mid.id FROM {spec['mid_table']} _sc_mid "
-                f"JOIN inspection_report _sc_ir ON _sc_mid.{spec['mid_fk']} = _sc_ir.id "
+                f"JOIN {primary_table} _sc_ir ON _sc_mid.{spec['mid_fk']} = _sc_ir.id "
                 f"WHERE {ir_predicate} AND _sc_mid.active = true AND _sc_ir.active = true)"
             )
 
         if mode == 'direct':
             pred = scope_filter
             for old_col, new_col in spec['column_map'].items():
-                pred = pred.replace(f"ir.{old_col}", f"{alias}.{new_col}")
+                pred = pred.replace(f"{spec.get('primary_alias', 'ir')}.{old_col}", f"{alias}.{new_col}")
             return pred
 
         if mode == 'inspector_only':
-            if 'inspector_user_id' not in scope_filter:
+            owner_col = spec.get('scope_col', 'inspector_user_id')
+            if owner_col not in scope_filter:
                 return "1 = 0"
             m = cls._USER_SUBQ_RE.search(scope_filter)
             subq = m.group(0) if m else "(SELECT NULL)"
             return f"{alias}.{spec['own_col']} = {subq}"
 
         if mode == 'inspector_only_reverse':
-            if 'inspector_user_id' not in scope_filter:
+            owner_col = spec.get('scope_col', 'inspector_user_id')
+            if owner_col not in scope_filter:
                 return "1 = 0"
             m = cls._USER_SUBQ_RE.search(scope_filter)
             subq = m.group(0) if m else "(SELECT NULL)"
@@ -106,25 +127,44 @@ class ScopeMixin:
             )
 
         if mode == 'connected_users':
+            # Derive the owner column(s) actually used in this predicate rather
+            # than hardcoding inspector_user_id/inspectee_user_id — domain-
+            # agnostic, since audit's equivalent predicate uses
+            # auditor_id/auditee_id instead. Match only `<col> = (SELECT` (the
+            # outer owner-column comparison), not the subquery's own
+            # `id_fk = <int>` — those two clauses are the only `<word> =`
+            # shapes this predicate ever contains.
+            found = re.findall(r'\b(\w+)\s*=\s*\(SELECT', ir_predicate)
+            owner_cols = found if found else ['inspector_user_id']
+            if len(owner_cols) == 1:
+                owner_cols = owner_cols * 2  # single-role — UNION of the same column twice is harmless
             return (
                 f"{alias}.{spec['own_col']} IN ("
-                f"SELECT inspector_user_id FROM inspection_report WHERE {ir_predicate} AND active = true "
+                f"SELECT {owner_cols[0]} FROM {primary_table} WHERE {ir_predicate} AND active = true "
                 f"UNION "
-                f"SELECT inspectee_user_id FROM inspection_report WHERE {ir_predicate} AND active = true)"
+                f"SELECT {owner_cols[1]} FROM {primary_table} WHERE {ir_predicate} AND active = true)"
             )
 
         raise ValueError(f"unknown secondary-scope mode {mode!r} for {tbl_name}")
 
 
-    def enforce_scope(self, sql: str, scope_filter: str) -> str:
+    def enforce_scope(
+        self, sql: str, scope_filter: str,
+        primary_table: str = 'inspection_report', primary_alias: str = 'ir',
+    ) -> str:
         """Hard data-visibility guard — AST-level injection, always applied.
 
         scope_filter == ''       → unrestricted, return SQL unchanged
         scope_filter == 'BLOCK'  → raise ValueError('SCOPE_BLOCKED')
         anything else            → inject into every Select that directly
-                                   FROM/JOINs inspection_report, or a
+                                   FROM/JOINs the primary table, or a
                                    secondary-scoped table (see
                                    _SECONDARY_SCOPE_TABLES / _build_secondary_predicate)
+
+        primary_table/primary_alias: the domain's hub table for row ownership
+        (inspection_report/ir for inspection — the default, unchanged
+        behavior; audit_schedule/asch for audit — see agent/domains.py's
+        DOMAIN_REGISTRY, threaded through from AgentOrchestrator).
 
         Raises ValueError('SCOPE_BLOCKED') — caller converts to HTTP 403.
         """
@@ -135,26 +175,26 @@ class ScopeMixin:
             raise ValueError('SCOPE_BLOCKED')
 
         sql_lower = sql.lower()
-        has_ir    = 'inspection_report' in sql_lower
+        has_primary = primary_table in sql_lower
 
-        # Strip "ir." alias so the predicate works inside a raw subquery
-        # (e.g., dual-role "(ir.inspector_user_id=X OR ir.inspectee_user_id=X)"
-        #  → "(inspector_user_id=X OR inspectee_user_id=X)")
-        ir_predicate = scope_filter.replace('ir.', '')
+        # Strip the primary alias prefix so the predicate works inside a raw
+        # subquery (e.g., dual-role "(ir.inspector_user_id=X OR
+        # ir.inspectee_user_id=X)" → "(inspector_user_id=X OR inspectee_user_id=X)")
+        primary_predicate = scope_filter.replace(f'{primary_alias}.', '')
 
         secondary_tables = [
             (tbl, spec) for tbl, spec in self._SECONDARY_SCOPE_TABLES.items()
             if tbl in sql_lower
         ]
 
-        if not has_ir and not secondary_tables:
+        if not has_primary and not secondary_tables:
             # Pure reference tables (frequency_definition, inspection_type, etc.)
             # carry no row-level owner — no scope injection required.
             return sql
 
         _log_security.info(
             "[SCOPE] injecting scope filter: via=%s filter=%s",
-            (["inspection_report"] if has_ir else []) + [t for t, _ in secondary_tables],
+            ([primary_table] if has_primary else []) + [t for t, _ in secondary_tables],
             scope_filter[:120],
         )
 
@@ -182,19 +222,20 @@ class ScopeMixin:
 
                 # Each SELECT node (including every branch of a UNION, and every
                 # subquery) is scoped independently — a query can mix a branch
-                # that joins inspection_report with a branch that reaches a
+                # that joins the primary table with a branch that reaches a
                 # secondary-scoped table bare; both must be caught on their
                 # own terms, not decided once for the whole statement.
                 def _inject(node):
                     if not isinstance(node, exp.Select):
                         return node
-                    if _alias_for_table(node, 'inspection_report'):
+                    if _alias_for_table(node, primary_table):
                         return node.where(scope_expr.copy())
                     for tbl_name, spec in secondary_tables:
                         alias = _alias_for_table(node, tbl_name)
                         if alias:
                             subq_where = self._build_secondary_predicate(
-                                tbl_name, spec, alias, scope_filter, ir_predicate
+                                tbl_name, spec, alias, scope_filter, primary_predicate,
+                                primary_table=primary_table,
                             )
                             node = node.where(
                                 sqlglot.parse_one(subq_where, dialect="postgres")
@@ -219,8 +260,11 @@ class ScopeMixin:
             r"\b(ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT)\b", sql_work, re.IGNORECASE
         )
 
-        parts = ([scope_filter] if has_ir else []) + [
-            self._build_secondary_predicate(tbl_name, spec, tbl_name, scope_filter, ir_predicate)
+        parts = ([scope_filter] if has_primary else []) + [
+            self._build_secondary_predicate(
+                tbl_name, spec, tbl_name, scope_filter, primary_predicate,
+                primary_table=primary_table,
+            )
             for tbl_name, spec in secondary_tables
         ]
         fragment = " AND ".join(f"({p})" for p in parts)

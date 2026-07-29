@@ -19,6 +19,7 @@ class ChartRequest(BaseModel):
     chart_type: str | None = None   # None → auto-advise; string → force that type
     x_col:      str | None = None   # override label column (column picker)
     y_cols:     list[str] | None = None  # override value columns (column picker)
+    view_all:   bool = False   # drill-down — skip top-N aggregation, return the full fetched dataset
 
 class StepInfo(BaseModel):
     tool: str
@@ -53,6 +54,15 @@ class ChartConfig(BaseModel):
     alternatives: list[dict] = []
     x_label: str | None = None      # category / x-axis column name
     y_labels: list[str] = []        # value column name(s)
+    # Top-N truncation metadata — mirrors ResultData's total_count/truncated
+    # pattern. For aggregated chart types (bar/pie/radar/... — see
+    # charts/advisor/public.py's _TOPN_BY_TYPE) rows_shown/rows_total count
+    # CATEGORIES (post-aggregation), not raw rows, since that's what's
+    # visually truncated. rows_shown == rows_total when nothing was truncated.
+    rows_shown: int | None = None
+    rows_total: int | None = None
+    is_aggregated: bool = False
+    can_view_all: bool = False      # true when a fuller/un-aggregated fetch is available via ChartRequest.view_all
 
 class DashboardData(BaseModel):
     show: bool = False

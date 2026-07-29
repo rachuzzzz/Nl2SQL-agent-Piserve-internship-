@@ -25,9 +25,9 @@ User: "show mitigative actions that are at risk"
 Turn 1: {"thought": "'at risk' = progress_stage = 'AT_RISK' (inspectee's schedule health). NOT risk_level = 'High' — that is severity, a different concept.", "tool": "generate_sql", "args": {"question": "mitigative actions at risk behind schedule progress", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.progress_stage, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.progress_stage = 'AT_RISK' AND ica.active = true AND ir.active = true LIMIT 100;"}}
 
 ─── MAs "at <company-like-name>" — facility, NOT organisation ───
-User: "mitigative actions at adnoc"
-Turn 1: {"thought": "'adnoc' looks like a company/brand name, but 'at X' always means fac.name here, not organisation — facilities are routinely named after their parent brand (e.g. 'Adnoc Schools- Ghayathi'). The organisation table is a separate, narrower concept and is almost never what 'at X' means. Filter by fac.name ILIKE, not org.name.", "tool": "generate_sql", "args": {"question": "mitigative actions at facilities matching adnoc", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE fac.name ILIKE '%adnoc%' AND ica.active = true AND ir.active = true AND ir.status != 'DRAFT' ORDER BY ica.created_on DESC LIMIT 100;"}}
-NEVER: WHERE org.name ILIKE '%adnoc%' — silently returns 0 rows since the
+User: "mitigative actions at [COMPANY]"
+Turn 1: {"thought": "'[COMPANY]' looks like a company/brand name, but 'at X' always means fac.name here, not organisation — facilities are routinely named after their parent brand (e.g. '[COMPANY] Schools - [LOCATION]'). The organisation table is a separate, narrower concept and is almost never what 'at X' means. Filter by fac.name ILIKE, not org.name.", "tool": "generate_sql", "args": {"question": "mitigative actions at facilities matching [COMPANY]", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.corrective_action, ica.responsible, ica.status, fac.name AS facility_name FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE fac.name ILIKE '%[COMPANY]%' AND ica.active = true AND ir.active = true AND ir.status != 'DRAFT' ORDER BY ica.created_on DESC LIMIT 100;"}}
+NEVER: WHERE org.name ILIKE '%[COMPANY]%' — silently returns 0 rows since the
   match is encoded in the facility name, not an organisation record.
 """,
     },
@@ -115,7 +115,7 @@ Turn 1: {"thought": "Total capex summary — use scalar subqueries, no JOIN. mit
             r"|\b(facility|site|location)\b.{0,50}\b(po|pr|purchase|financial|income|cost|profit)\b"
         ),
         "text": """\\u2500\u2500\u2500 Financial data (PO/PR) for a specific facility \u2500\u2500\u2500
-User: "show financial data for Al Ghadeer" / "PO and PR amounts at [facility]" / "income and cost for [facility]"
+User: "show financial data for [facility]" / "PO and PR amounts at [facility]" / "income and cost for [facility]"
 CRITICAL JOIN PATH: po_details.mitigative_action_uuid = ica.id  (ica.id is the UUID primary key)
 NEVER: po.mitigative_action_uuid = ica.corrective_action_id  \u2014 corrective_action_id is VARCHAR, causes type error
 NEVER: po.mitigative_action_uuid = ir.id  \u2014 matches zero rows
@@ -126,7 +126,7 @@ User: "show total capex and opex by facility" / "capex and opex breakdown by sit
 Turn 1: {"thought": "User wants capex/opex totals grouped by ALL facilities \u2014 no specific facility filter. Pre-aggregate po_details and pr_details in CTEs first to avoid fan-out, then JOIN and GROUP BY fac.id.", "tool": "generate_sql", "args": {"question": "total capex and opex by all facilities CTE", "schema_hint": "WITH po_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS capex_converted FROM po_details WHERE active = true GROUP BY 1), pr_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS opex_incurred FROM pr_details WHERE active = true GROUP BY 1) SELECT fac.name AS facility_name, COALESCE(SUM(ica.capex),0) AS capex_generated, COALESCE(SUM(po.capex_converted),0) AS capex_converted, COALESCE(SUM(pr.opex_incurred),0) AS opex_incurred FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id LEFT JOIN po_agg po ON po.ica_id = ica.id LEFT JOIN pr_agg pr ON pr.ica_id = ica.id WHERE ica.active = true AND ir.active = true AND fac.active = true AND ir.status != 'DRAFT' GROUP BY fac.id, fac.name ORDER BY capex_generated DESC LIMIT 100;"}}
 
 \u2500\u2500\u2500 Financial data for a specific named facility \u2500\u2500\u2500
-User: "show financial data for Al Ghadeer" / "PO and PR amounts at [facility]" / "income and cost for [facility]"
+User: "show financial data for [facility]" / "PO and PR amounts at [facility]" / "income and cost for [facility]"
 Turn 1: {"thought": "Financial data for a facility \u2014 must join po_details and pr_details via ica.id (UUID PK), NOT ica.corrective_action_id (varchar). Pre-aggregate in CTEs to avoid fan-out.", "tool": "generate_sql", "args": {"question": "financial data PO PR income cost for facility", "schema_hint": "WITH po_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_income FROM po_details WHERE active = true GROUP BY 1), pr_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_cost FROM pr_details WHERE active = true GROUP BY 1) SELECT fac.name AS facility_name, COALESCE(SUM(po.total_income),0) AS income, COALESCE(SUM(pr.total_cost),0) AS cost, COALESCE(SUM(po.total_income),0) - COALESCE(SUM(pr.total_cost),0) AS profit FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id LEFT JOIN po_agg po ON po.ica_id = ica.id LEFT JOIN pr_agg pr ON pr.ica_id = ica.id WHERE fac.name ILIKE '%[FACILITY]%' AND ica.active = true AND ir.active = true AND fac.active = true GROUP BY fac.id, fac.name;"}}
 """,
     },
@@ -285,8 +285,8 @@ Turn 1: {"thought": "Total score = SUM of ai_answers.score per inspection. NOT i
         ),
         "text": """\
 ─── Form answers: observation text at a specific facility ───
-User: "what did inspectors write in the observation field for Al Ghadeer?"
-Turn 1: {"thought": "Need ai_answers filtered by question label='Observation' AND facility='Al Ghadeer'. Must join: ai_answers → ai_questions (label) → inspection_report → facility. Exclude 'Observation Type' and 'Unique Identifier' — only the free-text Observation field.", "tool": "generate_sql", "args": {"question": "observation text at Al Ghadeer facility", "schema_hint": "SELECT aa.answer_text AS observation, ir.inspection_id, ir.submitted_on FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Observation' AND fac.name ILIKE '%Al Ghadeer%' AND aa.answer_text IS NOT NULL AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
+User: "what did inspectors write in the observation field for [FACILITY]?"
+Turn 1: {"thought": "Need ai_answers filtered by question label='Observation' AND facility='[FACILITY]'. Must join: ai_answers → ai_questions (label) → inspection_report → facility. Exclude 'Observation Type' and 'Unique Identifier' — only the free-text Observation field.", "tool": "generate_sql", "args": {"question": "observation text at [FACILITY] facility", "schema_hint": "SELECT aa.answer_text AS observation, ir.inspection_id, ir.submitted_on FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Observation' AND fac.name ILIKE '%[FACILITY]%' AND aa.answer_text IS NOT NULL AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 100;"}}
 """,
     },
     {
@@ -341,9 +341,9 @@ Turn 1: {"thought": "Need most recent inspection that has Inspection Form answer
         ),
         "text": """\
 ─── Scores for a named inspector's last inspection ───
-User: "show questions and scores for the last inspection by George"
+User: "show questions and scores for the last inspection by [NAME]"
 ROUTING RULE: ALWAYS use generate_sql here. NEVER use get_answers — it cannot filter by inspector name.
-Turn 1: {"thought": "Need ai_answers.score filtered to George's last inspection. Must use generate_sql with subquery to find the inspection_report_id first.", "tool": "generate_sql", "args": {"question": "questions and scores for last inspection by George", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer, aa.score FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT ir.id FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%George%') AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' AND aa.score IS NOT NULL ORDER BY aa.score DESC LIMIT 100;"}}
+Turn 1: {"thought": "Need ai_answers.score filtered to [NAME]'s last inspection. Must use generate_sql with subquery to find the inspection_report_id first.", "tool": "generate_sql", "args": {"question": "questions and scores for last inspection by [NAME]", "schema_hint": "SELECT aq.label AS question, aa.answer_text AS answer, aa.score FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id WHERE aa.inspection_report_id = (SELECT ir.id FROM inspection_report ir JOIN users u ON ir.inspector_user_id = u.id WHERE (u.first_name ILIKE '%[NAME]%' OR u.last_name ILIKE '%[NAME]%') AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 1) AND aa.module_name = 'Inspection Form' AND aa.score IS NOT NULL ORDER BY aa.score DESC LIMIT 100;"}}
 """,
     },
     {
@@ -420,9 +420,9 @@ Turn 1: {"thought": "Impact is multi-select category, not severity. 'High impact
         "question_pattern": r"(?i)\bdeviations?\b",
         "text": """\
 ─── Count deviations at a facility ───
-User: "how many deviations were raised at Al Ghadeer this year?"
+User: "how many deviations were raised at [FACILITY] this year?"
 ROUTING RULE: 'Deviation' is a KNOWN answer value for 'Observation Type'. Route directly to generate_sql — do NOT call search_questions or semantic_search first.
-Turn 1: {"thought": "'Deviation' is the known answer value for aq.label='Observation Type'. Route directly to generate_sql — no question lookup needed.", "tool": "generate_sql", "args": {"question": "count deviations at Al Ghadeer this year", "schema_hint": "SELECT COUNT(*) AS deviation_count FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Observation Type' AND aa.answer_text ILIKE '%Deviation%' AND aa.module_name = 'Inspection Form' AND fac.name ILIKE '%Al Ghadeer%' AND ir.active = true AND ir.status != 'DRAFT' AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE);"}}
+Turn 1: {"thought": "'Deviation' is the known answer value for aq.label='Observation Type'. Route directly to generate_sql — no question lookup needed.", "tool": "generate_sql", "args": {"question": "count deviations at [FACILITY] this year", "schema_hint": "SELECT COUNT(*) AS deviation_count FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Observation Type' AND aa.answer_text ILIKE '%Deviation%' AND aa.module_name = 'Inspection Form' AND fac.name ILIKE '%[FACILITY]%' AND ir.active = true AND ir.status != 'DRAFT' AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE);"}}
 """,
     },
     {

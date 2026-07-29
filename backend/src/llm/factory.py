@@ -16,18 +16,23 @@ from src.llm.ollama import build_ollama_client
 def get_reasoning_llm(model: str, base_url: str):
     """
     Reasoning/planning LLM. num_ctx=20000 fits schema + business rules +
-    Tier-2 worked examples; "think" disabled to save ~8-15s/call on Qwen3's
-    internal chain-of-thought (see agent/orchestrator/loop.py history).
+    Tier-2 worked examples; thinking disabled via the dedicated `thinking`
+    param (NOT additional_kwargs — see llm/ollama.py's build_ollama_client
+    docstring for why that silently didn't work before) to save ~8-15s/call
+    on Qwen3's internal chain-of-thought (see agent/orchestrator/loop.py
+    history) and to avoid it burning the whole num_predict budget on
+    <thinking> with zero tokens left for the actual answer — confirmed live
+    via agent/domain_router.py's Tier-3 classifier prompt.
     """
     return build_ollama_client(
         model=model,
         base_url=base_url,
         temperature=0.2,
         request_timeout=120.0,
+        thinking=False,
         additional_kwargs={
             "num_predict": 1024,
             "num_ctx": 20000,
-            "think": False,
         },
     )
 

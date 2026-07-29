@@ -6,12 +6,13 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
 - Use ILIKE for partial text matching on labels and names. NEVER use LIKE.
 - Use ILIKE for answer_text matching: aa.answer_text ILIKE '%High%' (answer_text stores plain strings but ILIKE is safer for partial matches).
 - FULL NAME SEARCH (first + last): ALWAYS use the concatenated column:
-    WHERE (u.first_name || ' ' || u.last_name) ILIKE '%George Smith%'
-  NEVER split: WHERE (u.first_name ILIKE '%George%' OR u.last_name ILIKE '%Smith%')
-  The OR split matches anyone named George OR anyone surnamed Smith — wrong.
+    WHERE (u.first_name || ' ' || u.last_name) ILIKE '%[FULL_NAME]%'
+  NEVER split: WHERE (u.first_name ILIKE '%[FIRST]%' OR u.last_name ILIKE '%[LAST]%')
+  The OR split matches anyone with that first name OR anyone with that surname — wrong.
   Only use separate first_name/last_name ILIKE when the user provides a single partial word (not a full name).
-  Single partial word example: WHERE (u.first_name ILIKE '%george%' OR u.last_name ILIKE '%george%') — OK.
-  Full name example: WHERE (u.first_name || ' ' || u.last_name) ILIKE '%George Smith%' — required.
+  Single partial word example: WHERE (u.first_name ILIKE '%[word]%' OR u.last_name ILIKE '%[word]%') — OK.
+  This rule only applies when the question itself names a specific person — do NOT invent a
+  name filter when the question doesn't reference one (e.g. "show all inspections").
 - Include LIMIT 100 unless aggregating.
 - For "top / most / best / worst" ranking queries, use LIMIT 10 (even if the user asks "which one" singular). This provides context for charts and lists while still highlighting the #1 result.
 - NEVER use SELECT *. Specify only the columns the user needs.

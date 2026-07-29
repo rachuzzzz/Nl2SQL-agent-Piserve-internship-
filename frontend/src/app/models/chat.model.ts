@@ -46,6 +46,13 @@ export interface ChartConfig {
   alternatives:     ChartAlt[];
   x_label?:         string | null;
   y_labels?:        string[];
+  // Top-N truncation metadata — see ChartConfig in backend/src/api/schemas.py.
+  // For aggregated chart types these count CATEGORIES (post-aggregation), not
+  // raw rows. rows_shown == rows_total when nothing was truncated.
+  rows_shown?:      number | null;
+  rows_total?:      number | null;
+  is_aggregated?:   boolean;
+  can_view_all?:    boolean;
 }
 
 export interface ColumnMeta {
@@ -61,6 +68,7 @@ export interface ChartRequest {
   chart_type?: string | null;
   x_col?:      string | null;
   y_cols?:     string[] | null;
+  view_all?:   boolean;
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────

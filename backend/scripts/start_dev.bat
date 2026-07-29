@@ -24,11 +24,13 @@ echo Repo root: %REPO_ROOT%
 echo.
 
 REM ---- start backend (activates venv if present) ----
+REM PYTHONUTF8=1 forces UTF-8 stdout so startup logging with unicode
+REM characters (checkmarks, etc.) doesn't crash on the cp1252 console.
 set "VENV_ACTIVATE=%REPO_ROOT%\venv\Scripts\activate.bat"
 if exist "%VENV_ACTIVATE%" (
-    start "InspectAI Backend" cmd /k "cd /d "%REPO_ROOT%" && call "%VENV_ACTIVATE%" && uvicorn src.api.app:app --app-dir backend --port %BACKEND_PORT%"
+    start "InspectAI Backend" cmd /k "cd /d "%REPO_ROOT%" && call "%VENV_ACTIVATE%" && set "PYTHONUTF8=1" && python -m uvicorn src.api.app:app --app-dir backend --port %BACKEND_PORT%"
 ) else (
-    start "InspectAI Backend" cmd /k "cd /d "%REPO_ROOT%" && uvicorn src.api.app:app --app-dir backend --port %BACKEND_PORT%"
+    start "InspectAI Backend" cmd /k "cd /d "%REPO_ROOT%" && set "PYTHONUTF8=1" && python -m uvicorn src.api.app:app --app-dir backend --port %BACKEND_PORT%"
 )
 
 echo Backend launching in a separate window...

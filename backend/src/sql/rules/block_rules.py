@@ -348,6 +348,7 @@ BLOCK_RULES: list[dict] = [
     {
         "id":          "block_ma_for_observation_wrong_path",
         "type":        BLOCK,
+        "code":        "MA_OBSERVATION_WRONG_PATH",
         "description": (
             "When fetching MAs for a specific observation text (ILIKE), must use "
             "observation_id → submission_id path, not inspection join."
@@ -366,6 +367,33 @@ BLOCK_RULES: list[dict] = [
             "aa.submission_id = ica.observation_id::varchar — NOT via ica.inspection_id = ir.id. "
             "The inspection join returns ALL MAs in the inspection; the observation_id join "
             "returns only MAs directly linked to that specific observation."
+        ),
+    },
+
+    {
+        "id":          "block_degenerate_label_groupby",
+        "type":        BLOCK,
+        "code":        "DEGENERATE_LABEL_GROUPBY",
+        "description": (
+            "GROUP BY aq.label is meaningless when WHERE already pins aq.label to one "
+            "literal value — collapses every row into a single bucket instead of grouping "
+            "by the actual answer content (e.g. which specific observation recurred)."
+        ),
+        # Caught live 2026-07-29 (audit domain, same shared ai_questions/aq alias):
+        # "which observation triggered the most MAs/CAs" generated
+        # WHERE aq.label = 'X' ... GROUP BY aq.label — every matching row already has
+        # aq.label = 'X', so GROUP BY aq.label produces exactly one group; COUNT(*)
+        # just counts total matching rows, not "which observation" at all.
+        "sql_pattern": (
+            r"(?=.*\baq\.label\s*=\s*'[^']+')"
+            r"(?=.*\bgroup\s+by\b[^;]*\baq\.label\b)"
+        ),
+        "message": (
+            "WRONG GROUP BY: aq.label is already pinned to one value by the WHERE filter, "
+            "so 'GROUP BY aq.label' collapses everything into a single meaningless group. "
+            "Group by the actual answer instead, e.g.: "
+            "GROUP BY aa.id, aa.answer_text, ir.inspection_id "
+            "(or aaa.id, aaa.answer_text, arep.audit_id for audit)."
         ),
     },
 
@@ -562,7 +590,7 @@ BLOCK_RULES: list[dict] = [
         "type":        BLOCK,
         "description": "ica.impact does not exist — only impact_id (UUID FK) exists.",
         "sql_pattern": r"\b(ica|inspection_corrective_action)\.impact\b(?!_id)",
-        "message":     "WRONG COLUMN: ica.impact does not exist. JOIN impact im ON ica.impact_id = im.id WHERE im.name ILIKE '%Non Confirmity%'",
+        "message":     "WRONG COLUMN: ica.impact does not exist. JOIN impact im ON ica.impact_id = im.id WHERE im.name ILIKE '%Financial%'",
     },
 
     # ICA ghost columns proven in debug traces — never exist on inspection_corrective_action
@@ -654,18 +682,7 @@ BLOCK_RULES: list[dict] = [
         "type":        BLOCK,
         "description": "impact_id is a UUID FK — never compare to a string.",
         "sql_pattern": r"\bimpact_id\s*(?:=|ILIKE|LIKE|!=|<>)\s*'(?![0-9a-f]{8}-)[^']*'",
-        "message":     "WRONG COMPARISON: impact_id is a UUID FK. JOIN impact im ON ica.impact_id = im.id WHERE im.name ILIKE '%Non Confirmity%'. NOTE: spelled 'Confirmity' not 'Conformity'.",
-    },
-
-
-    # ── Impact table spelling typo ────────────────────────────────────────────
-    {
-        "id":          "block_conformity_spelling",
-        "type":        BLOCK,
-        "description": "The impact table stores 'Non Confirmity' (with i) — 'conformity' returns zero rows.",
-        "sql_pattern": r"\bconformity\b",
-        "table_guard": "impact",
-        "message":     "DATA TYPO: impact table stores 'Non Confirmity' (NOT 'Non Conformity'). ILIKE '%conformity%' always returns zero rows. Use: WHERE im.name ILIKE '%Non Confirmity%'",
+        "message":     "WRONG COMPARISON: impact_id is a UUID FK. JOIN impact im ON ica.impact_id = im.id WHERE im.name ILIKE '%Financial%'",
     },
 
 
@@ -793,6 +810,44 @@ BLOCK_RULES: list[dict] = [
             "with JOIN users u ON ir.inspectee_user_id = u.id. "
             "ica.responsible is an enum column, not a person."
         ),
+    },
+
+    # ── review approval workflow — status='COMPLETED' != approved ───────────
+    # Mirrors audit_rules.py's audit_block_review_completed_not_approved —
+    # 'review' is the SAME shared polymorphic table in both domains, so the
+    # same trap applies: a completed review can be a rejection
+    # (action = 'RETURN_FOR_MODIFICATION'), not an approval. See
+    # schema_introspector.py's BUSINESS_RULES for the confirmed-live numbers.
+    {
+        "id":          "inspection_block_review_completed_not_approved",
+        "type":        BLOCK,
+        "code":        "REVIEW_COMPLETED_NOT_APPROVED",
+        "description": (
+            "review.status = 'COMPLETED' does NOT mean approved — a completed review can "
+            "have action = 'RETURN_FOR_MODIFICATION' (rejected/sent back) instead of "
+            "'APPROVE'. 'who/which approved' questions must filter "
+            "status = 'COMPLETED' AND action = 'APPROVE', not status alone."
+        ),
+        # MUST be anchored with ^ — see audit_rules.py's identical rule for why:
+        # without it, re.search() can find a starting position PAST an earlier
+        # exclude-word (e.g. "rejections") where the negative lookahead no longer
+        # sees it while a later approve-word is still ahead, producing a false match.
+        "question_pattern": (
+            r"(?i)^(?=.*\bapprov\w*\b)"
+            r"(?!.*\b(reject\w*|return\w*|declin\w*|pending)\b)"
+        ),
+        "sql_pattern": (
+            r"(?=.*\b(?:FROM|JOIN)\s+review\b)"
+            r"(?=.*\bstatus\s*=\s*'COMPLETED')"
+            r"(?!.*\baction\s*=\s*'APPROVE')"
+        ),
+        "message": (
+            "BLOCKED: review.status = 'COMPLETED' includes REJECTED reviews "
+            "(action = 'RETURN_FOR_MODIFICATION'), not just approved ones. For "
+            "'who/which approved' questions add AND action = 'APPROVE' alongside "
+            "status = 'COMPLETED'."
+        ),
+        "hard_fail": True,
     },
 
 ]

@@ -263,6 +263,7 @@ class RulesEngine:
 # immediately rather than at first query.
 
 _default_engine: RulesEngine | None = None
+_audit_engine: RulesEngine | None = None
 
 
 def get_engine() -> RulesEngine:
@@ -270,6 +271,20 @@ def get_engine() -> RulesEngine:
     if _default_engine is None:
         _default_engine = RulesEngine()
     return _default_engine
+
+
+def get_audit_engine() -> RulesEngine:
+    """Audit-domain equivalent of get_engine() — a separate cached singleton
+    over AUDIT_REGISTRY (audit_rules.py), never merged with the inspection
+    REGISTRY. See agent/domains.py's DOMAIN_REGISTRY."""
+    global _audit_engine
+    if _audit_engine is None:
+        from src.sql.rules.audit_rules import (
+            AUDIT_BLOCK_RULES, AUDIT_WARN_RULES, AUDIT_AUTOCORRECT_RULES, AUDIT_INJECT_RULES,
+        )
+        audit_registry = AUDIT_BLOCK_RULES + AUDIT_WARN_RULES + AUDIT_AUTOCORRECT_RULES + AUDIT_INJECT_RULES
+        _audit_engine = RulesEngine(rules=audit_registry)
+    return _audit_engine
 
 
 if __name__ == "__main__":

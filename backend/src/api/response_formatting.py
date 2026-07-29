@@ -309,10 +309,7 @@ def paginate_sql(sql: str, page: int, page_size: int) -> str:
     Replace (or append) LIMIT/OFFSET in an SQL query for the requested page.
     page is 0-based.
     """
+    from src.sql.execution import _strip_limit_offset
     offset = page * page_size
-    # Remove existing LIMIT / OFFSET
-    stripped = re.sub(
-        r'\bLIMIT\s+\d+(\s+OFFSET\s+\d+)?\s*;?\s*$', '',
-        sql.strip(), flags=re.IGNORECASE
-    ).strip().rstrip(';')
+    stripped = _strip_limit_offset(sql)
     return f"{stripped}\nLIMIT {page_size} OFFSET {offset};"

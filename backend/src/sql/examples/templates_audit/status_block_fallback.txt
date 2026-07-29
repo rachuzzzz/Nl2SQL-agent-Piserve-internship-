@@ -1,0 +1,22 @@
+-- DRAFT RECORDS ARE NEVER COUNTED — GLOBAL RULE:
+--   DRAFT audit plans are incomplete — they must NEVER appear in any count, list, average, or aggregate.
+--
+-- STATUS GROUPINGS — always bucket into two categories (never expose raw status names to user):
+--   conducted  = status IN ('SUBMITTED','RETURNED_FOR_MODIFICATION') — in-flight
+--   completed  = status = 'APPROVED'                                 — fully approved
+--
+-- DEFAULT for "total audit plans / how many audit plans / plans in <month>":
+--   Show as TWO-ROW summary using CASE grouping:
+--     CASE WHEN ap.status = 'APPROVED' THEN 'completed' ELSE 'conducted' END AS category
+--   NEVER show raw status breakdown (SUBMITTED/RETURNED_FOR_MODIFICATION/etc) unless user explicitly asks
+--   NEVER use status IN ('APPROVED','SUBMITTED') — that mixes conducted and completed
+--   NEVER use status != 'DRAFT' alone for conducted — APPROVED is not conducted
+--
+-- audit_report.status — a SEPARATE lifecycle from audit_plan.status above:
+--   conducted  = status = 'SUBMITTED'                          — audit carried out, report filed
+--   completed  = status IN ('CLOSED','CLOSED_WITH_EXCEPTION')  — fully closed out
+--   DISAMBIGUATION: a BARE "audit"/"the audit" (no "plan" qualifier) means
+--   audit_report — an actual audit EVENT with a report, form answers,
+--   corrective actions, a facility. "audit plan" (explicit) means audit_plan
+--   above. For "most recent/conducted/completed audit" without "plan", use
+--   audit_report.status, never audit_plan.status.

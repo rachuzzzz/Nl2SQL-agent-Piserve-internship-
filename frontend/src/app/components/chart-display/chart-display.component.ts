@@ -44,6 +44,19 @@ import * as echarts from 'echarts';
         </div>
       </div>
 
+      <!-- ── Top-N truncation banner — drill down to the full dataset ── -->
+      <div class="suggestion-bar view-all-bar" *ngIf="!showConflict && cfg.can_view_all && !resolvedViewAll">
+        <span class="suggestion-text">
+          Showing top <strong>{{ cfg.rows_shown }}</strong> of <strong>{{ cfg.rows_total }}</strong> categories
+          <span class="suggestion-reason" *ngIf="viewAllError">{{ viewAllError }}</span>
+        </span>
+        <div class="suggestion-actions">
+          <button class="btn-keep" [disabled]="viewAllLoading" (click)="viewAll()">
+            {{ viewAllLoading ? 'Loading…' : 'View all' }}
+          </button>
+        </div>
+      </div>
+
       <!-- ── Header ── -->
       <div class="chart-header" *ngIf="activeConfig">
         <!-- Left: icon + label + confidence badge -->
@@ -133,8 +146,14 @@ import * as echarts from 'echarts';
       </div>
 
       <!-- ── Chart canvas ── -->
-      <div class="chart-body" *ngIf="activeConfig">
+      <div class="chart-body" *ngIf="activeConfig && !renderError">
         <div #chartDiv [style.height]="chartHeight" class="echarts-host"></div>
+      </div>
+
+      <!-- ── Render-error fallback — never leave the user staring at a blank div ── -->
+      <div class="chart-render-error" *ngIf="activeConfig && renderError">
+        <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.72-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/></svg>
+        <span>Couldn't render this {{ typeLabel(activeType) }} — the underlying data table still has the full result.</span>
       </div>
 
       <!-- ── Chart-type switcher footer (control mode only) ── -->
@@ -258,6 +277,9 @@ import * as echarts from 'echarts';
     .chart-body { padding: 16px 16px 20px; background: transparent; min-width: 0; overflow: hidden; }
     .echarts-host { width: 100%; display: block; overflow: hidden; }
 
+    .chart-render-error { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 40px 24px; min-height: 200px; color: var(--chart-text-muted); font-size: 13px; text-align: center; font-family: ui-sans-serif,system-ui,sans-serif; }
+    .chart-render-error svg { width: 26px; height: 26px; color: #dc2626; opacity: 0.75; }
+
     /* Alt-switcher footer — full-width row below the chart */
     .alt-footer { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-top: 1px solid var(--chart-border); background: var(--chart-axis-bg); flex-wrap: wrap; }
     .alt-footer-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px; color: var(--chart-text-muted); white-space: nowrap; font-family: ui-sans-serif,system-ui,sans-serif; flex-shrink: 0; }
@@ -281,6 +303,7 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
 
   showConflict     = false;
   resolvedConflict = false;
+  resolvedViewAll  = false;
   activeConfig: any = null;
   activeType: string | null = null;
   hasZoomed        = false;
@@ -296,6 +319,18 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
   selectedY: string[] = [];
   axisLoading     = false;
   axisError       = '';
+
+  // Set when buildOption()/setOption() throws — e.g. a malformed value in the
+  // ECharts config (the historical 'transparentaa' invalid-color case was one
+  // instance of this whole failure class: one bad value can throw a canvas
+  // DOMException that silently blanks the ENTIRE chart with no indication).
+  // Shows a visible fallback instead of an empty div.
+  renderError     = false;
+
+  // Top-N truncation drill-down — see ChartConfig.rows_shown/rows_total/
+  // can_view_all (schemas.py) and viewAll() below.
+  viewAllLoading  = false;
+  viewAllError    = '';
 
   private chart: echarts.ECharts | null = null;
   private needsRender = false;
@@ -405,7 +440,8 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
 
   private init() {
     if (!this.cfg) return;
-    this.hasZoomed = false; this.resolvedConflict = false;
+    this.hasZoomed = false; this.resolvedConflict = false; this.resolvedViewAll = false;
+    this.renderError = false; this.viewAllError = '';
     this.showAxisPicker = this.mode === 'control'; this.axisError = '';
     this.cols = null; this.colsLoadError = false;
     const altList = (this.cfg.alternatives ?? []).filter(a => a.chart_type !== this.cfg.chart_type).slice(0, 3);
@@ -468,6 +504,33 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
       error: err => {
         this.axisLoading = false;
         this.axisError = err?.error?.detail ?? 'Could not update chart.';
+        this.cdr.markForCheck();
+      },
+    });
+  }
+
+  // ── Top-N drill-down ─────────────────────────────────────────────────────
+  viewAll(): void {
+    if (!this.sessionId || this.viewAllLoading) return;
+    this.viewAllLoading = true; this.viewAllError = '';
+    this.http.post<ChartConfig>(`${this.base}/chart`, {
+      session_id: this.sessionId,
+      chart_type: this.activeType,
+      view_all: true,
+    }).subscribe({
+      next: cfg => {
+        this.viewAllLoading = false;
+        this.resolvedViewAll = true;
+        this.destroyChart();
+        this.cfg           = cfg;
+        this.activeConfig  = cfg.config;
+        this.activeType    = cfg.chart_type;
+        this.needsRender   = true;
+        this.cdr.markForCheck();
+      },
+      error: err => {
+        this.viewAllLoading = false;
+        this.viewAllError = err?.error?.detail ?? 'Could not load the full dataset.';
         this.cdr.markForCheck();
       },
     });
@@ -573,12 +636,38 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
 
   private renderChart() {
     this.destroyChart();
+    this.renderError = false;
     const el = this.chartDivRef.nativeElement;
     const isDark = document.body.getAttribute('data-theme') === 'dark';
-    
+
+    // A single malformed value anywhere in the ECharts option (e.g. the
+    // historical 'transparentaa' invalid-color case — see the waterfall
+    // itemStyle guard in buildOption()) can throw during option-build or
+    // setOption() and silently leave a blank canvas with no user-visible
+    // indication. Catch here and show a visible fallback instead — this is
+    // the general fix; per-case guards like the waterfall one stay in place
+    // as defense-in-depth, not a replacement for this.
+    let option: any;
+    try {
+      option = this.buildOption(this.activeConfig, this.activeType, isDark);
+    } catch (e) {
+      console.error('Chart option build failed', e);
+      this.renderError = true;
+      this.cdr.markForCheck();
+      return;
+    }
+
     this.zone.runOutsideAngular(() => {
-      this.chart = echarts.init(el, isDark ? 'dark' : null, { renderer: 'canvas' });
-      this.chart.setOption(this.buildOption(this.activeConfig, this.activeType, isDark), { notMerge: true });
+      try {
+        this.chart = echarts.init(el, isDark ? 'dark' : null, { renderer: 'canvas' });
+        this.chart.setOption(option, { notMerge: true });
+      } catch (e) {
+        console.error('Chart render failed', e);
+        this.chart?.dispose();
+        this.chart = null;
+        this.zone.run(() => { this.renderError = true; this.cdr.markForCheck(); });
+        return;
+      }
       this.chart.on('dataZoom', () => this.zone.run(() => this.hasZoomed = true));
       if (this.activeType === 'calendar_heatmap') {
         el.addEventListener('wheel', (e: WheelEvent) => {
@@ -678,12 +767,8 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
     if (opt.legend) {
       const isPieFamily = ['pie','doughnut','nightingale'].includes(chartType ?? '');
       const containerW  = this.elRef.nativeElement.clientWidth || 9999;
-      // Scale legend text down for pie/doughnut/nightingale in narrow containers
-      // (both panels open or non-expanded). Thresholds: <420 → 9px, <560 → 10px, else 12px.
-      const legendFontSize = isPieFamily
-        ? (containerW < 420 ? 9 : containerW < 560 ? 10 : 11)
-        : 12;
-      const legendIconSize = isPieFamily && containerW < 560 ? 8 : 10;
+      const { fontSize: legendFontSize, iconSize: legendIconSize } =
+        this._legendSizeForWidth(containerW, isPieFamily);
       opt.legend = {
         ...opt.legend,
         type: 'scroll',
@@ -834,13 +919,22 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
     return opt;
   }
 
+  // Single source of truth for legend text/icon sizing — was previously
+  // computed independently (and identically, only by accident of never
+  // having drifted) in buildOption(), here, and via the ResizeObserver
+  // callback that just calls this method. Pie-family charts (pie/doughnut/
+  // nightingale) shrink in narrow containers; other chart types are fixed.
+  private _legendSizeForWidth(w: number, isPieFamily: boolean): { fontSize: number; iconSize: number } {
+    if (!isPieFamily) return { fontSize: 12, iconSize: 10 };
+    return { fontSize: w < 420 ? 9 : w < 560 ? 10 : 11, iconSize: w < 560 ? 8 : 10 };
+  }
+
   private _syncPieLegendSize() {
     const isPieFamily = ['pie','doughnut','nightingale'].includes(this.activeType ?? '');
     if (!isPieFamily || !this.chart) return;
     const w = this.elRef.nativeElement.clientWidth;
     if (!w) return;
-    const fontSize  = w < 420 ? 9 : w < 560 ? 10 : 11;
-    const iconSize  = w < 560 ? 8 : 10;
+    const { fontSize, iconSize } = this._legendSizeForWidth(w, true);
     this.chart.setOption({ legend: { textStyle: { fontSize }, itemWidth: iconSize, itemHeight: iconSize } }, false);
   }
 

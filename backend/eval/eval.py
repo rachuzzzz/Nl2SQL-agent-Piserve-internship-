@@ -1,5 +1,5 @@
 """
-NL2SQL Agent — Evaluation Test Set (66 queries)
+NL2SQL Agent — Evaluation Test Set (104 queries)
 ================================================
 Usage:
   python3 eval.py

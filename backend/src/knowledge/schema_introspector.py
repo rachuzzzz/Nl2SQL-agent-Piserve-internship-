@@ -10,6 +10,15 @@ Covers two domains:
 
 The fb_* form-builder tables are intentionally excluded — the ai_* tables
 are the public interface for all form question/answer data.
+
+AUDIT domain constants (AUDIT_*) live in this same file — the DatabaseSchema
+class and introspect_schema() are parameterized by these constant sets (see
+"DatabaseSchema is a dependency-injected dataclass" below) rather than
+duplicated, since the introspection MECHANISM is identical between domains;
+only the table lists / business rules / relationships text differ. Content
+verified live against the DB (not inferred) — see docs/Audit_Domain_Schema_Reference.docx
+and the domain-router plan's §1b for the review/review_level approval-workflow
+findings this was built from.
 """
 
 from dataclasses import dataclass, field
@@ -100,6 +109,24 @@ BUSINESS_RULES = [
     "matching the FM-side convention. 'Internal Auditor' (122) and 'External Auditor' (14) also exist "
     "but belong to the separate Audit domain, not this app — do NOT match them for inspection-domain "
     "role filters (e.g. avoid ILIKE '%inspector%' or '%audit%'; use an explicit IN list instead).",
+    "APPROVAL WORKFLOW — 'review' is a shared, POLYMORPHIC multi-level approval log (also used by "
+    "the separate Audit domain for AUDIT_PLAN/AUDIT_CORRECTIVE_ACTION/SCHEDULE/PORTFOLIO — this app "
+    "only ever queries the inspection-side entity_type values). review.entity_id has NO real FK — "
+    "always filter WHERE entity_type = '<TYPE>' AND entity_id = <target>.id. entity_type values for "
+    "inspection: 'INSPECTION_REPORT' (2 levels, both actively used — roughly even split between "
+    "level 1 and level 2, confirmed live), 'INSPECTION_PORTFOLIO' (1 level only), "
+    "'INSPECTION_SCHEDULE' (1 level only). review_type is NULL for all inspection entity_types "
+    "(unlike audit's AUDIT_CORRECTIVE_ACTION, inspection has no ADEQUACY/IMPLEMENTATION split).",
+    "'COMPLETED' ON review IS NOT 'APPROVED' — confirmed live (same table, same trap as audit): a "
+    "COMPLETED review can have action = 'RETURN_FOR_MODIFICATION' (rejected/sent back) instead of "
+    "'APPROVE'. 'who approved this inspection report/portfolio/schedule' MUST filter "
+    "WHERE status = 'COMPLETED' AND action = 'APPROVE' — status = 'COMPLETED' alone silently "
+    "includes rejected reviews. action is NULL while status = 'PENDING'.",
+    "review_level IS NOT RELIABLE for 'how many levels of approval' — it's a tiny 4-row config table "
+    "with NO row for INSPECTION_REPORT (despite INSPECTION_REPORT genuinely having 2 levels in real "
+    "review data) and only a stale-looking row for INSPECTION_PORTFOLIO. NEVER read review_level to "
+    "answer a levels question — compute it from review itself: SELECT entity_type, "
+    "COUNT(DISTINCT level) or MAX(level) FROM review WHERE entity_type = '<TYPE>' GROUP BY entity_type.",
 ]
 
 TABLE_RELATIONSHIPS = """\
@@ -232,6 +259,21 @@ MULTI-HOP EXAMPLES:
     WHERE it.name ILIKE '%safety%'
 
 RULE: TYPE names (Safety, PPE, Hygiene, etc.) live ONLY in inspection_type.name.
+
+APPROVAL WORKFLOW (review table — see BUSINESS_RULES for the two traps: review_level
+unreliability and status='COMPLETED' != approved):
+  review.entity_id     → POLYMORPHIC, no real FK — filter by entity_type + entity_id
+  review.assigned_to_id → users.id
+  review.reviewed_by    → users.id
+  entity_type values used by this app: 'INSPECTION_REPORT', 'INSPECTION_PORTFOLIO',
+    'INSPECTION_SCHEDULE' (entity_id = inspection_report.id / inspector_portfolio.id /
+    inspection_schedule.id respectively)
+  "who approved inspection X":
+    SELECT u.first_name || ' ' || u.last_name AS approved_by
+    FROM review rev
+    JOIN inspection_report ir ON rev.entity_id = ir.id AND rev.entity_type = 'INSPECTION_REPORT'
+    JOIN users u ON rev.reviewed_by = u.id
+    WHERE rev.status = 'COMPLETED' AND rev.action = 'APPROVE' AND ir.inspection_id = '<id>'
 """
 
 LOOKUP_TABLES = {
@@ -278,6 +320,9 @@ FK_RESOLUTION = {
     "inspection_cycle_id":   ("inspection_cycle", "ic", "ic.id"),
     # inspector_portfolio → cycle
     "cycle_id":              ("inspection_cycle", "ic", "ic.id"),
+    # review table FKs — shared polymorphic approval log, see BUSINESS_RULES
+    "assigned_to_id":        ("users", "u_asg", "u_asg.first_name || ' ' || u_asg.last_name AS assigned_to_name"),
+    "reviewed_by":           ("users", "u_rev", "u_rev.first_name || ' ' || u_rev.last_name AS reviewed_by_name"),
 }
 
 OPTIONAL_FKS = {
@@ -300,6 +345,8 @@ INSPECTION_TABLES = [
     "additional_inspectees",
     "po_details",    # CAPEX Converted — JOIN via po.mitigative_action_uuid = ica.id
     "pr_details",    # OPEX Incurred   — JOIN via pr.mitigative_action_uuid = ica.id
+    "review",        # shared polymorphic approval log — also used by audit, see BUSINESS_RULES
+    "review_level",  # NOT reliable for level counts — see BUSINESS_RULES warning
 ]
 
 AI_TABLES = [
@@ -381,17 +428,534 @@ USEFUL_COLUMNS = {
         "answer_text", "answer_text_raw", "answer_numeric", "score", "score_type", "max_score",
         "submitted_on",
     ],
+    "review": [
+        "entity_id", "entity_type", "review_type", "level", "status", "action",
+        "assigned_to_id", "reviewed_by", "reviewed_on", "submission_id",
+        # entity_type for inspection: 'INSPECTION_REPORT' (2 levels), 'INSPECTION_PORTFOLIO' (1),
+        #   'INSPECTION_SCHEDULE' (1) — see BUSINESS_RULES for the review_level warning and the
+        #   status='COMPLETED' != approved trap.
+    ],
 }
 
 # Columns to suppress entirely from the schema block shown to deepseek.
 # These exist in the DB but are either unreliable, blocked, or create noise.
 _SUPPRESS_COLUMNS: set[str] = {
-    "adequacy_status",  # adequacy workflow not in use yet
+    # NOTE: "adequacy_status" was previously suppressed here with the comment
+    # "adequacy workflow not in use yet" — misleading stray entry, removed
+    # 2026-07-28. adequacy_status doesn't exist on inspection_corrective_action
+    # at all (this set is inspection-only), and audit's OWN adequacy workflow
+    # (audit_corrective_action.adequacy_status) is very much in active use —
+    # see _AUDIT_SUPPRESS_COLUMNS below, which correctly does NOT suppress it.
     "total_inspection_hours",  # column exists but is always NULL — use EPOCH(submitted_on-start_date_time)
     "subform_id", "internal_stakeholder_id", "observation_id",
     "client_details_submission_id", "completion_submission_id",
     "deferred_submission_id", "pr_submission_id", "return_submission_id",
     "active", "created_by", "modified_by",  # audit/system columns — no query use
+}
+
+
+# ---------------------------------------------------------------------------
+# AUDIT DOMAIN constants — verified live against the DB (row-count-by-row-count
+# queries, not just docs). See docs/Audit_Domain_Schema_Reference.docx and the
+# domain-router plan's §1b for how this was derived. Data-freshness note: live
+# row counts (audit_report=13, audit_corrective_action=12 as of this build) are
+# much smaller than the doc's figures (46 / 69) — the environment was reseeded
+# since the doc was written — but every STRUCTURAL trap below (dead columns,
+# missing FKs, dead junction tables, CA_DRAFT placeholder ratio) was
+# independently re-confirmed live and still holds.
+# ---------------------------------------------------------------------------
+
+AUDIT_ENUM_COLUMNS = {
+    "audit_schedule.schedule_status": [
+        "DRAFT", "PENDING_REVIEW", "APPROVED", "ONGOING", "COMPLETED", "RETURN_MODIFICATION",
+    ],
+    "audit_schedule.audit_status": [],  # DEAD — always NULL, confirmed live. Use schedule_status.
+    "audit_plan.status": [
+        "DRAFT", "SUBMITTED", "APPROVED", "RETURNED_FOR_MODIFICATION",
+    ],
+    "auditor_portfolio.status": [
+        "APPROVED", "MODIFICATION",
+    ],
+    "audit_report.status": [
+        "DRAFT", "SUBMITTED", "CLOSED", "CLOSED_WITH_EXCEPTION",
+    ],  # CLOSED/CLOSED_WITH_EXCEPTION are in the schema enum but not present in current data
+    "audit_corrective_action.status": [
+        "DRAFT", "SUBMITTED", "OPEN", "OVERDUE", "CLOSED", "CLOSE_WITH_DEFERRED",
+    ],
+    "audit_corrective_action.implementation_status": [
+        "PENDING_FOR_REVIEW", "APPROVE", "RETURN_FOR_MODIFICATION",
+    ],  # NULL = not yet submitted for review
+    "audit_corrective_action.adequacy_status": [
+        "PENDING_FOR_REVIEW", "APPROVE", "RETURN_FOR_MODIFICATION",
+    ],  # NULL = not yet submitted for review
+    "audit_corrective_action.progress_stage": [
+        "NOT_STARTED", "ON_TRACK", "BEHIND", "AT_RISK", "COMPLETED", "CLOSE_WITH_DEFERRED",
+    ],  # NULL progress_stage = not started (mirrors inspection's progress_stage convention)
+    "audit_corrective_action.responsible": [
+        "CLIENT", "INTERNAL_OPERATIONS", "SUB_CONTRACTOR",
+    ],
+    "audit_corrective_action.pending_with": [],  # messy free text (names/emails), NOT an enum
+    "review.status": ["PENDING", "COMPLETED"],
+    "review.action": ["APPROVE", "RETURN_FOR_MODIFICATION"],  # NULL when status=PENDING
+    "review.review_type": ["ADEQUACY", "IMPLEMENTATION"],  # NULL for entity types that aren't split (PLAN/PORTFOLIO/SCHEDULE)
+}
+
+AUDIT_BUSINESS_RULES = [
+    "AUDIT_PLAN vs AUDIT_REPORT — 'conducted'/'completed' are TWO SEPARATE status "
+    "lifecycles on TWO DIFFERENT tables, confirmed live as a real bug (not hypothetical): "
+    "'show the most recently conducted audit' queried audit_plan (a still-pending proposal, "
+    "status IN ('SUBMITTED','RETURNED_FOR_MODIFICATION')) instead of audit_report (an actual "
+    "audit EVENT that was carried out — has a report, form answers, corrective actions, a "
+    "facility) — confirmed wrong by the very next question asking what the auditor filled out "
+    "for that 'audit', which only exists on audit_report/ai_audit_answers, never on audit_plan. "
+    "RULE: a BARE, unqualified 'audit'/'the audit' (no 'plan' qualifier) means audit_report — "
+    "conducted = arep.status = 'SUBMITTED', completed = arep.status IN ('CLOSED', "
+    "'CLOSED_WITH_EXCEPTION'). Only use audit_plan.status (conducted = ap.status IN "
+    "('SUBMITTED','RETURNED_FOR_MODIFICATION'), completed = ap.status = 'APPROVED') when the "
+    "question explicitly says 'audit plan(s)'. When unsure and the question could plausibly "
+    "lead to a follow-up about findings/answers/facility, use audit_report.",
+    "NEVER use SELECT *. Always specify the columns the user needs.",
+    "NEVER use SQL reserved words as table aliases (is, as, in, on, by, do, if).",
+    "Use ILIKE for text matching, never LIKE.",
+    "SOFT DELETE — every audit_* table has an 'active' boolean; always add WHERE active = true "
+    "unless the question is specifically about deleted/archived records. EXCEPTION (confirmed "
+    "live): the audit_form_* pure junction tables — audit_form_facilities, audit_form_countries, "
+    "audit_form_organizations, audit_form_regions, audit_form_projects — are bare 2-column "
+    "mapping tables (audit_form_id + the other FK only) with NO active column at all. A live-"
+    "caught hallucination: the model assumed every table follows the soft-delete convention and "
+    "added 'aff.active = true' on audit_form_facilities, getting a real Postgres 'column does "
+    "not exist' error. Never add an active filter on these five tables specifically.",
+    "LAST-MODIFIED TIMESTAMP NAMING: every audit_* table (confirmed live across all 16 of them, "
+    "including audit_corrective_action/audit_plan/audit_report/audit_schedule/auditor_portfolio) "
+    "uses modified_on/modified_by for its last-update timestamp — there is NO updated_on, "
+    "updated_at, or modified_at column anywhere in this domain. A live-caught hallucination: the "
+    "model assumed 'updated_on' (a common Rails/Django-style convention) and got a real Postgres "
+    "'column does not exist' error at execution time. created_on/created_by is the matching "
+    "creation-timestamp pair, also consistent across every audit_* table.",
+    "AUDIT FORM-ANSWER LAYER — corrected 2026-07-29, supersedes an earlier stale rule that said "
+    "this was empty. ai_audit_answers (audit's own flat answer table, NOT ai_answers — that "
+    "belongs to inspection) is live and populated (445 rows). It was built by copy-pasting "
+    "inspection's ai_answers schema, which left inspection-flavored column names that have since "
+    "been renamed: inspection_report_id -> audit_report_id (uuid FK to audit_report.id), "
+    "inspection_id -> audit_id (varchar, matches audit_report.audit_id display code), "
+    "inspector_user_id -> auditor_user_id (uuid, the auditor who filed the report). "
+    "ai_questions is a SHARED table across both domains (differentiated by module_name, not a "
+    "domain column) — audit's real conduct-form modules are 'Quality Audit', "
+    "'Health & Safety Audit', 'Logistics form', 'Statutory audit form - Soft services', "
+    "'Sustainability -water', plus workflow-remark modules like 'Audit Corrective Action Entry' "
+    "and the various Plan/Portfolio/Schedule Approval/Rejection modules. semantic_search / "
+    "get_answers / get_answer_stats now work for audit questions the same way they do for "
+    "inspection. See OBSERVATION -> CORRECTIVE ACTION rule below for the two-path form-answer "
+    "join pattern.",
+    "OBSERVATION → CORRECTIVE ACTION — two distinct paths, NEVER confuse them (audit's equivalent "
+    "of inspection's OBSERVATION -> MITIGATIVE ACTION two-path rule): "
+    "PATH 1 — the SPECIFIC observation a CA was raised against: "
+    "JOIN ai_audit_answers aaa ON aaa.submission_id = aca.observation_id::varchar "
+    "(cast the UUID side to varchar — NEVER aaa.submission_id::uuid = aca.observation_id, NEVER "
+    "aca.observation_id::text = aaa.submission_id). submission_id groups ALL answers for one "
+    "observation entry; to get the free-text finding itself, further filter "
+    "WHERE aq.label = 'Findings / Remarks' after joining ai_questions aq ON aaa.element_id = "
+    "aq.element_id. NOTE: unlike inspection (whose free-text field is literally labeled "
+    "'Observation'), audit's conduct-form question set has NO question labeled 'Observation' — "
+    "confirmed live; the label 'Findings / Remarks' is the equivalent field. Other labels in the "
+    "same observation group include Audit Checkpoint, Compliance, Impact, Requirement, "
+    "Requirement Type, Risk Level, Schedule Date and Time, Supporting Documents. "
+    "PATH 2 — ALL answers for the whole audit report (reconstructing the full filled-out form): "
+    "JOIN ai_audit_answers aaa ON aaa.audit_report_id = arep.id, then GROUP BY aaa.submission_id "
+    "since each distinct submission_id is one repeatable entry (e.g. one observation) within "
+    "the form. Use PATH 1 only when the user references a SPECIFIC CA/observation; use PATH 2 "
+    "for 'reconstruct this audit's form' / 'all answers for this audit' questions.",
+    "audit_schedule.audit_status is a DEAD column — always NULL (confirmed live). "
+    "The real schedule status is audit_schedule.schedule_status. NEVER filter/select audit_status.",
+    "audit_report has NO facility_id or project_id column of its own — TWO-HOP via "
+    "audit_report.schedule_id → audit_schedule.id → audit_schedule.facility_id/project_id. "
+    "This differs from inspection, where inspection_report.facility_id is direct.",
+    "audit_report.audit_type_id is a DEAD column — always NULL (confirmed live). "
+    "The real audit-type path is THREE hops: audit_report.schedule_id → audit_schedule.id "
+    "→ audit_schedule.audit_plan_id → audit_plan.id → audit_plan.audit_type_id → audit_type.id.",
+    "DEAD JUNCTION TABLES — audit_category_portfolio, audit_sub_category_portfolio, "
+    "audit_type_portfolio, and audit_cycle_auditor_portfolios are ALL always 0 rows (confirmed live) "
+    "despite naming that reads as equally valid to the real tables. NEVER join them. "
+    "Use portfolio_detail_audit_category / portfolio_detail_audit_subcategory / "
+    "portfolio_detail_audit_type instead (joined via auditor_portfolio_detail.id → detail_id), "
+    "and auditor_portfolio.audit_cycle_id directly (NOT the dead junction) for cycle coverage.",
+    "'auditor' as a ROLE NAME is unreliable for 'who is doing audit work' questions — several users "
+    "actually assigned as audit_schedule.auditor_id hold unrelated roles (HSE Officer, Internal "
+    "Inspector, Super Admin, FM Manager). Query audit_schedule.auditor_id/.auditee_id directly. "
+    "Only use the role table for explicit role/access-management questions, never to enumerate "
+    "'who audits'.",
+    "audit_corrective_action.corrective_action_id is the literal placeholder string 'CA_DRAFT' for "
+    "a large share of rows (draft/unsubmitted CAs) — display-only, NEVER assume uniqueness, and "
+    "never let a literal-ID lookup accidentally match every draft row.",
+    "audit_corrective_action.pending_with is mostly NULL with a few stray free-text names/emails, "
+    "not a clean enum — unreliable for exact-match filtering.",
+    "audit_corrective_action has THREE separate TEXT columns, confirmed live via DB "
+    "introspection: cause (why it happened), correction (the immediate fix already applied), "
+    "and corrective_action (the root-cause/longer-term action proposed to prevent recurrence). "
+    "corrective_action is NOT a synonym for correction and must never be answered with "
+    "correction's value — and neither is text at all like corrective_action_id, the VARCHAR "
+    "display code sharing a near-identical name.",
+    "risk_level, impact, and compliance are THREE separate, identically-shaped lookup tables "
+    "(id, name, scale, short_code, is_positive_impact) on audit_corrective_action, answering "
+    "different questions: risk_level=severity, compliance=compliance-gap classification, "
+    "impact=business-dimension affected. They share several identical label strings across "
+    "tables with DIFFERENT UUIDs — pick the source table (risk_level_id / impact_id / "
+    "compliance_id) from what the question actually asks about, never from the label text alone. "
+    "NEVER INNER JOIN more than one of these three axes at once unless the question explicitly "
+    "asks about more than one — confirmed live: a 'show details' follow-up that INNER-joined all "
+    "three silently returned 0 rows for 6 known corrective actions because impact_id/compliance_id "
+    "were NULL on those rows, dropping their correction/cause text along with everything else. "
+    "For a generic 'show details'/'more info' follow-up, reuse only the axis already established "
+    "by the prior filter; if displaying an extra axis without filtering on it, use LEFT JOIN.",
+    "APPROVAL WORKFLOW — the 'review' table is a shared, POLYMORPHIC multi-level approval log "
+    "(also used by inspection's INSPECTION_REPORT/INSPECTION_PORTFOLIO/INSPECTION_SCHEDULE — "
+    "audit_report itself is NOT reviewed this way, only DRAFT→SUBMITTED directly). "
+    "review.entity_id has NO real FK — always filter WHERE entity_type = '<TYPE>' AND "
+    "entity_id = <target>.id. entity_type values for audit: 'AUDIT_PLAN' (2 levels), "
+    "'PORTFOLIO' = auditor_portfolio (1 level), 'SCHEDULE' = audit_schedule (auditee's "
+    "accept/reschedule step on the scheduled visit, level 1, rare level 2), "
+    "'AUDIT_CORRECTIVE_ACTION' split by review_type: 'ADEQUACY' (auditor-side check, level 1, "
+    "rare level 2) and 'IMPLEMENTATION' (two-level: auditee-side then auditor-side sign-off). "
+    "Reviewer ROLE NAMES are dynamic, permission-driven labels, not fixed identities — NEVER "
+    "hardcode a specific expected role name as a filter; describe the workflow STAGE "
+    "(entity_type + review_type + level) instead, and join review→users→user_roles→role only "
+    "when the question asks 'who reviewed/approved', not as a correctness gate.",
+    "audit_schedule.reschedule_requested / reschedule_count reflect the auditee's SCHEDULE-level "
+    "review step (propose a new date vs. accept) — not a separate workflow from 'review'.",
+    "COLUMN-NAMING TRAP: portfolio_detail_audit_subcategory's FK column is audit_subcategory_id "
+    "(no underscore before 'category') — NOT audit_sub_category_id, even though the TABLE it "
+    "points to is named audit_sub_category (with the underscore). Confirmed live.",
+    "DATE FOR 'WHEN A SCHEDULE HAPPENED': audit_schedule.follow_up_date is the schedule's own "
+    "date — use THIS for 'last month'/'this week'/any date-range question about when a specific "
+    "audit visit occurred. audit_schedule has NO 'due_date' column (a live model confirmed to "
+    "hallucinate this) — do NOT invent one. audit_cycle.due_date is a COMPLETELY DIFFERENT "
+    "concept — the whole cycle's own end-of-period deadline, reached via "
+    "audit_schedule.audit_plan_id → audit_plan.cycle_id → audit_cycle.id (three hops, since "
+    "audit_schedule has no direct cycle_id either). NEVER substitute audit_cycle.due_date when "
+    "the question is about when a schedule/audit happened — that answers a different question "
+    "('when does this cycle wrap up') and silently returns 0 rows or the wrong rows.",
+    "audit_cycle HAS NO name/cycle_name/title/code COLUMN (confirmed live) — identify a cycle by "
+    "its acyc.start_date/acyc.end_date/acyc.status only, never invent a label column for it. This "
+    "is the single most common mistake seen in practice: any question about audit_plan/schedule/ "
+    "report that ALSO joins audit_cycle for context (not just cycle-specific questions) tends to "
+    "add a hallucinated acyc.name — burned 7+ wasted LLM calls across eval runs before this rule "
+    "was added. Same pattern as inspection_cycle, which also has no name column.",
+    "audit_cycle.status is a STRICT 3-value CHECK constraint (confirmed live): UPCOMING, ONGOING, "
+    "COMPLETED. There is NO 'CLOSED' value — a live-caught hallucination that silently returns "
+    "wrong rows instead of erroring, because status != 'CLOSED' is trivially true for every row "
+    "(no row can ever equal a value the column doesn't have), so it acts as a no-op filter and "
+    "returns ALL cycles including COMPLETED/UPCOMING ones. 'currently active'/'ongoing' cycle "
+    "MUST filter status = 'ONGOING' exactly — never status != 'CLOSED' or != 'COMPLETED' as a "
+    "substitute for 'active', since UPCOMING would incorrectly pass either of those too.",
+    "auditor_portfolio.status is a STRICT 4-value CHECK constraint (confirmed live): APPROVED, "
+    "DRAFT, MODIFICATION, PENDING. There is NO 'SUBMITTED' value — a live-caught hallucination "
+    "(structurally impossible, not just unused). 'under modification'/'needs modification'/"
+    "'returned for rework' (including the post-approval-edit workflow branch — a super-admin/"
+    "audit-in-charge-permission user editing an already-APPROVED portfolio) MUST filter "
+    "status = 'MODIFICATION' exactly. Confirmed live: without this rule stated up front, the "
+    "reasoning step has defaulted to status = 'APPROVED' instead for a 'which portfolios are "
+    "under modification' question, answering a completely different question with no error or "
+    "warning of any kind. 'pending submission' = status IN ('DRAFT', 'PENDING') instead — DRAFT/"
+    "PENDING are valid schema values with 0 populated rows in the current dataset, not invalid ones.",
+    "'COMPLETED' ON review IS NOT 'APPROVED' — confirmed live: of 261 COMPLETED reviews, 73 (28%) "
+    "have action = 'RETURN_FOR_MODIFICATION' (rejected/sent back), not 'APPROVE'. review.status "
+    "only tracks whether the review STEP is finished, not its outcome. 'who approved X' / 'was X "
+    "approved' / 'approved corrective actions|plans|schedules' MUST filter "
+    "WHERE status = 'COMPLETED' AND action = 'APPROVE' — filtering status = 'COMPLETED' alone "
+    "silently includes rejected reviews and overcounts/misattributes approvals. Conversely "
+    "'who rejected/returned X for modification' filters action = 'RETURN_FOR_MODIFICATION'. "
+    "action is NULL while status = 'PENDING' (not yet actioned either way).",
+    "audit_universe_id lives ONLY on audit_schedule — audit_plan has NO audit_universe_id column "
+    "(confirmed live), and there is NO direct FK between audit_plan and audit_universe at all. "
+    "For 'which universe does this plan belong to' OR 'which universe has the most plans', the "
+    "ONLY valid path is the three-table hop audit_universe <- audit_schedule.audit_universe_id, "
+    "audit_schedule.audit_plan_id -> audit_plan — confirmed live this gets it wrong by joining "
+    "audit_plan.audit_type_id directly to audit_universe.id instead (a live-caught mistake: both "
+    "happen to be UUID-typed so it doesn't error, it just silently matches nothing and returns 0 "
+    "rows for every universe). NEVER join audit_plan to audit_universe on audit_type_id, category_id, "
+    "or any column other than via audit_schedule. For a plan's own subject-matter tag (a DIFFERENT "
+    "question), use audit_plan.category_id -> audit_category instead. NOTE: because a plan can have "
+    "schedules in more than one universe (confirmed live: 2 plans do), COUNT(DISTINCT ap.id) per "
+    "universe can legitimately count the same plan under more than one universe — that is correct, "
+    "not a duplicate-row bug.",
+    "ALIAS COLLISION — 'ap' is the established alias for audit_plan throughout this codebase's seed "
+    "examples; auditor_portfolio uses 'po'. NEVER alias auditor_portfolio as 'ap' — it does not have "
+    "a 'title' column (that's audit_plan.title) or a 'portfolio_id' column (its own PK is just 'id'). "
+    "Confirmed live: reusing 'ap' for auditor_portfolio caused a hallucinated po.portfolio_id lookup.",
+    "review_level IS NOT A RELIABLE SOURCE for 'how many levels of approval does X have' — it is a "
+    "small, incomplete, stale-looking config table (4 rows total: AUDIT_CORRECTIVE_ACTION=1, "
+    "INSPECTION_PORTFOLIO=1, PORTFOLIO=1, SCHEDULE=2) that has NO row at all for AUDIT_PLAN or "
+    "INSPECTION_REPORT, and even where it does have a row it disagrees with real data — "
+    "AUDIT_CORRECTIVE_ACTION actually reaches level 2 for BOTH review_type='ADEQUACY' and "
+    "'IMPLEMENTATION' (confirmed live), not the single level review_level claims. NEVER join or "
+    "read review_level to answer a 'how many levels' question. Instead compute it empirically from "
+    "review itself: SELECT entity_type, review_type, COUNT(DISTINCT level) or MAX(level) FROM review "
+    "WHERE entity_type = '<TYPE>' [AND review_type = '<TYPE>'] GROUP BY entity_type, review_type — "
+    "review_type only meaningfully splits AUDIT_CORRECTIVE_ACTION (ADEQUACY vs IMPLEMENTATION); "
+    "it is NULL for every other entity_type. "
+    "WHY adequacy sometimes reaches level 2 (confirmed live 2026-07-28): it is NOT random or a "
+    "data-quality issue — the auditor explicitly escalates by checking a 'needs further approval' "
+    "option in the frontend when submitting the adequacy review. No dedicated schema column tracks "
+    "this trigger; a 2-level adequacy review is a normal, auditor-initiated case.",
+    "UNPLANNED AUDITS ARE A FULL FAST-TRACK, not just 'a schedule missing its plan' (confirmed live "
+    "2026-07-28): when audit_schedule.is_unplanned = true, the audit is created directly by a "
+    "super-admin-permission user and skips the ENTIRE audit_plan/portfolio/cycle chain AND the "
+    "auditee accept/reschedule review step (entity_type='SCHEDULE') — it goes straight to the "
+    "auditor conducting it. audit_schedule.audit_plan_id is therefore NOT guaranteed populated for "
+    "these rows. A query that INNER JOINs audit_plan to list/aggregate audit_schedule rows will "
+    "silently drop every unplanned audit with no error or row-count signal — use LEFT JOIN "
+    "audit_plan when the question shouldn't implicitly exclude unplanned audits. "
+    "audit_plan.is_unplanned is a SEPARATE, much rarer flag (the plan itself created ad hoc) — "
+    "do not conflate the two is_unplanned columns.",
+    "POST-APPROVAL PORTFOLIO EDITS are a real, distinct workflow branch (confirmed live 2026-07-28): "
+    "a super-admin/audit-in-charge-permission user can modify an auditor_portfolio row after it has "
+    "already reached status='APPROVED' — this is not an error state or a sign the row should have "
+    "gone back to a pending/returned status first.",
+]
+
+AUDIT_TABLE_RELATIONSHIPS = """\
+AUDIT WORKFLOW, END TO END:
+  audit_universe ─┐
+  audit_category ──┼──▶ audit_plan ──▶ audit_schedule ──▶ audit_report ──▶ audit_corrective_action
+  audit_type ──────┘                        │
+                                             └── (separately) auditor_portfolio — standing
+                                                 "auditor responsible for X this cycle" assignment,
+                                                 NOT a step in this linear chain.
+
+HOW TABLES CONNECT:
+  audit_plan.cycle_id              → audit_cycle.id
+  audit_plan.audit_type_id         → audit_type.id
+  audit_plan.category_id           → audit_category.id
+  audit_plan.user_id               → users.id           (the proposer — verified: always 'Internal Auditor')
+  audit_schedule.audit_plan_id     → audit_plan.id
+  audit_schedule.auditor_id        → users.id            (who conducts the visit)
+  audit_schedule.auditee_id        → users.id            (who is being audited)
+  audit_schedule.facility_id       → facility.id
+  audit_schedule.project_id        → project.id
+  audit_schedule.audit_universe_id → audit_universe.id
+  audit_schedule.audit_sub_category_id → audit_sub_category.id
+  audit_report.schedule_id         → audit_schedule.id   (⚠ ONLY path to facility/project — see below)
+  audit_report.audit_cycle_id      → audit_cycle.id
+  audit_report.audit_form_used_id  → audit_forms.id      (always populated — the reliable form link)
+  audit_report.client_id           → client.id           (owning client org)
+  audit_report.entity_id           → entity.id            (operating/contracting business unit —
+                                       genuinely independent of client_id, NOT redundant; both
+                                       always populated)
+  audit_corrective_action.audit_id → audit_report.id
+  audit_corrective_action.risk_level_id  → risk_level.id
+  audit_corrective_action.impact_id      → impact.id
+  audit_corrective_action.compliance_id  → compliance.id
+  audit_corrective_action.internal_stakeholder_id → users.id
+  auditor_portfolio.user_id        → users.id
+  auditor_portfolio.audit_cycle_id → audit_cycle.id      (DIRECT — NOT via the dead
+                                       audit_cycle_auditor_portfolios junction)
+  auditor_portfolio_detail.portfolio_id → auditor_portfolio.id
+  auditor_portfolio_detail.facility_id  → facility.id
+  auditor_portfolio_detail.project_id   → project.id
+  portfolio_detail_audit_category.detail_id    → auditor_portfolio_detail.id
+  portfolio_detail_audit_subcategory.detail_id → auditor_portfolio_detail.id
+  portfolio_detail_audit_type.detail_id        → auditor_portfolio_detail.id
+  review.entity_id                 → POLYMORPHIC, no real FK — filter by entity_type (see rules)
+  review.assigned_to_id            → users.id
+  review.reviewed_by               → users.id
+
+TRAP — facility/project from a report or corrective action, TWO/THREE hops (NOT direct):
+  From audit_report:            audit_report.schedule_id → audit_schedule.id → .facility_id / .project_id
+  From audit_corrective_action: .audit_id → audit_report.id → .schedule_id → audit_schedule.id → .facility_id
+
+TRAP — audit type of a report/schedule, THREE/TWO hops (NOT direct — audit_report.audit_type_id is dead):
+  From audit_report:  .schedule_id → audit_schedule.id → .audit_plan_id → audit_plan.id → .audit_type_id
+  From audit_schedule: .audit_plan_id → audit_plan.id → .audit_type_id
+
+TIMELINESS:
+  Corrective action: status NOT IN ('CLOSED','CLOSE_WITH_DEFERRED') = open; status = 'OVERDUE' is
+    its own explicit state, not derived from date arithmetic.
+  Report: status NOT IN ('CLOSED','CLOSED_WITH_EXCEPTION') = open.
+  Schedule: use schedule_status, never audit_status (dead).
+"""
+
+AUDIT_LOOKUP_TABLES = {
+    "audit_universe":      {"name_expr": None, "name_col": "name"},
+    "audit_category":      {"name_expr": None, "name_col": "name"},
+    "audit_sub_category":  {"name_expr": None, "name_col": "name"},
+    "audit_type":          {"name_expr": None, "name_col": "name"},
+    "audit_forms":         {"name_expr": None, "name_col": "title"},
+    "risk_level":          {"name_expr": None, "name_col": "name"},
+    "impact":              {"name_expr": None, "name_col": "name"},
+    "compliance":          {"name_expr": None, "name_col": "name"},
+    "facility":            {"name_expr": None, "name_col": "name"},
+    "project":              {"name_expr": None, "name_col": "name"},
+    "client":               {"name_expr": None, "name_col": "name"},
+    "entity":               {"name_expr": None, "name_col": "name"},
+    "users":                {"name_expr": "first_name || ' ' || last_name", "name_col": None},
+}
+
+AUDIT_FK_RESOLUTION = {
+    "auditor_id":           ("users", "u_aud",  "u_aud.first_name || ' ' || u_aud.last_name AS auditor_name"),
+    "auditee_id":           ("users", "u_ee",   "u_ee.first_name || ' ' || u_ee.last_name AS auditee_name"),
+    "facility_id":          ("facility", "fac", "fac.name AS facility_name"),
+    "project_id":           ("project",  "proj", "proj.name AS project_name"),
+    "client_id":            ("client",   "cl",   "cl.name AS client_name"),
+    "entity_id":            ("entity",   "ent",  "ent.name AS entity_name"),
+    "audit_type_id":        ("audit_type", "aty", "aty.name AS audit_type_name"),
+    "category_id":          ("audit_category", "acat", "acat.name AS category_name"),
+    "audit_sub_category_id":("audit_sub_category", "asub", "asub.name AS sub_category_name"),
+    "audit_universe_id":    ("audit_universe", "auniv", "auniv.name AS universe_name"),
+    # audit_cycle has NO name column (confirmed live) — its identity is its
+    # date span + status, same pattern as inspection_cycle. Hallucinating
+    # acyc.name/cycle_name/title/code burned 7 LLM calls in one eval_audit.py
+    # run before the model gave up and dropped the column entirely.
+    "cycle_id":             ("audit_cycle", "acyc", "acyc.start_date, acyc.end_date, acyc.status AS cycle_status"),
+    "audit_cycle_id":       ("audit_cycle", "acyc", "acyc.start_date, acyc.end_date, acyc.status AS cycle_status"),
+    "audit_plan_id":        ("audit_plan", "ap", "ap.title AS plan_title"),
+    "schedule_id":          ("audit_schedule", "asch", "asch.schedule_id AS schedule_display_id"),
+    "audit_id":             ("audit_report", "arep", "arep.audit_id AS report_display_id"),
+    "audit_form_used_id":   ("audit_forms", "aform", "aform.title AS form_title"),
+    "risk_level_id":        ("risk_level", "rl", "rl.name AS risk_level_name"),
+    "impact_id":            ("impact", "imp", "imp.name AS impact_name"),
+    "compliance_id":        ("compliance", "comp", "comp.name AS compliance_name"),
+    "internal_stakeholder_id": ("users", "u_stk", "u_stk.first_name || ' ' || u_stk.last_name AS stakeholder_name"),
+}
+
+AUDIT_TABLES = [
+    "audit_universe",
+    "audit_category",
+    "audit_sub_category",
+    "audit_type",
+    "audit_cycle",
+    "audit_plan",
+    "audit_schedule",
+    "audit_report",
+    "audit_corrective_action",
+    "auditor_portfolio",
+    "auditor_portfolio_detail",
+    "audit_forms",
+    "review",
+    "review_level",
+    "compliance",
+]
+
+# AI flat tables audit actually uses — ai_questions is SHARED with inspection
+# (differentiated by module_name, not a domain column); ai_audit_answers is
+# audit's own answer table (see AUDIT_BUSINESS_RULES "AUDIT FORM-ANSWER LAYER"
+# for the column-rename history). Was [] until 2026-07-29 — introspect_audit_schema()
+# previously assumed this layer was empty for audit; confirmed live it is not.
+AUDIT_AI_TABLES = ["ai_questions", "ai_audit_answers"]
+
+AUDIT_USEFUL_COLUMNS = {
+    "ai_questions": [
+        "element_id", "label", "module_name", "module_id", "entity_type",
+    ],
+    "ai_audit_answers": [
+        "element_id", "submission_id", "answer_text", "answer_numeric", "score",
+        "audit_report_id", "audit_id", "auditor_user_id", "module_name",
+        # audit_report_id/audit_id/auditor_user_id were renamed from
+        # inspection-flavored inspection_report_id/inspection_id/inspector_user_id
+        # 2026-07-29 — see AUDIT_BUSINESS_RULES.
+    ],
+    "audit_plan": [
+        "title", "status", "is_unplanned", "audit_type_id", "category_id", "cycle_id", "user_id",
+    ],
+    "audit_schedule": [
+        "schedule_id", "schedule_status", "duration", "follow_up_date", "reschedule_count",
+        "reschedule_requested", "is_unplanned", "auditor_id", "auditee_id", "facility_id",
+        "project_id", "audit_plan_id", "audit_universe_id", "audit_sub_category_id",
+        # audit_status DELIBERATELY excluded — dead column, see AUDIT_BUSINESS_RULES
+    ],
+    "audit_report": [
+        "audit_id", "status", "audit_score", "total_audit_hours", "submitted_on", "closed_on",
+        "schedule_id", "audit_cycle_id", "audit_form_used_id", "client_id", "entity_id",
+        # audit_type_id, facility_id, project_id DELIBERATELY excluded — dead/absent, see rules
+    ],
+    "audit_corrective_action": [
+        "corrective_action_id", "status", "implementation_status", "adequacy_status",
+        "progress_stage", "responsible", "pending_with", "cause", "correction",
+        "corrective_action",
+        # THREE SEPARATE TEXT FIELDS, confirmed live via DB introspection — do not
+        # conflate: cause = why it happened, correction = the immediate fix already
+        # applied, corrective_action = the (longer-term/root-cause) action proposed
+        # to prevent recurrence. corrective_action was missing from this list
+        # entirely until a live query asking for "corrective action text" only
+        # got back aca.correction because the model had never been told this
+        # column exists.
+        "target_close_out_date", "close_on", "completed_on", "audit_id",
+        "risk_level_id", "impact_id", "compliance_id", "internal_stakeholder_id",
+        "external_stakeholder_email", "external_stakeholder_name", "external_stakeholder_phone",
+    ],
+    "auditor_portfolio": [
+        "status", "submitted_date", "user_id", "audit_cycle_id",
+    ],
+    "auditor_portfolio_detail": [
+        "facility_id", "project_id", "portfolio_id",
+    ],
+    "audit_cycle": [
+        "start_date", "end_date", "due_date", "status", "send_notification_to_auditors",
+    ],
+    "audit_forms": [
+        "title", "status", "audit_scope", "audit_type_id", "audit_categories_id",
+        "audit_sub_category_id", "audit_universe_id", "audit_cycle_id", "client_id", "entity_id",
+        # audit_schedule_id DELIBERATELY excluded — always NULL, this is a TEMPLATE library
+    ],
+    "review": [
+        "entity_id", "entity_type", "review_type", "level", "status", "action",
+        "assigned_to_id", "reviewed_by", "reviewed_on", "submission_id",
+        # entity_type: 'AUDIT_PLAN' | 'PORTFOLIO' | 'SCHEDULE' | 'AUDIT_CORRECTIVE_ACTION'
+        #   (also 'INSPECTION_REPORT'/'INSPECTION_PORTFOLIO'/'INSPECTION_SCHEDULE' for
+        #   inspection domain — filter entity_type when only audit rows matter)
+        # entity_id is POLYMORPHIC — no FK — always pair with entity_type
+    ],
+}
+
+_AUDIT_SUPPRESS_COLUMNS: set[str] = {
+    "audit_status",  # DEAD on audit_schedule — always NULL
+    "audit_type_id",  # DEAD on audit_report — always NULL (real column exists on audit_plan too, kept there)
+    "gp_score",  # near-dead on audit_report (mostly NULL, redundant with audit_score where present)
+    "submission_answers",  # sparse JSONB, only a handful of rows populated
+    "active", "created_by", "modified_by",
+    # observation_id: suppressed from the generic column dump (mirrors inspection's
+    # identical choice for inspection_corrective_action, see _SUPPRESS_COLUMNS above)
+    # — it's real and heavily used, but taught via the dedicated OBSERVATION ->
+    # CORRECTIVE ACTION business rule + seed examples instead of the noisy generic list.
+    "observation_id",
+}
+
+_AUDIT_ENUM_QUERIES = {
+    "audit_type":         ("SELECT name FROM audit_type ORDER BY name", "name"),
+    "audit_category":     ("SELECT name FROM audit_category ORDER BY name", "name"),
+    "audit_sub_category": ("SELECT name FROM audit_sub_category ORDER BY name", "name"),
+    "audit_universe":     ("SELECT name FROM audit_universe ORDER BY name", "name"),
+    "compliance":         ("SELECT name FROM compliance ORDER BY name", "name"),
+    "audit_plan.status": (
+        "SELECT DISTINCT status FROM audit_plan WHERE status IS NOT NULL ORDER BY status", "status"
+    ),
+    "audit_schedule.schedule_status": (
+        "SELECT DISTINCT schedule_status FROM audit_schedule WHERE schedule_status IS NOT NULL "
+        "ORDER BY schedule_status", "schedule_status"
+    ),
+    "audit_report.status": (
+        "SELECT DISTINCT status FROM audit_report WHERE status IS NOT NULL ORDER BY status", "status"
+    ),
+    # audit_corrective_action's own status columns — previously missing here,
+    # relying only on the static AUDIT_ENUM_COLUMNS fallback. Confirmed live:
+    # this gap is what let the SQL-generation model guess
+    # implementation_status = 'APPROVED' (plausible English, wrong enum
+    # literal) instead of the real 'APPROVE' — silently 0 rows, no error.
+    "audit_corrective_action.status": (
+        "SELECT DISTINCT status FROM audit_corrective_action WHERE status IS NOT NULL ORDER BY status",
+        "status"
+    ),
+    "audit_corrective_action.implementation_status": (
+        "SELECT DISTINCT implementation_status FROM audit_corrective_action "
+        "WHERE implementation_status IS NOT NULL ORDER BY implementation_status", "implementation_status"
+    ),
+    "audit_corrective_action.adequacy_status": (
+        "SELECT DISTINCT adequacy_status FROM audit_corrective_action "
+        "WHERE adequacy_status IS NOT NULL ORDER BY adequacy_status", "adequacy_status"
+    ),
+    "audit_corrective_action.progress_stage": (
+        "SELECT DISTINCT progress_stage FROM audit_corrective_action "
+        "WHERE progress_stage IS NOT NULL ORDER BY progress_stage", "progress_stage"
+    ),
 }
 
 
@@ -409,12 +973,48 @@ class TableSchema:
 
 @dataclass
 class DatabaseSchema:
-    tables: dict = field(default_factory=dict)       # inspection_* tables
+    tables: dict = field(default_factory=dict)       # inspection_* tables (or domain-equivalent)
     ai_tables: dict = field(default_factory=dict)    # ai_question, ai_answer
     lookup_tables: dict = field(default_factory=dict)
     enum_values: dict = field(default_factory=dict)  # table → list of name values (dynamic)
     _system_cache: Optional[str] = field(default=None, repr=False)
     _reasoning_cache: Optional[str] = field(default=None, repr=False)
+
+    # ── Domain-injected constant sets — default to the INSPECTION globals so
+    # every existing caller (introspect_schema(), zero call-site changes) gets
+    # byte-identical behavior. introspect_audit_schema() below passes the
+    # AUDIT_* equivalents instead. This is dependency injection, not a second
+    # class, since the introspection MECHANISM (BFS-free, just per-table
+    # column/FK formatting) is identical between domains — only the content
+    # sets differ. See agent/domains.py's DOMAIN_REGISTRY for how a domain
+    # picks its schema instance.
+    _domain_tables_list: list = field(default_factory=lambda: list(INSPECTION_TABLES), repr=False)
+    _ai_tables_list: list = field(default_factory=lambda: list(AI_TABLES), repr=False)
+    _lookup_config: dict = field(default_factory=lambda: dict(LOOKUP_TABLES), repr=False)
+    _fk_resolution: dict = field(default_factory=lambda: dict(FK_RESOLUTION), repr=False)
+    _optional_fks: set = field(default_factory=lambda: set(OPTIONAL_FKS), repr=False)
+    _useful_columns: dict = field(default_factory=lambda: dict(USEFUL_COLUMNS), repr=False)
+    _enum_columns: dict = field(default_factory=lambda: dict(ENUM_COLUMNS), repr=False)
+    _suppress_columns: set = field(default_factory=lambda: set(_SUPPRESS_COLUMNS), repr=False)
+    _business_rules: list = field(default_factory=lambda: list(BUSINESS_RULES), repr=False)
+    _table_relationships: str = field(default=TABLE_RELATIONSHIPS, repr=False)
+    _section_title: str = field(default="INSPECTION WORKFLOW TABLES", repr=False)
+    _has_ai_section: bool = field(default=True, repr=False)
+    _ai_join_pattern: str = field(
+        default=(
+            "FROM ai_answers aa\n"
+            "  LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
+            "  JOIN inspection_report ir ON aa.inspection_report_id = ir.id"
+        ),
+        repr=False,
+    )
+    _status_enum_keys: tuple = field(
+        default=(
+            "inspection_report.status", "inspection_cycle.status", "inspection_schedule.status",
+            "inspection_corrective_action.status", "inspection_corrective_action.progress_stage",
+        ),
+        repr=False,
+    )
 
     def for_system_prompt(self) -> str:
         if not self._system_cache:
@@ -435,22 +1035,18 @@ class DatabaseSchema:
         return self._reasoning_cache
 
     def _build_reasoning_block(self) -> str:
-        lines = ["━━━ INSPECTION WORKFLOW TABLES — key columns ━━━", ""]
-        for tname in INSPECTION_TABLES + AI_TABLES:
-            cols = USEFUL_COLUMNS.get(tname)
+        lines = [f"━━━ {self._section_title} — key columns ━━━", ""]
+        for tname in self._domain_tables_list + self._ai_tables_list:
+            cols = self._useful_columns.get(tname)
             if cols:
                 lines.append(f"  {tname}: {', '.join(cols)}")
             else:
                 lines.append(f"  {tname} (call get_schema for columns)")
         lines.append("")
         lines.append(self._fmt_lookup())
-        lines.append("")
-        lines.append(
-            "AI FLAT TABLES join pattern:\n"
-            "  FROM ai_answers aa\n"
-            "  LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
-            "  JOIN inspection_report ir ON aa.inspection_report_id = ir.id"
-        )
+        if self._has_ai_section:
+            lines.append("")
+            lines.append(f"AI FLAT TABLES join pattern:\n  {self._ai_join_pattern}")
         return "\n".join(lines)
 
     def for_sql_prompt_slim(self) -> str:
@@ -462,14 +1058,14 @@ class DatabaseSchema:
         """
         lines = ["### Schema — key columns (get_schema for full DDL):"]
 
-        for tname, cols in USEFUL_COLUMNS.items():
+        for tname, cols in self._useful_columns.items():
             ev = self.enum_values.get(f"{tname}.status")
             status_note = f" | status: {', '.join(repr(v) for v in ev)}" if ev else ""
             lines.append(f"  {tname}: {', '.join(cols)}{status_note}")
 
         lines.append("")
         lines.append("Lookup tables (JOIN by UUID FK, never compare UUID to string):")
-        for tname, info in LOOKUP_TABLES.items():
+        for tname, info in self._lookup_config.items():
             ev = self.enum_values.get(tname)
             if ev and isinstance(ev[0], str):
                 vals = ", ".join(repr(v) for v in ev[:12])
@@ -488,7 +1084,7 @@ class DatabaseSchema:
         }
         lines.append("")
         lines.append("FK joins:")
-        for fk_col, (table, alias, sel) in FK_RESOLUTION.items():
+        for fk_col, (table, alias, sel) in self._fk_resolution.items():
             if fk_col in CRITICAL_FKS:
                 lines.append(f"  {fk_col} → JOIN {table} {alias} ON ...{fk_col}={alias}.id → {sel}")
 
@@ -501,7 +1097,7 @@ class DatabaseSchema:
             if ts:
                 parts.append(self._fmt_table(ts))
         parts.append(self._fmt_lookup())
-        parts.append(TABLE_RELATIONSHIPS)
+        parts.append(self._table_relationships)
         return "\n".join(parts)
 
     def _fmt_table(self, ts: TableSchema) -> str:
@@ -511,7 +1107,7 @@ class DatabaseSchema:
             col_name = col["name"]
 
             # Skip system/audit columns and known noisy columns
-            if col_name in _SUPPRESS_COLUMNS:
+            if col_name in self._suppress_columns:
                 continue
 
             ctype = str(col["type"]).lower()
@@ -526,8 +1122,8 @@ class DatabaseSchema:
 
             full_key = f"{ts.name}.{col_name}"
 
-            if full_key in ENUM_COLUMNS:
-                vals = ENUM_COLUMNS[full_key]
+            if full_key in self._enum_columns:
+                vals = self._enum_columns[full_key]
                 if vals:
                     col_parts.append(
                         f"  {col_name} ({ctype} — ENUM: {', '.join(repr(v) for v in vals)})")
@@ -538,10 +1134,10 @@ class DatabaseSchema:
             fk = next((f for f in ts.foreign_keys if f["column"] == col_name), None)
             if fk:
                 ref = fk["referred_table"]
-                is_opt = col_name in OPTIONAL_FKS
+                is_opt = col_name in self._optional_fks
                 jtype = "LEFT JOIN" if is_opt else "JOIN"
-                if col_name in FK_RESOLUTION:
-                    _, alias, sel = FK_RESOLUTION[col_name]
+                if col_name in self._fk_resolution:
+                    _, alias, sel = self._fk_resolution[col_name]
                     col_parts.append(
                         f"  {col_name} (uuid FK → {ref}. "
                         f"{jtype} {ref} {alias} ON ...{col_name} = {alias}.id → {sel})")
@@ -553,23 +1149,18 @@ class DatabaseSchema:
 
         lines.append("Columns:")
         lines.extend(col_parts)
-        if ts.name in USEFUL_COLUMNS:
-            lines.append(f"Useful output columns: {', '.join(USEFUL_COLUMNS[ts.name])}")
+        if ts.name in self._useful_columns:
+            lines.append(f"Useful output columns: {', '.join(self._useful_columns[ts.name])}")
         return "\n".join(lines)
 
     def _fmt_ai_section(self) -> str:
         lines = ["", "### AI FLAT TABLES — form questions and answers:", ""]
-        for tname in AI_TABLES:
+        for tname in self._ai_tables_list:
             ts = self.ai_tables.get(tname)
             if ts:
                 lines.append(self._fmt_table(ts))
                 lines.append("")
-        lines.append(
-            "Standard JOIN:\n"
-            "  FROM ai_answers aa\n"
-            "  LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
-            "  JOIN inspection_report ir ON aa.inspection_report_id = ir.id"
-        )
+        lines.append(f"Standard JOIN:\n  {self._ai_join_pattern}")
         return "\n".join(lines)
 
     def _fmt_lookup(self) -> str:
@@ -579,7 +1170,7 @@ class DatabaseSchema:
             "'responsible', 'pending_with', 'status' are string enums — NOT FKs.",
             "", "Lookup tables:",
         ]
-        for tname, info in LOOKUP_TABLES.items():
+        for tname, info in self._lookup_config.items():
             ts = self.lookup_tables.get(tname)
             if not ts:
                 continue
@@ -599,33 +1190,33 @@ class DatabaseSchema:
                 lines.append(f"    ⚠ {_USERS_ID_NOTE}")
 
         # Show live status enum values for key tables
-        for col_key in ("inspection_report.status", "inspection_cycle.status",
-                        "inspection_schedule.status"):
+        for col_key in self._status_enum_keys:
             vals = self.enum_values.get(col_key)
             if vals:
                 lines.append(f"  {col_key}: {', '.join(repr(v) for v in vals)}")
 
         lines.append("")
         lines.append("JOIN patterns:")
-        for fk_col, (table, alias, sel) in FK_RESOLUTION.items():
+        for fk_col, (table, alias, sel) in self._fk_resolution.items():
             lines.append(f"  {fk_col} → JOIN {table} {alias} ON ...{fk_col} = {alias}.id → {sel}")
         return "\n".join(lines)
 
     def _build_system_block(self) -> str:
-        lines = ["━━━ INSPECTION WORKFLOW TABLES ━━━", ""]
-        for tname in INSPECTION_TABLES:
+        lines = [f"━━━ {self._section_title} ━━━", ""]
+        for tname in self._domain_tables_list:
             ts = self.tables.get(tname)
             if ts:
                 lines.append(self._fmt_table(ts))
                 lines.append("")
         lines.append(self._fmt_lookup())
-        lines.append(self._fmt_ai_section())
+        if self._has_ai_section:
+            lines.append(self._fmt_ai_section())
         lines.append("")
         lines.append("BUSINESS RULES:")
-        for rule in BUSINESS_RULES:
+        for rule in self._business_rules:
             lines.append(f"  - {rule}")
         lines.append("")
-        lines.append(TABLE_RELATIONSHIPS)
+        lines.append(self._table_relationships)
         return "\n".join(lines)
 
 
@@ -633,10 +1224,62 @@ class DatabaseSchema:
 # Introspector
 # ---------------------------------------------------------------------------
 
-def introspect_schema(db_engine: Engine) -> DatabaseSchema:
-    print("  Introspecting database schema...")
+_INSPECTION_ENUM_QUERIES = {
+    # Lookup tables — query their name column
+    "risk_level":           ("SELECT name FROM risk_level ORDER BY name", "name"),
+    "impact":               ("SELECT name FROM impact ORDER BY name", "name"),
+    "inspection_type":      ("SELECT name FROM inspection_type ORDER BY name", "name"),
+    "frequency_definition": (
+        "SELECT name, repeat_count, repeat_interval, repeat_unit "
+        "FROM frequency_definition ORDER BY name", "name"
+    ),
+    # Enum columns on main tables — query DISTINCT values
+    "inspection_report.status": (
+        "SELECT DISTINCT status FROM inspection_report WHERE status IS NOT NULL ORDER BY status",
+        "status"
+    ),
+    "inspection_cycle.status": (
+        "SELECT DISTINCT status FROM inspection_cycle WHERE status IS NOT NULL ORDER BY status",
+        "status"
+    ),
+    "inspection_schedule.status": (
+        "SELECT DISTINCT status FROM inspection_schedule WHERE status IS NOT NULL ORDER BY status",
+        "status"
+    ),
+    # inspection_corrective_action's own status columns — same gap/fix as the
+    # audit domain's equivalent addition to _AUDIT_ENUM_QUERIES above.
+    "inspection_corrective_action.status": (
+        "SELECT DISTINCT status FROM inspection_corrective_action WHERE status IS NOT NULL ORDER BY status",
+        "status"
+    ),
+    "inspection_corrective_action.progress_stage": (
+        "SELECT DISTINCT progress_stage FROM inspection_corrective_action "
+        "WHERE progress_stage IS NOT NULL ORDER BY progress_stage", "progress_stage"
+    ),
+}
+# Keys whose query returns multiple columns and should be stored as a list of
+# dicts rather than a flat list of the "name" column — frequency_definition is
+# the only inspection-domain case today.
+_MULTI_COL_ENUM_KEYS = frozenset({"frequency_definition"})
+
+
+def _introspect(
+    db_engine: Engine,
+    *,
+    domain_tables: list,
+    ai_tables: list,
+    lookup_tables: dict,
+    enum_queries: dict,
+    multi_col_keys: frozenset = frozenset(),
+    schema_kwargs: dict | None = None,
+    label: str = "schema",
+) -> DatabaseSchema:
+    """Shared introspection mechanism — table/FK/enum discovery is identical
+    between domains, only which tables/queries to run differs. See
+    introspect_schema() / introspect_audit_schema() below."""
+    print(f"  Introspecting {label}...")
     inspector = sa_inspect(db_engine)
-    schema = DatabaseSchema()
+    schema = DatabaseSchema(**(schema_kwargs or {}))
     all_tables = set(inspector.get_table_names())
 
     def _do(tname) -> Optional[TableSchema]:
@@ -666,19 +1309,19 @@ def introspect_schema(db_engine: Engine) -> DatabaseSchema:
             print(f"    ⚠ Could not introspect {tname}: {e}")
             return None
 
-    for tname in INSPECTION_TABLES:
+    for tname in domain_tables:
         ts = _do(tname)
         if ts:
             schema.tables[tname] = ts
 
-    for tname in AI_TABLES:
+    for tname in ai_tables:
         ts = _do(tname)
         if ts:
             schema.ai_tables[tname] = ts
         else:
             print(f"    ⚠ AI table '{tname}' not found in database")
 
-    for tname in LOOKUP_TABLES:
+    for tname in lookup_tables:
         ts = _do(tname)
         if ts:
             schema.lookup_tables[tname] = ts
@@ -687,58 +1330,87 @@ def introspect_schema(db_engine: Engine) -> DatabaseSchema:
     # Query actual values from lookup tables and key enum columns at startup.
     # This means new risk_level tiers, inspection types, frequency definitions,
     # etc. are automatically visible without any code changes.
-    _ENUM_QUERIES = {
-        # Lookup tables — query their name column
-        "risk_level":           ("SELECT name FROM risk_level ORDER BY name", "name"),
-        "impact":               ("SELECT name FROM impact ORDER BY name", "name"),
-        "inspection_type":      ("SELECT name FROM inspection_type ORDER BY name", "name"),
-        "frequency_definition": (
-            "SELECT name, repeat_count, repeat_interval, repeat_unit "
-            "FROM frequency_definition ORDER BY name", "name"
-        ),
-        # Enum columns on main tables — query DISTINCT values
-        "inspection_report.status": (
-            "SELECT DISTINCT status FROM inspection_report WHERE status IS NOT NULL ORDER BY status",
-            "status"
-        ),
-        "inspection_cycle.status": (
-            "SELECT DISTINCT status FROM inspection_cycle WHERE status IS NOT NULL ORDER BY status",
-            "status"
-        ),
-        "inspection_schedule.status": (
-            "SELECT DISTINCT status FROM inspection_schedule WHERE status IS NOT NULL ORDER BY status",
-            "status"
-        ),
-    }
     try:
         from sqlalchemy import text as sa_text
         with db_engine.connect() as conn:
-            for key, (query, col) in _ENUM_QUERIES.items():
+            for key, (query, col) in enum_queries.items():
                 try:
                     rows = conn.execute(sa_text(query)).fetchall()
-                    if key == "frequency_definition":
-                        # Store full definition for richer context
-                        schema.enum_values[key] = [
-                            {"name": r[0], "repeat_count": r[1],
-                             "repeat_interval": r[2], "repeat_unit": r[3]}
-                            for r in rows
-                        ]
+                    if key in multi_col_keys:
+                        # Store full row for richer context (e.g. frequency_definition's
+                        # repeat_count/repeat_interval/repeat_unit alongside name)
+                        cols = list(rows[0]._mapping.keys()) if rows else [col]
+                        schema.enum_values[key] = [dict(zip(cols, r)) for r in rows]
                     else:
                         schema.enum_values[key] = [r[0] for r in rows if r[0]]
-                except Exception as e:
+                except Exception:
                     pass  # Non-fatal: hardcoded values in ENUM_COLUMNS still apply
     except Exception:
         pass  # DB not available — degrade gracefully
 
     print(
-        f"  ✓ Schema: {len(schema.tables)} inspection tables, "
+        f"  ✓ {label.title()}: {len(schema.tables)} domain tables, "
         f"{len(schema.ai_tables)} ai tables, "
         f"{len(schema.lookup_tables)} lookup tables"
     )
     if schema.enum_values:
         extracted = ", ".join(
             f"{k}={len(v)}" for k, v in schema.enum_values.items()
-            if isinstance(v[0], str) if v
+            if v and isinstance(v[0], str)
         )
         print(f"  ✓ Dynamic enums: {extracted}")
     return schema
+
+
+def introspect_schema(db_engine: Engine) -> DatabaseSchema:
+    """Inspection-domain introspection — unchanged behavior from before this
+    module supported multiple domains (all params/defaults match exactly)."""
+    return _introspect(
+        db_engine,
+        domain_tables=INSPECTION_TABLES,
+        ai_tables=AI_TABLES,
+        lookup_tables=LOOKUP_TABLES,
+        enum_queries=_INSPECTION_ENUM_QUERIES,
+        multi_col_keys=_MULTI_COL_ENUM_KEYS,
+        label="inspection schema",
+        # DatabaseSchema()'s field defaults already ARE the inspection globals —
+        # no schema_kwargs override needed.
+    )
+
+
+def introspect_audit_schema(db_engine: Engine) -> DatabaseSchema:
+    """Audit-domain introspection — same mechanism as introspect_schema(),
+    AUDIT_* content instead. See DOMAIN_REGISTRY in agent/domains.py."""
+    return _introspect(
+        db_engine,
+        domain_tables=AUDIT_TABLES,
+        ai_tables=AUDIT_AI_TABLES,
+        lookup_tables=AUDIT_LOOKUP_TABLES,
+        enum_queries=_AUDIT_ENUM_QUERIES,
+        multi_col_keys=frozenset(),
+        label="audit schema",
+        schema_kwargs=dict(
+            _domain_tables_list=list(AUDIT_TABLES),
+            _ai_tables_list=list(AUDIT_AI_TABLES),
+            _lookup_config=dict(AUDIT_LOOKUP_TABLES),
+            _fk_resolution=dict(AUDIT_FK_RESOLUTION),
+            _optional_fks=set(),
+            _useful_columns=dict(AUDIT_USEFUL_COLUMNS),
+            _enum_columns=dict(AUDIT_ENUM_COLUMNS),
+            _suppress_columns=set(_AUDIT_SUPPRESS_COLUMNS),
+            _business_rules=list(AUDIT_BUSINESS_RULES),
+            _table_relationships=AUDIT_TABLE_RELATIONSHIPS,
+            _section_title="AUDIT WORKFLOW TABLES",
+            _has_ai_section=True,
+            _ai_join_pattern=(
+                "FROM ai_audit_answers aaa\n"
+                "  LEFT JOIN ai_questions aq ON aaa.element_id = aq.element_id\n"
+                "  JOIN audit_report arep ON aaa.audit_report_id = arep.id"
+            ),
+            _status_enum_keys=(
+                "audit_plan.status", "audit_schedule.schedule_status", "audit_report.status",
+                "audit_corrective_action.status", "audit_corrective_action.implementation_status",
+                "audit_corrective_action.adequacy_status", "audit_corrective_action.progress_stage",
+            ),
+        ),
+    )

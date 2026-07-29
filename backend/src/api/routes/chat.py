@@ -5,16 +5,24 @@ Chat, pagination, and session routes — /api/chat, /api/page,
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from src.charts.advisor import advise, force_config, classify_columns, build_kpi_cards, should_show_dashboard
+from src.charts.advisor import (
+    advise, advise_full, force_config_full, classify_columns,
+    build_kpi_cards, should_show_dashboard,
+)
 from src.security.auth import require_auth
 from src.sql.result_shape import is_disambiguation_result, is_entity_disambiguation_result, extract_search_term
 from src.security.rbac import DATA_VISIBILITY_PERMS, build_scope_filter
-from src.api.deps import get_orch, get_or_create_session, refetch_for_calendar, _sessions
+from src.agent.orchestrator.models import ConversationTurn
+from src.api.deps import (
+    get_orch, get_orch_inspection, get_orch_audit, get_router,
+    get_or_create_session, _sessions,
+)
 from src.api.response_formatting import (
     is_chart_followup, extract_requested_type, strip_uuid_columns,
     redact_security_internals, clean_answer, generate_summary, paginate_sql,
@@ -30,15 +38,50 @@ log_security = logging.getLogger("inspectai.security")
 
 router = APIRouter()
 
+# A bare greeting is never a real data question worth carrying forward as a
+# domain-clarification's "origin" — see the domain-pick carryover logic below.
+_GREETING_RE = re.compile(r"^(hi|hello|hey|hiya|yo|sup|greetings)\b", re.IGNORECASE)
+
+# A "bare domain pick" names ONLY the domain itself ("Audit", "the audit
+# one", "i mean inspection") with no other content — meaningless standalone,
+# so the ORIGINAL question gets re-run against it (see _is_pending_domain_pick
+# below). A reply like "i mean mitigative actions" is NOT bare — "mitigative
+# actions" is itself a Tier-1 routing keyword (see agent/domain_router.py)
+# that's MORE specific than the vague original question ("Show all actions").
+# Confirmed live: qid=08fa6c7d discarded "i mean mitigative actions" in favor
+# of replaying "Show all actions" verbatim, so the reasoning LLM saw the same
+# vague question a second time (plus a confusing echo of the router's
+# inspection-vs-audit clarifying question in history) and invented a SECOND,
+# unprompted clarifying question about action sub-types instead of just
+# generating SQL — which it does correctly when given "mitigative actions"
+# directly (see the working "Show all mitigative actions" turn in the same
+# session). The old heuristic (word count <= 4) mistook "mitigative actions"
+# for a bare pick purely because it was short.
+_BARE_DOMAIN_PICK_RE = re.compile(
+    r"^\s*(?:i\s+mean\s+|the\s+|it'?s\s+|that'?s\s+)?"
+    r"(?:audit|audits|auditing|inspection|inspections|inspecting)"
+    r"(?:\s+one)?\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @router.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=Depends(get_orch)):
+async def chat(
+    req: ChatRequest, token_data: dict = Depends(require_auth),
+    orch_inspection=Depends(get_orch_inspection), orch_audit=Depends(get_orch_audit),
+    router_=Depends(get_router),
+):
     qid = uuid.uuid4().hex[:8]
     sub = token_data['sub']
     try:
         sess_key = f"{req.session_id}:{sub}"
         sess_data = get_or_create_session(sess_key)
+        # Chart-followup fast-path below is a pure UI replay against the
+        # LAST result — domain-agnostic (both orchestrators share one
+        # db_engine, see api/app.py's lifespan) — default to inspection here;
+        # real domain routing happens further below, before the LLM pipeline.
+        orch = orch_inspection
 
         log_query.info("[QUERY] START qid=%s sub=%s session=%s q=%r",
                        qid, sub, req.session_id, req.message[:120])
@@ -63,47 +106,39 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=
         # ── Chart follow-up fast-path — skip LLM entirely ────────────────────
         if is_chart_followup(req.message) and sess_data.get("last_raw_rows"):
             cols = sess_data["last_cols"]
-            rows = sess_data["last_raw_rows"]
+            sample_rows = sess_data["last_raw_rows"]
             requested = extract_requested_type(req.message)
+            _sql_params = sess_data.get("last_sql_params", {})
 
-            # Calendar heatmap needs the full date range, not just the cached 50 rows.
-            _cal_needed = (requested == "calendar_heatmap") or (not requested and advise(cols, rows).get("chart_type") == "calendar_heatmap")
-            if _cal_needed and sess_data.get("last_sql"):
-                _full = refetch_for_calendar(sess_data["last_sql"], orch, params=sess_data.get("last_sql_params", {}))
-                if _full:
-                    rows = _full
-                    cols = list(_full[0].keys())
-
-            rec = advise(cols, rows)
-            if rec.get("chart_type"):
-                if requested:
-                    # User explicitly typed /chart <type> — show it directly,
-                    # no conflict banner. The advisor config is the fallback only
-                    # if force_config returns nothing (e.g. unsupported combination).
-                    req_cfg = force_config(cols, rows, requested) or rec["config"]
-                    cc = ChartConfig(
-                        chart_type=requested,
-                        reason=f"Showing {requested.replace('_', ' ').title()} as requested",
-                        confidence="medium",
-                        config=req_cfg,
-                        conflict=False,
-                        requested_type=None,
-                        requested_config=None,
-                        alternatives=rec.get("alternatives", []),
-                        x_label=rec.get("labels_column"),
-                        y_labels=rec.get("values_columns") or [],
-                    )
-                else:
-                    cc = ChartConfig(
-                        chart_type=rec["chart_type"], reason=rec["reason"],
-                        confidence=rec["confidence"], config=rec["config"],
-                        conflict=False,
-                        requested_type=None,
-                        requested_config=None,
-                        alternatives=rec.get("alternatives", []),
-                        x_label=rec.get("labels_column"),
-                        y_labels=rec.get("values_columns") or [],
-                    )
+            if requested:
+                # User explicitly typed /chart <type> — show it directly, no
+                # conflict banner. force_config_full fetches a fuller dataset
+                # (any type, not just calendar) before building/aggregating,
+                # same flow every other chart-producing path now uses.
+                req_cfg, rows_total, rows_shown = force_config_full(
+                    cols, sample_rows, requested,
+                    sql=sess_data.get("last_sql"), orch=orch, params=_sql_params,
+                )
+                rec = advise(cols, sample_rows)  # only for alternatives/x_label/y_labels
+                if req_cfg is None:
+                    req_cfg = rec["config"]
+                    rows_total = rec.get("rows_total")
+                    rows_shown = rec.get("rows_shown")
+                cc = ChartConfig(
+                    chart_type=requested,
+                    reason=f"Showing {requested.replace('_', ' ').title()} as requested",
+                    confidence="medium",
+                    config=req_cfg,
+                    conflict=False,
+                    requested_type=None,
+                    requested_config=None,
+                    alternatives=rec.get("alternatives", []),
+                    x_label=rec.get("labels_column"),
+                    y_labels=rec.get("values_columns") or [],
+                    rows_shown=rows_shown, rows_total=rows_total,
+                    is_aggregated=bool(rows_total and rows_shown and rows_shown < rows_total),
+                    can_view_all=bool(rows_total and rows_shown and rows_shown < rows_total),
+                )
                 return ChatResponse(
                     answer="Here's the chart.",
                     sql=None, reasoning=None,
@@ -114,9 +149,95 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=
                     chart_config=cc,
                 )
 
+            rec = advise_full(
+                cols, sample_rows,
+                sql=sess_data.get("last_sql"), orch=orch, params=_sql_params,
+            )
+            if rec.get("chart_type"):
+                cc = ChartConfig(
+                    chart_type=rec["chart_type"], reason=rec["reason"],
+                    confidence=rec["confidence"], config=rec["config"],
+                    conflict=False,
+                    requested_type=None,
+                    requested_config=None,
+                    alternatives=rec.get("alternatives", []),
+                    x_label=rec.get("labels_column"),
+                    y_labels=rec.get("values_columns") or [],
+                    rows_shown=rec.get("rows_shown"), rows_total=rec.get("rows_total"),
+                    is_aggregated=rec.get("is_aggregated", False),
+                    can_view_all=rec.get("can_view_all", False),
+                )
+                return ChatResponse(
+                    answer="Here's the chart.",
+                    sql=None, reasoning=None,
+                    prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                    time_ms=1, llm_calls=0, sql_errors=0, steps=[],
+                    session_id=req.session_id,
+                    result_data=None,
+                    chart_config=cc,
+                )
+
+        # ── Domain routing — 3-tier hybrid (keyword → session stickiness →
+        # LLM judge), see agent/domain_router.py. Runs after the chart-followup
+        # fast-path (irrelevant to domain) and before the LLM pipeline. ──────
+        #
+        # If the PREVIOUS turn was itself an unresolved domain clarification
+        # (route.domain == "AMBIGUOUS"), a short reply now ("Audit", "the
+        # audit one") is a DOMAIN PICK, not a new question — classify on the
+        # reply text (Tier 1 resolves the bare domain word directly) but then
+        # run the ORIGINAL question, not the bare pick. Without this, "list
+        # all schedules" -> asked to clarify -> "Audit" -> the orchestrator
+        # receives the literal string "Audit" as its question, which is
+        # meaningless on its own and just asks the user to clarify AGAIN —
+        # confirmed live: qid=94c31bf3 did exactly this. Mirrors the existing
+        # disambiguation_origin_question pattern used for people/entity name
+        # picks (see agent/orchestrator/session.py's _origin_note).
+        _sess_obj = sess_data["session"]
+        _prev = _sess_obj.last_turn
+        # Only carry the origin forward when it actually LOOKS like a data
+        # question — confirmed live: "Hi" -> Tier 3 correctly said AMBIGUOUS
+        # (reasonable for a bare greeting) -> user replied "audits" -> this
+        # carryover fired and substituted "Hi" back in as the question,
+        # so the orchestrator just re-greeted the user instead of treating
+        # "audits" as their actual (if vague) request. A greeting is never
+        # worth re-running verbatim, unlike a genuine question like "list
+        # all schedules" that just needed a domain picked for it.
+        _origin_is_real_question = bool(
+            _prev and not _GREETING_RE.match(_prev.question.strip())
+            and len(_prev.question.strip().split()) >= 2
+        )
+        _is_pending_domain_pick = bool(
+            _prev and _prev.tool_used == "domain_clarification"
+            and _BARE_DOMAIN_PICK_RE.match(req.message.strip())
+            and _origin_is_real_question
+        )
+        # Tier 1/2/3 always classify on the REPLY text itself (Tier 1 needs
+        # to see the actual domain word, e.g. "Audit") — only the message
+        # actually sent to the orchestrator gets swapped for the origin
+        # question, once resolved.
+        route = router_.classify(req.message, session=_sess_obj)
+        log_query.info("[ROUTER] qid=%s tier=%d domain=%s confidence=%.2f%s",
+                        qid, route.tier, route.domain, route.confidence,
+                        " (origin-question carryover)" if _is_pending_domain_pick and route.domain != "AMBIGUOUS" else "")
+        if route.domain == "AMBIGUOUS":
+            _sess_obj.add_turn(ConversationTurn(
+                question=req.message, answer=route.clarifying_question,
+                tool_used="domain_clarification",
+            ))
+            return ChatResponse(
+                answer=route.clarifying_question,
+                sql=None, reasoning=None,
+                prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                time_ms=0, llm_calls=0, sql_errors=0, steps=[],
+                session_id=req.session_id,
+                result_data=None,
+            )
+        orch = orch_audit if route.domain == "AUDIT" else orch_inspection
+        _effective_message = _prev.question if _is_pending_domain_pick else req.message
+
         t0 = time.time()
         result = await asyncio.to_thread(
-            orch.query, req.message, session=sess_data["session"],
+            orch.query, _effective_message, session=sess_data["session"],
             visibility_scope=visibility_scope, query_id=qid,
         )
         elapsed_ms = int((time.time() - t0) * 1000)
@@ -319,7 +440,18 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=
             display_answer = summary if summary else clean_answer(result.answer, _result_rows)
             raw_for_chart = sess_data["last_raw_rows"] if sess_data.get("last_raw_rows") else _result_rows
 
-            rec = advise(_result_cols, raw_for_chart)
+            # Two-phase fetch: this is the previously-missing wiring — the
+            # calendar-only refetch_for_calendar bypass used to skip this path
+            # entirely, so a calendar chart embedded right after the initial
+            # answer could look sparser than the same chart requested a moment
+            # later via the chart-followup path below (which DID refetch).
+            # advise_full now fetches a fuller dataset for every chart type
+            # that benefits from it, consistently across all three paths.
+            rec = advise_full(
+                _result_cols, raw_for_chart,
+                sql=sess_data.get("last_sql"), orch=orch,
+                params=sess_data.get("last_sql_params", {}),
+            )
             if should_show_dashboard(_result_cols, raw_for_chart, rec):
                 # Dashboard path: embed chart_config directly; KPI cards computed here.
                 # The frontend renders dashboard-display (cards + chart + table) instead of
@@ -335,10 +467,17 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=
                     alternatives=rec.get("alternatives", []),
                     x_label=rec.get("labels_column"),
                     y_labels=rec.get("values_columns") or [],
+                    rows_shown=rec.get("rows_shown"), rows_total=rec.get("rows_total"),
+                    is_aggregated=rec.get("is_aggregated", False),
+                    can_view_all=rec.get("can_view_all", False),
                 )
+                # Use the fuller fetch for KPI sums/averages when advise_full
+                # got one — otherwise a card like "Total CAPEX" would silently
+                # report a partial sum over just the 50-row sample as if it
+                # were the true total.
                 _dashboard = DashboardData(
                     show=True,
-                    cards=build_kpi_cards(_result_cols, raw_for_chart),
+                    cards=build_kpi_cards(_result_cols, rec.get("_full_rows") or raw_for_chart),
                 )
             else:
                 _dashboard = DashboardData(show=False, cards=[])
@@ -375,6 +514,9 @@ async def chat(req: ChatRequest, token_data: dict = Depends(require_auth), orch=
                     alternatives=_pl_rec.get("alternatives", []),
                     x_label=_pl_rec.get("labels_column"),
                     y_labels=_pl_rec.get("values_columns") or [],
+                    rows_shown=_pl_rec.get("rows_shown"), rows_total=_pl_rec.get("rows_total"),
+                    is_aggregated=_pl_rec.get("is_aggregated", False),
+                    can_view_all=_pl_rec.get("can_view_all", False),
                 )
                 _dashboard = _dashboard or DashboardData(show=False, cards=[])
 

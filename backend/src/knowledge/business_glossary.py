@@ -32,12 +32,35 @@ try:
         old_completed_forbidden_regex as _old_completed_forbidden_regex,
         completed_filter as _completed_filter,
         conducted_in_list as _conducted_in_list,
+        AUDIT_SEMANTICS as _AUDIT_SEMANTICS,
+        AUDIT_REPORT_SEMANTICS as _AUDIT_REPORT_SEMANTICS,
     )
     _COMPLETED_REQUIRED  = _completed_required_regex()
     _CONDUCTED_REQUIRED  = _conducted_required_regex()
     _OLD_COMPLETED_BAD   = _old_completed_forbidden_regex()
     _COMPLETED_SQL       = f"status {_completed_filter()}"
     _CONDUCTED_SQL       = f"status IN {_conducted_in_list()}"
+    # Audit domain — TWO separate concepts, deliberately not conflated:
+    #   "completed/conducted audit PLANS" (word "plan" said explicitly) ->
+    #     audit_plan.status (conducted = SUBMITTED/RETURNED_FOR_MODIFICATION,
+    #     completed = APPROVED) — was this planning document approved.
+    #   bare "completed/conducted audits" (no qualifier) -> audit_report.status
+    #     (conducted = SUBMITTED, completed = CLOSED/CLOSED_WITH_EXCEPTION) —
+    #     was the audit itself actually carried out and closed out. Confirmed
+    #     live: this bare phrasing is what people actually mean almost every
+    #     time, not the plan-approval question — audit_plan is "just the
+    #     plan," not the audit.
+    # No "old wrong definition" forbidden pattern exists yet for either audit
+    # case (nothing confirmed live to need one), unlike inspection's
+    # _OLD_COMPLETED_BAD.
+    _AUDIT_PLAN_COMPLETED_REQUIRED = _completed_required_regex(_AUDIT_SEMANTICS)
+    _AUDIT_PLAN_CONDUCTED_REQUIRED = _conducted_required_regex(_AUDIT_SEMANTICS)
+    _AUDIT_PLAN_COMPLETED_SQL      = f"status {_completed_filter(_AUDIT_SEMANTICS)}"
+    _AUDIT_PLAN_CONDUCTED_SQL      = f"status IN {_conducted_in_list(_AUDIT_SEMANTICS)}"
+    _AUDIT_REPORT_COMPLETED_REQUIRED = _completed_required_regex(_AUDIT_REPORT_SEMANTICS)
+    _AUDIT_REPORT_CONDUCTED_REQUIRED = _conducted_required_regex(_AUDIT_REPORT_SEMANTICS)
+    _AUDIT_REPORT_COMPLETED_SQL      = f"status {_completed_filter(_AUDIT_REPORT_SEMANTICS)}"
+    _AUDIT_REPORT_CONDUCTED_SQL      = f"status IN {_conducted_in_list(_AUDIT_REPORT_SEMANTICS)}"
 except ImportError:
     # Fallback — keep in sync with knowledge/semantics_registry.py
     _COMPLETED_REQUIRED = r"status\s*=\s*'CLOSED'"
@@ -47,6 +70,18 @@ except ImportError:
     _OLD_COMPLETED_BAD  = r"status\s*IN\s*\(\s*'CLOSED'\s*,\s*'SUBMITTED'\s*\)"
     _COMPLETED_SQL      = "status = 'CLOSED'"
     _CONDUCTED_SQL      = "status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')"
+    _AUDIT_PLAN_COMPLETED_REQUIRED = r"status\s*=\s*'APPROVED'"
+    _AUDIT_PLAN_CONDUCTED_REQUIRED = (
+        r"status\s*IN\s*\([^)]*(?:'SUBMITTED'|'RETURNED_FOR_MODIFICATION')[^)]*\)"
+    )
+    _AUDIT_PLAN_COMPLETED_SQL = "status = 'APPROVED'"
+    _AUDIT_PLAN_CONDUCTED_SQL = "status IN ('SUBMITTED','RETURNED_FOR_MODIFICATION')"
+    _AUDIT_REPORT_COMPLETED_REQUIRED = (
+        r"status\s*IN\s*\([^)]*(?:'CLOSED'|'CLOSED_WITH_EXCEPTION')[^)]*\)"
+    )
+    _AUDIT_REPORT_CONDUCTED_REQUIRED = r"status\s*=\s*'SUBMITTED'"
+    _AUDIT_REPORT_COMPLETED_SQL = "status IN ('CLOSED','CLOSED_WITH_EXCEPTION')"
+    _AUDIT_REPORT_CONDUCTED_SQL = "status = 'SUBMITTED'"
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +226,82 @@ _RAW: list[dict] = [
         "forbidden_patterns": [],
         "correct_sql": "WHERE status = 'CLOSE_WITH_DEFERRED'",
         "message": "deferred mitigative actions: status = 'CLOSE_WITH_DEFERRED'",
+        "severity": "SOFT_WARN",
+    },
+
+    # ── Audit status terms — TWO SEPARATE tables/concepts, deliberately not
+    # conflated. Confirmed live: bare "completed/conducted audits" (no
+    # qualifier) is what people actually mean almost every time — whether the
+    # audit itself was carried out and closed out (audit_report.status) — NOT
+    # whether its planning document was approved (audit_plan.status, "just
+    # the plan"). The plan-specific terms below only match when the question
+    # explicitly says "audit plan(s)". ─────────────────────────────────────
+
+    {
+        "id": "completed_audits",
+        # Regex terms (not plain phrases) with a negative lookahead excluding
+        # "plan(s)" — "completed audit" as a plain word-boundary phrase would
+        # also match inside "completed audit PLANS" (word boundaries don't
+        # anchor on what follows), which would wrongly fire this
+        # report-scoped entry on a plan-scoped question too. Confirmed live.
+        "terms": [r"completed\s+audits?\b(?!\s+plans?\b)"],
+        "required_pattern": _AUDIT_REPORT_COMPLETED_REQUIRED,
+        "forbidden_patterns": [],
+        "correct_sql": _AUDIT_REPORT_COMPLETED_SQL,
+        "message": (
+            f"completed audits = {_AUDIT_REPORT_COMPLETED_SQL} on audit_report "
+            f"(fully closed out, with or without exceptions). SUBMITTED is "
+            f"'conducted' (audit done, report submitted, not yet closed) — not "
+            f"completed. This is about audit_report, NOT audit_plan.status."
+        ),
+        "severity": "SOFT_WARN",
+    },
+    {
+        "id": "conducted_audits",
+        # Same negative-lookahead reasoning as completed_audits above for the
+        # "conducted audit(s)" phrase; the other three terms don't collide
+        # with any "audit plan(s)" phrasing so stay plain.
+        "terms": [r"conducted\s+audits?\b(?!\s+plans?\b)", "in-flight audit",
+                   "in-flight audits", "audits in progress"],
+        "required_pattern": _AUDIT_REPORT_CONDUCTED_REQUIRED,
+        "forbidden_patterns": [],
+        "correct_sql": _AUDIT_REPORT_CONDUCTED_SQL,
+        "message": (
+            f"conducted audits = {_AUDIT_REPORT_CONDUCTED_SQL} on audit_report "
+            f"— the audit was carried out and the report submitted, but not yet "
+            f"closed out. Excludes DRAFT (not yet submitted) and CLOSED/"
+            f"CLOSED_WITH_EXCEPTION (completed). This is about audit_report, "
+            f"NOT audit_plan.status."
+        ),
+        "severity": "SOFT_WARN",
+    },
+    {
+        "id": "completed_audit_plans",
+        "terms": ["completed audit plan", "completed audit plans",
+                   "approved audit plan", "approved audit plans"],
+        "required_pattern": _AUDIT_PLAN_COMPLETED_REQUIRED,
+        "forbidden_patterns": [],
+        "correct_sql": _AUDIT_PLAN_COMPLETED_SQL,
+        "message": (
+            f"completed audit plans = {_AUDIT_PLAN_COMPLETED_SQL} on audit_plan "
+            f"(fully reviewed and approved). SUBMITTED/RETURNED_FOR_MODIFICATION "
+            f"are 'conducted' (in-flight), not completed."
+        ),
+        "severity": "SOFT_WARN",
+    },
+    {
+        "id": "conducted_audit_plans",
+        "terms": ["conducted audit plan", "conducted audit plans",
+                   "audit plans in progress", "in-flight audit plan",
+                   "in-flight audit plans"],
+        "required_pattern": _AUDIT_PLAN_CONDUCTED_REQUIRED,
+        "forbidden_patterns": [],
+        "correct_sql": _AUDIT_PLAN_CONDUCTED_SQL,
+        "message": (
+            f"conducted audit plans = {_AUDIT_PLAN_CONDUCTED_SQL} on audit_plan "
+            f"— in-flight, excludes both DRAFT (not started) and APPROVED "
+            f"(completed)."
+        ),
         "severity": "SOFT_WARN",
     },
 

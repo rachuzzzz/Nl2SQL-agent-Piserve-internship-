@@ -1,0 +1,12 @@
+-- REVIEW → AUDIT_CORRECTIVE_ACTION JOIN — exact form:
+--   rev.entity_id = aca.id AND rev.entity_type = 'AUDIT_CORRECTIVE_ACTION'
+--   (entity_id must join to aca.id, the UUID primary key — never aca.corrective_action_id,
+--   a VARCHAR display code that is never UUID-shaped; casting it to uuid will fail)
+--   NEVER: rev.entity_id = aca.corrective_action_id
+--   NEVER: rev.entity_id::text = aca.corrective_action_id
+
+-- OBSERVATION → AUDIT CORRECTIVE ACTION JOIN — exact form:
+--   aaa.submission_id = aca.observation_id::varchar
+--   (cast the UUID side to varchar — mirrors inspection's ica.observation_id/ai_answers pattern)
+--   NEVER: aaa.submission_id::uuid = aca.observation_id
+--   NEVER: aca.observation_id::text = aaa.submission_id

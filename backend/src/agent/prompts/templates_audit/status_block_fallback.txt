@@ -1,0 +1,13 @@
+-- DRAFT RECORDS ARE NEVER COUNTED — GLOBAL RULE:
+--   DRAFT audit plans are incomplete — they must NEVER appear in any count, list, average, or aggregate.
+--
+-- STATUS GROUPINGS — always bucket into two categories (never expose raw status names to user):
+--   conducted  = status IN ('SUBMITTED','RETURNED_FOR_MODIFICATION') — in-flight
+--   completed  = status = 'APPROVED'                                 — fully approved
+--
+-- DEFAULT for "total audit plans / how many audit plans / plans in <month>":
+--   Show as TWO-ROW summary using CASE grouping:
+--     CASE WHEN ap.status = 'APPROVED' THEN 'completed' ELSE 'conducted' END AS category
+--   NEVER show raw status breakdown (SUBMITTED/RETURNED_FOR_MODIFICATION/etc) unless user explicitly asks
+--   NEVER use status IN ('APPROVED','SUBMITTED') — that mixes conducted and completed
+--   NEVER use status != 'DRAFT' alone for conducted — APPROVED is not conducted

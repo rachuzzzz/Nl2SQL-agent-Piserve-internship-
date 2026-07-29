@@ -1,0 +1,11 @@
+-- AUDIT CORRECTIVE ACTION WORKFLOW — four independent tracks on aca:
+--   status (system):                    DRAFT | SUBMITTED | OPEN | OVERDUE | CLOSED | CLOSE_WITH_DEFERRED
+--   progress_stage (auditee):           NOT_STARTED, ON_TRACK, BEHIND, AT_RISK, COMPLETED, CLOSE_WITH_DEFERRED
+--   implementation_status (auditor, auditee-side check): NULL | PENDING_FOR_REVIEW | APPROVE | RETURN_FOR_MODIFICATION
+--   adequacy_status (auditor, adequacy check — NO inspection equivalent): same 4 values as implementation_status
+--     EXACT STRINGS for both: 'APPROVE' not 'APPROVED' — 'PENDING_FOR_REVIEW' not 'PENDING'
+-- INVARIANTS:
+--   status = 'CLOSED' co-occurs with implementation_status = 'APPROVE' AND adequacy_status = 'APPROVE'
+--   review.status = 'COMPLETED' does NOT mean approved — check review.action = 'APPROVE' too
+--   corrective_action_id displays as literal 'CA_DRAFT' until adequacy_status = 'APPROVE'
+-- TRAP: 'at risk' = progress_stage='AT_RISK' (schedule health), NOT risk_level='High' (severity)

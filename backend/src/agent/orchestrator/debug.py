@@ -143,9 +143,16 @@ def _has_uuid_leak(rows: list, columns: list) -> list[str]:
 # STATUS + CAST notes are generated from src.knowledge.semantics_registry — the single
 # source of truth. Never hardcode status groupings or cast directions here.
 try:
-    from src.knowledge.semantics_registry import constraint_note_status, constraint_note_cast
+    from src.knowledge.semantics_registry import (
+        constraint_note_status, constraint_note_cast, AUDIT_SEMANTICS,
+    )
     _NOTE_STATUS = constraint_note_status()
     _NOTE_CAST = constraint_note_cast()
+    _NOTE_STATUS_AUDIT = constraint_note_status(AUDIT_SEMANTICS)
+    _NOTE_CAST_AUDIT = (
+        constraint_note_cast(AUDIT_SEMANTICS) + "\n"
+        + constraint_note_cast(AUDIT_SEMANTICS, join_key="observation_to_ca")
+    )
 except ImportError:
     # Fallback literals — keep in sync with knowledge/semantics_registry.py
     _NOTE_STATUS = (
@@ -153,45 +160,31 @@ except ImportError:
         "('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION') | always exclude DRAFT"
     )
     _NOTE_CAST = "-- JOIN ON aa.submission_id = ica.observation_id::varchar"
+    _NOTE_STATUS_AUDIT = (
+        "-- completed = status = 'APPROVED' | conducted = status IN "
+        "('SUBMITTED','RETURNED_FOR_MODIFICATION') | always exclude DRAFT"
+    )
+    _NOTE_CAST_AUDIT = (
+        "-- JOIN ON rev.entity_id = aca.id AND rev.entity_type = 'AUDIT_CORRECTIVE_ACTION'\n"
+        "-- JOIN ON aaa.submission_id = aca.observation_id::varchar"
+    )
 
 
-_CONSTRAINT_NOTE_MAP = {
-    "WRONG_CAST_DIR": _NOTE_CAST,
+# Codes below with no domain-specific nouns (join-path/alias/date-format hints
+# rather than table- or column-name-specific facts) are shared verbatim between
+# domains — duplicating them would just be two copies to keep in sync for zero
+# benefit. Codes referencing inspection-only or audit-only tables/columns are
+# defined once per domain map instead.
+_CONSTRAINT_NOTE_SHARED = {
     "IMPOSSIBLE_JOIN": (
         "-- Check the join path carefully. Use get_schema to verify FK columns."
-    ),
-    "WRONG_COLUMN": (
-        "-- ai_answers has NO 'label' column. To filter by question label:\n"
-        "--   JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
-        "--   WHERE aq.label = 'Observation'  (or whichever label)\n"
-        "-- ai_answers also has NO 'form_name' column — it has 'module_name'."
-    ),
-    "CYCLE_FREQUENCY_MISSING_SUBQUERY": (
-        "-- 'list all cycles' / 'cycle types' = frequency_definition directly, NO inspection_cycle join:\n"
-        "--   SELECT name AS frequency_name, repeat_count, repeat_interval, repeat_unit\n"
-        "--   FROM frequency_definition WHERE active = true ORDER BY name;\n"
-        "-- The ic->ip->ipd->fd join chain with status='COMPLETED' is ONLY for\n"
-        "--   'the MOST RECENT completed cycle' and REQUIRES:\n"
-        "--   WHERE ic.id = (SELECT id FROM inspection_cycle WHERE status='COMPLETED'\n"
-        "--                   ORDER BY end_date DESC LIMIT 1)"
     ),
     "UNDEFINED_ALIAS": (
         "-- A table alias was referenced in WHERE/SELECT but never introduced via FROM/JOIN.\n"
         "--   EITHER add the missing JOIN for that alias (if you need its columns),\n"
         "--   OR remove every reference to that alias if the table isn't actually needed.\n"
-        "--   Re-check every alias used (ica, ir, fac, u, ...) has a matching\n"
+        "--   Re-check every alias used in this query has a matching\n"
         "--   'FROM <table> <alias>' or 'JOIN <table> <alias>' in the query."
-    ),
-    "WRONG_JOIN": (
-        "-- 'responsible' and 'pending_with' are VARCHAR enums, not UUID FKs.\n"
-        "--   Do NOT join to users table on these columns.\n"
-        "-- 'responsible party' = ica.responsible directly (CLIENT | INTERNAL_OPERATIONS | SUB_CONTRACTOR)\n"
-        "--   SELECT ica.responsible AS responsible_party — NO JOIN to users needed or possible.\n"
-        "--   If a previous attempt added LEFT JOIN users ON ica.responsible = '...', REMOVE that join entirely."
-    ),
-    "UUID_IN_SELECT": (
-        "-- ir.id is the UUID primary key — never SELECT it for display.\n"
-        "--   Use ir.inspection_id (VARCHAR) for human-readable inspection IDs."
     ),
     "SPLIT_NAME_MISMATCH": (
         "-- (x.first_name ILIKE '%A%' OR x.last_name ILIKE '%B%') with A != B matches\n"
@@ -204,22 +197,62 @@ _CONSTRAINT_NOTE_MAP = {
     "TOCHAR_WHERE_FILTER": (
         "-- TO_CHAR(col, 'Month YYYY') = 'January 2026' ALWAYS RETURNS 0 ROWS in WHERE.\n"
         "--   PostgreSQL pads month names with spaces: 'January   2026' != 'January 2026'.\n"
-        "--   CORRECT: EXTRACT(MONTH FROM ir.submitted_on) = 1 AND EXTRACT(YEAR ...) = 2026\n"
+        "--   CORRECT: EXTRACT(MONTH FROM <date_col>) = 1 AND EXTRACT(YEAR FROM <date_col>) = 2026\n"
         "--   TO_CHAR is only valid for SELECT/GROUP BY display labels, never WHERE."
     ),
     "STALE_DATE_LITERAL": (
         "-- NEVER hardcode a past year in date literals like DATE '2023-01-01'.\n"
         "--   The data is from 2025/2026. Use EXTRACT with CURRENT_DATE:\n"
-        "--     EXTRACT(MONTH FROM ir.submitted_on) = 1\n"
-        "--     AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)\n"
+        "--     EXTRACT(MONTH FROM <date_col>) = 1\n"
+        "--     AND EXTRACT(YEAR FROM <date_col>) = EXTRACT(YEAR FROM CURRENT_DATE)\n"
         "--   Only use a specific year if the user explicitly asked for it."
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# Per-domain maps — inherit the shared codes above, add domain-specific ones.
+# Split because several codes reference a specific table/alias (ica.responsible
+# vs aca.responsible, ir.id vs aca.id) — showing the wrong domain's alias in a
+# retry hint would actively mislead the SQL-generating LLM, not just look
+# untidy. See semantics_registry.py's module docstring for the same rationale
+# applied to constraint_note_status/constraint_note_cast.
+# ---------------------------------------------------------------------------
+
+_CONSTRAINT_NOTE_MAP_INSPECTION = {
+    **_CONSTRAINT_NOTE_SHARED,
+    "WRONG_COLUMN": (
+        "-- ai_answers has NO 'label' column. To filter by question label:\n"
+        "--   JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
+        "--   WHERE aq.label = 'Observation'  (or whichever label)\n"
+        "-- ai_answers also has NO 'form_name' column — it has 'module_name'."
+    ),
+    "WRONG_CAST_DIR": _NOTE_CAST,
+    "MISSING_COMPLETED_STATUS": _NOTE_STATUS,
+    "WRONG_JOIN": (
+        "-- 'responsible' and 'pending_with' are VARCHAR enums, not UUID FKs.\n"
+        "--   Do NOT join to users table on these columns.\n"
+        "-- 'responsible party' = ica.responsible directly (CLIENT | INTERNAL_OPERATIONS | SUB_CONTRACTOR)\n"
+        "--   SELECT ica.responsible AS responsible_party — NO JOIN to users needed or possible.\n"
+        "--   If a previous attempt added LEFT JOIN users ON ica.responsible = '...', REMOVE that join entirely."
+    ),
+    "UUID_IN_SELECT": (
+        "-- ir.id is the UUID primary key — never SELECT it for display.\n"
+        "--   Use ir.inspection_id (VARCHAR) for human-readable inspection IDs."
     ),
     "TRUNCATED_INSPECTION_ID": (
         "-- inspection_id is always the FULL string 'YYYY/MM/STXXX/INSXXX'.\n"
         "--   NEVER truncate to 'STXXX/INSXXX' — always use the complete value the user provided.\n"
         "--   Example: WHERE ir.inspection_id = '2026/01/ST074/INS002'"
     ),
-    "MISSING_COMPLETED_STATUS": _NOTE_STATUS,
+    "CYCLE_FREQUENCY_MISSING_SUBQUERY": (
+        "-- 'list all cycles' / 'cycle types' = frequency_definition directly, NO inspection_cycle join:\n"
+        "--   SELECT name AS frequency_name, repeat_count, repeat_interval, repeat_unit\n"
+        "--   FROM frequency_definition WHERE active = true ORDER BY name;\n"
+        "-- The ic->ip->ipd->fd join chain with status='COMPLETED' is ONLY for\n"
+        "--   'the MOST RECENT completed cycle' and REQUIRES:\n"
+        "--   WHERE ic.id = (SELECT id FROM inspection_cycle WHERE status='COMPLETED'\n"
+        "--                   ORDER BY end_date DESC LIMIT 1)"
+    ),
     # Fired when business_rules.py BLOCK rules trigger (error code is "BUSINESS_RULE").
     # The most common cause is block_capex_left_join_multiplication or
     # block_cte_reference_without_definition.  The note gives deepseek the two
@@ -242,17 +275,48 @@ _CONSTRAINT_NOTE_MAP = {
     ),
 }
 
+_CONSTRAINT_NOTE_MAP_AUDIT = {
+    **_CONSTRAINT_NOTE_SHARED,
+    "WRONG_COLUMN": (
+        "-- ai_audit_answers has NO 'label' column. To filter by question label:\n"
+        "--   JOIN ai_questions aq ON aaa.element_id = aq.element_id\n"
+        "--   WHERE aq.label = 'Observation'  (or whichever label)\n"
+        "-- ai_audit_answers also has NO 'form_name' column — it has 'module_name'."
+    ),
+    "WRONG_CAST_DIR": _NOTE_CAST_AUDIT,
+    "MISSING_COMPLETED_STATUS": _NOTE_STATUS_AUDIT,
+    "WRONG_JOIN": (
+        "-- 'responsible' and 'pending_with' are VARCHAR enums, not UUID FKs.\n"
+        "--   Do NOT join to users table on these columns.\n"
+        "-- 'responsible party' = aca.responsible directly (CLIENT | INTERNAL_OPERATIONS | SUB_CONTRACTOR)\n"
+        "--   SELECT aca.responsible AS responsible_party — NO JOIN to users needed or possible.\n"
+        "--   If a previous attempt added LEFT JOIN users ON aca.responsible = '...', REMOVE that join entirely."
+    ),
+    "UUID_IN_SELECT": (
+        "-- aca.id / ap.id / asch.id / arep.id are UUID primary keys — never SELECT them for display.\n"
+        "--   Use aca.corrective_action_id / asch.schedule_id / arep.audit_id (VARCHAR display codes) instead."
+    ),
+}
 
-def _build_constraint_notes(retry_reason: str) -> str:
+# Backward-compat alias — the pre-domain-split name, still imported by loop.py.
+_CONSTRAINT_NOTE_MAP = _CONSTRAINT_NOTE_MAP_INSPECTION
+
+
+def _build_constraint_notes(retry_reason: str, domain: str = "inspection") -> str:
     """
     Given a retry_reason string (from ValidationResult.retry_message()),
     return focused constraint notes for the codes present.
 
+    `domain` picks the alias-correct map (inspection's ica/ir vs audit's
+    aca/ap/asch/arep) — showing the wrong domain's table aliases in a retry
+    hint would mislead the SQL-generating LLM, not just look untidy.
+
     Returns empty string if no matching codes found — avoids adding noise
     for codes with no known constraint fix.
     """
+    note_map = _CONSTRAINT_NOTE_MAP_AUDIT if domain == "audit" else _CONSTRAINT_NOTE_MAP_INSPECTION
     notes = []
-    for code, note in _CONSTRAINT_NOTE_MAP.items():
+    for code, note in note_map.items():
         if code in retry_reason:
             notes.append(note)
     if notes:

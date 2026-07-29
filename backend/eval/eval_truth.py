@@ -112,6 +112,112 @@ GROUND_TRUTH: dict[str, dict] = {
             ) s
         """,
     },
+    "AGG-03": {  # total capex and opex across all mitigative actions
+        "mode": "row",
+        "sql": """
+            SELECT COALESCE(SUM(capex), 0) AS total_capex,
+                   COALESCE(SUM(opex), 0)  AS total_opex
+            FROM inspection_corrective_action
+            WHERE active = true
+        """,
+    },
+    "AGG-05": {  # inspections completed this month vs last month — completed = CLOSED only
+        "mode": "row",
+        "sql": """
+            SELECT
+                COUNT(*) FILTER (WHERE date_trunc('month', submitted_on) = date_trunc('month', CURRENT_DATE)) AS this_month,
+                COUNT(*) FILTER (WHERE date_trunc('month', submitted_on) = date_trunc('month', CURRENT_DATE - INTERVAL '1 month')) AS last_month
+            FROM inspection_report
+            WHERE active = true AND status = 'CLOSED'
+        """,
+    },
+    "AGG-06": {  # inspections overdue this quarter — inspection_schedule.status='OVERDUE'
+                 # is the authoritative field (463 rows total), not date arithmetic on
+                 # inspection_report (which has no overdue concept of its own).
+        "mode": "scalar",
+        "sql": """
+            SELECT COUNT(*)
+            FROM inspection_schedule
+            WHERE active = true AND status = 'OVERDUE'
+              AND date_trunc('quarter', due_date) = date_trunc('quarter', CURRENT_DATE)
+        """,
+    },
+    "AGG-07": {  # mitigative actions raised vs closed this quarter
+        "mode": "row",
+        "sql": """
+            SELECT
+                COUNT(*) FILTER (WHERE date_trunc('quarter', created_on) = date_trunc('quarter', CURRENT_DATE)) AS raised_this_quarter,
+                COUNT(*) FILTER (WHERE status IN ('CLOSED','CLOSE_WITH_DEFERRED')
+                                  AND date_trunc('quarter', completed_on) = date_trunc('quarter', CURRENT_DATE)) AS closed_this_quarter
+            FROM inspection_corrective_action
+            WHERE active = true
+        """,
+    },
+    "AGG-08": {  # average inspection duration in hours — total_inspection_hours is
+                 # entirely NULL in this DB, must compute from start/end timestamps.
+        "mode": "scalar",
+        "sql": """
+            SELECT ROUND(AVG(EXTRACT(EPOCH FROM (end_date_time - start_date_time)) / 3600.0)::numeric, 2)
+            FROM inspection_report
+            WHERE active = true AND start_date_time IS NOT NULL AND end_date_time IS NOT NULL
+        """,
+    },
+    "AGG-EXT-01": {  # average mitigative actions per inspection — averaged over
+                     # inspections that have >=1 MA (matches AGG-10's established
+                     # per-submission averaging convention, not all inspections).
+        "mode": "scalar",
+        "sql": """
+            SELECT ROUND(AVG(c)::numeric, 2) FROM (
+                SELECT COUNT(*) AS c
+                FROM inspection_corrective_action ica
+                JOIN inspection_report ir ON ica.inspection_id = ir.id
+                WHERE ica.active = true AND ir.active = true
+                GROUP BY ir.id
+            ) s
+        """,
+    },
+    "AGG-EXT-02": {  # mitigative actions closed on time vs late
+        "mode": "row",
+        "sql": """
+            SELECT
+                COUNT(*) FILTER (WHERE completed_on <= target_close_out_date) AS closed_on_time,
+                COUNT(*) FILTER (WHERE completed_on > target_close_out_date)  AS closed_late
+            FROM inspection_corrective_action
+            WHERE active = true AND status IN ('CLOSED','CLOSE_WITH_DEFERRED')
+              AND completed_on IS NOT NULL AND target_close_out_date IS NOT NULL
+        """,
+    },
+    "AGG-EXT-03": {  # percentage of mitigative actions currently overdue
+        "mode": "scalar",
+        "tol": {"abs": 0.5},
+        "sql": """
+            SELECT ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'OVERDUE') / NULLIF(COUNT(*), 0), 1)
+            FROM inspection_corrective_action
+            WHERE active = true
+        """,
+    },
+    "AGG-EXT-04": {  # facilities with zero inspections this year
+        "mode": "scalar",
+        "sql": """
+            SELECT COUNT(*)
+            FROM facility fac
+            WHERE fac.active = true AND NOT EXISTS (
+                SELECT 1 FROM inspection_report ir
+                WHERE ir.facility_id = fac.id AND ir.active = true
+                  AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
+            )
+        """,
+    },
+    "AGG-EXT-05": {  # total observations recorded across all inspections — same
+                     # per-submission counting convention as AGG-10.
+        "mode": "scalar",
+        "sql": """
+            SELECT COUNT(DISTINCT aa.submission_id)
+            FROM ai_answers aa
+            JOIN ai_questions aq ON aa.element_id = aq.element_id
+            WHERE aq.label = 'Observation' AND aa.module_name = 'Inspection Form'
+        """,
+    },
 
     # ── Joins / rankings ─────────────────────────────────────────────────────
     "JOI-06": {  # facility with most overdue MAs — winner + count
@@ -153,6 +259,39 @@ GROUND_TRUTH: dict[str, dict] = {
             WHERE rl.name = 'High' AND ica.active = true
         """,
     },
+    "ICA-01": {  # show all high risk MAs — same shape as ICA-03, "show all" ground
+                 # truth is a count since matching a free-form row listing is fragile.
+        "mode": "scalar",
+        "sql": """
+            SELECT COUNT(*)
+            FROM inspection_corrective_action ica
+            JOIN risk_level rl ON ica.risk_level_id = rl.id
+            WHERE rl.name = 'High' AND ica.active = true
+        """,
+    },
+    "ICA-02": {  # risk level breakdown of all MAs — GROUP BY rl.name (human-readable)
+        "mode": "set",
+        "sql": """
+            SELECT rl.name, COUNT(*) AS ma_count
+            FROM inspection_corrective_action ica
+            JOIN risk_level rl ON ica.risk_level_id = rl.id
+            WHERE ica.active = true
+            GROUP BY rl.name
+        """,
+    },
+    "ICA-04": {  # open + high-risk MAs grouped by facility (3-table join)
+        "mode": "set",
+        "sql": """
+            SELECT fac.name, COUNT(*) AS open_high_risk_count
+            FROM inspection_corrective_action ica
+            JOIN risk_level rl ON ica.risk_level_id = rl.id
+            JOIN inspection_report ir ON ica.inspection_id = ir.id
+            JOIN facility fac ON ir.facility_id = fac.id
+            WHERE rl.name = 'High' AND ica.status = 'OPEN'
+              AND ica.active = true AND ir.active = true AND fac.active = true
+            GROUP BY fac.id, fac.name
+        """,
+    },
 
     # ── Financial (P&L ground truth confirmed in pgAdmin) ────────────────────
     "FIN-01": {  # capex generated / converted / lost — one row, three numbers
@@ -174,6 +313,77 @@ GROUND_TRUTH: dict[str, dict] = {
                    COUNT(*)                    AS po_count
             FROM po_details
             WHERE EXTRACT(YEAR FROM po_date) = EXTRACT(YEAR FROM CURRENT_DATE)
+        """,
+    },
+    "FIN-02": {  # total opex incurred from purchase requisitions — SUM(pr.pr_amount), NOT ica.opex
+        "mode": "scalar",
+        "sql": "SELECT COALESCE(SUM(pr_amount), 0) FROM pr_details",
+    },
+    "FIN-03": {  # which FM manager generates the most capex — FM managers =
+                 # inspectee_user_id (NOT inspector_user_id)
+        "mode": "top1",
+        "sql": """
+            SELECT (u.first_name || ' ' || u.last_name) AS fm_manager,
+                   SUM(ica.capex) AS total_capex
+            FROM inspection_corrective_action ica
+            JOIN inspection_report ir ON ica.inspection_id = ir.id
+            JOIN users u ON ir.inspectee_user_id = u.id
+            WHERE ica.active = true AND ica.capex IS NOT NULL
+            GROUP BY u.id, u.first_name, u.last_name
+            ORDER BY total_capex DESC
+            LIMIT 1
+        """,
+    },
+    "FIN-04": {  # capex lost from rejected mitigative actions — capex_status = 'REJECTED'
+        "mode": "scalar",
+        "sql": """
+            SELECT COALESCE(SUM(capex), 0)
+            FROM inspection_corrective_action
+            WHERE active = true AND capex_status = 'REJECTED'
+        """,
+    },
+    "FIN-05": {  # total capex converted (po_details) and opex incurred (pr_details) by
+                 # facility — po/pr joined via ica -> ir -> facility. Only facilities
+                 # with at least one PO or PR are included (matching the question's
+                 # "from po and pr details" framing, not every facility).
+        "mode": "set",
+        "sql": """
+            SELECT fac.name,
+                   COALESCE(po_sum.total_po, 0) AS total_capex_converted,
+                   COALESCE(pr_sum.total_pr, 0) AS total_opex_incurred
+            FROM facility fac
+            JOIN inspection_report ir ON ir.facility_id = fac.id
+            JOIN inspection_corrective_action ica ON ica.inspection_id = ir.id
+            LEFT JOIN (
+                SELECT mitigative_action_uuid, SUM(po_amount) AS total_po
+                FROM po_details GROUP BY mitigative_action_uuid
+            ) po_sum ON po_sum.mitigative_action_uuid = ica.id
+            LEFT JOIN (
+                SELECT mitigative_action_uuid, SUM(pr_amount) AS total_pr
+                FROM pr_details GROUP BY mitigative_action_uuid
+            ) pr_sum ON pr_sum.mitigative_action_uuid = ica.id
+            WHERE fac.active = true AND ica.active = true
+              AND (po_sum.total_po IS NOT NULL OR pr_sum.total_pr IS NOT NULL)
+            GROUP BY fac.id, fac.name, po_sum.total_po, pr_sum.total_pr
+        """,
+    },
+    "FIN-07": {  # capex generated vs capex converted by FM manager — FM managers
+                 # (inspectee_user_id) generate capex via MAs, NOT inspector_user_id.
+                 # generated = SUM(ica.capex), converted = SUM(po.po_amount).
+        "mode": "set",
+        "sql": """
+            SELECT (u.first_name || ' ' || u.last_name) AS fm_manager,
+                   SUM(ica.capex) AS capex_generated,
+                   COALESCE(SUM(po_sum.total_po), 0) AS capex_converted
+            FROM inspection_corrective_action ica
+            JOIN inspection_report ir ON ica.inspection_id = ir.id
+            JOIN users u ON ir.inspectee_user_id = u.id
+            LEFT JOIN (
+                SELECT mitigative_action_uuid, SUM(po_amount) AS total_po
+                FROM po_details GROUP BY mitigative_action_uuid
+            ) po_sum ON po_sum.mitigative_action_uuid = ica.id
+            WHERE ica.active = true
+            GROUP BY u.id, u.first_name, u.last_name
         """,
     },
 
