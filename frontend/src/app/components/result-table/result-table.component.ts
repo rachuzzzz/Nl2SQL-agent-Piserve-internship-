@@ -33,7 +33,7 @@ import { ResultData } from '../../models/chat.model';
                 [class.row-even]="even"
                 [class.row-drilldown]="isDrilldown"
                 (click)="isDrilldown ? onRowClick(row) : null">
-              <td *ngFor="let col of display.columns">{{ formatCell(row[col]) }}</td>
+              <td *ngFor="let col of display.columns" [title]="formatCell(row[col])">{{ formatCell(row[col]) }}</td>
             </tr>
           </tbody>
         </table>

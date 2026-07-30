@@ -31,6 +31,47 @@ NEVER: WHERE arep.audit_type_id = ... — always NULL, silently returns 0 rows.
 """,
     },
     {
+        # Mirrors inspection's "Inspector performance ranking" worked example
+        # (examples_tier2.py) — same facility/site-quality-vs-person-skill bias
+        # applies to audit_score. Added 2026-07-29 after an observed inconsistency:
+        # "who is the worst inspector" correctly triggered a clarifying question
+        # (via the inspection-domain example), but "who is the worst auditor" had
+        # no equivalent guard and just silently picked "most overdue corrective
+        # actions" as its own interpretation without asking — one of several
+        # equally plausible metrics (score, overdue CAs, high-risk findings), not
+        # something the audit domain should guess on its own.
+        "title": "Auditor performance ranking — ambiguous 'best/worst', don't misuse audit_score",
+        "question_pattern": (
+            r"(?i)\b(best|top|worst|poorest|highest|lowest)\b.{0,30}\b(auditor|auditors)\b"
+            r"|\b(auditor|auditors)\b.{0,30}\b(perform\w*|rank\w*|effective\w*|produc\w*)\b"
+            r"|\bwhich\s+auditor\b.{0,30}\b(best|worst|most|highest|top)\b"
+            r"|\bauditor\b.{0,30}\b(leaderboard|ranking|comparison)\b"
+        ),
+        "text": """\
+─── Auditor performance ranking ───
+CRITICAL: DO NOT use AVG(arep.audit_score) to rank auditors.
+audit_score measures the AUDITED FACILITY/ENTITY's compliance, not the auditor's own
+skill — an auditor assigned only to well-run facilities always ranks first (facility bias),
+same trap as inspection_score for inspectors.
+
+"Best/worst auditor" is AMBIGUOUS. The correct behaviour is:
+  • If question says "best/worst by volume / most audits" → rank by COUNT(DISTINCT asch.id) conducted
+  • If question says "most overdue corrective actions / most findings" → rank by overdue CA count
+  • If question says "average audit score" or explicitly mentions audit_score → ok to use
+    AVG(arep.audit_score) but label it avg_audit_score and add audit_count alongside
+  • If "best"/"worst" is vague → ask for clarification (do not silently pick one metric)
+
+User: "who is the worst auditor"
+Turn 1: {"thought": "'Worst' is ambiguous for an auditor — volume, overdue CAs found, high-risk findings, or audit_score (which is facility quality, not auditor skill)? I must NOT guess a metric silently — ask for clarification, same as the inspector-performance rule.", "tool": "final_answer", "args": {"answer": "Could you clarify what you mean by 'worst auditor'?\\n\\n• Fewest audits conducted\\n• Most overdue corrective actions found\\n• Most high-risk findings\\n• Lowest average audit score (note: this reflects the audited facility's compliance, not the auditor's own skill)\\n\\nLet me know and I'll pull the right data."}}
+
+User follow-up: "most overdue corrective actions" (user answered the clarification — EXECUTE NOW, do NOT ask again)
+Turn 1: {"thought": "User clarified: most overdue CAs found. Previous turn was my clarification question — proceed immediately, do not ask again.", "tool": "generate_sql", "args": {"question": "auditor with the most overdue corrective actions found", "schema_hint": "SELECT u.first_name || ' ' || u.last_name AS auditor_name, COUNT(*) AS overdue_ca_count FROM audit_corrective_action aca JOIN audit_report arep ON aca.audit_id = arep.id JOIN audit_schedule asch ON arep.schedule_id = asch.id JOIN users u ON asch.auditor_id = u.id WHERE aca.status = 'OVERDUE' AND aca.active = true AND arep.active = true AND asch.active = true AND aca.adequacy_status = 'APPROVE' GROUP BY u.id, u.first_name, u.last_name ORDER BY overdue_ca_count DESC LIMIT 10;"}}
+
+User: "which auditor has the lowest average audit score?" (explicitly about audit_score)
+Turn 1: {"thought": "User explicitly asked for average audit_score per auditor — this is the avg FACILITY/audit score for what they audited, not auditor quality. I'll label it clearly.", "tool": "generate_sql", "args": {"question": "auditor with lowest average audit score", "schema_hint": "SELECT u.first_name || ' ' || u.last_name AS auditor_name, ROUND(AVG(arep.audit_score)::numeric, 2) AS avg_audit_score, COUNT(*) AS audit_count FROM audit_report arep JOIN audit_schedule asch ON arep.schedule_id = asch.id JOIN users u ON asch.auditor_id = u.id WHERE arep.active = true AND asch.active = true AND arep.audit_score IS NOT NULL GROUP BY u.id, u.first_name, u.last_name ORDER BY avg_audit_score ASC LIMIT 1;"}}
+""",
+    },
+    {
         "title": "Auditor/auditee — assignment column, not role table",
         "question_pattern": r"(?i)\bwho\s+(is|are)\s+the\s+audit(?:or|ee)s?\b|\blist\s+(all\s+)?audit(?:or|ee)s?\b",
         "text": """\
@@ -64,6 +105,21 @@ Turn 1: {"thought": "ADEQUACY review_type on AUDIT_CORRECTIVE_ACTION is the audi
 ─── impact / compliance / risk_level — pick the table from intent, not label text ───
 User: "show corrective actions with high impact"
 Turn 1: {"thought": "'impact' = business dimension affected, use impact_id. impact and compliance share some identical label strings with DIFFERENT UUIDs per table — never match a word against 'whichever table has it', pick from question intent.", "tool": "generate_sql", "args": {"question": "corrective actions ranked by impact scale", "schema_hint": "SELECT aca.corrective_action_id, imp.name AS impact_name, imp.scale FROM audit_corrective_action aca JOIN impact imp ON aca.impact_id = imp.id WHERE aca.active = true ORDER BY imp.scale DESC LIMIT 100;"}}
+""",
+    },
+    {
+        "title": "Who proposed/raised a CA — created_by, not responsible or pending_with",
+        "question_pattern": (
+            r"(?i)\bwho\s+(proposed|raised|raised\s+it|logged|created|filed|reported)\b.{0,30}"
+            r"\bcorrective\s+action"
+            r"|\bcorrective\s+action.{0,30}\bwho\s+(proposed|raised|logged|created|filed)\b"
+        ),
+        "text": """\
+─── Who proposed/raised a corrective action — created_by, NOT responsible ───
+User: "who proposed the corrective action"
+Turn 1: {"thought": "'who proposed/raised/logged' means the person who created the CA record — that's aca.created_by (UUID FK to users, populated on every row), NOT aca.responsible (a party/organization enum: KHIDMAH/KHIDMAH_AND_CLIENT/CLIENT/SERVICE_PROVIDER_CONTRACTOR/CONSULTANT — a category, not a person) and NOT aca.pending_with (free text, mostly NULL, unreliable).", "tool": "generate_sql", "args": {"question": "who created (raised) this corrective action", "schema_hint": "SELECT aca.corrective_action_id, u.first_name || ' ' || u.last_name AS raised_by FROM audit_corrective_action aca JOIN users u ON aca.created_by = u.id WHERE aca.active = true AND u.active = true LIMIT 100;"}}
+NEVER: SELECT aca.responsible AS proposer — that returns a party/organization label
+(e.g. 'KHIDMAH_AND_CLIENT'), not a person's name.
 """,
     },
     {

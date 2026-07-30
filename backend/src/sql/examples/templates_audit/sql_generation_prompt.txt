@@ -82,9 +82,12 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
   label text alone.
 
 ### PLAIN STRING ENUMS — NOT FOREIGN KEYS:
-  audit_corrective_action.responsible IN ('CLIENT', 'INTERNAL_OPERATIONS', 'SUB_CONTRACTOR')
+  audit_corrective_action.responsible IN ('KHIDMAH', 'KHIDMAH_AND_CLIENT', 'CLIENT',
+    'SERVICE_PROVIDER_CONTRACTOR', 'CONSULTANT') — WHICH PARTY executes the fix, not a person
   audit_corrective_action.pending_with is free text (mostly NULL)
   NEVER join users (or any table) on these columns — filter/select them directly as strings.
+  For "who proposed/raised/logged this CA" use created_by -> users.id instead (UUID FK,
+  populated on every row) — responsible answers "which party", not "which person".
 
 ### PLACEHOLDER ID TRAP:
   audit_corrective_action.corrective_action_id is the literal string 'CA_DRAFT' until the CA

@@ -288,8 +288,10 @@ _CONSTRAINT_NOTE_MAP_AUDIT = {
     "WRONG_JOIN": (
         "-- 'responsible' and 'pending_with' are VARCHAR enums, not UUID FKs.\n"
         "--   Do NOT join to users table on these columns.\n"
-        "-- 'responsible party' = aca.responsible directly (CLIENT | INTERNAL_OPERATIONS | SUB_CONTRACTOR)\n"
+        "-- 'responsible party' = aca.responsible directly (KHIDMAH | KHIDMAH_AND_CLIENT | CLIENT |\n"
+        "--   SERVICE_PROVIDER_CONTRACTOR | CONSULTANT) — a party/organization, not a person.\n"
         "--   SELECT aca.responsible AS responsible_party — NO JOIN to users needed or possible.\n"
+        "--   For 'who proposed/raised/logged this CA' use aca.created_by -> users.id instead.\n"
         "--   If a previous attempt added LEFT JOIN users ON aca.responsible = '...', REMOVE that join entirely."
     ),
     "UUID_IN_SELECT": (

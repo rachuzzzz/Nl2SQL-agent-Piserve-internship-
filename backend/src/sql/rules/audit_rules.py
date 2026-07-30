@@ -17,6 +17,24 @@ from src.sql.rules._types import BLOCK, WARN, INJECT, AUTOCORRECT
 
 AUDIT_BLOCK_RULES: list[dict] = [
     {
+        # Confirmed live 2026-07-29: the audit domain's SQL validator runs an
+        # entirely separate rule registry from inspection's (get_audit_engine()
+        # vs get_engine()) and had NO DML/DDL guard of its own — inspection's
+        # block_dml (block_rules.py) never gets consulted here. A generated
+        # audit-domain query that happened to be a DELETE/UPDATE/DROP would have
+        # reached Postgres unblocked. Mirrors block_rules.py's block_dml exactly,
+        # including the "DML_BLOCKED" code so it inherits the existing
+        # _NON_RETRYABLE_CODES handling in engine.py (no point retrying a
+        # destructive-statement attempt).
+        "id":          "audit_block_dml",
+        "type":        BLOCK,
+        "code":        "DML_BLOCKED",
+        "description": "Only SELECT is allowed — no data modification.",
+        "sql_pattern": r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE)\b",
+        "message":     "BLOCKED: DML/DDL detected. Only SELECT is allowed.",
+        "hard_fail": True,
+    },
+    {
         "id":          "audit_block_dead_schedule_status",
         "type":        BLOCK,
         "code":        "AUDIT_DEAD_SCHEDULE_STATUS",
@@ -47,12 +65,24 @@ AUDIT_BLOCK_RULES: list[dict] = [
         "id":          "audit_block_report_missing_facility_project",
         "type":        BLOCK,
         "code":        "AUDIT_REPORT_NO_FACILITY_PROJECT",
-        "description": "audit_report has no facility_id/project_id column of its own — must go via audit_schedule.",
-        "sql_pattern": r"(?:audit_report|arep)\.(?:facility_id|project_id)\b",
+        "description": (
+            "audit_report has no facility_id/project_id column of its own — must go via "
+            "audit_schedule. audit_corrective_action ALSO has no facility_id/project_id "
+            "(confirmed live 2026-07-29: 'show all overdue corrective actions' hallucinated "
+            "aca.facility_id, got a real Postgres UndefinedColumn error, and needed a 4th "
+            "iteration to reach the correct 3-hop path via aca.audit_id -> audit_report.id "
+            "-> .schedule_id -> audit_schedule.id -> .facility_id/project_id)."
+        ),
+        "sql_pattern": (
+            r"(?:audit_report|arep|audit_corrective_action|aca)\.(?:facility_id|project_id)\b"
+        ),
         "message": (
-            "BLOCKED: audit_report has NO facility_id or project_id column (confirmed live) — "
-            "unlike inspection_report where facility_id is direct. Two-hop via "
-            "audit_report.schedule_id → audit_schedule.id → audit_schedule.facility_id/project_id."
+            "BLOCKED: neither audit_report nor audit_corrective_action has a facility_id or "
+            "project_id column (confirmed live) — unlike inspection_report where facility_id "
+            "is direct. From audit_report: two-hop via audit_report.schedule_id -> "
+            "audit_schedule.id -> audit_schedule.facility_id/project_id. From "
+            "audit_corrective_action: three-hop via aca.audit_id -> audit_report.id -> "
+            ".schedule_id -> audit_schedule.id -> .facility_id/project_id."
         ),
         "hard_fail": True,
     },
@@ -60,12 +90,28 @@ AUDIT_BLOCK_RULES: list[dict] = [
         "id":          "audit_block_responsible_join",
         "type":        BLOCK,
         "code":        "AUDIT_RESPONSIBLE_NOT_FK",
-        "description": "audit_corrective_action.responsible is a plain string enum (CLIENT/INTERNAL_OPERATIONS/SUB_CONTRACTOR), not a users FK — confirmed live (a real generation failure caught in end-to-end testing: 'operator does not exist: character varying = integer').",
-        "sql_pattern": r"\.responsible\s*=\s*\w+\.id\b",
+        "description": (
+            "audit_corrective_action.responsible is a plain string enum (KHIDMAH/"
+            "KHIDMAH_AND_CLIENT/CLIENT/SERVICE_PROVIDER_CONTRACTOR/CONSULTANT — corrected "
+            "2026-07-29, the previous CLIENT/INTERNAL_OPERATIONS/SUB_CONTRACTOR list here was "
+            "copy-pasted from inspection_corrective_action.responsible and never checked "
+            "against audit's own live data), not a users FK — confirmed live (a real "
+            "generation failure caught in end-to-end testing: 'operator does not exist: "
+            "character varying = integer'). pending_with has the SAME trap — confirmed live "
+            "2026-07-29: 'show all overdue corrective actions' joined users ON aca.pending_with "
+            "= u_pending.id and got a real Postgres 'operator does not exist: character "
+            "varying = uuid' error (pending_with is mostly-NULL free text, not a clean FK)."
+        ),
+        "sql_pattern": r"\.(?:responsible|pending_with)\s*=\s*\w+\.id\b",
         "message": (
-            "BLOCKED: audit_corrective_action.responsible is a plain string enum "
-            "('CLIENT', 'INTERNAL_OPERATIONS', 'SUB_CONTRACTOR'), NOT a foreign key to users. "
-            "Never JOIN users ON ...responsible = u.id — filter/select it directly as a string."
+            "BLOCKED: audit_corrective_action.responsible and pending_with are both plain "
+            "string fields (responsible is an enum: 'KHIDMAH'/'KHIDMAH_AND_CLIENT'/'CLIENT'/"
+            "'SERVICE_PROVIDER_CONTRACTOR'/'CONSULTANT' — a party/organization category, not a "
+            "person; pending_with is free text, mostly NULL) — NEITHER is a foreign key to "
+            "users. For 'who proposed/raised/logged this' use created_by -> users instead. "
+            "Never JOIN users ON ...responsible = u.id or ...pending_with = u.id — filter/"
+            "select responsible directly as a string, or omit pending_with entirely from a "
+            "general listing."
         ),
         "hard_fail": True,
     },
@@ -244,9 +290,24 @@ AUDIT_BLOCK_RULES: list[dict] = [
         # broadening from aca.id specifically to any aca.<col> IS NULL, since
         # LEFT JOIN ... IS NULL commonly lands on whichever column was SELECTed,
         # not always the PK.
+        #
+        # NOT IN narrowed to require a subquery (2026-07-30) — confirmed live
+        # false positive: "corrective actions with both implementation and
+        # adequacy approved but not yet closed" is a plain, correct LISTING
+        # query (SELECT aca.corrective_action_id, ... WHERE aca.status NOT IN
+        # ('CLOSED', 'CLOSE_WITH_DEFERRED') AND aca.adequacy_status =
+        # 'APPROVE') — the general-listing rule (audit_block_ca_draft_not_
+        # excluded) CORRECTLY requires that adequacy_status filter, but the
+        # bare `\bNOT\s+IN\s*\(` here matched the totally unrelated
+        # aca.status NOT IN (...) value-list filter as if it were an
+        # existence check, blocking a query with nothing wrong with it. The
+        # actual existence-check shape this rule targets is always a
+        # subquery (`aca.id NOT IN (SELECT ...)`), never a literal value
+        # list — requiring `NOT IN (SELECT` distinguishes them without
+        # losing the real detection.
         "sql_pattern": (
             r"(?=.*\baudit_corrective_action\b)"
-            r"(?=.*(?:\baca\.\w+\s+IS\s+NULL\b|\bNOT\s+EXISTS\s*\(|\bNOT\s+IN\s*\())"
+            r"(?=.*(?:\baca\.\w+\s+IS\s+NULL\b|\bNOT\s+EXISTS\s*\(|\bNOT\s+IN\s*\(\s*SELECT\b))"
             r"(?=.*(?:adequacy_status\s*(?:=|!=|<>)\s*'APPROVE'|"
             r"corrective_action_id\s*(?:=|!=|<>)\s*'CA_DRAFT'))"
         ),
@@ -329,8 +390,20 @@ AUDIT_BLOCK_RULES: list[dict] = [
         # axis words itself — a genuine "corrective actions by risk level and compliance
         # gap" question legitimately wants both joined and must not be blocked. Six
         # lookaheads (both orders per pair) since ".*X.*Y" alone misses "Y ... X" ordering.
+        #
+        # ^ anchor added 2026-07-30 — confirmed live this was broken without it:
+        # RulesEngine evaluates question_pattern via .search(), which tries every
+        # start position in the string, not just position 0. A chain of negative
+        # lookaheads with no anchor will ALWAYS find some later position (e.g.
+        # right after the last axis word) where none of the forbidden two-axis
+        # sequences are still ahead, so .search() matched "corrective actions
+        # grouped by risk level and impact" anyway (at position 31, right after
+        # "risk") even though the question plainly names two axes together —
+        # the exclusion never actually fired for any real two-axis question.
+        # Anchoring at ^ forces the whole chain to be evaluated once, from the
+        # true start of the string, matching the original intent.
         "question_pattern": (
-            r"(?i)(?!.*\bimpact\b.*\bcompliance\b)(?!.*\bcompliance\b.*\bimpact\b)"
+            r"(?i)^(?!.*\bimpact\b.*\bcompliance\b)(?!.*\bcompliance\b.*\bimpact\b)"
             r"(?!.*\bimpact\b.*\brisk\b)(?!.*\brisk\b.*\bimpact\b)"
             r"(?!.*\bcompliance\b.*\brisk\b)(?!.*\brisk\b.*\bcompliance\b)"
         ),
@@ -368,6 +441,29 @@ AUDIT_BLOCK_RULES: list[dict] = [
             "DATA TYPO: the compliance table stores 'Non Confirmity' (NOT "
             "'Non Conformity') — confirmed live. ILIKE '%conformity%' always "
             "returns zero rows. Use: WHERE comp.name ILIKE '%Non Confirmity%'"
+        ),
+        "hard_fail": True,
+    },
+    {
+        "id":          "audit_block_forms_status_active_hallucination",
+        "type":        BLOCK,
+        "code":        "AUDIT_FORMS_STATUS_ACTIVE_HALLUCINATION",
+        "description": (
+            "audit_forms.status only ever holds DRAFT or SUBMITTED, confirmed live — "
+            "'ACTIVE' does not exist as a value and silently matches zero rows."
+        ),
+        # Caught live 2026-07-29 (qid=7f386051): "how many distinct audit forms are
+        # currently available" generated status = 'ACTIVE', returning 0 instead of
+        # the correct 5. "Available"/"active" means the active BOOLEAN column, not
+        # a status literal — audit_forms.status has no such concept at all.
+        "sql_pattern": r"(?i)status\s*=\s*'ACTIVE'",
+        "table_guard": "audit_forms",
+        "message": (
+            "BLOCKED: audit_forms.status only ever holds 'DRAFT' or 'SUBMITTED' "
+            "(confirmed live) — 'ACTIVE' does not exist and silently matches zero "
+            "rows. 'Currently available'/'active' forms means the active BOOLEAN "
+            "column (WHERE active = true), not a status filter — audit_forms.status "
+            "has no ACTIVE/PUBLISHED concept."
         ),
         "hard_fail": True,
     },
@@ -467,6 +563,150 @@ AUDIT_BLOCK_RULES: list[dict] = [
             "WRONG GROUP BY: aq.label is already pinned to one value by the WHERE filter, "
             "so 'GROUP BY aq.label' collapses everything into a single meaningless group. "
             "Group by the actual answer instead: GROUP BY aaa.id, aaa.answer_text, arep.audit_id."
+        ),
+        "hard_fail": True,
+    },
+    {
+        "id":          "audit_block_sub_category_inner_join",
+        "type":        BLOCK,
+        "code":        "AUDIT_SUB_CATEGORY_INNER_JOIN",
+        "description": (
+            "audit_schedule.audit_sub_category_id is NULL on a meaningful share of "
+            "active schedules — confirmed live 2026-07-29: 11/39 (~28%), including "
+            "PLANNED schedules, not just is_unplanned ones (category_id on "
+            "audit_plan and auditor_id on audit_schedule are, by contrast, never "
+            "NULL — this gap is specific to sub_category). An INNER JOIN silently "
+            "drops the entire row whenever sub-category alone is unset."
+        ),
+        # Caught live (qid=ff669ae7): "who conducted it what audit category and
+        # sub category was it under" INNER-joined audit_sub_category on an audit
+        # whose schedule had a populated auditor_id and audit_plan.category_id but
+        # a NULL audit_sub_category_id. The query executed with no error and
+        # returned rows=0 — silently hiding the answer to two of the three things
+        # asked (who conducted it, what category) because the third (sub-category)
+        # happened to be missing on this particular row.
+        "sql_pattern": r"(?<!LEFT )\bJOIN\s+audit_sub_category\b",
+        "message": (
+            "BLOCKED: audit_sub_category_id is NULL on ~28% of audit_schedule rows "
+            "(confirmed live, not limited to unplanned audits) — an INNER JOIN "
+            "silently drops the whole row (auditor, category, everything else "
+            "asked for) whenever sub-category alone is unset. Use LEFT JOIN "
+            "audit_sub_category instead, unless the question explicitly filters "
+            "for schedules that DO have a sub-category assigned."
+        ),
+        "hard_fail": True,
+    },
+    {
+        "id":          "audit_block_overdue_status_overbroad",
+        "type":        BLOCK,
+        "code":        "AUDIT_OVERDUE_INCLUDES_OPEN",
+        "description": (
+            "OPEN and OVERDUE are separate, mutually exclusive values on "
+            "audit_corrective_action.status (not a hierarchy — a row is one or the "
+            "other, never both). A question asking only for 'overdue' must filter "
+            "status = 'OVERDUE' alone; widening it to status IN ('OPEN','OVERDUE') "
+            "silently returns non-overdue rows the user didn't ask for."
+        ),
+        # Caught live 2026-07-29 (qid=987552fd): "lsit all corrective actions that
+        # are overdue" retrieved the nearest seed example — 'list open overdue
+        # corrective actions with risk level and facility', whose status IN
+        # ('OPEN', 'OVERDUE') filter is correct for THAT question — and copied it
+        # verbatim onto a question that never mentioned 'open'. Execution
+        # succeeded (no SQL error), so nothing caught the over-broad result set
+        # until a human noticed OPEN rows in the output. A second, now-adjacent
+        # seed example (audit_seed_data.py: 'list all corrective actions that are
+        # overdue', status = 'OVERDUE' only) addresses the retrieval side of this;
+        # this rule is the validation-side backstop in case retrieval still blends
+        # the two or a future example reintroduces the same pattern.
+        # MUST be anchored with ^ — same re.search()-scans-every-position trap
+        # as audit_block_review_completed_not_approved above: without ^, a
+        # question like "list open overdue corrective actions" lets the scan
+        # start just past the 'o' in "open", where the negative lookahead's
+        # forward-only view no longer sees the word — a false match.
+        "question_pattern": r"(?i)^(?=.*\boverdue\b)(?!.*\bopen\b)",
+        "sql_pattern": (
+            r"\b\w*\.?status\s+IN\s*\((?=[^)]*'OPEN')(?=[^)]*'OVERDUE')[^)]*\)"
+        ),
+        "message": (
+            "BLOCKED: query filters status IN ('OPEN', 'OVERDUE') but the question "
+            "only asked for overdue corrective actions. OPEN and OVERDUE are "
+            "separate, mutually exclusive status values, not a hierarchy — remove "
+            "'OPEN' unless the question explicitly asks for open ones too. "
+            "Correct: WHERE aca.status = 'OVERDUE'"
+        ),
+        "hard_fail": True,
+    },
+    {
+        "id":          "audit_block_closed_with_deferred_mislabel",
+        "type":        BLOCK,
+        "code":        "AUDIT_CLOSED_WITH_DEFERRED_MISLABEL",
+        "description": (
+            "A column aliased 'closed_with_deferred' whose query never references the "
+            "literal status 'CLOSE_WITH_DEFERRED' anywhere is almost certainly computing "
+            "something else (e.g. 'closed late' by date comparison) under the wrong name."
+        ),
+        # Caught live 2026-07-29 (qid=039d5f86): "which audit corrective actions are
+        # closed on time vs late" retrieved the "closed with deferred vs closed on
+        # time" seed example (a STATUS-based query) as its nearest neighbor and
+        # adapted the FILTER logic to compare completed_on/target_close_out_date
+        # instead — but kept the OLD alias 'closed_with_deferred' unchanged. The
+        # result: a column literally named 'closed_with_deferred' whose value was
+        # actually "count of CLOSED rows finished after their target date" — a
+        # completely different, unrelated number from the real CLOSE_WITH_DEFERRED
+        # status count. Anyone reading the labeled result would misinterpret it.
+        "sql_pattern": (
+            r"(?i)^(?=.*\bAS\s+closed_with_deferred\b)(?!.*'CLOSE_WITH_DEFERRED')"
+        ),
+        "message": (
+            "BLOCKED: a column aliased 'closed_with_deferred' must count rows where "
+            "status = 'CLOSE_WITH_DEFERRED' — this query never references that literal "
+            "anywhere, so the alias doesn't match what's actually being computed. If "
+            "this is about TIMELINESS (closed late vs on time, via completed_on vs "
+            "target_close_out_date), rename the column to 'closed_late' — do not reuse "
+            "'closed_with_deferred', which specifically means the CLOSE_WITH_DEFERRED "
+            "workflow status, not lateness."
+        ),
+        "hard_fail": True,
+    },
+    {
+        "id":          "audit_block_stakeholder_auditor_grain_mismatch",
+        "type":        BLOCK,
+        "code":        "AUDIT_STAKEHOLDER_GRAIN_MISMATCH",
+        "description": (
+            "internal_stakeholder_id is a per-CORRECTIVE-ACTION fact (audit_corrective_"
+            "action), but auditor_id/auditee_id are per-AUDIT facts (audit_schedule). "
+            "Joining both together fans out the audit-level auditor/auditee into one "
+            "duplicate row per corrective action — without corrective_action_id in the "
+            "SELECT list, the result looks like inconsistent/duplicate data instead of "
+            "'N corrective actions, each with its own stakeholder'."
+        ),
+        # Caught live 2026-07-29 (qid=4337464c): "who are the auditor, auditee and
+        # internal stakeholder related to this particular audit" joined
+        # aca.internal_stakeholder_id alongside asch.auditor_id/auditee_id but never
+        # selected corrective_action_id — 5 rows came back with the SAME auditor/
+        # auditee repeated and a DIFFERENT stakeholder each time, with nothing in the
+        # result explaining why. Confirmed live: the audit genuinely has 5 corrective
+        # actions, each with its own internal_stakeholder_id (George STG FM Manager /
+        # George FM Mgr 2 / George FM Engineer / George FM Mgr 2 / George STG FM
+        # Manager) — the fan-out itself is correct, it just needs the CA id to be
+        # legible instead of looking like a bug.
+        # MUST be anchored with ^ — same re.search()-scans-every-position trap as
+        # audit_block_overdue_status_overbroad above: without ^, a scan starting
+        # from a position AFTER corrective_action_id already appeared earlier in
+        # the SQL would no longer see it, letting a compliant query match.
+        "sql_pattern": (
+            r"(?i)^"
+            r"(?=.*\.internal_stakeholder_id\s*=)"
+            r"(?=.*\.(?:auditor_id|auditee_id)\s*=)"
+            r"(?!.*\bcorrective_action_id\b)"
+        ),
+        "message": (
+            "BLOCKED: this query joins both internal_stakeholder_id (a per-corrective-"
+            "action fact) and auditor_id/auditee_id (per-audit facts) but doesn't "
+            "SELECT corrective_action_id. This fans out the audit's auditor/auditee "
+            "into one row per corrective action — without the CA id, the result reads "
+            "as duplicate/inconsistent data instead of 'this many CAs, each with its "
+            "own stakeholder'. Add aca.corrective_action_id to the SELECT list."
         ),
         "hard_fail": True,
     },
@@ -587,6 +827,8 @@ AUDIT_INJECT_RULES: list[dict] = [
             r"|\bwho\s+approved\b|\bwho\s+reviewed\b|\blevel\s*[12]\s+review\b"
             r"|\badequacy\b|\bimplementation\s+(approval|status|review)\b"
             r"|\bapproved\s+by\b|\breturned\s+for\s+modification\b"
+            r"|\bapproval\s+status\b|\breview\s+status\b"
+            r"|\breview\s+(complete|completed|completion)\b|\bhow\s+(much|many)\s+review"
         ),
         "hint": (
             "\nAPPROVAL/REVIEW WORKFLOW — the 'review' table is a shared, POLYMORPHIC "
@@ -715,6 +957,36 @@ AUDIT_AUTOCORRECT_RULES: list[dict] = [
         "sql_pattern": r"(\badequacy_status\s*(?:=|!=|<>|IN\s*\(|NOT\s+IN\s*\()\s*'?)APPROVED\b",
         "replacement": r"\1APPROVE",
         "message":     "[autocorrect] Fixed adequacy_status enum value: 'APPROVED' -> 'APPROVE'",
+    },
+    {
+        "id":          "audit_autocorrect_review_entity_id_corrective_action_id",
+        "type":        AUTOCORRECT,
+        "description": (
+            "review.entity_id (UUID, polymorphic) must join to audit_corrective_action.id, "
+            "NEVER .corrective_action_id (the VARCHAR display code) — same trap as the BLOCK "
+            "rule audit_block_review_entity_id_corrective_action_id, but this substitution has "
+            "no legitimate alternate reading (review.entity_id is ALWAYS a UUID comparison), so "
+            "autocorrecting is strictly better than a retry round-trip. Confirmed live "
+            "(APPR-09 eval case, 2026-07-30): even with the BLOCK rule already in place, this "
+            "mistake still cost a full retry cycle (validation FAIL -> LLM regenerate) as part "
+            "of a 4-call/54K-token turn — fixing it here means validate() never even sees the "
+            "wrong join in the first place."
+        ),
+        "sql_pattern": r"(\bentity_id\s*=\s*\w+)\.corrective_action_id\b(?:\s*::\s*\w+)?",
+        "replacement": r"\1.id",
+        "message":     "[autocorrect] Fixed review.entity_id join: aca.corrective_action_id -> aca.id",
+    },
+    {
+        "id":          "audit_autocorrect_corrective_action_id_entity_id_reversed",
+        "type":        AUTOCORRECT,
+        "description": (
+            "Same fix as audit_autocorrect_review_entity_id_corrective_action_id above, "
+            "reversed operand order (<alias>.corrective_action_id = <alias2>.entity_id) — "
+            "mirrors the BLOCK rule's own two-direction sql_pattern."
+        ),
+        "sql_pattern": r"(\w+)\.corrective_action_id\b(?:\s*::\s*\w+)?(\s*=\s*\w+\.entity_id\b)",
+        "replacement": r"\1.id\2",
+        "message":     "[autocorrect] Fixed review.entity_id join (reversed): aca.corrective_action_id -> aca.id",
     },
     {
         "id":          "audit_autocorrect_desc_limit_nulls_last",

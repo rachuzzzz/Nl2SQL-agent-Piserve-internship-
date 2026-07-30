@@ -924,7 +924,21 @@ def audit_report_status_block() -> str:
   "audit plan" (explicit) → audit_plan.status groupings above.
   "the [most recent/latest/conducted/completed] audit" (no "plan") → THIS
   block, audit_report.status. When in doubt and the question could plausibly
-  lead to a follow-up about findings/answers/facility, use audit_report."""
+  lead to a follow-up about findings/answers/facility, use audit_report.
+
+  SCOPE — this disambiguation is about STATUS/LIFECYCLE questions only
+  (which table's status column to filter/group on). It does NOT mean every
+  bare "the audit" needs a fresh audit_report lookup. Confirmed live
+  2026-07-30: after a plan was already pinned down by an ordinal follow-up
+  ("the second one" → a specific audit_plan), "who is the auditee for the
+  audit mentioned above" triggered an unnecessary clarifying question asking
+  the user to re-specify — even though audit_schedule (which carries
+  auditee/auditor/facility) is reachable directly from that SAME plan via
+  audit_schedule.audit_plan_id, with no report lookup needed at all. For an
+  ATTRIBUTE question (auditee, auditor, facility, schedule date — not a
+  status/count/lifecycle question) about an entity a recent turn already
+  resolved to a specific audit_plan, join straight through audit_schedule
+  using that plan's id — do not ask the user to re-specify which audit."""
 
 
 def audit_ca_workflow_block() -> str:

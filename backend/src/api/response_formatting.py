@@ -73,6 +73,32 @@ def strip_uuid_columns(columns: list, rows: list) -> tuple[list, list]:
     return kept_cols, kept_rows
 
 
+def strip_row_identity_columns(columns: list, rows: list) -> tuple[list, list]:
+    """
+    Drop any column injected by src/sql/validation/identity.py's
+    inject_row_identity() (always named `<display_col>__id`) before the
+    result reaches the frontend OR the reasoning LLM's own next-turn prompt.
+
+    Unlike strip_uuid_columns above (which scrubs by VALUE — any column whose
+    contents happen to look like a UUID), this scrubs by NAME. The injected
+    columns are a deliberate internal-only enrichment (real row ids paired
+    with display values, so a later "the third one"/"that plan" follow-up
+    can resolve to WHERE ap.id = '<uuid>' instead of re-deriving one from a
+    possibly-duplicated display string) — they must never be shown to the
+    user or echoed back into a prompt where the model could hallucinate a
+    literal UUID into new SQL. Server-side consumers (synthesis.py) read
+    these columns from the RAW row dicts before this strip ever runs.
+    """
+    if not columns:
+        return columns, rows
+    id_cols = {col for col in columns if col.endswith("__id")}
+    if not id_cols:
+        return columns, rows
+    kept_cols = [c for c in columns if c not in id_cols]
+    kept_rows = [{k: v for k, v in row.items() if k not in id_cols} for row in rows]
+    return kept_cols, kept_rows
+
+
 _SCOPE_PREDICATE_RE = re.compile(
     r"ir\.(?:inspector|inspectee)_user_id\s*=\s*\(\s*SELECT\s+id\s+FROM\s+users\s+WHERE\s+id_fk\s*=\s*\d+[^)]*\)",
     re.IGNORECASE,

@@ -15,6 +15,7 @@ _log_llm   = logging.getLogger("inspectai.llm")
 from sqlalchemy import text as sql_text
 
 from src.sql.result_shape import is_disambiguation_result
+from src.api.response_formatting import strip_row_identity_columns
 
 from src.agent.orchestrator.models import AgentStep, QueryStats, ConversationTurn, AgentResult
 from src.agent.orchestrator.debug import _ilike_escape, _has_uuid_leak, _dbg, _detect_truncation
@@ -63,6 +64,35 @@ class SynthesisMixin:
         insp_ids, fac_names, insp_names, cycle_ids, user_ids = [], [], [], [], []
         audit_ids = []
         facility_ids = []
+        # audit_plan.title, under whatever alias the SQL happened to give it
+        # (bare "title" for a plans-only SELECT, "audit_plan_title"/"plan_title"
+        # etc. once it's joined to another table — e.g. review, for an
+        # approval-status question). Confirmed live 2026-07-30: a 2-row
+        # "approval status for the second one, who approved each level"
+        # result (SELECT ap.title AS audit_plan_title, rev.level, ...) had NO
+        # column literally named "title", so the OLD exact-match-only capture
+        # missed it entirely — active_subject_type stayed unset for that turn,
+        # a later non-ordinal follow-up ("who is the auditee for the audit
+        # mentioned above") had no structured pointer to the plan actually in
+        # focus, asked an unnecessary clarifying question, and its own retry
+        # then drifted to a DIFFERENT, older plan from several turns back
+        # instead of the one just discussed. Matched by suffix, not just
+        # exact name, and independent of row_titles below (which mixes in
+        # facility/person names too, not just the plan's own identifier).
+        plan_titles = []
+        # Real row ids paired with insp_ids/audit_ids/plan_titles/fac_names
+        # above, captured via the SAME __id-suffixed sibling columns
+        # inject_row_identity() (src/sql/validation/identity.py) attaches —
+        # e.g. a column named "audit_id" (inspection_report/audit_report's
+        # registered display column) gets a sibling "audit_id__id" holding
+        # the real UUID. Lets active_subject_id below resolve to WHERE
+        # x.id = '<uuid>' directly instead of re-deriving one from a
+        # display value (which may not be unique — see plan_titles' own
+        # docstring above for the confirmed live audit_plan.title case).
+        insp_row_ids: list = []
+        audit_row_ids: list = []
+        plan_row_ids: list = []
+        fac_row_ids: list = []
         single_row_vals = {}
         _UUID_PAT = re.compile(
             r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
@@ -76,14 +106,24 @@ class SynthesisMixin:
                 v = row.get(col)
                 if v and str(v) not in insp_ids:
                     insp_ids.append(str(v))
+                    insp_row_ids.append(str(row.get(f"{col}__id", "") or ""))
             for col in ("audit_id",):
                 v = row.get(col)
                 if v and str(v) not in audit_ids:
                     audit_ids.append(str(v))
+                    audit_row_ids.append(str(row.get(f"{col}__id", "") or ""))
+            for col in row:
+                if col == "title" or (isinstance(col, str) and col.endswith("_title")):
+                    v = row.get(col)
+                    if v and str(v) not in plan_titles:
+                        plan_titles.append(str(v))
+                        plan_row_ids.append(str(row.get(f"{col}__id", "") or ""))
+                    break
             for col in ("facility_name", "facility"):
                 v = row.get(col)
                 if v and str(v) not in fac_names:
                     fac_names.append(str(v))
+                    fac_row_ids.append(str(row.get(f"{col}__id", "") or ""))
             # Capture resolved facility UUID when the query happens to select
             # it (mirrors the user_id capture below) — lets build_context_block
             # prefer an exact fac.id filter over ILIKE on the name.
@@ -115,11 +155,65 @@ class SynthesisMixin:
                         insp_ids.append(str(_ga_insp))
                     break
 
+        # Capture an ordered display-value list for MULTI-row results (e.g.
+        # audit_plan.title) so a later "the first one"/"the second one"
+        # follow-up can resolve positionally against what was JUST listed,
+        # independent of active_subject_type below (which a multi-row list
+        # like this often leaves unset — see the stale-scope-inheritance
+        # comment further down). Preference order tries the row's own
+        # IDENTIFIER columns first (audit_id, schedule_id, ...) before
+        # descriptive/joined-in ATTRIBUTE columns (facility_name,
+        # auditor_name, ...). Confirmed live 2026-07-30: "show all audits
+        # part of this plan" selected both audit_id AND facility_name on the
+        # same row (SELECT ap.title, asch.schedule_id, ..., fac.name AS
+        # facility_name, ..., arep.audit_id, ...) — with facility_name
+        # checked first, row_titles captured ['ADGM Square', 'Al Oyoun
+        # Village', ...] instead of the audits themselves. The next turn,
+        # "for the first one show all corrective actions", then silently
+        # resolved "the first one" to "the first FACILITY" instead of "the
+        # first AUDIT" — losing the plan-scoping filter entirely (a facility
+        # can host schedules from OTHER plans too) rather than narrowing to
+        # one specific audit under THIS plan. The grammatical subject of a
+        # list question ("show all AUDITS", "list all PLANS") is what a bare
+        # ordinal should bind to; a facility/auditor/inspector name is
+        # usually a joined-in attribute describing that subject, not the
+        # subject itself, so it must lose this race whenever both appear on
+        # the same row.
+        row_titles = []
+        # Paired 1:1 with row_titles (same index = same row) via the __id
+        # sibling inject_row_identity() attaches to whichever column matched
+        # below — empty string when that query shape wasn't eligible for
+        # injection (e.g. a GROUP BY). Lets an ordinal follow-up ("the third
+        # one") resolve straight to WHERE x.id = '<uuid>' instead of
+        # re-deriving a row from row_titles[idx]'s display string, which may
+        # not be unique (see plan_titles' docstring above).
+        row_ids = []
+        if len(last_rows) > 1:
+            for row in last_rows[:5]:
+                if not isinstance(row, dict):
+                    continue
+                for col in ("title", "name", "audit_id", "schedule_id",
+                            "inspection_id", "corrective_action_id",
+                            "facility_name", "auditor_name", "inspector_name"):
+                    v = row.get(col)
+                    if v and str(v).strip():
+                        row_titles.append(str(v))
+                        row_ids.append(str(row.get(f"{col}__id", "") or ""))
+                        break
+
         # If only 1 row, store all values for maximum context
         if len(last_rows) == 1 and last_rows[0]:
+            # Excludes __id-injected columns (see validation/identity.py) —
+            # this dict gets rendered verbatim as "★ single-row result: {...}"
+            # in build_context_block(), read directly by the reasoning LLM;
+            # unlike the deliberate "resolved id='...'" ACTIVE CONTEXT
+            # phrasing (which the generation.py UUID-filter-guard separately
+            # re-verifies survives into the next SQL), a raw UUID leaking in
+            # here has no such downstream check and risks being hallucinated
+            # into a new query verbatim.
             single_row_vals = {
                 k: str(v) for k, v in last_rows[0].items()
-                if v is not None and str(v).strip()
+                if v is not None and str(v).strip() and not k.endswith("__id")
             }
             # Also pull cycle_id from single-row result
             for col in ("cycle_id", "inspection_cycle_id"):
@@ -135,31 +229,72 @@ class SynthesisMixin:
         active_subject_table = ""
         active_subject_alias = ""
         active_subject_domain = ""
+        # Real row id, paired with active_subject_value above wherever one's
+        # available (see the insp_row_ids/audit_row_ids/plan_row_ids/
+        # fac_row_ids capture above, or an already-UUID value like cycle_ids
+        # itself). Empty when no id could be resolved for this turn's query
+        # shape (e.g. a GROUP BY, which inject_row_identity() skips) — the
+        # ACTIVE CONTEXT/ordinal resolution in session.py falls back to
+        # title/ILIKE-based resolution in that case, same as before this
+        # field existed.
+        active_subject_id = ""
 
         if len(cycle_ids) == 1:
             active_subject_type = "cycle"
             active_subject_value = cycle_ids[0]
             active_subject_label = cycle_ids[0]
+            active_subject_id = cycle_ids[0]  # already the real UUID, not a display string
             active_subject_domain = self.domain
         elif len(insp_names) == 1:
             active_subject_type = "inspector"
             active_subject_value = insp_names[0]
             active_subject_label = insp_names[0]
+            # People have their own established id-resolution path
+            # (user_ids, captured from a literal user_id/inspector_user_id
+            # column) — not identity.py's injection, since `users` is
+            # deliberately excluded from ROW_IDENTITY_TABLES (composite
+            # display value; see identity.py's docstring).
+            active_subject_id = user_ids[0] if len(user_ids) == 1 else ""
             active_subject_domain = self.domain
         elif len(insp_ids) == 1:
             active_subject_type = "inspection"
             active_subject_value = insp_ids[0]
             active_subject_label = insp_ids[0]
+            active_subject_id = insp_row_ids[0] if insp_row_ids and insp_row_ids[0] else ""
             active_subject_domain = self.domain
         elif len(audit_ids) == 1:
             active_subject_type = "audit"
             active_subject_value = audit_ids[0]
             active_subject_label = audit_ids[0]
+            active_subject_id = audit_row_ids[0] if audit_row_ids and audit_row_ids[0] else ""
+            active_subject_domain = self.domain
+        # Distinct plan TITLE count, not row count — a multi-row result that's
+        # really about ONE plan (e.g. "approval status ... each review level"
+        # joining audit_plan to review, one row per level) still counts as a
+        # single resolved plan for follow-up purposes. See plan_titles' capture
+        # comment above for the live case this fixes.
+        elif len(set(plan_titles)) == 1:
+            active_subject_type = "plan"
+            active_subject_value = plan_titles[0]
+            active_subject_label = plan_titles[0]
+            # Any non-empty entry works — every row here is the SAME plan
+            # (that's what len(set(plan_titles)) == 1 means), so they all
+            # pair with the same real id when injection ran at all.
+            active_subject_id = next((pid for pid in plan_row_ids if pid), "")
             active_subject_domain = self.domain
         elif len(fac_names) == 1:
             active_subject_type = "facility"
             active_subject_value = fac_names[0]
             active_subject_label = fac_names[0]
+            # Prefer the pre-existing facility_ids capture (a literal
+            # facility_id/fac_id UUID column the query happened to select
+            # directly) over the new identity-injection pairing — same
+            # preference order session.py's facility ACTIVE CONTEXT branch
+            # already applies between its own two sources.
+            if len(facility_ids) == 1:
+                active_subject_id = facility_ids[0]
+            elif fac_row_ids and fac_row_ids[0]:
+                active_subject_id = fac_row_ids[0]
             active_subject_domain = self.domain
         # If previous turn had a scoped subject (cycle or facility) and this result
         # has no conflicting subject (e.g. a COUNT query with no facility_name column),
@@ -189,6 +324,7 @@ class SynthesisMixin:
                         active_subject_alias = _prev_turn.entity_disambiguation_alias
                     active_subject_value = _ed_matches[0]["name"]
                     active_subject_label = _ed_matches[0]["name"]
+                    active_subject_id = _ed_matches[0].get("id", "") or ""
                     active_subject_domain = self.domain
             # Read the persistent scope pointer directly instead of walking
             # session.turns — this is what makes scope survive a turn aging
@@ -208,13 +344,30 @@ class SynthesisMixin:
                 active_subject_table = _cs["table"]
                 active_subject_alias = _cs["alias"]
                 active_subject_domain = _cs["domain"]
+                active_subject_id = _cs.get("id", "") or ""
 
         if session is not None:
             # MT-03 fix: if we have a facility name but no inspection_id (e.g. MT-01
             # returned only facility_name without ir.inspection_id in SELECT), do a quick
             # DB lookup so the follow-up turn can filter by inspection_id rather than
             # falling back to the worked-example placeholder "INS-EXAMPLE-001".
-            if fac_names and not insp_ids and len(last_rows) <= 3:
+            #
+            # Gated to the inspection domain — confirmed live 2026-07-29 (qid=2a519e8d):
+            # this fired unconditionally regardless of self.domain, so an AUDIT-domain
+            # turn that happened to return a facility name (very common — "Aldar HQ"
+            # appears on nearly every audit result) got a totally unrelated inspection_id
+            # attached to it anyway. session.py's build_context_block() then surfaces
+            # that as a "★ inspection_id(s) from this result" active-context clue, and
+            # the reasoning model — reasonably, given how prominently it's shown — used
+            # it as if it were the current AUDIT's identifier ("count corrective actions
+            # for this audit... the inspection_id associated with this is
+            # 2026/07/ST041/INS006"). That value doesn't match any audit_report.audit_id,
+            # so the query silently returned 0 instead of the real answer (4) — a wrong
+            # answer with no error, not a retryable failure, because the SQL itself was
+            # syntactically and structurally correct. This lookup only ever benefits an
+            # inspection-domain follow-up in the first place, so it must not run at all
+            # while answering in the audit domain.
+            if self.domain == "inspection" and fac_names and not insp_ids and len(last_rows) <= 3:
                 try:
                     fac_escaped = _ilike_escape(fac_names[0])
                     _lookup = (
@@ -232,6 +385,48 @@ class SynthesisMixin:
                              f"facility={fac_names[0]} → {insp_ids[0]}", 0)
                 except Exception:
                     pass  # Silently skip — follow-up will have less context
+
+            # Resolve the plan's real UUID, not just its title, so a follow-up
+            # can filter WHERE ap.id = '<uuid>' instead of ap.title = '<title>'
+            # or ILIKE. Confirmed live 2026-07-30: audit_plan.title has NO
+            # uniqueness constraint at the DB level — only `id` does — and the
+            # live data already has duplicates ('Delegation plan -1' and
+            # 'Delegation testing' each have 2 active rows). A follow-up
+            # scoped by title alone would silently operate on whichever
+            # duplicate the DB happens to return first, with no error and no
+            # sign anything's wrong. When the lookup itself finds more than
+            # one match, deliberately leave plan_ids empty and flag
+            # plan_title_ambiguous instead of guessing — session.py's ACTIVE
+            # CONTEXT hint then warns rather than presenting false precision.
+            #
+            # M4: this round trip is now the FALLBACK, superseded by
+            # active_subject_id whenever inject_row_identity() (identity.py)
+            # already resolved one directly from the row itself — cheaper,
+            # and reflects the EXACT row this turn's query returned rather
+            # than a fresh lookup that could theoretically disagree (e.g. if
+            # a plan was renamed between the query and this synthesis step).
+            # Only reachable when that query shape wasn't eligible for
+            # injection (e.g. a GROUP BY).
+            plan_ids: list = []
+            plan_title_ambiguous = False
+            if active_subject_type == "plan" and active_subject_id:
+                plan_ids = [active_subject_id]
+            elif self.domain == "audit" and active_subject_type == "plan":
+                try:
+                    with self.db_engine.connect() as _conn:
+                        _prows = _conn.execute(
+                            sql_text(
+                                "SELECT id FROM audit_plan "
+                                "WHERE title = :t AND active = true"
+                            ),
+                            {"t": active_subject_value},
+                        ).fetchall()
+                    if len(_prows) == 1:
+                        plan_ids = [str(_prows[0][0])]
+                    elif len(_prows) > 1:
+                        plan_title_ambiguous = True
+                except Exception:
+                    pass  # Silently skip — follow-up falls back to title/ILIKE
 
             # Detect if this turn was a disambiguation query (user_id + name cols)
             _disambig_name, _disambig_candidates = self._extract_disambiguation(
@@ -270,7 +465,10 @@ class SynthesisMixin:
                 sql=last_sql,
                 total_count=last_total,
                 page_offset=len(last_rows),
-                columns=last_cols,
+                # Excludes __id-injected columns (see validation/identity.py)
+                # — this list is rendered verbatim as "Columns: [...]" in
+                # build_context_block(), read directly by the reasoning LLM.
+                columns=[c for c in last_cols if not c.endswith("__id")],
                 inspection_ids=insp_ids[:5],
                 audit_ids=audit_ids[:5],
                 facility_names=fac_names[:5],
@@ -278,6 +476,8 @@ class SynthesisMixin:
                 cycle_ids=cycle_ids[:3],
                 user_ids=user_ids[:5],
                 facility_ids=facility_ids[:5],
+                plan_ids=plan_ids,
+                plan_title_ambiguous=plan_title_ambiguous,
                 disambiguation_name=_disambig_name,
                 disambiguation_candidates=_disambig_candidates,
                 disambiguation_origin_question=_disambig_origin_question,
@@ -285,12 +485,15 @@ class SynthesisMixin:
                 entity_disambiguation_table=_ent_disambig_table,
                 entity_disambiguation_alias=_ent_disambig_alias,
                 single_row_values=single_row_vals,
+                row_titles=row_titles,
+                row_ids=row_ids,
                 active_subject_type=active_subject_type,
                 active_subject_value=active_subject_value,
                 active_subject_label=active_subject_label,
                 active_subject_table=active_subject_table,
                 active_subject_alias=active_subject_alias,
                 active_subject_domain=active_subject_domain,
+                active_subject_id=active_subject_id,
             ))
 
         _final_stats = stats or QueryStats()
@@ -441,6 +644,21 @@ class SynthesisMixin:
         if tool_name == "execute_sql" and isinstance(data, dict):
             rows = data.get("rows", [])
             cols = data.get("columns", [])
+            # Strip __id columns (inject_row_identity(), see validation/identity.py)
+            # HERE, once, before any downstream branch below can see them —
+            # confirmed live 2026-07-30 (eval run, 18/74 questions): the
+            # deterministic "Found N result(s): 1. title: ... | title__id:
+            # <uuid>" formatter further below built its own row-by-row text
+            # directly from these raw rows, via a hide-list (_HIDE_COLS) that
+            # had no way to know about this new column shape — a real UUID
+            # leaked straight into the actual answer shown to the user. The
+            # _llm_answer() fallback further down also json.dumps()s this
+            # same `data` into the reasoning LLM's own prompt, risking it
+            # echoing a raw UUID into free text too. Stripping once here,
+            # before either path runs, closes both at the source instead of
+            # patching each rendering branch separately.
+            cols, rows = strip_row_identity_columns(cols, rows)
+            data = {**data, "rows": rows, "columns": cols}
             truncated = data.get("truncated", False)
             total_count = data.get("total_count", len(rows))
 
@@ -559,7 +777,20 @@ class SynthesisMixin:
                               # AUDIT_FK_RESOLUTION) that would otherwise leak as UUIDs
                               "auditor_id", "auditee_id", "audit_cycle_id",
                               "internal_stakeholder_id"}
-                displayable_cols = [c for c in rows[0].keys() if c not in _HIDE_COLS]
+                # Confirmed live 2026-07-30 (eval run, 18/74 questions):
+                # inject_row_identity()'s __id-suffixed columns (see
+                # validation/identity.py) leaked a raw UUID straight into this
+                # deterministic answer text — e.g. "1. title: del 01 | ... |
+                # title__id: 54327f53-...". This code path builds the actual
+                # user-facing answer directly from raw rows and has its own
+                # separate hide-list from the columns/single_row_values fields
+                # this module already quarantines earlier in _finish() — those
+                # only ever covered the fields fed back into a LATER turn's
+                # prompt, not this same-turn answer text. Any _HIDE_COLS
+                # membership check below must also exclude __id columns.
+                def _is_hidden_col(c: str) -> bool:
+                    return c in _HIDE_COLS or c.endswith("__id")
+                displayable_cols = [c for c in rows[0].keys() if not _is_hidden_col(c)]
                 if len(rows) > 1:
                     for col in displayable_cols:
                         vals = {str(r.get(col)) for r in rows}
@@ -574,11 +805,24 @@ class SynthesisMixin:
                     const_str = ", ".join(f"{k}={v}" for k, v in constant_cols.items())
                     header += f" ({const_str})"
 
+                # The 100-char cutoff below exists to stop a wall of text when
+                # there are MANY rows, not to shorten the one thing a small
+                # result is actually about. Confirmed live 2026-07-29
+                # (qid=25cbdee7): "show the observation raised for which the
+                # above action was proposed" returned exactly 1 row whose whole
+                # point was aca.observation_text (a long free-text finding) —
+                # the chat summary cut it to 97 chars + "..." even though the
+                # separate rows/columns payload the frontend also renders (see
+                # api/routes/chat.py) had the full text the whole time, so the
+                # chat bubble and the table visibly disagreed. Skip truncation
+                # entirely when the result is small enough that there's no
+                # wall-of-text risk.
+                _truncate_values = len(rows) > 3
                 lines = [header]
                 for i, row in enumerate(rows[:max_display_rows], 1):
                     parts = []
                     for col, val in row.items():
-                        if col in _HIDE_COLS:
+                        if _is_hidden_col(col):
                             continue
                         # Skip columns promoted to header (constant across all rows)
                         if col in constant_cols:
@@ -588,7 +832,7 @@ class SynthesisMixin:
                                 parts.append(f"{col}: N/A")
                             continue
                         val_str = str(val)
-                        if len(val_str) > 100:
+                        if _truncate_values and len(val_str) > 100:
                             val_str = val_str[:97] + "..."
                         parts.append(f"{col}: {val_str}")
                     lines.append(f"  {i}. {' | '.join(parts) or '(no data)'}")

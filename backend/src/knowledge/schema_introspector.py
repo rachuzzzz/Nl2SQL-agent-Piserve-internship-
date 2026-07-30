@@ -479,6 +479,15 @@ AUDIT_ENUM_COLUMNS = {
     "audit_report.status": [
         "DRAFT", "SUBMITTED", "CLOSED", "CLOSED_WITH_EXCEPTION",
     ],  # CLOSED/CLOSED_WITH_EXCEPTION are in the schema enum but not present in current data
+    # Confirmed live 2026-07-29 (qid=7f386051): "how many distinct audit forms are
+    # currently available" generated WHERE status = 'ACTIVE' — that value does not
+    # exist on this column at all (only DRAFT/SUBMITTED do), so the query silently
+    # returned 0 instead of the correct 5. "Currently available" means active = true
+    # (the boolean column) — audit_forms.status has no 'ACTIVE'/'PUBLISHED' concept;
+    # do not filter status for an "available"/"active" question, only the active flag.
+    "audit_forms.status": [
+        "DRAFT", "SUBMITTED",
+    ],
     "audit_corrective_action.status": [
         "DRAFT", "SUBMITTED", "OPEN", "OVERDUE", "CLOSED", "CLOSE_WITH_DEFERRED",
     ],
@@ -491,8 +500,15 @@ AUDIT_ENUM_COLUMNS = {
     "audit_corrective_action.progress_stage": [
         "NOT_STARTED", "ON_TRACK", "BEHIND", "AT_RISK", "COMPLETED", "CLOSE_WITH_DEFERRED",
     ],  # NULL progress_stage = not started (mirrors inspection's progress_stage convention)
+    # NOT the same values as inspection_corrective_action.responsible — confirmed
+    # live 2026-07-29 this entry had been copy-pasted from inspection's enum
+    # (CLIENT/INTERNAL_OPERATIONS/SUB_CONTRACTOR) without checking audit's own
+    # live data, same root cause as the earlier ai_audit_answers column-name
+    # copy-paste. A filter like WHERE aca.responsible = 'INTERNAL_OPERATIONS'
+    # would silently match zero rows in the audit domain.
     "audit_corrective_action.responsible": [
-        "CLIENT", "INTERNAL_OPERATIONS", "SUB_CONTRACTOR",
+        "KHIDMAH", "KHIDMAH_AND_CLIENT", "CLIENT", "SERVICE_PROVIDER_CONTRACTOR",
+        "CONSULTANT",
     ],
     "audit_corrective_action.pending_with": [],  # messy free text (names/emails), NOT an enum
     "review.status": ["PENDING", "COMPLETED"],
@@ -513,7 +529,11 @@ AUDIT_BUSINESS_RULES = [
     "'CLOSED_WITH_EXCEPTION'). Only use audit_plan.status (conducted = ap.status IN "
     "('SUBMITTED','RETURNED_FOR_MODIFICATION'), completed = ap.status = 'APPROVED') when the "
     "question explicitly says 'audit plan(s)'. When unsure and the question could plausibly "
-    "lead to a follow-up about findings/answers/facility, use audit_report.",
+    "lead to a follow-up about findings/answers/facility, use audit_report. THIS RULE IS ABOUT "
+    "STATUS/LIFECYCLE questions only — for an ATTRIBUTE question (auditee, auditor, facility, "
+    "schedule date) about an entity a recent turn already resolved to a specific audit_plan, "
+    "do not ask the user to re-specify which audit; join straight through audit_schedule (which "
+    "carries auditee/auditor/facility for both plans and reports) using that plan's id.",
     "NEVER use SELECT *. Always specify the columns the user needs.",
     "NEVER use SQL reserved words as table aliases (is, as, in, on, by, do, if).",
     "Use ILIKE for text matching, never LIKE.",
@@ -711,6 +731,54 @@ AUDIT_BUSINESS_RULES = [
     "a super-admin/audit-in-charge-permission user can modify an auditor_portfolio row after it has "
     "already reached status='APPROVED' — this is not an error state or a sign the row should have "
     "gone back to a pending/returned status first.",
+    "WHO ON audit_corrective_action — FOUR different columns answer FOUR different 'who' "
+    "questions, confirmed live 2026-07-29 (qid=f87d531f: 'who proposed the corrective action' "
+    "got answered with aca.responsible AS proposer, returning values like "
+    "'SERVICE_PROVIDER_CONTRACTOR'/'KHIDMAH_AND_CLIENT' as if they were a person's name): "
+    "created_by (UUID FK to users, populated on every row) = who raised/logged this CA — the "
+    "right answer for 'who proposed/raised/logged/created' questions. internal_stakeholder_id "
+    "(UUID FK to users, populated on every row regardless of responsible's value) = the "
+    "Khidmah-side assigned point of contact/owner — the right answer for 'who owns/is assigned "
+    "to' questions. responsible (VARCHAR enum: KHIDMAH, KHIDMAH_AND_CLIENT, CLIENT, "
+    "SERVICE_PROVIDER_CONTRACTOR, CONSULTANT — NOT a users FK, NEVER join it to users) = which "
+    "PARTY/ORGANIZATION is responsible for executing the fix — a category, not a person; only "
+    "the right answer when the question asks 'which party/organization'. pending_with (free "
+    "text, mostly NULL, unreliable) = whichever name/email a user happened to type in, not a "
+    "reliable lookup. Never substitute one for another just because the question says 'who'.",
+    "STAKEHOLDER/AUDITOR GRAIN MISMATCH — confirmed live 2026-07-29 (qid=4337464c): "
+    "internal_stakeholder_id lives on audit_corrective_action (one value PER CORRECTIVE "
+    "ACTION), while auditor_id/auditee_id live on audit_schedule (one value for the WHOLE "
+    "audit). 'who are the auditor, auditee, and internal stakeholder for this audit' joined "
+    "both together but selected no corrective_action_id — got back 5 rows with the SAME "
+    "auditor/auditee repeated and a DIFFERENT stakeholder each time, nothing explaining why. "
+    "The fan-out itself was correct (the audit genuinely has 5 CAs, each with its own "
+    "stakeholder) — it just needs corrective_action_id in the SELECT so it reads as '5 CAs, "
+    "each with its own stakeholder' instead of looking like duplicate/inconsistent data. "
+    "ALWAYS include aca.corrective_action_id when internal_stakeholder_id and auditor_id/"
+    "auditee_id appear in the same query.",
+    "audit_schedule.audit_sub_category_id is NULL on ~28% of active schedules, confirmed live "
+    "2026-07-29 (11/39) — and NOT limited to unplanned audits (category_id on audit_plan and "
+    "auditor_id on audit_schedule are, by contrast, never NULL). A query that INNER JOINs "
+    "audit_sub_category to answer a 'who/what' question about a specific audit will silently "
+    "return zero rows whenever sub-category alone happens to be unset, even though the auditor "
+    "and category both exist — confirmed live: 'who conducted it, what category and sub "
+    "category' returned rows=0 for exactly this reason on an audit with a real auditor and "
+    "category. Use LEFT JOIN audit_sub_category unless the question explicitly filters for "
+    "schedules that DO have a sub-category assigned.",
+    "SCOPE DISCIPLINE for general 'list <entity>' / 'list <entity> with details' questions — "
+    "confirmed live 2026-07-29 (qid=d5e2317b): 'list all overdue corrective actions' (no mention "
+    "of facility, project, client, entity, or responsible/pending_with) generated a schema_hint "
+    "with all six joined in anyway, self-injecting THREE unrelated hallucinated FKs "
+    "(aca.responsible = users.id, aca.pending_with = users.id, direct aca.facility_id/"
+    "project_id) that the validator then had to block, costing a wasted iteration on a question "
+    "that never asked for any of it. DEFAULT to the entity's own columns only (for "
+    "audit_corrective_action: corrective_action_id, status, progress_stage, implementation_status, "
+    "adequacy_status, cause, correction, corrective_action, target_close_out_date, completed_on) "
+    "plus whatever the question's own words name. Only reach for facility/project/client/entity "
+    "(multi-hop via audit_report → audit_schedule) or risk_level/impact/compliance/reviewer "
+    "identity when the question itself names that concept — 'with details'/'full details' alone "
+    "does NOT license adding facility, project, client, entity, or responsible/pending_with; it "
+    "means 'show the entity's own text fields', not 'join everything reachable'.",
 ]
 
 AUDIT_TABLE_RELATIONSHIPS = """\
@@ -726,11 +794,19 @@ HOW TABLES CONNECT:
   audit_plan.cycle_id              → audit_cycle.id
   audit_plan.audit_type_id         → audit_type.id
   audit_plan.category_id           → audit_category.id
+  TRAP — audit_plan has NO audit_type_name or category_name column of its
+  own (confirmed live: a schema_hint selecting ap.audit_type_name/
+  ap.category_name directly got a real Postgres 'column does not exist'
+  error, costing a retry). These are FK ids only — JOIN audit_type aty ON
+  ap.audit_type_id = aty.id and SELECT aty.name AS audit_type_name (same
+  pattern for category via audit_category acat / acat.name AS category_name).
   audit_plan.user_id               → users.id           (the proposer — verified: always 'Internal Auditor')
   audit_schedule.audit_plan_id     → audit_plan.id
   audit_schedule.auditor_id        → users.id            (who conducts the visit)
   audit_schedule.auditee_id        → users.id            (who is being audited)
   audit_schedule.facility_id       → facility.id
+  facility.country_id              → country.id           (DIRECT — no need to go via region)
+  facility.region_id               → region.id             (region.country_id → country.id also reaches country)
   audit_schedule.project_id        → project.id
   audit_schedule.audit_universe_id → audit_universe.id
   audit_schedule.audit_sub_category_id → audit_sub_category.id
@@ -742,6 +818,14 @@ HOW TABLES CONNECT:
                                        genuinely independent of client_id, NOT redundant; both
                                        always populated)
   audit_corrective_action.audit_id → audit_report.id
+  TRAP — audit_report ALSO has its own column literally named audit_id, but it's a
+  DIFFERENT thing: audit_report.audit_id is a VARCHAR display code (e.g.
+  '2026/07/ST034/AUD001'), not the PK. audit_corrective_action.audit_id is a UUID
+  and must join to audit_report.id — NEVER audit_report.audit_id, even inside a
+  subquery built to "fetch the audit's id" (confirmed live: a correlated subquery
+  written as `SELECT arep.audit_id FROM audit_report arep WHERE ...` produced
+  'operator does not exist: uuid = character varying' — the same trap as a direct
+  JOIN, just one level removed). Only select audit_report.audit_id for DISPLAY.
   audit_corrective_action.risk_level_id  → risk_level.id
   audit_corrective_action.impact_id      → impact.id
   audit_corrective_action.compliance_id  → compliance.id
@@ -955,6 +1039,14 @@ _AUDIT_ENUM_QUERIES = {
     "audit_corrective_action.progress_stage": (
         "SELECT DISTINCT progress_stage FROM audit_corrective_action "
         "WHERE progress_stage IS NOT NULL ORDER BY progress_stage", "progress_stage"
+    ),
+    # Added 2026-07-29 after "how many distinct audit forms are currently
+    # available" hallucinated status = 'ACTIVE' (doesn't exist — only DRAFT/
+    # SUBMITTED do) and silently returned 0 instead of 5. Live-refreshed rather
+    # than relying only on the static AUDIT_ENUM_COLUMNS fallback, same fix
+    # shape as audit_corrective_action's status columns above.
+    "audit_forms.status": (
+        "SELECT DISTINCT status FROM audit_forms WHERE status IS NOT NULL ORDER BY status", "status"
     ),
 }
 
@@ -1411,6 +1503,7 @@ def introspect_audit_schema(db_engine: Engine) -> DatabaseSchema:
                 "audit_plan.status", "audit_schedule.schedule_status", "audit_report.status",
                 "audit_corrective_action.status", "audit_corrective_action.implementation_status",
                 "audit_corrective_action.adequacy_status", "audit_corrective_action.progress_stage",
+                "audit_forms.status",
             ),
         ),
     )

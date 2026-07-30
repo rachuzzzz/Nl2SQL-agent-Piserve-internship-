@@ -599,6 +599,35 @@ LIMIT 100;
         'domain': 'audit_corrective_action', 'intent': 'filter', 'limit': 100,
     },
     {
+        # Deliberately kept as its OWN example, not folded into the
+        # 'list open overdue corrective actions' one above — confirmed live
+        # 2026-07-29 (qid=987552fd): "lsit all corrective actions that are
+        # overdue" retrieved that OPEN+OVERDUE example as its nearest
+        # neighbor and copied its status IN ('OPEN', 'OVERDUE') filter
+        # verbatim, silently widening a single-status ask into two statuses.
+        # OPEN and OVERDUE are separate, mutually exclusive enum values
+        # (see AUDIT_ENUM_COLUMNS) — "overdue" alone means status = 'OVERDUE'
+        # only. Having both examples side by side gives the retriever a
+        # closer-matching neighbor for the single-status phrasing instead of
+        # forcing every "overdue" question through the open+overdue example.
+        'nl':     'list all corrective actions that are overdue',
+        'sql':    """\
+SELECT aca.corrective_action_id, aca.cause, aca.status, rl.name AS risk_level_name,
+       fac.name AS facility_name, aca.target_close_out_date
+FROM audit_corrective_action aca
+JOIN audit_report arep ON aca.audit_id = arep.id
+JOIN audit_schedule asch ON arep.schedule_id = asch.id
+LEFT JOIN risk_level rl ON aca.risk_level_id = rl.id
+LEFT JOIN facility fac ON asch.facility_id = fac.id
+WHERE aca.status = 'OVERDUE' AND aca.active = true
+  AND arep.active = true AND asch.active = true
+  AND aca.adequacy_status = 'APPROVE'
+ORDER BY aca.target_close_out_date ASC NULLS LAST
+LIMIT 100;
+""",
+        'domain': 'audit_corrective_action', 'intent': 'filter', 'limit': 100,
+    },
+    {
         'nl':     'corrective actions that are at risk behind schedule progress stage',
         'sql':    """\
 -- 'at risk' = progress_stage = 'AT_RISK' ONLY — do NOT OR in NULL/NOT_STARTED.
@@ -614,9 +643,35 @@ LIMIT 100;
     {
         'nl':     'how many corrective actions closed with deferred vs closed on time',
         'sql':    """\
+-- status = 'CLOSE_WITH_DEFERRED' is a WORKFLOW STATE (deferred to next cycle),
+-- NOT a timeliness judgment — do not confuse with "closed late" below, a
+-- completely different concept derived from comparing dates.
 SELECT
   COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_on_time,
   COUNT(*) FILTER (WHERE status = 'CLOSE_WITH_DEFERRED') AS closed_with_deferred
+FROM audit_corrective_action
+WHERE active = true AND adequacy_status = 'APPROVE';
+""",
+        'domain': 'audit_corrective_action', 'intent': 'aggregate', 'limit': None,
+    },
+    {
+        # Caught live 2026-07-29 (qid=039d5f86): "which audit corrective actions
+        # are closed on time vs late" retrieved the example above (STATUS-based,
+        # CLOSED vs CLOSE_WITH_DEFERRED) as its nearest neighbor and adapted the
+        # FILTER logic to compare dates instead — but kept the OLD alias
+        # 'closed_with_deferred' unchanged, so the result was a column literally
+        # named 'closed_with_deferred' whose actual value was "count of CLOSED
+        # rows completed after target_close_out_date" — completely unrelated to
+        # the real CLOSE_WITH_DEFERRED status. This is a DIFFERENT concept
+        # (timeliness, derived from comparing two dates) from the workflow-state
+        # example above — kept as its own seed example so retrieval can tell
+        # them apart instead of blending one's filter logic with the other's
+        # column names.
+        'nl':     'which corrective actions are closed on time vs closed late',
+        'sql':    """\
+SELECT
+  COUNT(*) FILTER (WHERE status = 'CLOSED' AND completed_on <= target_close_out_date) AS closed_on_time,
+  COUNT(*) FILTER (WHERE status = 'CLOSED' AND completed_on > target_close_out_date) AS closed_late
 FROM audit_corrective_action
 WHERE active = true AND adequacy_status = 'APPROVE';
 """,
@@ -656,8 +711,32 @@ LIMIT 100;
         'domain': 'audit_corrective_action', 'intent': 'filter', 'limit': 100,
     },
     {
-        'nl':     'corrective actions by responsible party client internal operations subcontractor',
+        # Caught live 2026-07-29 (qid=f87d531f): "who proposed the corrective
+        # action" was answered with aca.responsible AS proposer — returning a
+        # party/organization label (e.g. 'KHIDMAH_AND_CLIENT') as if it were a
+        # person's name. created_by is the actual person who raised/logged the
+        # CA, populated on every row, and a clean UUID FK to users.
+        'nl':     'who proposed or raised this corrective action',
         'sql':    """\
+SELECT aca.corrective_action_id,
+       u.first_name || ' ' || u.last_name AS raised_by
+FROM audit_corrective_action aca
+JOIN users u ON aca.created_by = u.id
+WHERE aca.active = true AND u.active = true
+  AND aca.adequacy_status = 'APPROVE'
+ORDER BY aca.created_on DESC
+LIMIT 100;
+""",
+        'domain': 'audit_corrective_action', 'intent': 'filter', 'limit': 100,
+    },
+    {
+        'nl':     'corrective actions by responsible party khidmah client contractor consultant',
+        'sql':    """\
+-- responsible values (confirmed live, corrected 2026-07-29 — this is NOT the
+-- same enum as inspection_corrective_action.responsible): KHIDMAH,
+-- KHIDMAH_AND_CLIENT, CLIENT, SERVICE_PROVIDER_CONTRACTOR, CONSULTANT.
+-- This is WHICH PARTY/ORGANIZATION is responsible for executing the fix, not
+-- a person — for "who proposed/raised this CA" use created_by -> users instead.
 SELECT responsible, COUNT(*) AS ca_count
 FROM audit_corrective_action
 WHERE active = true AND adequacy_status = 'APPROVE'
@@ -1085,13 +1164,44 @@ LIMIT 20;
     # AUDIT_BUSINESS_RULES "AUDIT FORM-ANSWER LAYER" / "OBSERVATION -> CORRECTIVE
     # ACTION" and AUDIT_SEMANTICS["joins"]["observation_to_ca"] for the cast rule) ──
     {
+        # Fixed 2026-07-29 (qid=9ce471eb): "for what observation was this raised"
+        # matched this example and returned ALL 9 form fields in the submission
+        # (Audit Checkpoint, Compliance, Impact, Requirement Type, Risk Level,
+        # Schedule Date and Time, Supporting Documents, etc.) instead of just the
+        # free-text finding — noisy for a question asking specifically "what
+        # observation", and missing the aq.label filter AUDIT_BUSINESS_RULES'
+        # OBSERVATION -> CORRECTIVE ACTION rule documents for PATH 1 ("to get the
+        # free-text finding itself, further filter WHERE aq.label = 'Findings /
+        # Remarks'"). Use the FULL-SUBMISSION variant below when the question asks
+        # to see everything filled out, not just what triggered the CA.
         'nl':     'what was the observation for this corrective action observation text for a specific CA what triggered this corrective action',
         'sql':    """-- OBSERVATION -> CA PATH: aaa.submission_id = aca.observation_id::varchar
 -- Cast UUID side to varchar — NOT aaa.submission_id::uuid (submission_id is varchar, observation_id is UUID)
 -- This is the DIRECT link — NOT aca.audit_id = arep.id (that returns ALL CAs in the report)
+-- Filter to the free-text finding itself — omitting this returns all 9 form
+-- fields in the submission (Audit Checkpoint, Compliance, Impact, etc.), not
+-- just the observation.
+SELECT aca.corrective_action_id,
+       aaa.answer_text AS observation_text
+FROM audit_corrective_action aca
+JOIN ai_audit_answers aaa ON aaa.submission_id = aca.observation_id::varchar
+JOIN ai_questions aq ON aaa.element_id = aq.element_id
+WHERE aca.corrective_action_id = '<CA_ID>'
+  AND aca.observation_id IS NOT NULL
+  AND aca.active = true
+  AND aq.label = 'Findings / Remarks'
+LIMIT 1;
+""",
+        'domain': 'ai_audit_answers', 'intent': 'join', 'limit': 1,
+    },
+    {
+        'nl':     'show the full submission everything filled out for this observation entry',
+        'sql':    """-- Full-submission variant — every form field for the observation entry
+-- this CA was raised against, not just the free-text finding. Use when the
+-- question asks to see everything filled out, not "what observation" alone.
 SELECT aca.corrective_action_id,
        aq.label AS field,
-       aaa.answer_text AS linked_observation_value
+       aaa.answer_text AS value
 FROM audit_corrective_action aca
 JOIN ai_audit_answers aaa ON aaa.submission_id = aca.observation_id::varchar
 JOIN ai_questions aq ON aaa.element_id = aq.element_id

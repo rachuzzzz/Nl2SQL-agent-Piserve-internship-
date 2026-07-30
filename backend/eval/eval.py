@@ -844,6 +844,8 @@ import sys, os, time, json, argparse
 from datetime import datetime
 from collections import defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
              skip_multiturn=False, category_filter=None, output_file=None):

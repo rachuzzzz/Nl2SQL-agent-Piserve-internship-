@@ -175,6 +175,24 @@ def _check_uuid_pk_in_select_ast(
             # Unwrap alias: SELECT ir.id AS something → col_expr is Alias, col_expr.this is Column
             col = col_expr.this if isinstance(col_expr, exp.Alias) else col_expr
             if isinstance(col, exp.Column) and col.name.lower() == "id":
+                # Exempt columns identity.py's inject_row_identity() added
+                # (always output-aliased as "<display_col>__id") — confirmed
+                # live 2026-07-30: this check runs a SECOND time in
+                # execution.py's execute_sql() (a defense-in-depth
+                # re-validation gate independent of generation.py's own
+                # post-injection call), and without this exemption it HARD_
+                # FAILs on the injected column exactly like a real "bare .id
+                # leaked into display" mistake — except the reasoning LLM
+                # never wrote it and has no way to remove something it
+                # didn't select, so every retry regenerates clean SQL,
+                # injection reintroduces the same column, and the query
+                # fails every iteration up to the retry cap. This is a
+                # deliberately internal-only column (see
+                # response_formatting.py's strip_row_identity_columns,
+                # which removes it before it ever reaches a user or a
+                # prompt) — never a genuine display leak.
+                if (col_expr.output_name or "").lower().endswith("__id"):
+                    continue
                 alias = (col.table or "").lower()
                 if alias in pk_display_map:
                     display = pk_display_map[alias]
@@ -291,3 +309,84 @@ def _check_uuid_leaks_regex(
                 retryable=False,
             ))
             ValidatorStats.record("UUID_LEAK", is_retry_trigger=False)
+
+
+
+
+_AGG_FUNCS = (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)
+
+
+def _check_ungrouped_select_columns_ast(sql: str, issues: list[ValidationIssue]) -> None:
+    """
+    Postgres requires every SELECT-list column that isn't wrapped in an
+    aggregate function to appear in GROUP BY. Deepseek routinely violates
+    this by tacking on one extra "detail" column next to an aggregate
+    (e.g. a row-level id alongside COUNT(...)) — syntactically plausible,
+    so the cleaner's regex/shape checks pass it, but Postgres rejects it at
+    execution with "column must appear in the GROUP BY clause or be used
+    in an aggregate function".
+
+    Confirmed live: eval_audit.py's ADMIN-08 run ("audit schedules per
+    country") selected asch.schedule_id alongside COUNT(DISTINCT asch.id)
+    with GROUP BY fac.country_id, c.name — asch.schedule_id belongs to
+    neither, and the query only failed at the DB round-trip, burning an
+    LLM call a pre-execution check could have caught for free.
+
+    Deliberately narrow — only flags a BARE exp.Column directly in the
+    outermost SELECT list (unwrapped from a simple Alias), never columns
+    buried inside CASE/window/concat expressions, where Postgres' actual
+    functional-dependency rules are harder to reproduce safely without
+    false positives. Also bails out on positional GROUP BY (e.g. "GROUP BY
+    1, 2") since ordinal positions can't be reliably correlated back here.
+    Fail-safe on anything ambiguous — false negatives are fine, a false
+    positive would block valid SQL.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, dialect="postgres")
+    except Exception:
+        return
+
+    top_select = None
+    if isinstance(tree, exp.Select):
+        top_select = tree
+    elif isinstance(tree, exp.With):
+        final = tree.this
+        if isinstance(final, exp.Select):
+            top_select = final
+
+    if top_select is None:
+        return
+
+    group = top_select.args.get("group")
+    if group is None:
+        return
+    if any(isinstance(g, exp.Literal) and g.is_int for g in group.expressions):
+        return
+
+    grouped_keys = {g.sql(dialect="postgres").lower() for g in group.expressions}
+
+    has_aggregate_sibling = any(
+        isinstance((e.this if isinstance(e, exp.Alias) else e), _AGG_FUNCS)
+        or list((e.this if isinstance(e, exp.Alias) else e).find_all(*_AGG_FUNCS))
+        for e in top_select.expressions
+    )
+    if not has_aggregate_sibling:
+        return
+
+    for col_expr in top_select.expressions:
+        inner = col_expr.this if isinstance(col_expr, exp.Alias) else col_expr
+        if not isinstance(inner, exp.Column):
+            continue
+        key = inner.sql(dialect="postgres").lower()
+        if key not in grouped_keys:
+            rendered = inner.sql(dialect="postgres")
+            issues.append(ValidationIssue(
+                "HARD_FAIL", "UNGROUPED_COLUMN",
+                f"'{rendered}' is selected alongside an aggregate but is not in "
+                f"GROUP BY — Postgres will reject this with 'column must appear "
+                f"in the GROUP BY clause or be used in an aggregate function'. "
+                f"Either add it to GROUP BY or remove it from SELECT.",
+                detail=f"GROUP BY currently has: {group.sql(dialect='postgres')}",
+            ))
+            ValidatorStats.record("UNGROUPED_COLUMN", is_retry_trigger=True)
+            return

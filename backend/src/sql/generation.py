@@ -387,6 +387,43 @@ def generate_sql(
         if _ast_mutations and _debug_logger:
             _debug_logger.debug(f"  [ast-repair] {'; '.join(_ast_mutations)}")
 
+        # Deterministic fix for a bare <alias>.id selected for display on a
+        # table with no (or a known) display substitute — the single most
+        # common validation retry in the audit domain (confirmed live via
+        # eval_audit.py, reproducible at temperature=0.0). Same "fix it
+        # ourselves instead of blocking and hoping the LLM remembers"
+        # principle as ast_repair above; unconditional (not question-gated)
+        # since dropping/replacing a bare id never changes which rows come
+        # back, only which columns are displayed.
+        sql, _bare_id_mutations = validator.strip_bare_uuid_pk_select(sql)
+        if _bare_id_mutations and _debug_logger:
+            _debug_logger.debug(f"  [bare-id-autocorrect] {'; '.join(_bare_id_mutations)}")
+
+        # Same principle, for a hallucinated display-name column (e.g.
+        # acyc.name, po.portfolio_name) on a table confirmed to have NO
+        # substitute at all — see identity.py's strip_hallucinated_no_
+        # substitute_columns docstring for the PLAN-08 (7 calls) / PORT-03
+        # (hallucinated twice, even after a get_schema check) history this
+        # closes.
+        sql, _halluc_mutations = validator.strip_hallucinated_no_substitute_columns(sql)
+        if _halluc_mutations and _debug_logger:
+            _debug_logger.debug(f"  [bare-id-autocorrect] {'; '.join(_halluc_mutations)}")
+
+        # Question-aware intent autocorrects — same "fix it ourselves instead
+        # of blocking and hoping the LLM remembers" principle as ast_repair
+        # above, but gated on the ORIGINAL QUESTION TEXT too (not just SQL
+        # shape), reusing the exact compiled regexes their corresponding
+        # BLOCK rule already defines. Runs BEFORE validate() specifically so
+        # it prevents that BLOCK from ever firing, unlike identity injection
+        # below (which deliberately runs AFTER).
+        sql, _intent_mutations = validator.inject_ca_adequacy_filter(sql, question)
+        if _intent_mutations and _debug_logger:
+            _debug_logger.debug(f"  [intent-autocorrect] {'; '.join(_intent_mutations)}")
+
+        sql, _axis_mutations = validator.downgrade_ca_multi_axis_joins(sql, question)
+        if _axis_mutations and _debug_logger:
+            _debug_logger.debug(f"  [intent-autocorrect] {'; '.join(_axis_mutations)}")
+
         # validate() returns ValidationResult — hard fails block, soft warns are advisory only.
         vresult = validator.validate(sql, question)
 
@@ -404,6 +441,26 @@ def generate_sql(
             if not shape_result.passed:
                 # Merge shape failure into vresult
                 vresult = shape_result
+
+        # Row-identity injection (sqlglot AST, see validation/identity.py):
+        # append a hidden <alias>.id sibling alongside any display column
+        # already selected from a "nameable" table (audit_plan.title,
+        # facility.name, ...), so a later conversational follow-up can
+        # resolve "the third one"/"that plan" to a real row id instead of
+        # re-deriving one from a possibly-duplicated display string.
+        # Deliberately runs AFTER validate()/validate_shape() have already
+        # passed on the MODEL'S OWN sql — never before — so the synthetic
+        # column is invisible to every validation pass (in particular
+        # UUID_IN_SELECT, which would otherwise flag a bare `.id` selection)
+        # and never risks being injected into a draft that's about to be
+        # retried/discarded. Every consumer of the resulting row data (see
+        # synthesis.py / response_formatting.py) is responsible for stripping
+        # these __id-suffixed columns before they reach the end user or the
+        # reasoning LLM's own next-turn prompt.
+        if vresult.passed:
+            sql, _identity_mutations = validator.inject_row_identity(sql)
+            if _identity_mutations and _debug_logger:
+                _debug_logger.debug(f"  [row-identity] {'; '.join(_identity_mutations)}")
 
         # Log cleaned SQL and validation result
         if _debug_logger:
