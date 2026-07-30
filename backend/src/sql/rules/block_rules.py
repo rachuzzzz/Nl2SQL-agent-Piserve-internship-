@@ -354,13 +354,30 @@ BLOCK_RULES: list[dict] = [
             "observation_id → submission_id path, not inspection join."
         ),
         # Fires when: ai_answers ILIKE filter present + ICA joined via inspection_report
-        # but observation_id → submission_id join is absent
+        # but observation_id → submission_id join is absent.
+        #
+        # EXEMPTION — ica.id IS NULL (anti-join / existence check): confirmed live
+        # 2026-07-30, eval.py's CROSS-04 run ("which facilities have high risk
+        # observations but no mitigative actions raised") false-positived on this
+        # rule 3 of 4 calls. That query's ILIKE filters ai_answers down to
+        # high-risk OBSERVATIONS (an unrelated WHERE predicate, nothing to do with
+        # which MA rows get pulled in) and separately LEFT JOINs ica ON
+        # ica.inspection_id = ir.id ... WHERE ica.id IS NULL to test "does this
+        # inspection have ANY MA at all" — the correct, intentional PATH 2 join
+        # from block_rules.py's own docs. The observation_id→submission_id path
+        # this rule demands is for a structurally different question (retrieve
+        # the MA row(s) tied to ONE specific observation's text) that never
+        # pairs an anti-join shape with the ILIKE — a real "MAs for this
+        # observation" query selects ica.* rows directly, it doesn't test their
+        # absence. Excluding the anti-join shape removes the false positive
+        # without weakening detection of the actual wrong-path case.
         "sql_pattern": (
             r"(?=.*\bai_answers\b)"                          # ai_answers present
             r"(?=.*\bilike\b)"                               # ILIKE filter present
             r"(?=.*\binspection_corrective_action\b)"        # ICA present
             r"(?=.*\bica\.inspection_id\s*=\s*ir\.id\b)"     # wrong path: via inspection
             r"(?!.*\bica\.observation_id\b)"                 # correct path absent
+            r"(?!.*\bica\.id\s+is\s+null\b)"                 # not an existence/anti-join check
         ),
         "message":     (
             "WRONG PATH: When filtering MAs by observation text (ILIKE), join via "

@@ -125,6 +125,51 @@ def _reconstruct_fragmented_schema_hint(args: dict) -> dict:
     return cleaned
 
 
+def _reconstruct_fragmented_answer(args: dict) -> dict:
+    """
+    Repair a final_answer's `answer` string fragmented into spurious extra
+    keys by json_repair's heuristics.
+
+    Confirmed live 2026-07-30: the reasoning LLM's raw output was truncated
+    mid-answer (missing closing brace — "TRUNCATED — 1 unclosed brace(s)" in
+    debug_llm log). The answer text itself happened to contain a
+    "word: value"-shaped substring ("...proposed audits, status: DRAFT,
+    SUBMITTED, APPROVED)..."), and json_repair's truncated-JSON recovery
+    mistook "status" for a new key instead of prose inside the still-open
+    answer string — splitting one continuous sentence into
+    args={"answer": "...proposed audits", "status": "DRAFT, SUBMITTED, ..."}.
+    dispatch() only ever reads args["answer"] for final_answer (see below),
+    so the user silently received the answer text truncated mid-sentence —
+    missing the rest of the list and the closing prompt — while the log's
+    "PARSED TOOL CALL" line showed the (unused) "status" fragment sitting
+    right next to it, looking harmless.
+
+    Unlike the schema_hint fragmentation above, the spurious key here isn't
+    drawn from a fixed SQL-clause vocabulary — it's an arbitrary word from
+    the model's prose, so there's no prefix list to match against. But
+    final_answer only has ONE meaningful arg ("answer"); ANY other key
+    present on a final_answer call is necessarily this same corruption, not
+    a real separate field, so it's always safe to fold every extra key back
+    onto the end of the answer in insertion order (dicts preserve it).
+    """
+    if "answer" not in args:
+        return args
+    extra_keys = [k for k in args if k != "answer" and isinstance(k, str)]
+    if not extra_keys:
+        return args
+
+    parts = [str(args["answer"])]
+    for key in extra_keys:
+        val = args[key]
+        parts.append(f", {key}: {val}" if val not in (None, "") else f", {key}")
+
+    cleaned = dict(args)
+    cleaned["answer"] = "".join(parts)
+    for key in extra_keys:
+        cleaned.pop(key, None)
+    return cleaned
+
+
 def _escape_newlines_in_strings(text: str) -> str:
     """Escape literal newlines/carriage-returns inside JSON string values.
 
@@ -294,6 +339,11 @@ def _validate_tool_call(parsed: Any, raw_output: str) -> dict[str, Any]:
     # Python-style multiline string concatenation which the JSON parser splits
     # into separate keys (FROM, WHERE, GROUP BY become top-level args keys).
     parsed["args"] = _reconstruct_fragmented_schema_hint(parsed["args"])
+
+    # Same repair, targeted at final_answer's `answer` string — see
+    # _reconstruct_fragmented_answer's docstring for the live-caught case.
+    if parsed.get("tool") == "final_answer":
+        parsed["args"] = _reconstruct_fragmented_answer(parsed["args"])
 
     # Normalise: ensure "thought" key exists (model sometimes omits it)
     parsed.setdefault("thought", "")

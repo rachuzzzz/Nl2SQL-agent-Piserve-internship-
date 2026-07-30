@@ -42,14 +42,17 @@ from src.sql.validation.ast_checks import (
     _check_uuid_pk_in_select_ast,
     _check_uuid_leaks_ast,
     _check_uuid_leaks_regex,
+    _check_ungrouped_select_columns_ast,
 )
 from src.sql.validation.cleaner import CleanerMixin
+from src.sql.validation.identity import IdentityMixin
+from src.sql.validation.autocorrect_intent import IntentAutocorrectMixin
 from src.sql.validation.shape import ShapeMixin
 from src.sql.validation.semantic import SemanticMixin
 from src.sql.validation.scope import ScopeMixin
 
 
-class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
+class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMixin, SemanticMixin, ScopeMixin):
     """
     Two-tier SQL validation.
 
@@ -115,6 +118,12 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
         "project_name":    "JOIN project proj ON ir.project_id = proj.id → proj.name",
         "type_name":       "JOIN inspection_type it ON ir.inspection_type_id = it.id → it.name",
         "inspection_type": "JOIN inspection_type it ON ir.inspection_type_id = it.id → it.name",
+        # Confirmed live 2026-07-29 (qid=fe1426e8): "was there any inspection at
+        # aldar hQ" hallucinated ir.inspection_type_name directly — a real Postgres
+        # "column does not exist" error, self-corrected on retry, but the existing
+        # "inspection_type" entry above doesn't catch this since the word-boundary
+        # match requires an exact column name and "_name" continues the word.
+        "inspection_type_name": "JOIN inspection_type it ON ir.inspection_type_id = it.id → it.name",
         # Quarter-comparison ghost columns — deepseek hallucinates these when
         # Qwen writes bad schema_hints like AVG(ir.current_qtr_score)
         "current_qtr_score": "does not exist — compute with CASE WHEN ir.submitted_on >= date_trunc('quarter', NOW()) THEN ir.inspection_score END",
@@ -222,6 +231,10 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
                            "u ON po.user_id = u.id)",
         "code":           "does not exist on auditor_portfolio — identify it by its owning auditor "
                            "instead (JOIN users u ON po.user_id = u.id)",
+        "submitted_on":   "does not exist on auditor_portfolio — the real column is submitted_date "
+                           "(confirmed live: eval_audit.py's APPR-10 run hit a live UndefinedColumn "
+                           "error on this after the ap->po alias was already fixed, burning a 3rd "
+                           "LLM call). Use po.submitted_date instead.",
     }
 
 
@@ -373,6 +386,43 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
         # for_observation_wrong_path's Group I entry above) was defined but never added
         # here — silently dead until discovered 2026-07-29 while wiring up its audit twin.
         "block_ma_for_observation_wrong_path",
+        # Group M — OPEN and OVERDUE are mutually exclusive status values; a
+        # question asking only for "overdue" must not get status IN ('OPEN',
+        # 'OVERDUE') copied in from the adjacent open+overdue seed example
+        # (caught live 2026-07-29, qid=987552fd — see audit_seed_data.py's
+        # now-separate 'list all corrective actions that are overdue' example
+        # for the retrieval-side half of this fix).
+        "audit_block_overdue_status_overbroad",
+        # Group N — audit_schedule.audit_sub_category_id is NULL on ~28% of active
+        # schedules (confirmed live 2026-07-29, qid=ff669ae7) — INNER JOIN silently
+        # drops the whole row (auditor, category, everything) when only the
+        # sub-category happens to be unset.
+        "audit_block_sub_category_inner_join",
+        # Group O — internal_stakeholder_id (per-CA) joined alongside auditor_id/
+        # auditee_id (per-audit) without corrective_action_id in the SELECT list
+        # fans out into rows that look like duplicate/inconsistent data (confirmed
+        # live 2026-07-29, qid=4337464c).
+        "audit_block_stakeholder_auditor_grain_mismatch",
+        # Group Q — mechanical fix for review.entity_id joined to
+        # aca.corrective_action_id (the VARCHAR display code) instead of aca.id
+        # (the UUID PK) — same trap the Group F BLOCK rule above catches, but
+        # this substitution has no legitimate alternate reading, so it's fixed
+        # here before validate() ever runs instead of costing a retry.
+        "audit_autocorrect_review_entity_id_corrective_action_id",
+        "audit_autocorrect_corrective_action_id_entity_id_reversed",
+        # Group P — audit domain had no DML/DDL guard of its own (confirmed live
+        # 2026-07-29) — get_audit_engine()'s registry is entirely separate from
+        # inspection's, so block_dml above never covered audit-domain queries.
+        "audit_block_dml",
+        # Group Q — 'closed_with_deferred' alias reused for a different concept
+        # (closed-late timeliness) without renaming, confirmed live 2026-07-29
+        # (qid=039d5f86) — see audit_seed_data.py's now-separate 'closed on time vs
+        # closed late' example for the retrieval-side half of this fix.
+        "audit_block_closed_with_deferred_mislabel",
+        # Group R — audit_forms.status only ever holds DRAFT/SUBMITTED (confirmed
+        # live 2026-07-29, qid=7f386051) — 'ACTIVE' is a hallucinated value that
+        # silently matched zero rows instead of the correct count.
+        "audit_block_forms_status_active_hallucination",
     })
 
 
@@ -704,6 +754,14 @@ class SQLValidator(CleanerMixin, ShapeMixin, SemanticMixin, ScopeMixin):
         # burning 3 retries before Llama finally added the missing JOIN.
         if _HAS_SQLGLOT:
             _check_undefined_table_aliases(sql, issues)
+
+        # ── 6c. Ungrouped SELECT column alongside an aggregate — HARD_FAIL ──
+        # Catches: SELECT a, COUNT(b) ... GROUP BY a, c  where a stray column
+        # (not in GROUP BY, not aggregated) sits next to a real aggregate.
+        # Domain-agnostic — this is plain Postgres GROUP BY semantics, not an
+        # audit/inspection-specific trap. See _check_ungrouped_select_columns_ast.
+        if _HAS_SQLGLOT:
+            _check_ungrouped_select_columns_ast(sql, issues)
 
         # ── 9b. Stale hardcoded date literal — HARD_FAIL ─────────────────
         # deepseek hallucinates DATE '2023-01-01' or '2022-...' from training data

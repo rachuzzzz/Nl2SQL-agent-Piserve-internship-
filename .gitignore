@@ -26,6 +26,7 @@ Thumbs.db
 
 # Evaluation outputs
 eval_results_*.json
+eval_audit_results_*.json
 
 # Generated output dir (logs, eval results, etc.)
 backend/var/

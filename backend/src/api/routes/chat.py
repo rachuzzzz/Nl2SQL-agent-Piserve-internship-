@@ -25,6 +25,7 @@ from src.api.deps import (
 )
 from src.api.response_formatting import (
     is_chart_followup, extract_requested_type, strip_uuid_columns,
+    strip_row_identity_columns,
     redact_security_internals, clean_answer, generate_summary, paginate_sql,
     TYPE_LABELS, ALT_MAP,
 )
@@ -273,10 +274,17 @@ async def chat(
                 rows = inner.get("rows", [])
                 info.result_preview = str(rows[:3])[:200] if rows else "No rows"
                 if rows and isinstance(rows[0], dict):
-                    sess_data["last_raw_rows"] = rows       # cache for fast-path
-                    sess_data["last_cols"] = list(rows[0].keys())
-                    _result_rows = [{k: str(v) for k, v in row.items()} for row in rows]
-                    _result_cols = list(rows[0].keys())
+                    # Strip __id columns injected by identity.py (see
+                    # inject_row_identity()) before caching — this cache feeds
+                    # the chart advisor and the chart-followup fast-path, not
+                    # just the response, so it must be clean at the source.
+                    _clean_cols, _clean_rows = strip_row_identity_columns(
+                        list(rows[0].keys()), rows
+                    )
+                    sess_data["last_raw_rows"] = _clean_rows  # cache for fast-path
+                    sess_data["last_cols"] = _clean_cols
+                    _result_rows = [{k: str(v) for k, v in row.items()} for row in _clean_rows]
+                    _result_cols = _clean_cols
                     _row_count = inner.get("row_count", len(rows))
 
                     # Cache SQL for pagination — prefer this execute_sql step's own
@@ -299,10 +307,12 @@ async def chat(
                 rows = inner.get("rows", [])
                 info.result_preview = str(rows[:3])[:200] if rows else "No rows"
                 if rows and isinstance(rows[0], dict):
-                    sess_data["last_raw_rows"] = rows
-                    sess_data["last_cols"] = inner.get("columns", list(rows[0].keys()))
-                    _result_rows = [{k: str(v) for k, v in row.items()} for row in rows]
-                    _result_cols = inner.get("columns", list(rows[0].keys()))
+                    _ga_cols_raw = inner.get("columns", list(rows[0].keys()))
+                    _clean_cols, _clean_rows = strip_row_identity_columns(_ga_cols_raw, rows)
+                    sess_data["last_raw_rows"] = _clean_rows
+                    sess_data["last_cols"] = _clean_cols
+                    _result_rows = [{k: str(v) for k, v in row.items()} for row in _clean_rows]
+                    _result_cols = _clean_cols
                     _row_count = inner.get("row_count", len(rows))
                     # Rebuild the tool's query as a parameterised SQL template so
                     # /api/page can paginate safely. All LLM-supplied values go through
@@ -523,6 +533,11 @@ async def chat(
         # Scrub raw UUID columns (user_id, facility_id, ...) right before the
         # table reaches the frontend — done last so it never affects chart/KPI
         # column selection or summary generation upstream, only the payload.
+        # __id columns are already stripped at cache time above (the
+        # execute_sql/get_answers branches) — this is defense-in-depth only,
+        # in case some other path populated _result_cols/_result_rows without
+        # going through that cache step.
+        _result_cols, _result_rows = strip_row_identity_columns(_result_cols, _result_rows)
         _result_cols, _result_rows = strip_uuid_columns(_result_cols, _result_rows)
         display_answer = redact_security_internals(display_answer)
         reasoning = redact_security_internals(reasoning)
@@ -621,6 +636,12 @@ async def get_page(req: PageRequest, token_data: dict = Depends(require_auth), o
                 if _term:
                     _page_disambiguation = {"kind": _page_entity[0], "search_term": _term}
 
+        # This path re-executes the cached SQL directly (line 611) — which is
+        # the already identity-injected SQL (see identity.py), so __id
+        # columns are fresh here and bypass the cache-time strip in
+        # /api/chat. Must strip before strip_uuid_columns' own value-based
+        # scrub, same as there — by name, not by sniffing the value.
+        columns, rows = strip_row_identity_columns(columns, rows)
         columns, rows = strip_uuid_columns(columns, rows)
 
         return {

@@ -29,6 +29,73 @@ def _hard_fail_codes(sql, question=""):
 # BLOCK rules
 # ---------------------------------------------------------------------------
 
+def test_block_dml_delete():
+    hard, _, passed = _hard_fail_codes(
+        "DELETE FROM audit_corrective_action WHERE corrective_action_id = 'CA_DRAFT';"
+    )
+    assert "DML_BLOCKED" in hard
+    assert not passed
+
+
+def test_block_dml_drop():
+    hard, _, passed = _hard_fail_codes("DROP TABLE audit_report;")
+    assert "DML_BLOCKED" in hard
+    assert not passed
+
+
+def test_block_dml_update():
+    hard, _, passed = _hard_fail_codes(
+        "UPDATE audit_corrective_action SET status = 'CLOSED' WHERE active = true;"
+    )
+    assert "DML_BLOCKED" in hard
+    assert not passed
+
+
+def test_block_dml_stays_quiet_for_select():
+    hard, _, _ = _hard_fail_codes(
+        "SELECT aca.corrective_action_id FROM audit_corrective_action aca "
+        "WHERE aca.active = true AND aca.adequacy_status = 'APPROVE' LIMIT 100;"
+    )
+    assert "DML_BLOCKED" not in hard
+
+
+def test_block_closed_with_deferred_mislabel():
+    hard, _, passed = _hard_fail_codes(
+        "SELECT COUNT(*) FILTER (WHERE status = 'CLOSED' AND completed_on <= target_close_out_date) "
+        "AS closed_on_time, "
+        "COUNT(*) FILTER (WHERE status = 'CLOSED' AND completed_on > target_close_out_date) "
+        "AS closed_with_deferred "
+        "FROM audit_corrective_action WHERE active = true AND adequacy_status = 'APPROVE';"
+    )
+    assert "AUDIT_CLOSED_WITH_DEFERRED_MISLABEL" in hard
+    assert not passed
+
+
+def test_block_closed_with_deferred_mislabel_stays_quiet_for_real_status_use():
+    hard, _, _ = _hard_fail_codes(
+        "SELECT COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_on_time, "
+        "COUNT(*) FILTER (WHERE status = 'CLOSE_WITH_DEFERRED') AS closed_with_deferred "
+        "FROM audit_corrective_action WHERE active = true AND adequacy_status = 'APPROVE';"
+    )
+    assert "AUDIT_CLOSED_WITH_DEFERRED_MISLABEL" not in hard
+
+
+def test_block_forms_status_active_hallucination():
+    hard, _, passed = _hard_fail_codes(
+        "SELECT COUNT(DISTINCT id) AS form_count FROM audit_forms WHERE active = true "
+        "AND status = 'ACTIVE' LIMIT 100;"
+    )
+    assert "AUDIT_FORMS_STATUS_ACTIVE_HALLUCINATION" in hard
+    assert not passed
+
+
+def test_block_forms_status_active_hallucination_stays_quiet_without_status_filter():
+    hard, _, _ = _hard_fail_codes(
+        "SELECT COUNT(DISTINCT id) AS form_count FROM audit_forms WHERE active = true LIMIT 100;"
+    )
+    assert "AUDIT_FORMS_STATUS_ACTIVE_HALLUCINATION" not in hard
+
+
 def test_block_ca_draft_not_excluded():
     hard, _, passed = _hard_fail_codes(
         "SELECT aca.corrective_action_id, aca.correction FROM audit_corrective_action aca "
@@ -61,6 +128,55 @@ def test_block_review_entity_id_corrective_action_id():
     assert not passed
 
 
+def test_ca_existence_check_adequacy_filtered_stays_quiet_for_plain_status_filter():
+    """
+    Confirmed live 2026-07-30 (eval_audit.py WORKFLOW-08, "corrective actions
+    with both implementation and adequacy approved but not yet closed"): a
+    plain, correct LISTING query — aca.status NOT IN ('CLOSED', ...) is a
+    normal value-list status filter, nothing to do with checking whether a
+    CA exists — got blocked anyway because the rule's old sql_pattern
+    matched ANY "NOT IN (" text, and the query also (correctly, per
+    audit_block_ca_draft_not_excluded) has adequacy_status = 'APPROVE'.
+    NOT IN now requires a subquery (the actual existence-check shape) to
+    distinguish it from a literal value-list filter.
+    """
+    hard, _, passed = _hard_fail_codes(
+        "SELECT aca.corrective_action_id, aca.status, aca.implementation_status, "
+        "aca.adequacy_status FROM audit_corrective_action aca WHERE aca.active = true "
+        "AND aca.implementation_status = 'APPROVE' AND aca.adequacy_status = 'APPROVE' "
+        "AND aca.status NOT IN ('CLOSED', 'CLOSE_WITH_DEFERRED') ORDER BY aca.created_on DESC;",
+        question="corrective actions with both implementation and adequacy approved but not yet closed",
+    )
+    assert "AUDIT_CA_EXISTENCE_CHECK_ADEQUACY_FILTERED" not in hard
+    assert passed
+
+
+def test_ca_existence_check_adequacy_filtered_still_blocks_subquery_form():
+    """The rule must still catch the genuine bug it exists for: a real
+    existence check (NOT IN a subquery) combined with an adequacy_status
+    filter, which would wrongly exclude CA_DRAFT rows from counting as
+    'raised'."""
+    hard, _, passed = _hard_fail_codes(
+        "SELECT arep.audit_id FROM audit_report arep WHERE arep.active = true AND arep.id NOT IN "
+        "(SELECT aca.audit_id FROM audit_corrective_action aca WHERE aca.adequacy_status = 'APPROVE' "
+        "AND aca.active = true);",
+        question="audits with no approved corrective actions",
+    )
+    assert "AUDIT_CA_EXISTENCE_CHECK_ADEQUACY_FILTERED" in hard
+    assert not passed
+
+
+def test_ca_existence_check_adequacy_filtered_still_blocks_is_null_form():
+    hard, _, passed = _hard_fail_codes(
+        "SELECT arep.audit_id FROM audit_report arep LEFT JOIN audit_corrective_action aca "
+        "ON aca.audit_id = arep.id AND aca.adequacy_status = 'APPROVE' "
+        "WHERE aca.id IS NULL AND arep.active = true;",
+        question="audits with no approved corrective actions raised",
+    )
+    assert "AUDIT_CA_EXISTENCE_CHECK_ADEQUACY_FILTERED" in hard
+    assert not passed
+
+
 def test_block_review_completed_not_approved():
     hard, _, passed = _hard_fail_codes(
         "SELECT u.first_name FROM review rev JOIN users u ON rev.reviewed_by = u.id "
@@ -77,6 +193,118 @@ def test_block_review_completed_not_approved_stays_quiet_for_rejection_questions
         question="which reviews were rejected or returned for modification",
     )
     assert "REVIEW_COMPLETED_NOT_APPROVED" not in hard
+
+
+def test_block_report_missing_facility_project():
+    hard, _, passed = _hard_fail_codes(
+        "SELECT aca.corrective_action_id, fac.name FROM audit_corrective_action aca "
+        "LEFT JOIN facility fac ON aca.facility_id = fac.id "
+        "WHERE aca.active = true LIMIT 100;"
+    )
+    assert "AUDIT_REPORT_NO_FACILITY_PROJECT" in hard
+    assert not passed
+
+
+def test_block_responsible_join_pending_with():
+    hard, _, passed = _hard_fail_codes(
+        "SELECT aca.corrective_action_id FROM audit_corrective_action aca "
+        "LEFT JOIN users u_pending ON aca.pending_with = u_pending.id "
+        "WHERE aca.active = true LIMIT 100;"
+    )
+    assert "AUDIT_RESPONSIBLE_NOT_FK" in hard
+    assert not passed
+
+
+def test_block_responsible_join_responsible_column():
+    hard, _, passed = _hard_fail_codes(
+        "SELECT aca.corrective_action_id FROM audit_corrective_action aca "
+        "LEFT JOIN users u ON aca.responsible = u.id "
+        "WHERE aca.active = true LIMIT 100;"
+    )
+    assert "AUDIT_RESPONSIBLE_NOT_FK" in hard
+    assert not passed
+
+
+def test_block_overdue_status_overbroad():
+    hard, _, passed = _hard_fail_codes(
+        "SELECT aca.corrective_action_id FROM audit_corrective_action aca "
+        "WHERE aca.status IN ('OPEN', 'OVERDUE') AND aca.active = true LIMIT 100;",
+        question="list all corrective actions that are overdue",
+    )
+    assert "AUDIT_OVERDUE_INCLUDES_OPEN" in hard
+    assert not passed
+
+
+def test_block_overdue_status_overbroad_stays_quiet_when_question_asks_for_open_too():
+    hard, _, _ = _hard_fail_codes(
+        "SELECT aca.corrective_action_id FROM audit_corrective_action aca "
+        "WHERE aca.status IN ('OPEN', 'OVERDUE') AND aca.active = true LIMIT 100;",
+        question="list open overdue corrective actions",
+    )
+    assert "AUDIT_OVERDUE_INCLUDES_OPEN" not in hard
+
+
+def test_block_overdue_status_overbroad_stays_quiet_for_overdue_only_sql():
+    hard, _, passed = _hard_fail_codes(
+        "SELECT aca.corrective_action_id FROM audit_corrective_action aca "
+        "WHERE aca.status = 'OVERDUE' AND aca.active = true "
+        "AND aca.adequacy_status = 'APPROVE' LIMIT 100;",
+        question="list all corrective actions that are overdue",
+    )
+    assert "AUDIT_OVERDUE_INCLUDES_OPEN" not in hard
+    assert passed
+
+
+def test_block_sub_category_inner_join():
+    hard, _, passed = _hard_fail_codes(
+        "SELECT u.first_name, acat.name, asub.name FROM audit_report arep "
+        "JOIN audit_schedule asch ON arep.schedule_id = asch.id "
+        "JOIN users u ON asch.auditor_id = u.id "
+        "JOIN audit_plan ap ON asch.audit_plan_id = ap.id "
+        "JOIN audit_category acat ON ap.category_id = acat.id "
+        "JOIN audit_sub_category asub ON asch.audit_sub_category_id = asub.id "
+        "WHERE arep.audit_id = '2026/07/ST033/AUD001';"
+    )
+    assert "AUDIT_SUB_CATEGORY_INNER_JOIN" in hard
+    assert not passed
+
+
+def test_block_sub_category_inner_join_stays_quiet_for_left_join():
+    hard, _, _ = _hard_fail_codes(
+        "SELECT u.first_name, asub.name FROM audit_schedule asch "
+        "JOIN users u ON asch.auditor_id = u.id "
+        "LEFT JOIN audit_sub_category asub ON asch.audit_sub_category_id = asub.id "
+        "WHERE asch.active = true LIMIT 100;"
+    )
+    assert "AUDIT_SUB_CATEGORY_INNER_JOIN" not in hard
+
+
+def test_block_stakeholder_auditor_grain_mismatch():
+    hard, _, passed = _hard_fail_codes(
+        "SELECT u_aud.first_name AS auditor_name, u_stk.first_name AS stakeholder_name "
+        "FROM audit_corrective_action aca "
+        "JOIN audit_report arep ON aca.audit_id = arep.id "
+        "JOIN audit_schedule asch ON arep.schedule_id = asch.id "
+        "JOIN users u_aud ON asch.auditor_id = u_aud.id "
+        "JOIN users u_stk ON aca.internal_stakeholder_id = u_stk.id "
+        "WHERE arep.audit_id = '2026/06/ST041/AUD003';"
+    )
+    assert "AUDIT_STAKEHOLDER_GRAIN_MISMATCH" in hard
+    assert not passed
+
+
+def test_block_stakeholder_auditor_grain_mismatch_stays_quiet_with_ca_id():
+    hard, _, _ = _hard_fail_codes(
+        "SELECT aca.corrective_action_id, u_aud.first_name AS auditor_name, "
+        "u_stk.first_name AS stakeholder_name "
+        "FROM audit_corrective_action aca "
+        "JOIN audit_report arep ON aca.audit_id = arep.id "
+        "JOIN audit_schedule asch ON arep.schedule_id = asch.id "
+        "JOIN users u_aud ON asch.auditor_id = u_aud.id "
+        "JOIN users u_stk ON aca.internal_stakeholder_id = u_stk.id "
+        "WHERE arep.audit_id = '2026/06/ST041/AUD003';"
+    )
+    assert "AUDIT_STAKEHOLDER_GRAIN_MISMATCH" not in hard
 
 
 def test_block_portfolio_ap_alias_collision():

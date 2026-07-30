@@ -21,7 +21,7 @@ from src.agent.orchestrator.debug import _ilike_escape
 # the same facility/users/project/client/entity/organisation tables, so those
 # carry across a domain switch safely. Used by build_context_block()'s domain
 # gate and by the entity_memory recall check below.
-_DOMAIN_EXCLUSIVE = frozenset({"inspection", "audit", "cycle"})
+_DOMAIN_EXCLUSIVE = frozenset({"inspection", "audit", "cycle", "plan"})
 
 # entity_memory cap — deliberately much larger than MAX_TURNS since these are
 # small labeled records (no raw text), not full turns. Bounds a very long
@@ -59,6 +59,7 @@ class ConversationSession:
                 "table": turn.active_subject_table,
                 "alias": turn.active_subject_alias,
                 "domain": turn.active_subject_domain,
+                "id": turn.active_subject_id,
             }
             self.current_scope = scope
             _dup = (
@@ -104,7 +105,8 @@ class ConversationSession:
             r"\b(it|its|them|they|she|he|her|his|their|here|"
             r"(?:that|this)\s+(?:inspection|site|facility|form|inspector|cycle|"
             r"person|project|client|action|schedule)|"
-            r"the\s+same|the\s+above|from\s+there|more|rest|remaining|"
+            r"the\s+same|the\s+above|one\s+above|that\s+one|this\s+one|"
+            r"from\s+there|more|rest|remaining|"
             r"continue|next|previous|last\s+one|back\s+to|go\s+back)\b",
             re.IGNORECASE,
         )
@@ -148,6 +150,8 @@ class ConversationSession:
                 lines.append(f"  ★ inspector(s) from this result: {t.inspector_names[:5]}")
             if t.single_row_values:
                 lines.append(f"  ★ single-row result: {t.single_row_values}")
+            if t.row_titles:
+                lines.append(f"  ★ items from this result, IN ORDER: {t.row_titles}")
             # Show active subject for each turn
             if t.active_subject_type and t.active_subject_value:
                 lines.append(
@@ -156,6 +160,127 @@ class ConversationSession:
                     f"(exact value: {t.active_subject_value})"
                 )
         lines.append("")
+
+        # ── Ordinal follow-up ("the first one", "the 2nd one") ────────────────
+        # Confirmed live 2026-07-30: "for the first one show the approval
+        # status" (right after a 7-row audit_plan listing) resolved against a
+        # ◆ ACTIVE SUBJECT pointer that had been silently INHERITED from an
+        # unrelated audit_cycle list 5 turns earlier (that plan-listing turn
+        # set no active_subject_type of its own, since it returned multiple
+        # rows rather than a single entity — see synthesis.py's inheritance
+        # branch). The model picked the first row of that stale cycle list
+        # instead of the first row of the plan list it had just been shown,
+        # answering a different question entirely (portfolio approvals for a
+        # 2030 UPCOMING cycle) than the one asked. An ordinal word almost
+        # always refers to the MOST RECENT listing shown to the user, not to
+        # ACTIVE SUBJECT (which can persist across many unrelated turns) and
+        # not to an older turn's list — regardless of what ACTIVE SUBJECT
+        # says below.
+        _ORDINAL_RE = re.compile(
+            r"\b(the\s+)?(1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth)"
+            r"(\s+(one|row|result|plan|entry|item))?\b",
+            re.IGNORECASE,
+        )
+        _ordinal_match = _ORDINAL_RE.search(current_question)
+        if _ordinal_match:
+            _last_with_items = next(
+                (t for t in reversed(self.turns) if t.row_titles), None
+            )
+            if _last_with_items:
+                _ORDINAL_WORD_TO_IDX = {
+                    "1st": 0, "first": 0, "2nd": 1, "second": 1,
+                    "3rd": 2, "third": 2, "4th": 3, "fourth": 3,
+                    "5th": 4, "fifth": 4,
+                }
+                _ord_word = _ordinal_match.group(2).lower()
+                _idx = _ORDINAL_WORD_TO_IDX.get(_ord_word)
+                _target_id = ""
+                if (_idx is not None
+                        and _idx < len(_last_with_items.row_titles)
+                        and _idx < len(_last_with_items.row_ids)):
+                    _target_id = _last_with_items.row_ids[_idx]
+
+                if _target_id:
+                    # Deterministic resolution — inject_row_identity() (see
+                    # validation/identity.py) paired this exact row with its
+                    # real id at query time, so there's no ambiguity window
+                    # left to warn about even if the display value below
+                    # happens to be shared by another row (confirmed live:
+                    # 'Delegation testing' appears twice in the same 7-row
+                    # plan listing — two different plans, same title).
+                    lines.append(
+                        f"ORDINAL RESOLVED ('{_ordinal_match.group(0).strip()}') — "
+                        f"row {_idx + 1} of the list from the MOST RECENT turn that "
+                        f"listed multiple rows = id '{_target_id}' (display value "
+                        f"{_last_with_items.row_titles[_idx]!r}).\n"
+                        f"  Use WHERE <alias>.id = '{_target_id}' — NOT title/ILIKE, "
+                        f"even if this display value appears more than once in that "
+                        f"list. Do NOT resolve against any ◆ ACTIVE SUBJECT below — "
+                        f"that pointer may be stale, carried over from an unrelated "
+                        f"earlier turn.\n"
+                    )
+                else:
+                    lines.append(
+                        f"ORDINAL REFERENCE DETECTED ('{_ordinal_match.group(0).strip()}') — "
+                        f"resolve it against the ★ items list from the MOST RECENT turn that "
+                        f"listed multiple rows ({_last_with_items.row_titles}), NOT against any "
+                        f"◆ ACTIVE SUBJECT below — that pointer may be stale, carried over from "
+                        f"an unrelated earlier turn. 'the first one' = "
+                        f"{_last_with_items.row_titles[0]!r}.\n"
+                    )
+                    # DUPLICATE-WITHIN-LIST TRAP — fallback path only, for
+                    # query shapes inject_row_identity() skips (e.g. GROUP
+                    # BY — see identity.py). Confirmed live 2026-07-30: the
+                    # SAME 7-row plan listing (a single ONGOING cycle)
+                    # contains 'Delegation testing' TWICE, at positions 3
+                    # and 6 — two genuinely different audit_plan rows
+                    # (different audit_type/category) that happen to share
+                    # an identical title. Resolving an ordinal to a title
+                    # string and then filtering follow-up SQL by WHERE
+                    # ap.title = '<that title>' (or ILIKE) would silently
+                    # match BOTH rows and merge two different plans' data
+                    # into one answer — wrong, with no error.
+                    if _idx is not None and _idx < len(_last_with_items.row_titles):
+                        _target = _last_with_items.row_titles[_idx]
+                        if _last_with_items.row_titles.count(_target) > 1:
+                            lines.append(
+                                f"WARNING — '{_target}' appears MORE THAN ONCE in that same "
+                                f"list (not a data error — confirmed live: distinct rows can "
+                                f"share an identical title/name). Filtering by "
+                                f"WHERE ... = '{_target}' alone would match ALL of them and "
+                                f"silently merge multiple different records into one answer. "
+                                f"Do NOT filter by this value alone — either add another "
+                                f"filter from a column also shown in that same row (e.g. "
+                                f"audit_type/category) to pin down this ONE row specifically, "
+                                f"or re-run the LAST SQL with the SAME ORDER BY and "
+                                f"OFFSET {_idx} LIMIT 1 to reselect this exact row by "
+                                f"position instead of by name.\n"
+                            )
+
+        # ── Pending clarifying question this turn's answer may be resolving ──
+        # Confirmed live 2026-07-29 (qid=c3004b3d → qid=7d5d343d): "top 5 capex
+        # converters" got a clarifying question back ("if you mean FM Managers...
+        # just say which group and metric"); the reply "FM manafers" should have
+        # resolved it and continued the ORIGINAL request, but instead got treated
+        # as a brand-new, unrelated ambiguous-person-name search — the original
+        # request was silently dropped and never answered. Distinct from the
+        # DISAMBIGUATION RESOLVED/CONTEXT blocks below, which only cover the
+        # SQL-driven "N candidates found" flow — this covers a clarifying
+        # question the reasoning model invented on its own via final_answer.
+        _last_for_clarification = self.turns[-1]
+        if _last_for_clarification.clarification_origin_question:
+            lines.append(
+                f"PENDING CLARIFICATION — your previous turn asked a clarifying "
+                f"question in response to "
+                f"'{_last_for_clarification.clarification_origin_question}': "
+                f"\"{_last_for_clarification.answer}\"\n"
+                f"  The current message is very likely answering THAT question, not a "
+                f"brand-new unrelated request. Resolve it using the current message, "
+                f"then continue answering the ORIGINAL request "
+                f"('{_last_for_clarification.clarification_origin_question}') — do NOT "
+                f"treat a short reply like a role/group name as an ambiguous-person-name "
+                f"search unless the current message clearly asks about a specific person.\n"
+            )
 
         # ── Resolve active subject across all turns ──────────────────────────
         # "go back to that inspector" can re-anchor to an earlier turn's subject.
@@ -170,6 +295,7 @@ class ConversationSession:
         active_label = ""
         active_table = ""
         active_alias = ""
+        active_id = ""
 
         def _domain_ok(scope: dict) -> bool:
             return (
@@ -196,6 +322,7 @@ class ConversationSession:
                     active_label = t.active_subject_label
                     active_table = t.active_subject_table
                     active_alias = t.active_subject_alias
+                    active_id = t.active_subject_id
                     break
         else:
             # Normal: use the persistent current_scope pointer (survives turns
@@ -207,6 +334,7 @@ class ConversationSession:
                 active_label = self.current_scope["label"]
                 active_table = self.current_scope["table"]
                 active_alias = self.current_scope["alias"]
+                active_id = self.current_scope.get("id", "") or ""
 
         # self.turns is guaranteed non-empty (early-return above), so `last` is
         # always defined for both the fallback block and the disambiguation
@@ -214,7 +342,7 @@ class ConversationSession:
         last = self.turns[-1]
 
         # ── Emit the scoped context block ────────────────────────────────────
-        def _lookup_entity_id(label: str) -> str:
+        def _lookup_entity_id(label: str) -> tuple[str, list[str]]:
             """
             Find the id captured for `label` in the most recent turn whose
             entity_disambiguation_candidates contains an exact (case-insensitive)
@@ -222,16 +350,26 @@ class ConversationSession:
             branch below already uses for people, so facility/project/client/
             organisation follow-ups can filter by exact id too instead of
             re-searching by ILIKE name every time.
+
+            Returns (id, all_matching_ids). Confirmed live 2026-07-30: this
+            used to return the FIRST match silently — a name collision (two
+            different facility/project/client/organisation rows sharing a
+            display name, same class of bug as audit_plan.title duplicates)
+            would resolve to an arbitrary one of them with no warning, unlike
+            the equivalent people-search flow below, which already correctly
+            detects `_ambiguous_duplicate_names` and hard-STOPs instead of
+            guessing. Collect ALL matches so the facility/entity branches can
+            apply the same STOP guard rather than trusting `next()`'s pick.
             """
             for t in reversed(self.turns):
-                match = next(
-                    (c for c in t.entity_disambiguation_candidates
-                     if c.get("name", "").strip().lower() == label.lower() and c.get("id")),
-                    None
-                )
-                if match:
-                    return match["id"]
-            return ""
+                matches = [
+                    c for c in t.entity_disambiguation_candidates
+                    if c.get("name", "").strip().lower() == label.lower() and c.get("id")
+                ]
+                if matches:
+                    _ids = [m["id"] for m in matches]
+                    return _ids[0], _ids
+            return "", []
 
         # Scope only carries forward when the question is an actual detected
         # follow-up (pronoun, "that <entity>", "back to", etc.) — NOT merely
@@ -287,6 +425,73 @@ class ConversationSession:
                     f" — use WHERE arep.audit_id = '{active_value}'"
                     f" (join audit_report arep as needed for the target table)."
                 )
+            elif active_type == "plan":
+                # Prefer an exact id filter — audit_plan.title has NO uniqueness
+                # constraint at the DB level (only `id` does), and the live data
+                # already has duplicate active titles (confirmed 2026-07-30:
+                # 'Delegation plan -1', 'Delegation testing' — 2 active rows
+                # each). Filtering by title/ILIKE risks silently scoping to
+                # whichever duplicate the DB happens to return first, with no
+                # error. See synthesis.py's plan_ids lookup for how this gets
+                # resolved (or flagged ambiguous) at turn-finish time.
+                # Prefer active_id (M2: captured directly via the __id
+                # sibling column inject_row_identity() attaches, or already
+                # resolved by the ordinal-resolution block above) — only
+                # fall back to the plan_ids DB round-trip below when
+                # injection didn't run for that turn's query shape (e.g. a
+                # GROUP BY).
+                _last_with_pid = next(
+                    (t for t in reversed(self.turns) if t.plan_ids),
+                    None
+                )
+                _pid = active_id
+                if not _pid and _last_with_pid and len(_last_with_pid.plan_ids) == 1:
+                    _pid = _last_with_pid.plan_ids[0]
+                if _pid:
+                    lines.append(
+                        f"ACTIVE CONTEXT — The conversation is about audit plan "
+                        f"'{active_value}' (resolved id='{_pid}'). When the user "
+                        f"says 'it', 'that plan', 'this plan', or asks an "
+                        f"ATTRIBUTE question about 'the audit' (auditee, auditor, "
+                        f"facility, schedule date — NOT a status/count/lifecycle "
+                        f"question) with no other plan/report named — filter "
+                        f"EXACTLY by WHERE ap.id = '{_pid}' — NOT title/ILIKE "
+                        f"(join audit_schedule for auditee/auditor/facility, via "
+                        f"asch.audit_plan_id = ap.id). Do NOT ask the user to "
+                        f"re-specify which audit/plan they mean."
+                    )
+                else:
+                    _ambiguous_note = ""
+                    if _last_with_pid is None:
+                        _prev_plan_turn = next(
+                            (t for t in reversed(self.turns)
+                             if t.active_subject_type == "plan"
+                             and t.active_subject_value == active_value),
+                            None
+                        )
+                        if _prev_plan_turn and _prev_plan_turn.plan_title_ambiguous:
+                            _ambiguous_note = (
+                                f" WARNING: more than one ACTIVE audit_plan "
+                                f"currently shares the title '{active_value}' — "
+                                f"a title/ILIKE filter is NOT guaranteed to hit "
+                                f"the one the user actually means. If precision "
+                                f"matters, ask the user to disambiguate (by "
+                                f"cycle, status, or created date) rather than "
+                                f"silently picking one."
+                            )
+                    lines.append(
+                        f"ACTIVE CONTEXT — The conversation is about audit plan "
+                        f"'{active_value}'. When the user says 'it', 'that plan', "
+                        f"'this plan', or asks an ATTRIBUTE question about 'the "
+                        f"audit' (auditee, auditor, facility, schedule date — NOT "
+                        f"a status/count/lifecycle question) with no other plan/"
+                        f"report named — use WHERE ap.title = "
+                        f"'{_ilike_escape(active_value)}' (join audit_plan ap as "
+                        f"needed; join audit_schedule for auditee/auditor/"
+                        f"facility, via asch.audit_plan_id = ap.id). Do NOT ask "
+                        f"the user to re-specify which audit/plan they mean."
+                        f"{_ambiguous_note}"
+                    )
             elif active_type == "facility":
                 # Prefer an exact id filter if one is available. Two sources,
                 # checked in order: (1) a facility_id/fac_id column captured
@@ -294,16 +499,31 @@ class ConversationSession:
                 # mirrors _last_with_uid for inspectors above), (2) a name
                 # resolved via the STEP 1 disambiguation flow (_lookup_entity_id,
                 # unchanged). Only falls back to ILIKE if neither has an id.
+                # M3: active_id (M2's direct capture — either an existing
+                # facility_id/fac_id column or the __id sibling identity
+                # injection attached to facility.name) takes priority over
+                # both fallbacks below.
                 _last_with_fid = next(
                     (t for t in reversed(self.turns) if t.facility_ids),
                     None
                 )
-                _fid = ""
-                if _last_with_fid and len(_last_with_fid.facility_ids) == 1:
+                _fid = active_id
+                _fid_matches: list[str] = []
+                if not _fid and _last_with_fid and len(_last_with_fid.facility_ids) == 1:
                     _fid = _last_with_fid.facility_ids[0]
                 if not _fid:
-                    _fid = _lookup_entity_id(active_label)
-                if _fid:
+                    _fid, _fid_matches = _lookup_entity_id(active_label)
+                if len(_fid_matches) > 1:
+                    _dup_fids = ", ".join(f"'{f}'" for f in _fid_matches)
+                    lines.append(
+                        f"⚠️ STOP — '{active_label}' matches {len(_fid_matches)} DIFFERENT facility"
+                        f" records from the previous list (same name, different rows:"
+                        f" facility id IN ({_dup_fids})).\n"
+                        f"  YOU MUST call final_answer NOW asking the user to disambiguate further"
+                        f" (e.g. by project, client, or code) — do NOT pick one of these ids"
+                        f" arbitrarily and do NOT call generate_sql."
+                    )
+                elif _fid:
                     lines.append(
                         f"ACTIVE CONTEXT — The conversation is scoped to facility '{active_label}'"
                         f" (resolved facility_id='{_fid}')."
@@ -327,8 +547,20 @@ class ConversationSession:
                 # STEP 1 disambiguation actually searched.
                 _tbl = active_table or "entity"
                 _als = active_alias or "e"
-                _eid = _lookup_entity_id(active_label)
-                if _eid:
+                _eid = active_id
+                _eid_matches: list[str] = []
+                if not _eid:
+                    _eid, _eid_matches = _lookup_entity_id(active_label)
+                if len(_eid_matches) > 1:
+                    _dup_eids = ", ".join(f"'{e}'" for e in _eid_matches)
+                    lines.append(
+                        f"⚠️ STOP — '{active_label}' matches {len(_eid_matches)} DIFFERENT {_tbl}"
+                        f" records from the previous list (same name, different rows:"
+                        f" {_tbl} id IN ({_dup_eids})).\n"
+                        f"  YOU MUST call final_answer NOW asking the user to disambiguate further"
+                        f" — do NOT pick one of these ids arbitrarily and do NOT call generate_sql."
+                    )
+                elif _eid:
                     lines.append(
                         f"ACTIVE CONTEXT — The conversation is scoped to {_tbl} '{active_label}'"
                         f" (resolved {_tbl}_id='{_eid}')."
@@ -766,6 +998,19 @@ class ConversationSession:
         lines.append(
             "REFINEMENT: If the user says 'filter by X', 'only the Y ones', 'sort by Z'"
             " — modify the LAST SQL by adding/changing WHERE or ORDER BY."
+        )
+        lines.append(
+            "AUGMENTATION: If the user says 'show along with X', 'also show Y', 'include Z',"
+            " 'add the Y column' — reuse the LAST SQL's FROM/JOIN/WHERE EXACTLY as-is (the"
+            " same filters, the same join directions — a LEFT JOIN stays a LEFT JOIN, do not"
+            " make it an INNER JOIN) and only ADD the newly-requested column/join to the"
+            " SELECT list. Confirmed live 2026-07-29: 'show along with auditees' regenerated"
+            " the query from scratch instead of extending it — it silently dropped the"
+            " previous query's schedule_status != 'COMPLETED' filter and switched the"
+            " auditor/auditee/facility joins from LEFT to INNER, changing the row count from"
+            " 10 to 17 for a question that only asked to add one column. Do NOT change or"
+            " drop any filter, and do NOT change any join's direction, unless the user"
+            " explicitly asked for that change."
         )
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         return "\n".join(lines)

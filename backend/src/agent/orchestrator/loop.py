@@ -559,6 +559,21 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                             _last_sql, _last_rows, _last_columns
                         )
                     )
+                    # A clarifying question this turn invented on its own (not a SQL-driven
+                    # disambiguation, which is tracked separately via disambiguation_name
+                    # above) — heuristic: final_answer's own text ends with "?". Confirmed
+                    # live 2026-07-29 (qid=c3004b3d → qid=7d5d343d): "top 5 capex converters"
+                    # got "could you clarify... if you mean FM Managers..."; the reply "FM
+                    # manafers" should have resolved that and continued the ORIGINAL request,
+                    # but nothing recorded that a clarification was pending, so the next turn
+                    # treated "FM manafers" as a brand-new ambiguous-person-name search instead.
+                    # "?" anywhere, not just at the end — confirmed live 2026-07-29
+                    # (qid=c3004b3d): the real clarifying answer was "Could you clarify
+                    # ... means?\n\n**If you mean FM Managers**...\n\nJust say which
+                    # group and metric and I'll pull the data." — the "?" is mid-answer,
+                    # followed by option text, and the answer ENDS with a period. An
+                    # endswith("?") check misses this exact real-world shape entirely.
+                    _clarification_origin = question if "?" in ans else ""
                     session.add_turn(ConversationTurn(
                         question=question, answer=ans[:300], domain=self.domain,
                         tool_used="final_answer", sql=_last_sql,
@@ -570,6 +585,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                         entity_disambiguation_candidates=_fa_ent_candidates,
                         entity_disambiguation_table=_fa_ent_table,
                         entity_disambiguation_alias=_fa_ent_alias,
+                        clarification_origin_question=_clarification_origin,
                     ))
                 return AgentResult(question, ans, steps, iteration, True, stats)
 
@@ -659,7 +675,20 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                         _log_sql.warning("[SQL ] %siter=%d execution FAIL in %dms — %s",
                                          _pfx, iteration, _exec_ms, er.get("error", "?")[:200])
                         _cur_sig = _failure_signature(er.get("error", ""))
-                        if _cur_sig == _last_retry_signature:
+                        # Intersection, not exact equality — confirmed live 2026-07-29
+                        # (qid=4f892604): a persistent root-cause code (here,
+                        # AUDIT_OVERDUE_INCLUDES_OPEN) survived all 3 attempts while a
+                        # DIFFERENT second code accompanied it each time (CA_DRAFT_NOT_
+                        # EXCLUDED, then MULTI_AXIS_UNASKED_JOIN, then alone) — the exact
+                        # SET never repeated, so exact-equality never detected "stuck",
+                        # skip_top_n stayed 0 the whole time, the contaminating seed
+                        # example was never dropped, DeepSeek kept copying its wrong
+                        # status IN ('OPEN','OVERDUE') filter for all 3 tries, and the
+                        # system force-executed that still-wrong SQL after exhausting
+                        # retries — shipping an over-broad answer to the user with no
+                        # error. Any shared code across consecutive failures means the
+                        # model is still stuck on at least that one wall.
+                        if _cur_sig and _last_retry_signature and (_cur_sig & _last_retry_signature):
                             _sql_retry_signal += 1
                         else:
                             _sql_retry_signal = 0
@@ -722,7 +751,13 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                         retry_reason = "; ".join(hard_errs[:3]) if hard_errs else "unknown"
                         _cur_sig = frozenset(hard_errs)
 
-                    if _cur_sig == _last_retry_signature:
+                    # Intersection, not exact equality — see the matching comment on
+                    # the execution-failure branch above for the live incident
+                    # (qid=4f892604) this fixes: a persistent code accompanied by a
+                    # different second code each attempt never equals the previous
+                    # exact set, so escalation never fired and the contaminating seed
+                    # example never got dropped.
+                    if _cur_sig and _last_retry_signature and (_cur_sig & _last_retry_signature):
                         _sql_retry_signal += 1
                     else:
                         _sql_retry_signal = 0
