@@ -58,21 +58,27 @@ LIMIT 100;
     {
         'nl':     'who audited this facility last month which auditor conducted the audit in a date range',
         'sql':    """\
--- audit_schedule.follow_up_date is the schedule's own date — use THIS for 'last month'/date-range
--- questions about when a specific audit happened. audit_schedule has NO 'due_date' column.
--- NEVER use audit_cycle.due_date here — that's the whole CYCLE's period deadline, a different
--- concept, reached via a different 3-hop path (audit_plan_id -> audit_plan.cycle_id -> audit_cycle) —
--- substituting it for 'when this schedule happened' answers the wrong question and silently
--- returns 0 or the wrong rows.
-SELECT u.first_name || ' ' || u.last_name AS auditor_name, asch.schedule_id, asch.follow_up_date
-FROM audit_schedule asch
+-- CORRECTED 2026-07-31 — use audit_report.submitted_on for 'when was this audit conducted/
+-- happened', NOT audit_schedule.follow_up_date. Live-confirmed follow_up_date is a target/
+-- due-by date for the schedule (values cluster almost entirely on month-end dates across the
+-- whole table) — not the day the audit actually took place. submitted_on is the closest real
+-- signal for 'conducted that day', per business convention. follow_up_date is still the right
+-- column for genuinely forward-looking/scheduling questions ('due this month', 'overdue') —
+-- just never for 'when did this audit happen'.
+-- NEVER use audit_cycle.due_date here either — that's the whole CYCLE's period deadline, a
+-- different concept, reached via a different 3-hop path
+-- (audit_plan_id -> audit_plan.cycle_id -> audit_cycle) — substituting it for 'when this audit
+-- happened' answers the wrong question and silently returns 0 or the wrong rows.
+SELECT u.first_name || ' ' || u.last_name AS auditor_name, arep.audit_id, arep.submitted_on
+FROM audit_report arep
+JOIN audit_schedule asch ON arep.schedule_id = asch.id
 JOIN facility fac ON asch.facility_id = fac.id
 JOIN users u ON asch.auditor_id = u.id
 WHERE fac.name ILIKE '%[FACILITY]%'
-  AND asch.follow_up_date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month')
-  AND asch.follow_up_date <  DATE_TRUNC('month', CURRENT_DATE)
-  AND asch.active = true AND fac.active = true AND u.active = true
-ORDER BY asch.follow_up_date DESC
+  AND arep.submitted_on >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month')
+  AND arep.submitted_on <  DATE_TRUNC('month', CURRENT_DATE)
+  AND arep.active = true AND asch.active = true AND fac.active = true AND u.active = true
+ORDER BY arep.submitted_on DESC
 LIMIT 100;
 """,
         'domain': 'audit_schedule', 'intent': 'filter', 'limit': 100,
@@ -581,6 +587,24 @@ ORDER BY aca.status;
         'domain': 'audit_corrective_action', 'intent': 'aggregate', 'limit': None,
     },
     {
+        'nl':     'how many corrective actions were raised for audit 2026/06/ST074/AUD001',
+        'sql':    """\
+-- aca.audit_id is a UUID FK to audit_report.id, NEVER the display code
+-- itself ('2026/06/ST074/AUD001' lives on audit_report.audit_id instead) —
+-- confirmed live: filtering aca.audit_id directly against the display
+-- code fails at execution with "invalid input syntax for type uuid".
+-- Must join audit_report and filter ON ITS audit_id column instead, even
+-- for a bare COUNT scoped to a single report.
+SELECT COUNT(*) AS ca_count
+FROM audit_corrective_action aca
+JOIN audit_report arep ON aca.audit_id = arep.id
+WHERE arep.audit_id = '2026/06/ST074/AUD001'
+  AND aca.active = true AND arep.active = true
+  AND aca.adequacy_status = 'APPROVE';
+""",
+        'domain': 'audit_corrective_action', 'intent': 'aggregate', 'limit': None,
+    },
+    {
         'nl':     'list open overdue corrective actions with risk level and facility',
         'sql':    """\
 SELECT aca.corrective_action_id, aca.cause, aca.status, rl.name AS risk_level_name,
@@ -842,12 +866,38 @@ LIMIT 100;
         'domain': 'auditor_portfolio', 'intent': 'filter', 'limit': 100,
     },
     {
-        'nl':     'which auditors have not submitted their portfolio for this cycle',
+        'nl':     'which auditors have submitted their portfolio for this cycle',
         'sql':    """\
+-- 'submitted' = status IN ('APPROVED', 'MODIFICATION') — the two values that
+-- have actually passed through submission (MODIFICATION means it WAS
+-- submitted, reviewed, and sent back for rework — not that it's still a
+-- draft). DRAFT/PENDING are the not-yet-submitted values (see the adjacent
+-- 'pending submission' example) and must NEVER be included here even though
+-- they're valid values on the same 4-value CHECK constraint (APPROVED,
+-- DRAFT, MODIFICATION, PENDING) — a query for 'submitted' that copies all
+-- four in is equivalent to no filter at all and silently answers a
+-- different question (confirmed live 2026-08-03, qid=eee602ce/d73988fb).
 SELECT u.first_name || ' ' || u.last_name AS auditor_name, po.status, po.submitted_date
 FROM auditor_portfolio po
 JOIN users u ON po.user_id = u.id
-WHERE po.status != 'APPROVED' AND po.active = true
+WHERE po.status IN ('APPROVED', 'MODIFICATION') AND po.active = true
+ORDER BY po.submitted_date DESC
+LIMIT 100;
+""",
+        'domain': 'auditor_portfolio', 'intent': 'filter', 'limit': 100,
+    },
+    {
+        'nl':     'which auditors have not submitted their portfolio for this cycle',
+        'sql':    """\
+-- 'not submitted' = status IN ('DRAFT', 'PENDING') — the complement of the
+-- 'submitted' example above. NEVER status != 'APPROVED': that wrongly counts
+-- MODIFICATION (submitted, reviewed, then returned for rework) as
+-- not-submitted, when it's actually the opposite — it can only reach
+-- MODIFICATION by having been submitted first.
+SELECT u.first_name || ' ' || u.last_name AS auditor_name, po.status, po.submitted_date
+FROM auditor_portfolio po
+JOIN users u ON po.user_id = u.id
+WHERE po.status IN ('DRAFT', 'PENDING') AND po.active = true
 ORDER BY po.submitted_date ASC NULLS FIRST
 LIMIT 100;
 """,

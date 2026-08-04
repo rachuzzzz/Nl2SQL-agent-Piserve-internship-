@@ -107,6 +107,90 @@ def test_active_subject_id_empty_when_injection_did_not_run():
     assert turn.active_subject_id == ""
 
 
+def test_row_titles_captures_cycle_composite_display():
+    """audit_cycle has no name/title column — row_titles must fall back to
+    the synthetic "<start_date> to <end_date> (<status>)" composite display,
+    gated on the "<alias>_cycle_row__id" sibling that identity.py's
+    _CYCLE_TABLES branch injects (see test_identity_injection.py's
+    test_injects_cycle_composite_id_for_audit_cycle for the M1 half). This is
+    the fix for the confirmed-live ordinal-resolution failure on cycle
+    listings (qid=f2ec1739/f13ab827/4d1d0bf4)."""
+    rows = [
+        {"start_date": "2026-01-01", "end_date": "2026-01-31", "status": "COMPLETED",
+         "acyc_cycle_row__id": "cccc0001-0000-0000-0000-000000000001"},
+        {"start_date": "2026-02-01", "end_date": "2026-02-28", "status": "ONGOING",
+         "acyc_cycle_row__id": "cccc0002-0000-0000-0000-000000000002"},
+    ]
+    session = _run("list all cycles", rows)
+    turn = session.turns[-1]
+
+    assert turn.row_titles[0] == "2026-01-01 to 2026-01-31 (COMPLETED)"
+    assert turn.row_ids[0] == "cccc0001-0000-0000-0000-000000000001"
+    assert turn.row_id_columns[0] == "id"
+    assert turn.row_titles[1] == "2026-02-01 to 2026-02-28 (ONGOING)"
+    assert turn.row_ids[1] == "cccc0002-0000-0000-0000-000000000002"
+    # No __id column ever leaks into the columns list shown to the LLM
+    assert not any(c.endswith("__id") for c in turn.columns)
+
+
+def test_row_entity_type_audit_priority1():
+    """Priority 1's matched column name (audit_id/schedule_id/inspection_id/
+    corrective_action_id) IS the entity-type signal — no new plumbing
+    needed beyond a lookup keyed on which column matched."""
+    rows = [
+        {"plan_title": "Delegation retirement plan", "audit_id": "2026/07/ST034/AUD001",
+         "audit_id__id": "aaaa1111-0000-0000-0000-000000000001"},
+        {"plan_title": "Delegation retirement plan", "audit_id": "2026/07/ST157/AUD001",
+         "audit_id__id": "aaaa2222-0000-0000-0000-000000000002"},
+    ]
+    session = _run("show all audits part of this plan", rows)
+    assert session.turns[-1].row_entity_type == "audit"
+
+
+def test_row_entity_type_cycle_priority1_5():
+    rows = [
+        {"start_date": "2026-01-01", "end_date": "2026-01-31", "status": "COMPLETED",
+         "acyc_cycle_row__id": "cccc0001-0000-0000-0000-000000000001"},
+        {"start_date": "2026-02-01", "end_date": "2026-02-28", "status": "ONGOING",
+         "acyc_cycle_row__id": "cccc0002-0000-0000-0000-000000000002"},
+    ]
+    session = _run("list all cycles", rows)
+    assert session.turns[-1].row_entity_type == "cycle"
+
+
+def test_row_entity_type_plan_priority2():
+    rows = [
+        {"title": "Delegation testing", "status": "ACTIVE"},
+        {"title": "Delegation plan -2", "status": "ACTIVE"},
+    ]
+    session = _run("list all plans", rows)
+    assert session.turns[-1].row_entity_type == "plan"
+
+
+def test_row_entity_type_person_for_auditor_name():
+    """auditor_name/inspector_name are unified to 'person' — both draw from
+    the identical `users` table, just via a different FK role."""
+    rows = [
+        {"auditor_name": "George Auditor", "auditor_name__id": "bbbb0001-0000-0000-0000-000000000001"},
+        {"auditor_name": "Jane Auditor", "auditor_name__id": "bbbb0002-0000-0000-0000-000000000002"},
+    ]
+    session = _run("list all auditors", rows)
+    assert session.turns[-1].row_entity_type == "person"
+
+
+def test_row_entity_type_empty_for_ambiguous_bare_name():
+    """A bare 'name' column could be a facility, a portfolio, or anything
+    else with a generic display column — deliberately left untyped rather
+    than guessing, since a wrong type label would block a legitimate later
+    ordinal match just as badly as no label at all."""
+    rows = [
+        {"name": "Something A"},
+        {"name": "Something B"},
+    ]
+    session = _run("list all somethings", rows)
+    assert session.turns[-1].row_entity_type == ""
+
+
 def test_facility_prefers_existing_facility_id_over_identity_injection():
     # facility_ids only captures values that actually look like a UUID (see
     # the _UUID_PAT guard in synthesis.py) — use a real-shaped one here so

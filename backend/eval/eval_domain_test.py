@@ -93,6 +93,30 @@ SINGLE_CASES = [
      "prior_domain": None, "expected_domain": "AMBIGUOUS", "expected_tier": 3, "needs_llm": True},
     {"id": "T3-03", "category": "tier3", "question": "what's pending review",
      "prior_domain": None, "expected_domain": "AMBIGUOUS", "expected_tier": 3, "needs_llm": True},
+
+    # ── Ambiguous-synonym backstop (Tier 1, deterministic, no LLM) ─────────────
+    # Confirmed live 2026-08-03: the in-prompt DOMAIN-MISMATCH CHECK (a
+    # semantic judgment call by the reasoning LLM) is NOT reliably
+    # consistent — the same model caught "remedial actions" but silently
+    # missed "curative actions" in the same session, once a nearby specific
+    # cue ("at risk") pulled its attention away from the ambiguous word.
+    # This deterministic router-level backstop can't be inconsistently
+    # skipped the way the in-prompt check can.
+    {"id": "SYN-01", "category": "ambiguous_synonym", "question": "show all remedial actions",
+     "prior_domain": "audit", "expected_domain": "AMBIGUOUS", "expected_tier": 1},
+    {"id": "SYN-02", "category": "ambiguous_synonym",
+     "question": "show all curative actions that are at risk",
+     "prior_domain": "audit", "expected_domain": "AMBIGUOUS", "expected_tier": 1},
+    {"id": "SYN-03", "category": "ambiguous_synonym", "question": "list all preventive actions",
+     "prior_domain": "inspection", "expected_domain": "AMBIGUOUS", "expected_tier": 1},
+    {"id": "SYN-04", "category": "ambiguous_synonym",
+     "question": "any rectification actions outstanding",
+     "prior_domain": None, "expected_domain": "AMBIGUOUS", "expected_tier": 1},
+    # An explicit domain keyword elsewhere in the same message still wins
+    # outright — the backstop only fires when Tier 1's own keyword check
+    # found nothing to resolve on.
+    {"id": "SYN-05", "category": "ambiguous_synonym", "question": "audit's remedial actions",
+     "prior_domain": None, "expected_domain": "AUDIT", "expected_tier": 1},
 ]
 
 

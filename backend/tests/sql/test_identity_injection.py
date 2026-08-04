@@ -94,11 +94,31 @@ def test_multi_table_join_injects_per_matching_expression_not_from_table():
     assert len(mutations) == 1
 
 
-def test_skips_group_by_queries():
+def test_skips_group_by_query_when_id_not_grouped():
+    """GROUP BY ap.title (not ap.id) — injecting ap.id here would be a real
+    Postgres 'column must appear in the GROUP BY clause' error, so this
+    must still skip."""
     sql = "SELECT ap.title, COUNT(*) AS cnt FROM audit_plan ap GROUP BY ap.title;"
     result_sql, mutations = _inject(sql)
     assert result_sql == sql
     assert mutations == []
+
+
+def test_injects_group_by_query_when_id_already_grouped():
+    """Confirmed live 2026-08-03: "list all auditors" (grouped by
+    u.id/first_name/last_name, with a COUNT(schedule) aggregate) got NO
+    id-injection at all under the old blanket "skip any GROUP BY" rule,
+    despite u.id being safely groupable (already in the GROUP BY clause) —
+    a later "the 6th auditor" ordinal follow-up had no id to resolve to and
+    fell back to re-searching by name, surfacing unrelated same-named
+    people instead of the specific auditor already shown. Since ap.id is
+    ALREADY in the GROUP BY here, adding a second SELECT expression
+    referencing that same grouped column is always valid SQL — must inject
+    normally, not skip."""
+    sql = "SELECT ap.title, COUNT(*) AS cnt FROM audit_plan ap GROUP BY ap.id, ap.title;"
+    result_sql, mutations = _inject(sql)
+    assert "ap.id AS title__id" in result_sql
+    assert len(mutations) == 1
 
 
 def test_skips_when_no_nameable_table_present():
@@ -146,3 +166,125 @@ def test_left_joined_nameable_table_still_gets_injected():
     assert "asch.id AS schedule_id__id" in result_sql
     assert "fac.id AS name__id" in result_sql
     assert len(mutations) == 2
+
+
+def test_injects_cycle_composite_id_for_audit_cycle():
+    """audit_cycle has NO name/title column at all — the display value is a
+    synthetic composite of 3 separate SELECT expressions (start_date,
+    end_date, status), so this can't reuse ROW_IDENTITY_TABLES' single-column
+    matching. Confirmed live 2026-08-03 (qid=f2ec1739/f13ab827/4d1d0bf4): an
+    ordinal follow-up ("the 4th one") to a cycle listing had nothing to
+    resolve against, and fell back to the SQL-gen model hallucinating a
+    fictitious column trying to implement LIMIT 1 OFFSET N itself."""
+    sql = "SELECT acyc.start_date, acyc.end_date, acyc.status FROM audit_cycle acyc WHERE acyc.active = true;"
+    result_sql, mutations = _inject(sql)
+    assert "acyc.id AS acyc_cycle_row__id" in result_sql
+    assert len(mutations) == 1
+
+
+def test_injects_cycle_composite_id_for_inspection_cycle():
+    """Same gap, same fix, inspection domain's cycle table — fixed
+    symmetrically rather than leaving a known-identical gap on purpose."""
+    sql = "SELECT ic.start_date, ic.end_date, ic.status FROM inspection_cycle ic WHERE ic.active = true;"
+    result_sql, mutations = _inject(sql)
+    assert "ic.id AS ic_cycle_row__id" in result_sql
+    assert len(mutations) == 1
+
+
+def test_skips_cycle_injection_when_status_missing():
+    """All three of start_date/end_date/status are required — a query only
+    selecting 2 of the 3 doesn't get the composite display injected, since
+    synthesis.py's row_titles capture needs all three to build the display
+    string."""
+    sql = "SELECT acyc.start_date, acyc.end_date FROM audit_cycle acyc WHERE acyc.active = true;"
+    result_sql, mutations = _inject(sql)
+    assert result_sql == sql
+    assert mutations == []
+
+
+def test_cycle_injection_fires_on_unaliased_single_table_query():
+    """Confirmed live 2026-08-03 (qid=ca987d9a): DeepSeek sometimes emits a
+    single-table query with NO alias at all — `SELECT id, start_date,
+    end_date, due_date, status FROM audit_cycle WHERE active = true ...` —
+    leaving every column's .table empty. Since there's only one table in the
+    whole query, an unqualified column can only ever mean that table; this
+    must still fire the injection instead of silently skipping (which is
+    what happened live: row_titles stayed empty for that turn, and both
+    follow-up ordinal references had to fall back to the SQL-gen model
+    guessing at LIMIT/OFFSET or ROW_NUMBER() itself)."""
+    sql = "SELECT id, start_date, end_date, due_date, status FROM audit_cycle WHERE active = true ORDER BY start_date DESC LIMIT 100;"
+    result_sql, mutations = _inject(sql)
+    assert "audit_cycle.id AS audit_cycle_cycle_row__id" in result_sql
+    assert len(mutations) == 1
+
+
+def test_unaliased_column_skipped_when_query_is_ambiguous():
+    """The single-table fallback must NOT apply when 2+ tables are present —
+    an unqualified column there could belong to any of them, so col.table is
+    still required."""
+    sql = (
+        "SELECT title, status FROM audit_plan ap "
+        "JOIN audit_cycle acyc ON ap.cycle_id = acyc.id;"
+    )
+    result_sql, mutations = _inject(sql)
+    assert result_sql == sql
+    assert mutations == []
+
+
+def test_users_composite_fires_on_unaliased_single_table_query():
+    """Same fallback, users branch — an unaliased `FROM users` with a bare
+    `first_name || ' ' || last_name` concat must still get the id injected."""
+    sql = "SELECT first_name || ' ' || last_name AS auditor_name FROM users WHERE active = true;"
+    result_sql, mutations = _inject(sql)
+    assert "users.id AS auditor_name__id" in result_sql
+    assert len(mutations) == 1
+
+
+def test_injects_users_composite_when_group_by_includes_id():
+    """The exact real-world failing shape: 'list all auditors' as a GROUP BY
+    with a COUNT(schedule) aggregate — u.id is already grouped, so injecting
+    the composite-name id sibling is safe."""
+    sql = (
+        "SELECT u.first_name || ' ' || u.last_name AS name, COUNT(asch.id) AS schedule_count "
+        "FROM users u LEFT JOIN audit_schedule asch ON asch.auditor_id = u.id "
+        "GROUP BY u.id, u.first_name, u.last_name;"
+    )
+    result_sql, mutations = _inject(sql)
+    assert "u.id AS name__id" in result_sql
+    assert len(mutations) == 1
+
+
+def test_skips_users_composite_when_group_by_excludes_id():
+    sql = (
+        "SELECT u.first_name || ' ' || u.last_name AS name, COUNT(*) AS cnt "
+        "FROM users u GROUP BY u.first_name, u.last_name;"
+    )
+    result_sql, mutations = _inject(sql)
+    assert result_sql == sql
+    assert mutations == []
+
+
+def test_injects_cycle_composite_when_group_by_includes_id():
+    sql = (
+        "SELECT acyc.start_date, acyc.end_date, acyc.status, COUNT(ap.id) AS plan_count "
+        "FROM audit_cycle acyc LEFT JOIN audit_plan ap ON ap.cycle_id = acyc.id "
+        "GROUP BY acyc.id, acyc.start_date, acyc.end_date, acyc.status;"
+    )
+    result_sql, mutations = _inject(sql)
+    assert "acyc.id AS acyc_cycle_row__id" in result_sql
+    assert len(mutations) == 1
+
+
+def test_cycle_injection_fires_when_only_touching_cycle_table():
+    """Regression test for the early-return gate at the top of
+    inject_row_identity(): a query that touches ONLY audit_cycle — no
+    ROW_IDENTITY_TABLES table, no users — must still reach the cycle branch
+    instead of returning early. The gate must OR in _CYCLE_TABLES membership,
+    not just ROW_IDENTITY_TABLES/users."""
+    sql = (
+        "SELECT acyc.start_date, acyc.end_date, acyc.status FROM audit_cycle acyc "
+        "WHERE acyc.active = true ORDER BY acyc.start_date LIMIT 100;"
+    )
+    result_sql, mutations = _inject(sql)
+    assert "acyc.id AS acyc_cycle_row__id" in result_sql
+    assert len(mutations) == 1

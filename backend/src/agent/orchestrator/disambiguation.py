@@ -13,6 +13,70 @@ from src.sql.result_shape import is_disambiguation_result, is_entity_disambiguat
 from src.agent.orchestrator.debug import _ilike_escape, _UUID_RE
 
 
+# Module-level (not a method) so session.py's ordinal-noun-type lookup
+# (entity_type_for_ordinal_noun below) can reuse the EXACT SAME map
+# _is_preparatory_result consumes for its table-membership check, instead
+# of hand-rolling a parallel noun list that could drift out of sync.
+#
+# 3-tuples: (regex pattern, table name or None, entity-type label).
+#   - `table` is consumed ONLY by _is_preparatory_result below (is the
+#     table this noun implies actually present in the executed SQL?).
+#   - `entity_type` is consumed ONLY by entity_type_for_ordinal_noun below,
+#     and must match the row_entity_type strings synthesis.py's _finish()
+#     assigns (see that file's row_titles-capture loop).
+#   - `table=None` marks an entry that exists PURELY for the entity-type
+#     lookup, deliberately excluded from the table-membership check — a
+#     bare "auditor"/"inspector" -> "users" table check would misfire on a
+#     legitimate answer already scoped by a resolved id (e.g. WHERE
+#     po.auditor_id = '<uuid>', no JOIN users needed at all).
+def _entity_noun_tables(domain):
+    _people = [
+        (r"\bauditors?\b", None, "person"),
+        (r"\binspectors?\b", None, "person"),
+    ]
+    if domain == "audit":
+        return [
+            (r"\baudit\s+plans?\b", "audit_plan", "plan"),
+            (r"\b(?:audit\s+)?schedules?\b", "audit_schedule", "schedule"),
+            (r"\bportfolios?\b", "auditor_portfolio", "portfolio"),
+            (r"\bcorrective\s+actions?\b", "audit_corrective_action", "corrective_action"),
+            (r"\baudit\s+reports?\b", "audit_report", "audit"),
+            (r"\baudit\s+cycles?\b", "audit_cycle", "cycle"),
+            (r"\baudit\s+forms?\b", "audit_forms", "form"),
+        ] + _people
+    return [
+        (r"\binspection\s+reports?\b", "inspection_report", "inspection"),
+        (r"\bmitigative\s+actions?\b", "inspection_corrective_action", "corrective_action"),
+        (r"\bschedules?\b", "inspection_schedule", "schedule"),
+        (r"\bportfolios?\b", "inspector_portfolio", "portfolio"),
+    ] + _people
+
+
+def entity_type_for_ordinal_noun(noun_snippet: str, domain: str) -> str:
+    """Entity-type label for the first recognized noun in `noun_snippet`.
+
+    Callers (session.py's ordinal resolver) must pass only the few words
+    immediately following an ordinal phrase ("the 6th ___"), NOT the whole
+    question — so an unrelated entity noun elsewhere in the sentence ("list
+    all audit PLANS under the 6th AUDITOR") can't be mistaken for the noun
+    THIS ordinal is actually about. Returns "" when nothing recognized —
+    e.g. a bare ordinal ("the 4th one") — callers must preserve today's
+    untyped-match behavior in that case, not silently skip resolution.
+    """
+    for pat, _table, etype in _entity_noun_tables(domain):
+        if re.search(pat, noun_snippet, re.IGNORECASE):
+            return etype
+    if not domain:
+        # domain wasn't passed/known — also try "audit" rather than
+        # silently defaulting to only the inspection-side map (which
+        # _entity_noun_tables' domain=="audit"-else branching would
+        # otherwise do for any falsy domain).
+        for pat, _table, etype in _entity_noun_tables("audit"):
+            if re.search(pat, noun_snippet, re.IGNORECASE):
+                return etype
+    return ""
+
+
 class DisambiguationMixin:
 
     @staticmethod
@@ -226,6 +290,61 @@ class DisambiguationMixin:
         # silently becomes a dead-end table dump.
         if is_disambiguation_result(columns, sql) or is_entity_disambiguation_result(columns, sql):
             return True
+
+        # A result whose only columns are bare identifier lookups (e.g.
+        # "cycle_id", "id", "portfolio_id") is virtually always an
+        # intermediate ordinal/name-resolution step — the reasoning model
+        # asking "what's this row's actual ID" before it can filter a
+        # follow-up query — never a genuine answer to a question asking to
+        # list/show entity data. This has to be checked before the
+        # wants_content/is_superlative heuristics below, which are both
+        # keyword-gated on the ORIGINAL question text and can miss this
+        # entirely when the question names an entity (e.g. "portfolios")
+        # that isn't one of their trigger words.
+        #
+        # Confirmed live 2026-08-03 (qid=f13ab827): "list all portfolios
+        # submitted for the 4th one in the list" — after two failed attempts
+        # at a combined query (hallucinated acyc.cycle_number), the reasoning
+        # model fell back to just resolving the ordinal (`SELECT id AS
+        # cycle_id FROM audit_cycle ... LIMIT 1 OFFSET 3`, its own thought
+        # said "I need to first get the 4th cycle's ID... then use it in a
+        # separate query"). Neither wants_content ("question/label/answer/
+        # response/what...in" — none appear) nor is_superlative ("first/
+        # last/latest/..." — none appear either) fired, so the loop treated
+        # this single-column, single-row cycle ID as the final answer and
+        # never issued the follow-up query the model itself said it needed.
+        _id_only_columns = bool(columns) and all(
+            c == "id" or c.endswith("_id") or c.endswith("_uuid") for c in columns
+        )
+        if _id_only_columns and row_count <= 5:
+            return True
+
+        # The question names a specific entity table ("audit plans",
+        # "portfolios", ...) but the executed SQL never touches that table
+        # at all — a strong signal the query only resolved an ORDINAL
+        # REFERENCE ("the 6th auditor") and stopped there, never taking the
+        # second step the reasoning model's own plan called for. Unlike the
+        # bare-id-only check above, this catches the case where the
+        # preparatory result ALSO includes a real display column (e.g. a
+        # person's name) — not just raw ids — so it doesn't look
+        # column-empty enough for that check to fire.
+        #
+        # Confirmed live 2026-08-03 (qid=081c7a81): "list all audit plans
+        # under the 6th auditor from the list" — the model's own thought
+        # said "I need to first identify who the 6th auditor is... Then
+        # I'll get the audit plans for that auditor", but only ever issued
+        # the first half (`SELECT u.id, u.first_name || ' ' || u.last_name
+        # AS name FROM users u ... LIMIT 1 OFFSET 5` — no audit_plan
+        # anywhere). Result: columns=['id','name','name__id'], 1 row — not
+        # id-only (has a real 'name' column), so the check above missed it,
+        # and the loop returned "the 6th auditor's name" as if it were "the
+        # audit plans under them".
+        sql_lower = sql.lower()
+        for _pat, _table, _etype in _entity_noun_tables(getattr(self, "domain", None)):
+            if _table is None:
+                continue  # type-only entry (e.g. auditor/inspector) — see _entity_noun_tables
+            if re.search(_pat, q_lower) and _table not in sql_lower:
+                return True
 
         wants_content = bool(re.search(
             r'\b(question|label|answer|response|what.*in)\b', q_lower))

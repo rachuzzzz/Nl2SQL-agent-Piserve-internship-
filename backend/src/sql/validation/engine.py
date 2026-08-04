@@ -40,6 +40,10 @@ from src.sql.validation.ast_checks import (
     _check_undefined_table_aliases,
     _check_ir_id_in_select_ast,
     _check_uuid_pk_in_select_ast,
+    _check_display_code_uuid_compare_ast,
+    _check_uuid_fk_compared_to_display_code_ast,
+    _check_display_code_wrong_table_ast,
+    _check_subquery_uuid_display_code_mismatch_ast,
     _check_uuid_leaks_ast,
     _check_uuid_leaks_regex,
     _check_ungrouped_select_columns_ast,
@@ -310,6 +314,75 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
     }
 
 
+    # Inverse of AUDIT_UUID_PK_DISPLAY_MAP, for the inverse failure shape —
+    # see _check_display_code_uuid_compare_ast. Confirmed live: ordinal
+    # resolution ("the 1st one in the list") correctly resolved a row's real
+    # UUID from session context, but the reasoning model wrote
+    # WHERE arep.audit_id = '<uuid>' instead of WHERE arep.id = '<uuid>' —
+    # silently returned 0 rows instead of the real 4.
+    #
+    # Keyed by the EXACT (alias, column) pair, NOT the bare column name —
+    # audit_id/schedule_id/inspection_id are each a genuine UUID foreign key
+    # on a DIFFERENT table while being the display code on their OWN table
+    # (audit_corrective_action.audit_id -> audit_report.id is a real UUID
+    # FK; audit_report.schedule_id -> audit_schedule.id is a real UUID FK).
+    # A bare column-name check would false-block those legitimate FK
+    # comparisons, so this must stay alias-scoped.
+    DISPLAY_CODE_UUID_COMPARE_MAP: dict[tuple[str, str], str] = {
+        ("arep", "audit_id"): "arep.id",
+        ("asch", "schedule_id"): "asch.id",
+        ("aca", "corrective_action_id"): "aca.id",
+        ("ica", "corrective_action_id"): "ica.id",
+        ("ir", "inspection_id"): "ir.id",
+    }
+
+
+    # Inverse of the inverse: catches the OTHER failure shape on the same
+    # (alias, column) family — a display-code-shaped string literal compared
+    # against a column that is a genuine UUID FK on a DIFFERENT table,
+    # merely sharing its bare name with the display-code column above.
+    # See _check_uuid_fk_compared_to_display_code_ast. Confirmed live TWICE
+    # (2026-07-29, 2026-08-04): the reasoning model wrote
+    # WHERE aca.audit_id = '2026/06/ST0NN/AUDNNN' (a display code) instead of
+    # joining audit_report and filtering arep.audit_id — aca.audit_id is a
+    # UUID FK to arep.id, not a display code itself. Failed at DB execution
+    # with psycopg2.errors.InvalidTextRepresentation, burning 2-4 retries.
+    #
+    # Keyed by the EXACT (alias, column) pair for the same false-positive
+    # reason as DISPLAY_CODE_UUID_COMPARE_MAP above — a bare column-name
+    # check would false-block legitimate uses of these columns as display
+    # codes on their OWN table (arep.audit_id, asch.schedule_id,
+    # ir.inspection_id are all legitimately compared to a display-code
+    # string on their own alias).
+    UUID_FK_DISPLAY_CODE_COMPARE_MAP: dict[tuple[str, str], tuple[str, str]] = {
+        ("aca", "audit_id"): ("audit_report", "audit_id"),
+        ("arep", "schedule_id"): ("audit_schedule", "schedule_id"),
+        ("ica", "inspection_id"): ("inspection_report", "inspection_id"),
+    }
+
+
+    # A third failure shape on the same column family — see
+    # _check_display_code_wrong_table_ast. Both prior maps only fire when a
+    # UUID is involved on one side; this one catches two ordinary, well-
+    # formed display codes from DIFFERENT tables being confused for each
+    # other (e.g. a schedule's code fed into audit_report.audit_id).
+    # Confirmed live 2026-08-04: ordinal resolution ("the second one")
+    # correctly resolved a schedule's code, but the reasoning model then
+    # filtered arep.audit_id with it instead of joining audit_schedule ->
+    # audit_report — silently returned 0 rows (confirmed against the DB:
+    # the schedule's real linked report has a genuinely different code).
+    #
+    # Keyed by each table's OWN display-code (alias, column) — the value is
+    # the token that column's values always start their trailing segment
+    # with (confirmed live via distinct real samples of each column:
+    # '2026/08/ST040/AUD001', '2026/06/ST001/SCH002', '2026/07/ST006/INS001').
+    OWN_DISPLAY_CODE_TOKEN_MAP: dict[tuple[str, str], str] = {
+        ("arep", "audit_id"): "AUD",
+        ("asch", "schedule_id"): "SCH",
+        ("ir", "inspection_id"): "INS",
+    }
+
+
     # Rule ids from core/business_rules.py's REGISTRY that validate()/clean_sql()
     # actually consume — an explicit allowlist so a new registry rule never
     # silently starts firing in production without deliberate opt-in here.
@@ -423,6 +496,12 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
         # live 2026-07-29, qid=7f386051) — 'ACTIVE' is a hallucinated value that
         # silently matched zero rows instead of the correct count.
         "audit_block_forms_status_active_hallucination",
+        # Group S — auditor_portfolio 'submitted' questions copying the full
+        # 4-value CHECK constraint list (APPROVED, DRAFT, MODIFICATION, PENDING)
+        # instead of narrowing to the submitted subset (confirmed live
+        # 2026-08-03, qid=eee602ce/d73988fb) — same overbroad-status-list trap
+        # shape as Group M's audit_block_overdue_status_overbroad.
+        "audit_block_portfolio_submitted_status_overbroad",
     })
 
 
@@ -743,6 +822,40 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
         # fallback needed — sqlglot is a hard dependency of this module).
         if self.domain == "audit" and _HAS_SQLGLOT:
             _check_uuid_pk_in_select_ast(sql, issues, self.AUDIT_UUID_PK_DISPLAY_MAP)
+
+        # ── 6a-inverse. A UUID-shaped literal compared against a VARCHAR
+        # display-code column instead of the row's real id — confirmed live:
+        # ordinal resolution ("the 1st one") handed the model a real UUID,
+        # but it filtered arep.audit_id = '<uuid>' instead of arep.id =
+        # '<uuid>', silently returning 0 rows. Not gated to domain=="audit"
+        # (the map covers both audit and inspection aliases) — cheap AST
+        # check, same pattern as 6a above.
+        if _HAS_SQLGLOT:
+            _check_display_code_uuid_compare_ast(sql, issues, self.DISPLAY_CODE_UUID_COMPARE_MAP)
+
+        # ── 6a-inverse-2. The mirror failure shape: a display-code-shaped
+        # literal compared against a column that is a genuine UUID FK on a
+        # different table (e.g. aca.audit_id = '2026/06/ST074/AUD001') —
+        # confirmed live twice, see UUID_FK_DISPLAY_CODE_COMPARE_MAP above.
+        # Same domain-agnostic, cheap-AST-check pattern as 6a-inverse.
+        if _HAS_SQLGLOT:
+            _check_uuid_fk_compared_to_display_code_ast(sql, issues, self.UUID_FK_DISPLAY_CODE_COMPARE_MAP)
+
+        # ── 6a-inverse-3. Two ordinary, well-formed display codes from
+        # DIFFERENT tables confused for each other (e.g. a schedule's code
+        # fed into audit_report.audit_id) — see OWN_DISPLAY_CODE_TOKEN_MAP
+        # above. Same domain-agnostic, cheap-AST-check pattern.
+        if _HAS_SQLGLOT:
+            _check_display_code_wrong_table_ast(sql, issues, self.OWN_DISPLAY_CODE_TOKEN_MAP)
+
+        # ── 6a-inverse-4. Same column family, through a scalar subquery
+        # instead of a literal — confirmed live twice (2026-07-30,
+        # 2026-08-04), see _check_subquery_uuid_display_code_mismatch_ast's
+        # docstring. Self-contained (no domain-specific map — spans both
+        # domains), a guaranteed Postgres type error either way, so zero
+        # false-positive risk.
+        if _HAS_SQLGLOT:
+            _check_subquery_uuid_display_code_mismatch_ast(sql, issues)
 
         # ── 6b. Undefined table aliases — column refs to aliases not in FROM/JOIN ──
         # Catches: SELECT ... WHERE ir.active = true  with NO "FROM/JOIN ... ir"

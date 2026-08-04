@@ -11,12 +11,19 @@ defined on the corresponding BLOCK rule (audit_rules.py) rather than
 duplicating them here, so the two can never silently drift out of sync.
 """
 
+import re
+
 try:
     import sqlglot
     import sqlglot.expressions as exp
     _HAS_SQLGLOT = True
 except ImportError:
     _HAS_SQLGLOT = False
+
+
+_UUID_LITERAL_RE = re.compile(
+    r"'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'"
+)
 
 
 class IntentAutocorrectMixin:
@@ -194,5 +201,112 @@ class IntentAutocorrectMixin:
             if repaired and not repaired.rstrip().endswith(";"):
                 repaired = repaired.rstrip() + ";"
             return repaired, mutations
+        except Exception:
+            return sql, []
+
+    def strip_redundant_name_filter_on_undefined_alias(self, sql: str) -> tuple:
+        """
+        Confirmed live 2026-08-03 (qid=c6520cf2, "list all plans under the
+        1st person"): once a person's name has already been resolved to a
+        UUID upstream (e.g. asch.auditor_id = '<uuid>' pinned via the
+        reasoning model's schema_hint), DeepSeek still frequently ALSO bolts
+        on a redundant `(u.first_name || ' ' || u.last_name) ILIKE
+        '%<name>%'` predicate — with no corresponding `JOIN users u`
+        anywhere in the query. This is the same failure mode the
+        generation.py uuid-guard docstring already names ("DeepSeek can
+        silently discard [a resolved UUID] and invent its own ILIKE/name-
+        based filter instead"), just the inverse shape: the UUID filter
+        survives, but a second, bogus, unjoined filter rides along next to
+        it. The uuid-guard only checks whether the UUID is MISSING, so it
+        never fires here — validation's UNDEFINED_ALIAS check catches it
+        every time instead, costing a full LLM round trip (confirmed live:
+        this exact bug reproduced on 2 consecutive iterations, then survived
+        a 3rd force-executed attempt, before a 4th regeneration finally
+        dropped it).
+
+        Deliberately narrow, matching cleaner.py's ast_repair() §6 rationale
+        for why WHERE-clause undefined-alias terms are NOT touched in
+        general there (unlike ORDER BY/GROUP BY, removing a WHERE condition
+        changes which rows come back — unsafe to do blindly). This is safe
+        ONLY because of the added precondition below: the dropped conjunct
+        must reference an alias that is genuinely undefined anywhere in the
+        query, AND a UUID-literal equality filter must survive elsewhere
+        after it's gone. That second condition is what makes the removal
+        provably non-broadening — the row set is still pinned to a specific
+        resolved identity either way, so dropping the redundant, broken
+        clause can only ever be a no-op or a fix, never a silent widening of
+        the result set the way blindly stripping any undefined-alias WHERE
+        term would risk.
+        """
+        if not _HAS_SQLGLOT:
+            return sql, []
+
+        try:
+            tree = sqlglot.parse_one(sql, dialect="postgres")
+        except Exception:
+            return sql, []
+        if not isinstance(tree, exp.Select):
+            return sql, []
+
+        where = tree.args.get("where")
+        if where is None or where.this is None:
+            return sql, []
+
+        defined: set = set()
+        from_clause = tree.args.get("from_") or tree.args.get("from")
+        if from_clause is not None and isinstance(from_clause.this, exp.Table):
+            t = from_clause.this
+            if t.name:
+                defined.add((t.alias or t.name).lower())
+        for j in (tree.args.get("joins") or []):
+            t = j.this
+            if isinstance(t, exp.Table) and t.name:
+                defined.add((t.alias or t.name).lower())
+
+        def _flatten_and(node):
+            if isinstance(node, exp.And):
+                return _flatten_and(node.this) + _flatten_and(node.expression)
+            if isinstance(node, exp.Paren):
+                return _flatten_and(node.this)
+            return [node]
+
+        conjuncts = _flatten_and(where.this)
+        if len(conjuncts) < 2:
+            return sql, []  # nothing else would be left to pin the identity
+
+        def _is_undefined_name_filter(node) -> bool:
+            cols = list(node.find_all(exp.Column))
+            if not cols:
+                return False
+            if not all(c.table and c.table.lower() not in defined for c in cols):
+                return False
+            return any(c.name.lower() in ("first_name", "last_name") for c in cols)
+
+        dropped = [c for c in conjuncts if _is_undefined_name_filter(c)]
+        if not dropped:
+            return sql, []
+        kept = [c for c in conjuncts if c not in dropped]
+        if not kept:
+            return sql, []
+
+        kept_sql = " AND ".join(c.sql(dialect="postgres") for c in kept)
+        if not _UUID_LITERAL_RE.search(kept_sql):
+            return sql, []  # no surviving identity pin — not safe to drop
+
+        new_where = kept[0]
+        for c in kept[1:]:
+            new_where = exp.And(this=new_where, expression=c)
+        where.set("this", new_where)
+
+        try:
+            repaired = tree.sql(dialect="postgres", pretty=False)
+            if repaired and not repaired.rstrip().endswith(";"):
+                repaired = repaired.rstrip() + ";"
+            dropped_sql = "; ".join(c.sql(dialect="postgres") for c in dropped)
+            return repaired, [
+                f"Dropped redundant WHERE condition on undefined alias "
+                f"(no matching FROM/JOIN, resolved UUID filter already pins "
+                f"the row): {dropped_sql}"
+            ]
         except Exception:
             return sql, []

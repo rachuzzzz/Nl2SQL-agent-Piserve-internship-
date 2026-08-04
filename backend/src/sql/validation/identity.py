@@ -88,6 +88,20 @@ class IdentityMixin:
         "organisation": "name",
     }
 
+    # Cycle tables — no name/title column exists at all (confirmed live,
+    # documented separately in engine.py's AUDIT_UUID_PK_DISPLAY_MAP and this
+    # module's strip_hallucinated_no_substitute_columns). Deliberately
+    # separate from ROW_IDENTITY_TABLES: the display value is a synthetic
+    # composite of THREE separate SELECT expressions (start_date, end_date,
+    # status), not one column or one concat expression like the `users`
+    # branch below — requires ALL THREE present as direct SELECT expressions
+    # from the SAME aliased table before firing, so a lone `acyc.status`
+    # reference (e.g. in an unrelated WHERE-only query) never triggers this.
+    _CYCLE_TABLES: dict = {
+        "audit_cycle": {"start_date", "end_date", "status"},
+        "inspection_cycle": {"start_date", "end_date", "status"},
+    }
+
     def inject_row_identity(self, sql: str) -> tuple:
         """
         For every direct SELECT expression in the OUTERMOST select that is a
@@ -100,13 +114,25 @@ class IdentityMixin:
 
         Skips entirely (returns the SQL unchanged, no mutations) if:
           - sqlglot isn't installed, or the SQL doesn't parse
-          - the outermost SELECT has a GROUP BY (can't inject an ungrouped
-            column into an aggregate query without breaking it — the
-            plan_ids-style DB round-trip fallback in synthesis.py keeps
-            covering this specific gap)
           - no table/alias in this query is in ROW_IDENTITY_TABLES
           - a matching display column is found but its own `<col>__id`
             output name is already taken (don't guess, don't collide)
+
+        A GROUP BY no longer blocks injection wholesale — only injection
+        for a SPECIFIC alias whose `.id` isn't itself already part of the
+        GROUP BY clause (adding `<alias>.id` to SELECT would then be a real
+        "column must appear in the GROUP BY clause" error). When `<alias>.id`
+        IS already grouped (e.g. `GROUP BY u.id, u.first_name, u.last_name`
+        — a common shape for "list all X with a COUNT(...)"), injecting a
+        second SELECT expression referencing that same already-grouped
+        column is always valid, so it proceeds normally for that alias.
+        Confirmed live 2026-08-03: "list all auditors" (grouped by
+        u.id/first_name/last_name, with a COUNT(schedule) aggregate) got
+        NO id-injection at all under the old blanket skip, despite u.id
+        being safely groupable — a later "the 6th auditor" ordinal
+        follow-up had no id to resolve to, fell back to re-searching by
+        name from scratch, and surfaced unrelated same-named people instead
+        of the specific auditor already shown.
 
         Returns (sql, mutations) — mutations is a list of human-readable
         strings for a "[row-identity] ..." debug log line, empty if nothing
@@ -139,9 +165,6 @@ class IdentityMixin:
         if top_select is None:
             return sql, []
 
-        if top_select.args.get("group") is not None:
-            return sql, []
-
         # alias -> table_name for EVERY table in FROM/JOIN, regardless of
         # join side. Unlike cleaner.py's _direct_tables (which deliberately
         # excludes LEFT-joined tables, since it's deciding what's safe to
@@ -160,8 +183,44 @@ class IdentityMixin:
             if isinstance(t, exp.Table) and t.name:
                 alias_to_table[(t.alias or t.name).lower()] = t.name.lower()
 
-        if not any(tname in self.ROW_IDENTITY_TABLES for tname in alias_to_table.values()):
+        if not any(tname in self.ROW_IDENTITY_TABLES or tname == "users"
+                   or tname in self._CYCLE_TABLES
+                   for tname in alias_to_table.values()):
             return sql, []
+
+        # Single-table queries often omit an explicit alias entirely (e.g.
+        # `SELECT id, start_date, status FROM audit_cycle` — no "acyc"
+        # anywhere, every column's .table is empty). When there's exactly
+        # one table in the whole FROM/JOIN clause, an unqualified column can
+        # only ever mean that one table — safe to treat it as implicitly
+        # qualified by it (Postgres itself allows referencing
+        # <table_name>.col even with no explicit alias declared). A 2+-table
+        # query is NOT covered by this — a bare column there could belong to
+        # any of them, so col.table is still required in that case.
+        # Confirmed live 2026-08-03: a "list all cycles" query came back
+        # with zero table qualifiers at all, so none of the matching below
+        # fired, row_titles stayed empty for that turn, and a follow-up
+        # ordinal reference ("the 5th one") fell back to the SQL-gen model
+        # guessing — first a real Postgres error (`acyc.id = 5`, uuid =
+        # integer), then a working-but-fragile ROW_NUMBER() workaround.
+        _sole_alias = next(iter(alias_to_table)) if len(alias_to_table) == 1 else None
+
+        # GROUP BY safety: collect "<alias>.<col>" for every plain column
+        # reference in the GROUP BY clause (same _sole_alias fallback as
+        # SELECT columns above, for an unaliased single-table GROUP BY).
+        # `_group_clause is None` means no GROUP BY at all — injection is
+        # then always safe for every alias, same as before this fix.
+        _group_clause = top_select.args.get("group")
+        _grouped_cols: set = set()
+        if _group_clause is not None:
+            for _g in _group_clause.expressions:
+                if isinstance(_g, exp.Column) and _g.name:
+                    _g_alias = (_g.table or _sole_alias or "").lower()
+                    if _g_alias:
+                        _grouped_cols.add(f"{_g_alias}.{_g.name.lower()}")
+
+        def _id_safe_to_inject(alias: str) -> bool:
+            return _group_clause is None or f"{alias}.id" in _grouped_cols
 
         existing_outputs = {
             e.output_name.lower() for e in top_select.expressions if e.output_name
@@ -172,14 +231,18 @@ class IdentityMixin:
 
         for col_expr in top_select.expressions:
             col = col_expr.this if isinstance(col_expr, exp.Alias) else col_expr
-            if not isinstance(col, exp.Column) or not col.table:
+            if not isinstance(col, exp.Column):
                 continue
 
-            source_alias = col.table.lower()
+            source_alias = (col.table or _sole_alias or "").lower()
+            if not source_alias:
+                continue
             table_name = alias_to_table.get(source_alias)
             if not table_name or table_name not in self.ROW_IDENTITY_TABLES:
                 continue
             if col.name.lower() != self.ROW_IDENTITY_TABLES[table_name].lower():
+                continue
+            if not _id_safe_to_inject(source_alias):
                 continue
 
             output_alias = col_expr.output_name
@@ -193,7 +256,7 @@ class IdentityMixin:
                 exp.Alias(
                     this=exp.Column(
                         this=exp.Identifier(this="id"),
-                        table=exp.Identifier(this=col.table),
+                        table=exp.Identifier(this=source_alias),
                     ),
                     alias=exp.Identifier(this=id_output_name),
                 )
@@ -203,11 +266,197 @@ class IdentityMixin:
                 f"Injected {source_alias}.id AS {id_output_name} ({table_name})"
             )
 
+        # ── People (users) — composite full-name display, no single column ──
+        # `users` is deliberately excluded from ROW_IDENTITY_TABLES above
+        # (its display value is first_name || ' ' || last_name, a
+        # concatenation, not a plain column the bare-column loop above can
+        # match) — but that concatenation still unambiguously identifies one
+        # real person per row. Confirmed live 2026-07-31: a follow-up "the
+        # 2nd auditor in the list" had no id to resolve to for exactly this
+        # reason, so instead of reusing the specific person the prior turn
+        # had already pinned down, the model had to re-search auditor_name
+        # across the WHOLE users table from scratch — surfacing other people
+        # who share that name and were never in the original list at all,
+        # then asking the user to pick one. Injecting <alias>.id AS
+        # <output>__id here lets a later ordinal resolve straight to that
+        # one already-identified person instead of re-searching.
+        # Deliberately narrow: exactly 2 columns, both first_name/last_name
+        # (either order), both from the same users-aliased table — the one
+        # concatenation shape used throughout this codebase's own seed
+        # examples — to avoid misfiring on some unrelated 2-column concat.
+        for col_expr in top_select.expressions:
+            if not isinstance(col_expr, exp.Alias):
+                continue
+            output_alias = col_expr.output_name
+            if not output_alias:
+                continue
+            id_output_name = f"{output_alias}__id"
+            if id_output_name.lower() in existing_outputs:
+                continue
+            cols_used = list(col_expr.this.find_all(exp.Column))
+            if len(cols_used) != 2:
+                continue
+            aliases_used = {(c.table or _sole_alias or "").lower() for c in cols_used}
+            aliases_used.discard("")
+            names_used = {c.name.lower() for c in cols_used}
+            if len(aliases_used) != 1 or names_used != {"first_name", "last_name"}:
+                continue
+            src_alias = next(iter(aliases_used))
+            if alias_to_table.get(src_alias) != "users":
+                continue
+            if not _id_safe_to_inject(src_alias):
+                continue
+            to_append.append(
+                exp.Alias(
+                    this=exp.Column(this=exp.Identifier(this="id"),
+                                     table=exp.Identifier(this=src_alias)),
+                    alias=exp.Identifier(this=id_output_name),
+                )
+            )
+            existing_outputs.add(id_output_name.lower())
+            mutations.append(
+                f"Injected {src_alias}.id AS {id_output_name} (users, composite name)"
+            )
+
+        # ── Cycles (audit_cycle/inspection_cycle) — composite date+status
+        # display, no single output_name to suffix "__id" onto (the display
+        # spans 3 separate SELECT expressions, not one). Emits a FIXED,
+        # alias-namespaced sibling instead: <alias>_cycle_row__id.
+        # synthesis.py reads it back via this exact suffix, gated on its
+        # presence so it can never misfire on some unrelated joined table's
+        # own "status" column.
+        cols_by_alias: dict = {}
+        for col_expr in top_select.expressions:
+            col = col_expr.this if isinstance(col_expr, exp.Alias) else col_expr
+            if isinstance(col, exp.Column):
+                _alias = (col.table or _sole_alias or "").lower()
+                if _alias:
+                    cols_by_alias.setdefault(_alias, set()).add(col.name.lower())
+
+        for src_alias, table_name in alias_to_table.items():
+            required = self._CYCLE_TABLES.get(table_name)
+            if not required or not required.issubset(cols_by_alias.get(src_alias, set())):
+                continue
+            id_output_name = f"{src_alias}_cycle_row__id"
+            if id_output_name.lower() in existing_outputs:
+                continue
+            if not _id_safe_to_inject(src_alias):
+                continue
+            to_append.append(
+                exp.Alias(
+                    this=exp.Column(this=exp.Identifier(this="id"),
+                                     table=exp.Identifier(this=src_alias)),
+                    alias=exp.Identifier(this=id_output_name),
+                )
+            )
+            existing_outputs.add(id_output_name.lower())
+            mutations.append(
+                f"Injected {src_alias}.id AS {id_output_name} ({table_name}, composite date+status)"
+            )
+
         if not to_append:
             return sql, []
 
         for node in to_append:
             top_select.expressions.append(node)
+
+        try:
+            repaired = tree.sql(dialect="postgres", pretty=False)
+            if repaired and not repaired.rstrip().endswith(";"):
+                repaired = repaired.rstrip() + ";"
+            return repaired, mutations
+        except Exception:
+            return sql, []
+
+    # Tables where answer_text is a free-text form answer and submission_id
+    # is the row's own directly-filterable identifier (not a UUID primary
+    # key needing a __id sibling — submission_id IS the real, joinable value,
+    # see synthesis.py's row_titles/row_ids "Priority 0" capture).
+    _OBSERVATION_ANSWER_TABLES: frozenset = frozenset({"ai_audit_answers", "ai_answers"})
+
+    def inject_observation_submission_id(self, sql: str) -> tuple:
+        """
+        Ensures submission_id rides along whenever answer_text is selected
+        from ai_audit_answers/ai_answers, so a later ordinal follow-up
+        ("the first finding") has a real id to resolve to instead of falling
+        back to a generic ORDER BY/LIMIT re-derivation.
+
+        Confirmed live 2026-07-31: the SAME question ("observations for audit
+        X") generated SQL with submission_id selected on one run and without
+        it on another — the reasoning/SQL-gen models don't reliably include
+        it on their own even though the worked example shows it, so
+        synthesis.py's row_titles/row_ids capture (which depends on
+        submission_id being present) only worked opportunistically. This
+        makes it deterministic instead, mirroring inject_row_identity()'s
+        own rationale but for a column that's already a directly-filterable
+        value, not a primary key needing a synthetic __id sibling.
+
+        Same skip conditions as inject_row_identity(): no sqlglot, unparsable
+        SQL, or a GROUP BY on the outermost SELECT.
+        """
+        if not _HAS_SQLGLOT:
+            return sql, []
+        try:
+            tree = sqlglot.parse_one(sql, dialect="postgres")
+        except Exception:
+            return sql, []
+
+        top_select = None
+        if isinstance(tree, exp.Select):
+            top_select = tree
+        elif isinstance(tree, exp.With):
+            final = tree.this
+            if isinstance(final, exp.Select):
+                top_select = final
+            elif isinstance(final, exp.Subquery):
+                inner = final.this
+                if isinstance(inner, exp.Select):
+                    top_select = inner
+        if top_select is None:
+            return sql, []
+        if top_select.args.get("group") is not None:
+            return sql, []
+
+        alias_to_table: dict = {}
+        from_clause = top_select.args.get("from_") or top_select.args.get("from")
+        if (from_clause is not None and isinstance(from_clause.this, exp.Table)
+                and from_clause.this.name):
+            t = from_clause.this
+            alias_to_table[(t.alias or t.name).lower()] = t.name.lower()
+        for j in (top_select.args.get("joins") or []):
+            t = j.this
+            if isinstance(t, exp.Table) and t.name:
+                alias_to_table[(t.alias or t.name).lower()] = t.name.lower()
+
+        _obs_aliases = {
+            a for a, tname in alias_to_table.items()
+            if tname in self._OBSERVATION_ANSWER_TABLES
+        }
+        if not _obs_aliases:
+            return sql, []
+
+        _answer_text_alias = None
+        _has_submission_id = False
+        for col_expr in top_select.expressions:
+            col = col_expr.this if isinstance(col_expr, exp.Alias) else col_expr
+            if not isinstance(col, exp.Column) or not col.table:
+                continue
+            src_alias = col.table.lower()
+            if src_alias not in _obs_aliases:
+                continue
+            if col.name.lower() == "answer_text":
+                _answer_text_alias = src_alias
+            elif col.name.lower() == "submission_id":
+                _has_submission_id = True
+
+        if not _answer_text_alias or _has_submission_id:
+            return sql, []
+
+        top_select.expressions.append(
+            exp.Column(this=exp.Identifier(this="submission_id"),
+                       table=exp.Identifier(this=_answer_text_alias))
+        )
+        mutations = [f"Injected {_answer_text_alias}.submission_id (observation row identity)"]
 
         try:
             repaired = tree.sql(dialect="postgres", pretty=False)

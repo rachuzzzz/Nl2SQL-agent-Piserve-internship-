@@ -62,6 +62,36 @@ _INSPECTION_KEYWORDS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Deterministic backstop for generic "fix-it action" vocabulary that belongs
+# to NEITHER domain's canonical keyword list above, but is a well-known
+# synonym risk for both ("remedial actions" for inspection's "mitigative
+# actions", "curative actions" for audit's "corrective actions", etc.) — a
+# real ambiguity, not resolvable by picking one domain over the other.
+#
+# This exists because the semantic-judgment check baked into each domain's
+# own system prompt (the DOMAIN-MISMATCH CHECK block) is NOT reliably
+# consistent: confirmed live 2026-08-03, the SAME reasoning model caught
+# "show all remedial actions" (its own thought explicitly invoked the
+# DOMAIN-MISMATCH CHECK rule) but silently missed "show all curative actions
+# that are at risk" in the same session — a nearby specific cue ("at risk" ->
+# a real column mapping it was confident about) pulled its attention away
+# from the ambiguous word entirely, and it substituted "corrective" for
+# "curative" without ever considering the mismatch. Nothing else catches
+# this once the model skips the check — unlike SQL correctness, there's no
+# validation-layer backstop for a domain guess. This regex is that backstop:
+# deterministic, instant, free, and — being a router-level Tier 1 check —
+# fires BEFORE the LLM is ever involved, so it can't be inconsistently
+# skipped the way the in-prompt check can.
+#
+# Deliberately a SMALL, curated list, not an attempt to enumerate every
+# possible synonym (that's exactly the whack-a-mole the semantic check was
+# built to avoid) — just the terms confirmed live to be genuinely ambiguous
+# between the two domains' "fix a problem" vocabulary.
+_AMBIGUOUS_SYNONYM_RE = re.compile(
+    r"\b(?:remedial|curative|preventive|preventative|rectification)\s+actions?\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class DomainRoute:
@@ -158,6 +188,19 @@ class DomainRouter:
         # Both fire (e.g. "compare audit corrective actions vs mitigative
         # actions") or neither fires — not a hard Tier-1 signal either way,
         # fall through to stickiness/LLM rather than guess.
+
+        # ── Tier 1 ambiguous-synonym backstop (instant, still no LLM call) ──
+        # Only reached when neither domain's own keyword won outright above —
+        # an explicit "audit"/"inspection" mention elsewhere in the same
+        # message still takes priority and is never second-guessed here.
+        if _AMBIGUOUS_SYNONYM_RE.search(question or ""):
+            return DomainRoute(
+                domain="AMBIGUOUS", tier=1, confidence=1.0,
+                clarifying_question=(
+                    "Just to confirm — are you asking about audits or "
+                    "facility inspections? The term you used could mean either."
+                ),
+            )
 
         # ── Tier 2 — session stickiness (instant) ───────────────────────────
         if session is not None:

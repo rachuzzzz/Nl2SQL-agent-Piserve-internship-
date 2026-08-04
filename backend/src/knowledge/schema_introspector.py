@@ -517,19 +517,25 @@ AUDIT_ENUM_COLUMNS = {
 }
 
 AUDIT_BUSINESS_RULES = [
-    "AUDIT_PLAN vs AUDIT_REPORT — 'conducted'/'completed' are TWO SEPARATE status "
-    "lifecycles on TWO DIFFERENT tables, confirmed live as a real bug (not hypothetical): "
-    "'show the most recently conducted audit' queried audit_plan (a still-pending proposal, "
-    "status IN ('SUBMITTED','RETURNED_FOR_MODIFICATION')) instead of audit_report (an actual "
-    "audit EVENT that was carried out — has a report, form answers, corrective actions, a "
-    "facility) — confirmed wrong by the very next question asking what the auditor filled out "
-    "for that 'audit', which only exists on audit_report/ai_audit_answers, never on audit_plan. "
+    "AUDIT_PLAN vs AUDIT_REPORT — 'conducted'/'completed' are audit_report vocabulary ONLY, "
+    "confirmed live as a real bug (not hypothetical): 'show the most recently conducted audit' "
+    "queried audit_plan (a still-pending proposal, status IN ('SUBMITTED', "
+    "'RETURNED_FOR_MODIFICATION')) instead of audit_report (an actual audit EVENT that was "
+    "carried out — has a report, form answers, corrective actions, a facility) — confirmed wrong "
+    "by the very next question asking what the auditor filled out for that 'audit', which only "
+    "exists on audit_report/ai_audit_answers, never on audit_plan. "
     "RULE: a BARE, unqualified 'audit'/'the audit' (no 'plan' qualifier) means audit_report — "
     "conducted = arep.status = 'SUBMITTED', completed = arep.status IN ('CLOSED', "
-    "'CLOSED_WITH_EXCEPTION'). Only use audit_plan.status (conducted = ap.status IN "
-    "('SUBMITTED','RETURNED_FOR_MODIFICATION'), completed = ap.status = 'APPROVED') when the "
-    "question explicitly says 'audit plan(s)'. When unsure and the question could plausibly "
-    "lead to a follow-up about findings/answers/facility, use audit_report. THIS RULE IS ABOUT "
+    "'CLOSED_WITH_EXCEPTION'). "
+    "AUDIT_PLAN DOES NOT USE 'conducted'/'completed' AT ALL — confirmed real usage: users refer "
+    "to plan status directly by its own vocabulary ('submitted plans', 'approved plans', 'plans "
+    "returned for modification'), never as 'conducted'/'completed' plans. Do not translate "
+    "conducted/completed into an ap.status filter — if the question says 'audit plan(s)', map "
+    "the status word the user actually said straight onto ap.status "
+    "(DRAFT/SUBMITTED/APPROVED/RETURNED_FOR_MODIFICATION), and if it's a vague status word with "
+    "no direct audit_plan status match, treat 'audit' as bare and use audit_report instead. When "
+    "unsure and the question could plausibly lead to a follow-up about findings/answers/facility, "
+    "use audit_report. THIS RULE IS ABOUT "
     "STATUS/LIFECYCLE questions only — for an ATTRIBUTE question (auditee, auditor, facility, "
     "schedule date) about an entity a recent turn already resolved to a specific audit_plan, "
     "do not ask the user to re-specify which audit; join straight through audit_schedule (which "
@@ -593,6 +599,13 @@ AUDIT_BUSINESS_RULES = [
     "audit_report.audit_type_id is a DEAD column — always NULL (confirmed live). "
     "The real audit-type path is THREE hops: audit_report.schedule_id → audit_schedule.id "
     "→ audit_schedule.audit_plan_id → audit_plan.id → audit_plan.audit_type_id → audit_type.id.",
+    "audit_report.audit_cycle_id is ALSO a DEAD column — always NULL (confirmed live "
+    "2026-07-31: 0 of 17 active rows populated), same trap as audit_type_id above just on a "
+    "different FK on the same table. Live-caught: 'list all audits' INNER JOINed audit_cycle "
+    "straight through this column and silently returned 0 rows for every real audit_report row. "
+    "The real cycle path is THREE hops: audit_report.schedule_id → audit_schedule.id → "
+    "audit_schedule.audit_plan_id → audit_plan.id → audit_plan.cycle_id → audit_cycle.id. NEVER "
+    "join audit_cycle directly off audit_report.audit_cycle_id.",
     "DEAD JUNCTION TABLES — audit_category_portfolio, audit_sub_category_portfolio, "
     "audit_type_portfolio, and audit_cycle_auditor_portfolios are ALL always 0 rows (confirmed live) "
     "despite naming that reads as equally valid to the real tables. NEVER join them. "
@@ -645,15 +658,25 @@ AUDIT_BUSINESS_RULES = [
     "COLUMN-NAMING TRAP: portfolio_detail_audit_subcategory's FK column is audit_subcategory_id "
     "(no underscore before 'category') — NOT audit_sub_category_id, even though the TABLE it "
     "points to is named audit_sub_category (with the underscore). Confirmed live.",
-    "DATE FOR 'WHEN A SCHEDULE HAPPENED': audit_schedule.follow_up_date is the schedule's own "
-    "date — use THIS for 'last month'/'this week'/any date-range question about when a specific "
-    "audit visit occurred. audit_schedule has NO 'due_date' column (a live model confirmed to "
-    "hallucinate this) — do NOT invent one. audit_cycle.due_date is a COMPLETELY DIFFERENT "
-    "concept — the whole cycle's own end-of-period deadline, reached via "
-    "audit_schedule.audit_plan_id → audit_plan.cycle_id → audit_cycle.id (three hops, since "
-    "audit_schedule has no direct cycle_id either). NEVER substitute audit_cycle.due_date when "
-    "the question is about when a schedule/audit happened — that answers a different question "
-    "('when does this cycle wrap up') and silently returns 0 rows or the wrong rows.",
+    "DATE FOR 'WHEN AN AUDIT WAS CONDUCTED': use audit_report.submitted_on, NOT "
+    "audit_schedule.follow_up_date. CORRECTED 2026-07-31 — live-confirmed the previous version "
+    "of this rule was wrong: 'show audits conducted on jul 6 2026' filtered on follow_up_date and "
+    "returned 0 rows for a date that genuinely had a submitted audit (submitted_on matched, "
+    "follow_up_date did not). Checked the real data: follow_up_date values cluster almost "
+    "entirely on month-end dates (2026-06-30, 07-29/30/31, 08-31) across the WHOLE table, not "
+    "just a few rows — it's a target/due-by date for the schedule, not the day the audit actually "
+    "happened. audit_schedule has no column recording the actual visit date at all; "
+    "audit_report.submitted_on is the closest real signal and is treated as 'the audit was "
+    "conducted that day' per business convention. Use follow_up_date only for genuinely "
+    "forward-looking/scheduling questions ('which audits are due this month', 'overdue "
+    "schedules') — never for 'when did/was this audit happen/conducted/occur'. "
+    "audit_schedule has NO 'due_date' column (a live model confirmed to hallucinate this) — do "
+    "NOT invent one. audit_cycle.due_date is a COMPLETELY DIFFERENT concept — the whole cycle's "
+    "own end-of-period deadline, reached via audit_schedule.audit_plan_id → audit_plan.cycle_id "
+    "→ audit_cycle.id (three hops, since audit_schedule has no direct cycle_id either). NEVER "
+    "substitute audit_cycle.due_date when the question is about when an audit was conducted — "
+    "that answers a different question ('when does this cycle wrap up') and silently returns 0 "
+    "rows or the wrong rows.",
     "audit_cycle HAS NO name/cycle_name/title/code COLUMN (confirmed live) — identify a cycle by "
     "its acyc.start_date/acyc.end_date/acyc.status only, never invent a label column for it. This "
     "is the single most common mistake seen in practice: any question about audit_plan/schedule/ "
@@ -948,8 +971,13 @@ AUDIT_USEFUL_COLUMNS = {
     ],
     "audit_report": [
         "audit_id", "status", "audit_score", "total_audit_hours", "submitted_on", "closed_on",
-        "schedule_id", "audit_cycle_id", "audit_form_used_id", "client_id", "entity_id",
-        # audit_type_id, facility_id, project_id DELIBERATELY excluded — dead/absent, see rules
+        "schedule_id", "audit_form_used_id", "client_id", "entity_id",
+        # audit_type_id, audit_cycle_id, facility_id, project_id DELIBERATELY excluded —
+        # dead/absent, see AUDIT_BUSINESS_RULES. audit_cycle_id removed 2026-07-31: it was
+        # still listed here (unlike audit_type_id, already excluded) despite being confirmed
+        # 0-of-17 populated live — the LLM could still see it as an available column and
+        # propose it, relying only on the reactive BLOCK rule to catch it after the fact
+        # instead of never seeing it as an option in the first place.
     ],
     "audit_corrective_action": [
         "corrective_action_id", "status", "implementation_status", "adequacy_status",

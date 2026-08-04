@@ -41,7 +41,7 @@ _KNOWN_TOOLS = {
     "list_forms", "semantic_search", "search_questions",
     "get_answers", "get_answer_stats",
     "generate_sql", "execute_sql", "get_schema",
-    "final_answer",
+    "final_answer", "redirect_domain",
 }
 _TOOL_NAMES_PATTERN = "|".join(re.escape(t) for t in sorted(_KNOWN_TOOLS, key=len, reverse=True))
 _TOOL_RE = re.compile(
@@ -342,6 +342,12 @@ def _validate_tool_call(parsed: Any, raw_output: str) -> dict[str, Any]:
 
     # Same repair, targeted at final_answer's `answer` string — see
     # _reconstruct_fragmented_answer's docstring for the live-caught case.
+    # Deliberately NOT applied to redirect_domain: that repair's whole premise
+    # is "final_answer only has ONE meaningful arg, so any other key is
+    # necessarily corruption" — but redirect_domain legitimately has a SECOND
+    # meaningful arg (suspected_domain) always present, so running it through
+    # this repair would unconditionally mangle suspected_domain into the
+    # answer text on every single well-formed call, not just fragmented ones.
     if parsed.get("tool") == "final_answer":
         parsed["args"] = _reconstruct_fragmented_answer(parsed["args"])
 
@@ -364,12 +370,24 @@ def dispatch(tool_call: dict[str, Any], registry: ToolRegistry) -> dict[str, Any
 
     Special tool names handled here (not in ToolRegistry):
       - "final_answer": passes through directly.
+      - "redirect_domain": passes through directly, same shape as
+        final_answer — not actually reached via loop.py's main iteration
+        (which intercepts and returns before dispatch() is called, exactly
+        like final_answer), kept here for consistency/defensiveness so a
+        future direct caller of dispatch() doesn't hit an unhandled tool name.
     """
     tool_name = tool_call.get("tool", "")
     args = tool_call.get("args", {})
 
     # final_answer is handled by the orchestrator, not the registry
     if tool_name == "final_answer":
+        return {
+            "success": True,
+            "result": args.get("answer", ""),
+            "error": None,
+        }
+
+    if tool_name == "redirect_domain":
         return {
             "success": True,
             "result": args.get("answer", ""),
