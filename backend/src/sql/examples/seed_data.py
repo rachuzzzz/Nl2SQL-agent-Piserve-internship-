@@ -160,6 +160,26 @@ LIMIT 100;
         'limit':  100,
     },
     {
+        'nl':     'how many mitigative actions were raised for inspection 2026/04/ST001/INS001',
+        'sql':    """\
+-- ica.inspection_id is a UUID FK to inspection_report.id, NEVER the display
+-- code itself ('2026/04/ST001/INS001' lives on inspection_report.inspection_id
+-- instead) — mirrors a confirmed-live audit-domain bug where the analogous
+-- aca.audit_id was compared directly to a display code and failed at
+-- execution with "invalid input syntax for type uuid". Must join
+-- inspection_report and filter ON ITS inspection_id column instead, even
+-- for a bare COUNT scoped to a single report.
+SELECT COUNT(*) AS ma_count
+FROM inspection_corrective_action ica
+JOIN inspection_report ir ON ica.inspection_id = ir.id
+WHERE ir.inspection_id = '2026/04/ST001/INS001'
+  AND ica.active = true AND ir.active = true;
+""",
+        'domain': 'corrective_action',
+        'intent': 'aggregate',
+        'limit':  None,
+    },
+    {
         'nl':     'mitigative actions sent back returned for modification rejected by reviewer MAs returned to inspectee',
         'sql':    """\
 -- Sent back = implementation_status = 'RETURN_FOR_MODIFICATION'

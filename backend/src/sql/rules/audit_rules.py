@@ -62,6 +62,27 @@ AUDIT_BLOCK_RULES: list[dict] = [
         "hard_fail": True,
     },
     {
+        "id":          "audit_block_dead_report_audit_cycle",
+        "type":        BLOCK,
+        "code":        "AUDIT_DEAD_REPORT_AUDIT_CYCLE",
+        "description": (
+            "audit_report.audit_cycle_id is always NULL (confirmed live 2026-07-31: 0 of 17 "
+            "active rows populated) — resolve the cycle via audit_plan instead. Live-caught: "
+            "'list all audits' INNER JOINed audit_cycle straight through this column and "
+            "silently returned 0 rows for every audit, despite 17 real audit_report rows "
+            "existing — same trap class as AUDIT_DEAD_REPORT_AUDIT_TYPE above, just on a "
+            "different dead FK on the same table."
+        ),
+        "sql_pattern": r"(?:audit_report|arep)\.audit_cycle_id\b",
+        "message": (
+            "BLOCKED: audit_report.audit_cycle_id is a dead column (always NULL, confirmed "
+            "live). The real cycle path is THREE hops: audit_report.schedule_id → "
+            "audit_schedule.id → audit_schedule.audit_plan_id → audit_plan.id → "
+            "audit_plan.cycle_id → audit_cycle.id."
+        ),
+        "hard_fail": True,
+    },
+    {
         "id":          "audit_block_report_missing_facility_project",
         "type":        BLOCK,
         "code":        "AUDIT_REPORT_NO_FACILITY_PROJECT",
@@ -665,6 +686,47 @@ AUDIT_BLOCK_RULES: list[dict] = [
             "target_close_out_date), rename the column to 'closed_late' — do not reuse "
             "'closed_with_deferred', which specifically means the CLOSE_WITH_DEFERRED "
             "workflow status, not lateness."
+        ),
+        "hard_fail": True,
+    },
+    {
+        "id":          "audit_block_portfolio_submitted_status_overbroad",
+        "type":        BLOCK,
+        "code":        "AUDIT_PORTFOLIO_SUBMITTED_STATUS_OVERBROAD",
+        "description": (
+            "auditor_portfolio.status is a 4-value CHECK constraint (APPROVED, DRAFT, "
+            "MODIFICATION, PENDING). 'submitted' means status IN ('APPROVED', 'MODIFICATION') "
+            "— DRAFT and PENDING are the not-yet-submitted values (see the 'pending "
+            "submission' seed example). A query answering a 'submitted' question that filters "
+            "status IN (...all four...) applies no real filter at all and silently answers a "
+            "different question."
+        ),
+        # Caught live 2026-08-03 (qid=eee602ce 'Who all submitted portfolios in this cycle',
+        # qid=d73988fb 'list all portfolios submitted for this cycle'): both generated
+        # po.status IN ('APPROVED', 'DRAFT', 'MODIFICATION', 'PENDING') — the full CHECK
+        # constraint value list — instead of narrowing to the submitted subset. Executed
+        # without error (both happened to return 0 rows this session), so nothing surfaced
+        # the bug until a human compared the filter against the schema's own DRAFT/PENDING =
+        # not-yet-submitted business rule. Same trap shape as audit_block_overdue_status_
+        # overbroad below: an adjacent seed example's broader status list gets copied onto a
+        # question asking for a narrower subset.
+        # MUST be anchored with ^ for the same re.search()-scans-every-position reason as
+        # audit_block_overdue_status_overbroad — without it, a question containing "not
+        # submitted" could still match starting just past "not ".
+        "question_pattern": (
+            r"(?i)^(?=.*\bportfolio)(?=.*\bsubmit(?:ted|s|ting)?\b)"
+            r"(?!.*\b(?:not|pending|draft|haven'?t|hasn'?t|yet)\b)"
+        ),
+        "sql_pattern": (
+            r"(?i)^"
+            r"(?=.*\bFROM\s+auditor_portfolio\b)"
+            r"(?=.*\b\w*\.?status\s+IN\s*\((?:(?!\)).)*'(?:DRAFT|PENDING)')"
+        ),
+        "message": (
+            "BLOCKED: question asks for SUBMITTED portfolios, but the query filters "
+            "po.status IN (...) including 'DRAFT' and/or 'PENDING' — those are the "
+            "not-yet-submitted values on auditor_portfolio's 4-value CHECK constraint. "
+            "Correct: WHERE po.status IN ('APPROVED', 'MODIFICATION')"
         ),
         "hard_fail": True,
     },

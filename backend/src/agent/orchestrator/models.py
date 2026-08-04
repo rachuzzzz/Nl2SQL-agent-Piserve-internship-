@@ -130,6 +130,27 @@ class ConversationTurn:
     # that particular row (not necessarily the whole turn — each row is
     # captured independently in the same loop that builds row_titles).
     row_ids: list = field(default_factory=list)
+    # Paired 1:1 with row_ids — the COLUMN NAME the id actually filters on
+    # (e.g. "id" for the usual primary key, "submission_id" for an
+    # ai_audit_answers/ai_answers observation row). Lets session.py's
+    # ORDINAL RESOLVED hint phrase the right WHERE clause instead of always
+    # assuming a primary key — see synthesis.py's row_titles/row_ids capture.
+    row_id_columns: list = field(default_factory=list)
+    # One value per TURN (not per row) — the entity type of the list this
+    # turn displayed: "audit", "schedule", "inspection", "corrective_action",
+    # "cycle", "plan", "facility", "person" (auditor/inspector — unified,
+    # both draw from `users`), "observation", or "" when ambiguous/unmatched.
+    # Lets session.py's ordinal resolver require the noun in an ordinal
+    # phrase ("the 6th AUDITOR") to match the type of list being resolved
+    # against, instead of blindly grabbing the most recent turn with ANY
+    # row_titles regardless of what kind of list it was — confirmed live
+    # (qid=081c7a81): "list all audit plans under the 6th auditor from the
+    # list" resolved "the 6th" against a CYCLES list (the only row_titles
+    # this session had), used one cycle's UUID as if it were an auditor's
+    # id, and produced a well-formed but empty result — wrong, no error.
+    # Set once per turn in synthesis.py's row_titles capture loop, from
+    # whichever priority branch fires first for that turn.
+    row_entity_type: str = ""
 
 
 

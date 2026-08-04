@@ -132,4 +132,57 @@ Turn 1: {"thought": "audit_category_portfolio is always 0 rows (dead, confirmed 
 NEVER: JOIN audit_category_portfolio — always 0 rows.
 """,
     },
+    {
+        # Added 2026-07-31 after a live UI session dead-end (confirmed by user):
+        # "how many audit plans are under this cycle" (COUNT(*) only, no row ids)
+        # -> "show details" -> "of the above", BOTH turns asked the user to
+        # clarify instead of resolving. Root cause: the FOLLOW-UP QUERY RULES
+        # mechanism only reuses a resolved ENTITY id from ACTIVE CONTEXT — a
+        # COUNT-only turn never stores one (there IS no single row to point
+        # at), so a terse "show details" had literally nothing to attach to
+        # and the model defaulted to asking. The fix isn't an id lookup, it's
+        # re-deriving the listing from the COUNT query's own WHERE/JOIN
+        # scope — the filter that made it a valid count is exactly the filter
+        # that makes a valid listing.
+        "title": "'Show details' / 'of the above' after a COUNT-only turn — expand the same filter, don't ask",
+        "question_pattern": (
+            r"(?i)\bshow\s+(me\s+)?(the\s+)?details?\b"
+            r"|\bof\s+the\s+above\b"
+            r"|^\s*details?\s*$"
+            r"|^\s*list\s+(them|those|it)\s*$"
+        ),
+        "text": """\
+─── 'Show details' / 'of the above' — resolve, don't reflexively clarify ───
+RULE: A terse follow-up like "show details" or "of the above" is NEVER itself
+ambiguous about WHAT to show — it always means "expand whatever the last turn
+was about into full rows." What's ambiguous (if anything) is only WHICH prior
+turn to expand. Resolve in this order, and only ask for clarification if
+BOTH of the following fail:
+  1. If an earlier turn in this conversation already returned real row-level
+     data (a listing, not just a scalar), expand/detail THAT turn's rows —
+     prefer it over a more recent scalar COUNT/aggregate turn, since a COUNT
+     has no rows to show details OF.
+  2. Otherwise, if the most recent turn was a COUNT/aggregate with a clear
+     scoping filter (a named cycle, plan, facility, date range, status,
+     etc.), re-run the SAME underlying entity + SAME WHERE/JOIN scope as
+     that count, but SELECT full columns instead of COUNT(*). The filter
+     that made the count meaningful is exactly the filter that makes the
+     listing meaningful — do not discard it and do not ask the user to
+     restate it.
+Only ask for clarification if NEITHER a prior listing NOR an unambiguous
+count-scope exists to expand.
+
+User: "how many audit plans are under this cycle" (cycle already resolved earlier this conversation)
+Turn 1: {"thought": "Scalar count, scoped to one resolved cycle_id.", "tool": "generate_sql", "args": {"question": "count of audit plans under this cycle", "schema_hint": "SELECT COUNT(*) AS total_plans FROM audit_plan ap WHERE ap.cycle_id = '<resolved_cycle_id>' AND ap.active = true;"}}
+
+User: "show details"
+Turn 1: {"thought": "No row-level list exists yet in this conversation to point at — the only prior turn was a COUNT. Per the RULE, re-run the SAME entity + SAME WHERE scope (cycle_id) as that count, this time selecting full rows instead of COUNT(*). This is NOT ambiguous — 'details' of the thing I just counted means the rows behind the count. Do not ask for clarification.", "tool": "generate_sql", "args": {"question": "list audit plans under this cycle with full details", "schema_hint": "SELECT ap.title AS audit_plan_title, ap.status AS audit_plan_status, ap.audit_type_id, ap.category_id, ap.cycle_id FROM audit_plan ap WHERE ap.cycle_id = '<resolved_cycle_id>' AND ap.active = true ORDER BY ap.created_on DESC LIMIT 100;"}}
+
+Contrast — when a REAL listing already happened earlier, prefer it over a later scalar count:
+User turn A: "show all corrective actions and who approved their implementation statuses" -> returns 15 row-level CAs.
+User turn B: "how many of the above are closed" -> scalar COUNT(*) reusing turn A's filter, no rows.
+User turn C: "show details"
+Turn 1: {"thought": "Most recent turn (B) was a scalar COUNT with no rows of its own. Per the RULE, prefer the earlier turn (A) that has real row-level data — 'details' means the 15 CAs from turn A, not a re-expansion of turn B's count. Reuse turn A's filters/columns.", "tool": "generate_sql", "args": {"question": "corrective actions and who approved their implementation statuses, in detail", "schema_hint": "<same shape as turn A's query>"}}
+""",
+    },
 ]

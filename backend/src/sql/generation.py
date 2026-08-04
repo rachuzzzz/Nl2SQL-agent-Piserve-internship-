@@ -41,8 +41,35 @@ def _fetch_key_schemas(db_engine: Engine) -> str:
         return ""
 
 
+_TABLE_REF_RE = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+
+
+def _extract_table_names_from_sql(text: str) -> list[str]:
+    """
+    Pull candidate table names out of a raw (possibly draft/invalid) SQL
+    string — used to derive a join-path-hint fallback from the reasoning
+    model's OWN schema_hint when it didn't separately supply relevant_tables
+    (see _select_schema_block's fallback_tables param for why this exists).
+
+    Deliberately permissive: dedups preserving first-seen order, doesn't
+    validate against a real table list (path_as_hint/find_join_path already
+    degrade gracefully — return None — for any name that isn't a real graph
+    node, confirmed by test_bogus_table_in_pair_degrades_gracefully), and
+    may occasionally pick up a CTE alias as if it were a table. Worst case
+    is a missed hint for that pair, never a crash or a fabricated one — the
+    join graph itself is the source of truth for whether a pair resolves.
+    """
+    seen: list[str] = []
+    for m in _TABLE_REF_RE.finditer(text or ""):
+        name = m.group(1).lower()
+        if name not in seen:
+            seen.append(name)
+    return seen
+
+
 def _select_schema_block(
     db_schema, relevant_tables: list | None, db_engine=None, join_graph_module=None,
+    fallback_tables: list | None = None,
 ) -> str:
     """
     Prefer a targeted, full-column-detail block for the tables the reasoning
@@ -60,6 +87,22 @@ def _select_schema_block(
     inspection, sql/audit_join_graph.py for audit — see agent/domains.py's
     DOMAIN_REGISTRY). None defaults to inspection's, preserving behavior for
     every existing caller.
+
+    fallback_tables: confirmed live (2026-07-30, 2026-08-04) that
+    relevant_tables is essentially NEVER populated in practice — checked 58
+    real generate_sql calls across 5 sessions spanning 5 days, zero hits.
+    Root cause: the system prompt frames it as needed only for tables
+    "beyond the default schema context", but the tables where the join-path
+    hint matters most (audit_report/audit_schedule/audit_corrective_action)
+    are ALREADY in that default context, so the reasoning model has no
+    reason to ever list them. Rather than rely on prompt-compliance for a
+    fix, fallback_tables carries table names extracted from the reasoning
+    model's OWN schema_hint (see _extract_table_names_from_sql) — supplied
+    on nearly every call, unlike relevant_tables — and is used ONLY to
+    still append the join-path hint onto the slim block; it deliberately
+    does NOT switch to the larger for_schema_hint() per-table block (that
+    stays gated on explicit relevant_tables) to preserve the token-budget
+    tradeoff for_sql_prompt_slim() exists for.
     """
     if db_schema is not None:
         if isinstance(relevant_tables, list) and relevant_tables:
@@ -69,7 +112,10 @@ def _select_schema_block(
                 if len(clean) >= 2:
                     block += _join_path_hints(clean, join_graph_module)
                 return block
-        return db_schema.for_sql_prompt_slim()
+        block = db_schema.for_sql_prompt_slim()
+        if fallback_tables and len(fallback_tables) >= 2:
+            block += _join_path_hints(fallback_tables, join_graph_module)
+        return block
     if db_engine:
         return _fetch_key_schemas(db_engine)
     return ""
@@ -126,12 +172,29 @@ def generate_sql(
     _join_graph_module=None,
 ) -> dict[str, Any]:
     try:
+        # Captured BEFORE the auto_schema concatenation below so the
+        # schema-hint-fidelity guard (further down) can extract table names
+        # from exactly what the reasoning model itself proposed — the
+        # curated auto_schema block appended next is a general column
+        # reference, not a specific table requirement, and would pollute
+        # the extraction with unrelated tables if included.
+        _llama_schema_hint = schema_hint
+
         # Schema block — the slim version keeps context under ~600 tokens.
         # A full introspected column dump for every table (~2000+ tokens) inflates
         # deepseek's context 3x and degrades 7B model generation quality.
         # When the reasoning model supplies relevant_tables, use a targeted
         # full-detail block for just those tables instead (see _select_schema_block).
-        auto_schema = _select_schema_block(_db_schema, relevant_tables, db_engine, _join_graph_module)
+        #
+        # fallback_tables: relevant_tables is confirmed almost never supplied
+        # in practice (see _select_schema_block's docstring) — derive a
+        # fallback from the tables the reasoning model's OWN schema_hint
+        # already names, so the join-path hint still has a chance to fire
+        # without depending on that separate, effectively-unused argument.
+        auto_schema = _select_schema_block(
+            _db_schema, relevant_tables, db_engine, _join_graph_module,
+            fallback_tables=_extract_table_names_from_sql(_llama_schema_hint),
+        )
 
         if auto_schema and not schema_hint.startswith("Use"):
             schema_hint = f"{auto_schema}\n{schema_hint}" if schema_hint else auto_schema
@@ -216,6 +279,80 @@ def generate_sql(
             _debug_logger.debug(
                 f"\n{'='*70}\n>>> DEEPSEEK RAW OUTPUT\n{'='*70}\n{raw_sql}\n"
             )
+
+        # ── Ordinal-offset guard: when schema_hint resolves "the Nth one"
+        # via LIMIT 1 OFFSET <n> (the fallback the reasoning model uses when
+        # it can't pull a literal UUID for the ordinal straight out of
+        # conversation history — see the uuid-guard below for the sibling
+        # case where it CAN), DeepSeek must preserve that row-selection
+        # mechanism somewhere in its query. Dropping it silently discards
+        # "the 4th one" entirely, and — unlike a missing UUID literal, which
+        # is a single findable substring — there's no way to check for its
+        # *substance* being preserved under an expanded/rewritten query, so
+        # this only checks that an OFFSET clause survives at all.
+        #
+        # Confirmed live 2026-08-03 (qid=4d1d0bf4): given schema_hint
+        # "SELECT ac.id AS cycle_id, ... FROM audit_cycle ac ... LIMIT 1
+        # OFFSET 3" (the reasoning model's own thought said "get the 4th
+        # cycle's id, then use it in a separate query"), DeepSeek instead
+        # reproduced an unrelated retrieved example nearly verbatim ("which
+        # category and type does this auditor portfolio cover") — joining
+        # audit_cycle, auditor_portfolio, users, auditor_portfolio_detail,
+        # facility, and audit_category with NO LIMIT/OFFSET at all, so the
+        # query ran against every cycle's portfolios at once instead of just
+        # the 4th one, and dropped the status filter as a side effect of
+        # copying the wrong example. It validated and executed cleanly (a
+        # wrong-scope query rarely errors the way a wrong-column one does),
+        # so nothing caught it until a human compared the result against the
+        # original question — this class of bug is strictly worse than an
+        # execution failure, since it returns a confident, plausible-
+        # looking, entirely wrong-scope answer instead of triggering a
+        # retry. A plain table-overlap check would have MISSED this: the
+        # bad query still legitimately touched audit_cycle, it just dropped
+        # the row-selector that pinned it to one specific row. ────────────
+        try:
+            if re.search(r'\bOFFSET\s+\d+', _llama_schema_hint or "", re.IGNORECASE):
+                if not re.search(r'\bOFFSET\s+\d+', raw_sql, re.IGNORECASE):
+                    _base_prompt = re.sub(r"\[SQL\]\s*$", "", prompt).rstrip()
+                    forced_prompt = (
+                        _base_prompt
+                        + f"\n\n### MANDATORY (do not deviate)\n"
+                        f"Your schema_hint above resolves \"the Nth one\" via a LIMIT 1 OFFSET "
+                        f"clause on audit_cycle — your query MUST include that same LIMIT/OFFSET "
+                        f"row-selection (directly, or via a subquery/CTE using it to pin the "
+                        f"specific cycle). Do NOT drop it and query across every cycle instead, "
+                        f"and do NOT substitute a different table structure copied from one of "
+                        f"the examples.\n"
+                        f"[SQL]\n"
+                    )
+                    import logging as _logging
+                    _logging.getLogger("inspectai").warning(
+                        "[offset-guard] retry fired — schema_hint has OFFSET, raw_sql doesn't"
+                    )
+                    if _debug_logger:
+                        _debug_logger.debug(
+                            "  [offset-guard] firing retry — schema_hint has OFFSET, raw_sql doesn't"
+                        )
+                    response_og = sql_llm.complete(forced_prompt)
+                    raw_sql = str(response_og).strip()
+                    if _debug_logger:
+                        _debug_logger.debug(
+                            f"\n{'='*70}\n>>> DEEPSEEK RAW OUTPUT (offset-guard retry)"
+                            f"\n{'='*70}\n{raw_sql}\n"
+                        )
+
+                    if not re.search(r'\bOFFSET\s+\d+', raw_sql, re.IGNORECASE):
+                        _logging.getLogger("inspectai").warning(
+                            "[offset-guard] retry did NOT fix it — still no OFFSET"
+                        )
+                        if _debug_logger:
+                            _debug_logger.debug(
+                                "  [offset-guard] retry unsuccessful — still no OFFSET"
+                            )
+        except Exception as _og_exc:
+            if _debug_logger:
+                _debug_logger.debug(f"  [offset-guard] skipped: {_og_exc}")
+        # ── end ordinal-offset guard ─────────────────────────────────────────
 
         # ── Table guard: if inject rules required specific tables and they're
         # missing from the generated SQL, force one retry with the requirement
@@ -424,6 +561,13 @@ def generate_sql(
         if _axis_mutations and _debug_logger:
             _debug_logger.debug(f"  [intent-autocorrect] {'; '.join(_axis_mutations)}")
 
+        # Question-independent (SQL-shape-only, like ast_repair) — see its
+        # own docstring for why dropping a WHERE term is safe here despite
+        # cleaner.py's general rule against doing so.
+        sql, _name_filter_mutations = validator.strip_redundant_name_filter_on_undefined_alias(sql)
+        if _name_filter_mutations and _debug_logger:
+            _debug_logger.debug(f"  [intent-autocorrect] {'; '.join(_name_filter_mutations)}")
+
         # validate() returns ValidationResult — hard fails block, soft warns are advisory only.
         vresult = validator.validate(sql, question)
 
@@ -461,6 +605,15 @@ def generate_sql(
             sql, _identity_mutations = validator.inject_row_identity(sql)
             if _identity_mutations and _debug_logger:
                 _debug_logger.debug(f"  [row-identity] {'; '.join(_identity_mutations)}")
+
+            # Same rationale, different shape: ai_audit_answers/ai_answers.
+            # submission_id is already a directly-filterable value (not a
+            # primary key needing a synthetic __id sibling), but confirmed
+            # live 2026-07-31 the SQL-gen model doesn't reliably include it
+            # alongside answer_text on its own — this makes it deterministic.
+            sql, _obs_mutations = validator.inject_observation_submission_id(sql)
+            if _obs_mutations and _debug_logger:
+                _debug_logger.debug(f"  [row-identity] {'; '.join(_obs_mutations)}")
 
         # Log cleaned SQL and validation result
         if _debug_logger:

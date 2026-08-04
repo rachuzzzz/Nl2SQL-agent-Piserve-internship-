@@ -10,6 +10,7 @@ from typing import Optional
 
 from src.agent.orchestrator.models import ConversationTurn
 from src.agent.orchestrator.debug import _ilike_escape
+from src.agent.orchestrator.disambiguation import entity_type_for_ordinal_noun
 
 
 
@@ -46,6 +47,19 @@ class ConversationSession:
         # back ("what about Facility A again") get it back even though it's
         # no longer the current_scope and long since evicted from self.turns.
         self.entity_memory: list[dict] = []
+        # Plain-language "here's what I resolved your reference to" string,
+        # computed fresh by build_context_block() below whenever THIS turn's
+        # question contains an ordinal/back-reference — e.g. "Showing results
+        # for 'del 01' (3rd item in your previous list)". Read by
+        # synthesis.py's _synthesize() and prepended to the deterministic
+        # row-dump answer text. Exists because that answer text is built by a
+        # plain Python formatter, not composed by the LLM — a prompt-only
+        # instruction telling the LLM to "state what you resolved" can never
+        # surface through that path, since the formatter never reads the
+        # LLM's own final_answer/thought text. Reset to "" at the top of
+        # every build_context_block() call so a resolution from an earlier
+        # turn never leaks into a later turn's answer that didn't need one.
+        self.pending_resolved_disclosure: str = ""
 
     def add_turn(self, turn: ConversationTurn):
         self.turns.append(turn)
@@ -89,6 +103,7 @@ class ConversationSession:
         return ""
 
     def build_context_block(self, current_question: str = "", current_domain: str = "") -> str:
+        self.pending_resolved_disclosure = ""
         if not self.turns:
             return ""
 
@@ -151,7 +166,22 @@ class ConversationSession:
             if t.single_row_values:
                 lines.append(f"  ★ single-row result: {t.single_row_values}")
             if t.row_titles:
-                lines.append(f"  ★ items from this result, IN ORDER: {t.row_titles}")
+                # Capped preview, unlike the sibling ★ lists above this was
+                # historically rendered in full — harmless for the short
+                # id-code lists synthesis.py usually captures, but one of its
+                # three capture paths (the observation/submission_id path)
+                # stores full free-text answer_text values, and a turn
+                # listing many rows (LIMIT 100 is this codebase's standard
+                # pattern) echoed the ENTIRE list into every subsequent
+                # turn's context for up to MAX_TURNS turns — confirmed live
+                # as a real contributor to a reasoning-LLM prompt hitting
+                # num_ctx and truncating its own tool-call JSON mid-object.
+                # Render-only: ordinal resolution below indexes the full
+                # stored row_titles/row_ids on the ConversationTurn, never
+                # this preview, so "the 47th one" still works unchanged.
+                _preview = [str(x)[:80] for x in t.row_titles[:10]]
+                _more = f" (+{len(t.row_titles) - 10} more)" if len(t.row_titles) > 10 else ""
+                lines.append(f"  ★ items from this result, IN ORDER: {_preview}{_more}")
             # Show active subject for each turn
             if t.active_subject_type and t.active_subject_value:
                 lines.append(
@@ -176,29 +206,126 @@ class ConversationSession:
         # ACTIVE SUBJECT (which can persist across many unrelated turns) and
         # not to an older turn's list — regardless of what ACTIVE SUBJECT
         # says below.
+        # Word-form ordinals up to twentieth — matches the raised row_titles/
+        # row_ids capture cap in synthesis.py (up to 20, the same limit the
+        # deterministic answer formatter actually displays to the user via
+        # max_display_rows). Numeric-suffix ordinals (6th, 10th, 23rd, ...)
+        # are handled generically below via regex, not hardcoded — a fixed
+        # 1st-5th word list was confirmed live 2026-07-31 to silently fail
+        # "show observations for the 10th one" (no match at all, since "10th"
+        # wasn't in the list): the model got no ORDINAL context, fell back to
+        # re-listing the same rows on its own, and the turn ended there
+        # without ever actually answering what was asked.
+        _ORDINAL_WORDS = (
+            "first", "second", "third", "fourth", "fifth", "sixth", "seventh",
+            "eighth", "ninth", "tenth", "eleventh", "twelfth", "thirteenth",
+            "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth",
+            "nineteenth", "twentieth",
+        )
+        _ORDINAL_WORD_TO_IDX = {w: i for i, w in enumerate(_ORDINAL_WORDS)}
+
+        def _ordinal_to_idx(word: str):
+            # \s* between digit and suffix tolerates "2 nd" as well as "2nd"
+            # — confirmed live 2026-07-31: "list all audit plans by the 2 nd
+            # person in the list" had this exact space (a plausible typo, not
+            # contrived), never matched, so NO structured ORDINAL context got
+            # injected at all. Unlike other ordinal misses this session where
+            # the model's own conversation-history fallback still landed on
+            # a reasonable answer, this one sent it into a genuine stuck
+            # reasoning loop — 9 LLM calls, ~165K tokens, 122 seconds,
+            # success=False. Worth the tolerance given a real failure this
+            # severe, not just a theoretical gap.
+            w = re.sub(r"\s+", "", word.lower())
+            m = re.match(r"^(\d+)(?:st|nd|rd|th)$", w)
+            if m:
+                n = int(m.group(1))
+                return n - 1 if n >= 1 else None
+            return _ORDINAL_WORD_TO_IDX.get(w)
+
+        def _ord_suffix(idx0: int) -> str:
+            pos = idx0 + 1
+            if 10 <= pos % 100 <= 20:
+                return "th"
+            return {1: "st", 2: "nd", 3: "rd"}.get(pos % 10, "th")
+
+        # \s* between digit and suffix tolerates "2 nd" as well as "2nd" — see
+        # _ordinal_to_idx's matching comment for why this matters live.
+        #
+        # Negative lookahead excludes "First/Second/Third(-)party" — confirmed
+        # live 2026-08-04: "list all schedules under Second party audit"
+        # matched "Second" as an ordinal, resolving against an unrelated
+        # prior turn's list (e.g. the 2nd row of a plans listing) even
+        # though the question is a plain name filter — 'First Party',
+        # 'Second Party', and 'Third party / ISO audit' are real audit_type
+        # values, and 'Third-party inspection' a real inspection_type value
+        # (confirmed against the live DB), so this collision hits BOTH
+        # domains. Only "party"/"parties" is excluded, not the ordinal words
+        # generally — "party" never appears as a genuine ordinal-referenced
+        # noun in this schema, so this can't suppress a real ordinal follow-up.
         _ORDINAL_RE = re.compile(
-            r"\b(the\s+)?(1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth)"
+            r"\b(the\s+)?(\d+\s*(?:st|nd|rd|th)|" + "|".join(_ORDINAL_WORDS) + r")"
+            r"(?!-?\s*part(?:y|ies)\b)"
             r"(\s+(one|row|result|plan|entry|item))?\b",
             re.IGNORECASE,
         )
         _ordinal_match = _ORDINAL_RE.search(current_question)
         if _ordinal_match:
-            _last_with_items = next(
-                (t for t in reversed(self.turns) if t.row_titles), None
+            # Noun bound to THIS ordinal — only the few words immediately
+            # AFTER the match ("the 6th AUDITOR"), never the whole question,
+            # so an unrelated noun earlier in the sentence ("list all audit
+            # PLANS under the 6th auditor") isn't mistaken for it. Confirmed
+            # live (qid=081c7a81): without this type check, "the 6th
+            # auditor" silently resolved against the most recent list
+            # turn regardless of type (a CYCLES list, in that case), using
+            # one cycle's UUID as if it were an auditor's id — a
+            # well-formed but empty result, wrong with no error.
+            _ord_tail = current_question[_ordinal_match.end():].strip()
+            _ord_noun_type = entity_type_for_ordinal_noun(
+                " ".join(_ord_tail.split()[:6]), current_domain
             )
+
+            if _ord_noun_type:
+                _last_with_items = next(
+                    (t for t in reversed(self.turns)
+                     if t.row_titles and t.row_entity_type == _ord_noun_type),
+                    None,
+                )
+                if _last_with_items is None:
+                    # A noun was named but no matching-type list exists
+                    # anywhere in history — ask, never silently resolve
+                    # against a differently-typed list.
+                    lines.append(
+                        f"ORDINAL REFERENCE NEEDS CLARIFICATION "
+                        f"('{_ordinal_match.group(0).strip()}') — the question "
+                        f"refers to an ordinal position among '{_ord_noun_type}'-"
+                        f"type items, but no earlier turn in this conversation "
+                        f"actually listed items of that type. Do NOT resolve "
+                        f"this against any OTHER list shown above (even if one "
+                        f"exists) — it is a different kind of item, and "
+                        f"guessing would silently answer the wrong question. "
+                        f"YOU MUST call final_answer NOW asking the user to "
+                        f"first show/list the '{_ord_noun_type}' items they "
+                        f"mean — do NOT call generate_sql.\n"
+                    )
+            else:
+                # No recognized noun — bare ordinal ("the 4th one"). Exact
+                # prior behavior, unchanged: most recent turn with any
+                # row_titles, regardless of type.
+                _last_with_items = next(
+                    (t for t in reversed(self.turns) if t.row_titles), None
+                )
+
             if _last_with_items:
-                _ORDINAL_WORD_TO_IDX = {
-                    "1st": 0, "first": 0, "2nd": 1, "second": 1,
-                    "3rd": 2, "third": 2, "4th": 3, "fourth": 3,
-                    "5th": 4, "fifth": 4,
-                }
                 _ord_word = _ordinal_match.group(2).lower()
-                _idx = _ORDINAL_WORD_TO_IDX.get(_ord_word)
+                _idx = _ordinal_to_idx(_ord_word)
                 _target_id = ""
+                _target_col = "id"
                 if (_idx is not None
                         and _idx < len(_last_with_items.row_titles)
                         and _idx < len(_last_with_items.row_ids)):
                     _target_id = _last_with_items.row_ids[_idx]
+                    if _idx < len(_last_with_items.row_id_columns):
+                        _target_col = _last_with_items.row_id_columns[_idx] or "id"
 
                 if _target_id:
                     # Deterministic resolution — inject_row_identity() (see
@@ -208,18 +335,65 @@ class ConversationSession:
                     # happens to be shared by another row (confirmed live:
                     # 'Delegation testing' appears twice in the same 7-row
                     # plan listing — two different plans, same title).
+                    self.pending_resolved_disclosure = (
+                        f"Showing results for {_last_with_items.row_titles[_idx]!r} "
+                        f"({_idx + 1}{_ord_suffix(_idx)} item in your previous list):"
+                    )
+                    _non_pk_note = (
+                        # Confirmed live: the reasoning model correctly received
+                        # this exact UUID and correctly resolved "the 1st one",
+                        # but then wrote WHERE arep.audit_id = '<uuid>' instead
+                        # of WHERE arep.id = '<uuid>' — because "id" here is a
+                        # bare, ungrounded token; nowhere ELSE in this same
+                        # prompt does the model ever see a column literally
+                        # named "id" for this row, whereas it has repeatedly
+                        # seen audit_id/schedule_id/corrective_action_id/
+                        # inspection_id as ITS identifying column (★ items
+                        # list, ACTIVE CONTEXT, prior SQL). The query executed
+                        # without error and silently returned 0 rows. Naming
+                        # and ruling out those display columns explicitly
+                        # (rather than just saying "id") is the fix — a
+                        # deterministic AST guardrail
+                        # (DISPLAY_CODE_UUID_COMPARE in ast_checks.py) also
+                        # blocks this shape as a backstop either way.
+                        f" NOTE: '{_target_col}' here means the row's actual "
+                        f"PRIMARY KEY column (<alias>.id) — it is a different "
+                        f"column from audit_id/schedule_id/corrective_action_id/"
+                        f"inspection_id, the human-readable VARCHAR display "
+                        f"codes you may have seen for this same row elsewhere "
+                        f"in this context. A UUID like '{_target_id}' will "
+                        f"never match one of those display columns — it "
+                        f"silently returns 0 rows instead of erroring.\n"
+                        if _target_col == "id" else
+                        f" NOTE: {_target_col} is NOT a table's primary key — it's a "
+                        f"correlation value shared across tables (e.g. "
+                        f"ai_audit_answers.submission_id / ai_answers.submission_id "
+                        f"also matches a corrective action's observation_id, cast as "
+                        f"::varchar). Filter directly on the exact column this value "
+                        f"came from, do not treat it as some table's own .id.\n"
+                    )
                     lines.append(
                         f"ORDINAL RESOLVED ('{_ordinal_match.group(0).strip()}') — "
                         f"row {_idx + 1} of the list from the MOST RECENT turn that "
-                        f"listed multiple rows = id '{_target_id}' (display value "
-                        f"{_last_with_items.row_titles[_idx]!r}).\n"
-                        f"  Use WHERE <alias>.id = '{_target_id}' — NOT title/ILIKE, "
-                        f"even if this display value appears more than once in that "
-                        f"list. Do NOT resolve against any ◆ ACTIVE SUBJECT below — "
-                        f"that pointer may be stale, carried over from an unrelated "
-                        f"earlier turn.\n"
+                        f"listed multiple rows = {_target_col} '{_target_id}' (display "
+                        f"value {_last_with_items.row_titles[_idx]!r}).\n"
+                        f"  Use WHERE <alias>.{_target_col} = '{_target_id}' — NOT "
+                        f"title/ILIKE, even if this display value appears more than "
+                        f"once in that list. Do NOT resolve against any ◆ ACTIVE "
+                        f"SUBJECT below — that pointer may be stale, carried over "
+                        f"from an unrelated earlier turn.\n"
+                        f"{_non_pk_note}"
+                        f"  (Your answer will automatically be prefixed with a "
+                        f"disclosure naming this resolved item — see "
+                        f"pending_resolved_disclosure — you do not need to restate "
+                        f"it yourself.)\n"
                     )
                 else:
+                    if _idx is not None and _idx < len(_last_with_items.row_titles):
+                        self.pending_resolved_disclosure = (
+                            f"Showing results for {_last_with_items.row_titles[_idx]!r} "
+                            f"({_idx + 1}{_ord_suffix(_idx)} item in your previous list):"
+                        )
                     lines.append(
                         f"ORDINAL REFERENCE DETECTED ('{_ordinal_match.group(0).strip()}') — "
                         f"resolve it against the ★ items list from the MOST RECENT turn that "
@@ -227,6 +401,10 @@ class ConversationSession:
                         f"◆ ACTIVE SUBJECT below — that pointer may be stale, carried over from "
                         f"an unrelated earlier turn. 'the first one' = "
                         f"{_last_with_items.row_titles[0]!r}.\n"
+                        f"  (Your answer will automatically be prefixed with a disclosure "
+                        f"naming the resolved item, if one could be determined — see "
+                        f"pending_resolved_disclosure — you do not need to restate it "
+                        f"yourself.)\n"
                     )
                     # DUPLICATE-WITHIN-LIST TRAP — fallback path only, for
                     # query shapes inject_row_identity() skips (e.g. GROUP
@@ -531,6 +709,10 @@ class ConversationSession:
                         f" or form answers should filter EXACTLY by WHERE fac.id = '{_fid}'"
                         f" — NOT ILIKE — unless the user explicitly asks for a global/all-facilities view."
                         f" Do NOT query globally when the context is scoped to this facility."
+                        f" If this turn's own question isn't actually about mitigative actions/"
+                        f"inspections/scores/form answers for a facility at all — e.g. it's asking"
+                        f" for a global ranking, count, or comparison — IGNORE this scope and answer"
+                        f" globally instead; it may be stale, carried over from an unrelated earlier turn."
                     )
                 else:
                     lines.append(
@@ -540,6 +722,10 @@ class ConversationSession:
                         f" (fac.name ILIKE '%{_ilike_escape(active_label)}%') unless the user explicitly asks"
                         f" for a global/all-facilities view."
                         f" Do NOT query globally when the context is scoped to this facility."
+                        f" If this turn's own question isn't actually about mitigative actions/"
+                        f"inspections/scores/form answers for a facility at all — e.g. it's asking"
+                        f" for a global ranking, count, or comparison — IGNORE this scope and answer"
+                        f" globally instead; it may be stale, carried over from an unrelated earlier turn."
                     )
             elif active_type == "entity":
                 # Generic scope for project/client/organisation — same idea as

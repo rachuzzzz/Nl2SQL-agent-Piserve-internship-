@@ -267,6 +267,23 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         if session and session.turns:
             system_content += "\n\n" + session.build_context_block(question, current_domain=self.domain)
 
+        # Cheap char-count proxy for "getting close to num_ctx" — this
+        # codebase doesn't tokenize prompts client-side, so this is only a
+        # rough correlate, not a token count. Confirmed live (twice: the
+        # 2026-06-13 fix referenced above, and again via row_titles growth)
+        # that num_ctx overflow silently truncates the model's own tool-call
+        # JSON mid-object rather than erroring — this makes the NEXT
+        # occurrence visible in debug_llm logs as a warning before it
+        # truncates, instead of only being diagnosable after the fact from
+        # the truncated output. Threshold is deliberately rough (~15-18K
+        # tokens' worth of chars, comfortably below the 20K num_ctx ceiling).
+        if len(system_content) > 60_000:
+            _log_llm.warning(
+                "[PROMPT-SIZE] system_content=%d chars — approaching num_ctx=20000 "
+                "budget, tool-call JSON may truncate",
+                len(system_content),
+            )
+
         messages = [
             ChatMessage(role=MessageRole.SYSTEM, content=system_content),
             ChatMessage(role=MessageRole.USER, content=question),
@@ -369,7 +386,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                                 ))
                             return AgentResult(question, ans, steps, 1, True, stats)
 
-                        ans = self._synthesize(question, "execute_sql", er, max_display_rows=100, sql=prev.sql)
+                        ans = self._synthesize(question, "execute_sql", er, max_display_rows=100, sql=prev.sql, session=session)
                         stats.total_wall_ms = int((time.time() - query_start) * 1000)
                         if session is not None:
                             _pg_name, _pg_candidates = self._extract_disambiguation(
@@ -408,7 +425,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                                   "get_answers", ga_args, er, 0)
                     steps.append(s); _emit(s)
                     if er.get("success"):
-                        ans = self._synthesize(question, "get_answers", er, max_display_rows=100)
+                        ans = self._synthesize(question, "get_answers", er, max_display_rows=100, session=session)
                         stats.total_wall_ms = int((time.time() - query_start) * 1000)
                         if session is not None:
                             session.add_turn(ConversationTurn(
@@ -589,6 +606,44 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                     ))
                 return AgentResult(question, ans, steps, iteration, True, stats)
 
+            if tool == "redirect_domain":
+                suspected = str(args.get("suspected_domain", "")).upper()
+                ans = args.get("answer", "")
+                s = AgentStep(iteration, thought, "redirect_domain", args,
+                              {"suspected_domain": suspected, "answer": ans},
+                              int((time.time()-t0)*1000))
+                steps.append(s); _emit(s)
+                stats.total_wall_ms = int((time.time() - query_start) * 1000)
+                if session is not None:
+                    # domain="" (NOT self.domain) — deliberately mirrors
+                    # chat.py's own Tier-3 AMBIGUOUS turn construction, which
+                    # also omits domain=. If left as self.domain (the domain
+                    # that just misfired), Tier-2 stickiness on the NEXT
+                    # ambiguous follow-up would stick right back to the
+                    # domain that admitted uncertainty, defeating the point.
+                    # ConversationTurn.domain already defaults to "", so this
+                    # just means not overriding it.
+                    #
+                    # Deliberately NOT setting clarification_origin_question —
+                    # that field drives a different, same-domain "PENDING
+                    # CLARIFICATION" hint in session.py's build_context_block,
+                    # whose premise is "the next message answers THIS SAME
+                    # orchestrator's own question." Setting it here would
+                    # inject a redundant/conflicting hint into whichever
+                    # orchestrator (a possibly different domain instance)
+                    # handles the next turn.
+                    #
+                    # tool_used="domain_clarification" is the exact same
+                    # literal string chat.py's own router-AMBIGUOUS branch
+                    # already writes — this is what lets chat.py's existing
+                    # resume-from-reply logic (_is_pending_domain_pick) pick
+                    # this turn up unchanged, with no chat.py edits needed.
+                    session.add_turn(ConversationTurn(
+                        question=question, answer=ans[:300],
+                        tool_used="domain_clarification",
+                    ))
+                return AgentResult(question, ans, steps, iteration, True, stats)
+
             # Any direct execute_sql call the LLM emits only ever carries {"sql": "..."}
             # (see system_prompt.txt's tool schema) — it never supplies "question". Without
             # this, validator.validate(sql, question) receives question="" and every
@@ -618,6 +673,39 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                             question, "You don't have permission to query this data.",
                             steps, iteration, False, stats,
                         )
+
+            # Redirect get_answers -> generate_sql when the question is about
+            # observations/findings on an audit — get_answers(inspection_id=...)
+            # returns the WHOLE form (every question), not the one observation
+            # field. system_prompt.txt already documents this for the narrower
+            # "observation for this CA" direction, but confirmed live
+            # 2026-07-31: "what were the observations raised for that [audit]"
+            # (the more common, direct audit->observations direction) still hit
+            # this trap — fetched all 27 form answers, then the very next turn
+            # ("corrective actions for this particular observation") couldn't
+            # tell which of the 27 was meant and had to stop and ask, a dead
+            # end that only existed because this turn fetched the wrong thing.
+            # A prompt rule alone already missed this once under different
+            # phrasing, so this blocks it deterministically instead of relying
+            # on the LLM reliably reading the narrower worked example.
+            if (tool == "get_answers" and self.domain == "audit"
+                    and re.search(r"\bobservations?\b|\bfindings?\b", question, re.IGNORECASE)):
+                messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
+                messages.append(ChatMessage(role=MessageRole.USER, content=(
+                    "get_answers(inspection_id=...) returns the audit's WHOLE form — "
+                    "every question, not just the observation. For 'observations'/"
+                    "'findings' about an audit, use generate_sql instead: "
+                    "JOIN ai_audit_answers aaa ON aaa.audit_report_id = arep.id "
+                    "JOIN ai_questions aq ON aaa.element_id = aq.element_id "
+                    "WHERE aq.label = 'Findings / Remarks'.\n"
+                    f"Original question: \"{question}\"\n"
+                    "Rewrite this as a generate_sql call for THIS question."
+                )))
+                s = AgentStep(iteration, "[auto] blocked get_answers for observations",
+                              "[blocked]", args,
+                              {"error": "redirected to generate_sql (observations/findings)"}, 0)
+                steps.append(s); _emit(s)
+                continue
 
             # Pass scope through to get_answers so the tool enforces data visibility.
             # scope_filter is never 'BLOCK' here — BLOCK is returned before this loop.
@@ -731,7 +819,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                         messages.append(ChatMessage(role=MessageRole.USER, content=followup))
                         continue
 
-                    ans = self._synthesize(question, "execute_sql", er, sql=sql)
+                    ans = self._synthesize(question, "execute_sql", er, sql=sql, session=session)
                     return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
                 else:
@@ -795,7 +883,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                                              "execute_sql", {"sql": sql}, er, 0)
                             steps.append(auto); _emit(auto)
                             if er.get("success"):
-                                ans = self._synthesize(question, "execute_sql", er, sql=sql)
+                                ans = self._synthesize(question, "execute_sql", er, sql=sql, session=session)
                                 return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
                             # Forced execution still failed — either a genuine Postgres
@@ -823,7 +911,8 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             # Path B: terminal tools → synthesize and return
             if tool in self._TERMINAL_TOOLS and result.get("success"):
                 ans = self._synthesize(question, tool, result,
-                                        sql=args.get("sql", "") if tool == "execute_sql" else "")
+                                        sql=args.get("sql", "") if tool == "execute_sql" else "",
+                                        session=session)
                 return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
 
             # Path C: non-terminal → continue reasoning

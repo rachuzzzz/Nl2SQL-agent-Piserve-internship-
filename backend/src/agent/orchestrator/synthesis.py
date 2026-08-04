@@ -21,6 +21,44 @@ from src.agent.orchestrator.models import AgentStep, QueryStats, ConversationTur
 from src.agent.orchestrator.debug import _ilike_escape, _has_uuid_leak, _dbg, _detect_truncation
 
 
+# Maps each ACTIVE CONTEXT scope type to the SQL keyword(s) that indicate
+# THIS turn's own query still relates to it — used below to stop a stale
+# scope from being silently re-affirmed onto an unrelated turn. Confirmed
+# live: a facility scope set by one turn's incidental facility_name column
+# (2 rows sharing a facility, neither about the facility itself) got
+# silently re-stamped onto 5 unrelated intervening turns (observations,
+# corrective actions, capex rankings — none referencing a facility at all)
+# via the inheritance branch below, then misapplied to a 6th turn's global
+# FM-manager ranking ("show top 5 of the same"), filtering it down to 1 row
+# with no error. Deliberately scoped to the types with one fixed,
+# unambiguous table name — "inspector"/"entity" aren't included, not
+# confirmed to need the same gate and harder to pin to one keyword (person
+# joins vary: inspector_user_id/auditor_id/auditee_id/...).
+_SCOPE_RELEVANCE_KEYWORDS = {
+    "facility": ("facility",),
+    "cycle": ("cycle",),
+    "audit": ("audit_report", "audit_plan", "audit_schedule"),
+    "inspection": ("inspection_report",),
+    "plan": ("audit_plan",),
+}
+
+
+def _sql_still_relevant_to_scope(sql: str, scope_type: str) -> bool:
+    """True when it's safe to keep carrying this scope forward — either the
+    type isn't gated (see _SCOPE_RELEVANCE_KEYWORDS) or this turn's own SQL
+    shows some sign of relating to it. Empty SQL (no generate_sql this
+    turn — e.g. a get_answers pagination turn) is treated as "can't tell,
+    don't disturb it" — the existing pagination-continuation mechanism
+    already owns that case elsewhere."""
+    if not sql:
+        return True
+    keywords = _SCOPE_RELEVANCE_KEYWORDS.get(scope_type, ())
+    if not keywords:
+        return True
+    sql_lower = sql.lower()
+    return any(kw in sql_lower for kw in keywords)
+
+
 class SynthesisMixin:
 
     # ------------------------------------------------------------------ #
@@ -188,17 +226,144 @@ class SynthesisMixin:
         # re-deriving a row from row_titles[idx]'s display string, which may
         # not be unique (see plan_titles' docstring above).
         row_ids = []
+        # Paired 1:1 with row_ids — the COLUMN NAME the id actually filters
+        # on, e.g. "id" for the usual __id-sibling-injected primary key, or
+        # "submission_id" for an ai_audit_answers/ai_answers observation row
+        # (see Priority 0 below). session.py's ORDINAL RESOLVED hint reads
+        # this to phrase the right WHERE clause (<alias>.id vs
+        # <alias>.submission_id) instead of always assuming a primary key.
+        row_id_columns = []
+        # One value for the WHOLE turn (not per row) — which entity type the
+        # list actually is, set once from whichever priority branch below
+        # fires first. Lets session.py's ordinal resolver require a named
+        # noun ("the 6th AUDITOR") to match the type of list being resolved
+        # against, instead of matching any list regardless of type — see
+        # models.py's row_entity_type field docstring for the confirmed-live
+        # bug this closes.
+        row_entity_type = ""
+        _ROW_ID_COL_TYPES = {
+            "audit_id": "audit", "schedule_id": "schedule",
+            "inspection_id": "inspection", "corrective_action_id": "corrective_action",
+        }
+        _ROW_NAME_COL_TYPES = {
+            "facility_name": "facility", "auditor_name": "person", "inspector_name": "person",
+        }
+        # Capped at 20, matching max_display_rows' default — the same number
+        # of rows the deterministic answer formatter (_synthesize_body) actually
+        # shows the user. Was capped at 5 until 2026-07-31: live-confirmed
+        # "list all audits" displayed 17 rows to the user, but "show
+        # observations for the 10th one" had nothing to resolve against since
+        # row_titles/row_ids only ever captured the first 5 — combined with
+        # session.py's old 1st-5th-only ordinal word list, "the 10th one" had
+        # no chance of resolving either way. Rows beyond what's actually
+        # displayed have no visible position for an ordinal to refer to, so
+        # this cap should always track max_display_rows, not exceed it.
         if len(last_rows) > 1:
-            for row in last_rows[:5]:
+            for row in last_rows[:20]:
                 if not isinstance(row, dict):
                     continue
-                for col in ("title", "name", "audit_id", "schedule_id",
-                            "inspection_id", "corrective_action_id",
-                            "facility_name", "auditor_name", "inspector_name"):
+                _matched = False
+                # Priority 0: an observation/answer row (ai_audit_answers or
+                # ai_answers) — submission_id IS the real, directly-filterable
+                # identifier already (no __id sibling needed, unlike entity
+                # tables), and answer_text is the meaningful display value.
+                # Confirmed live 2026-07-31: "what were the corrective actions
+                # for the first finding in the above list" — the model's OWN
+                # reasoning correctly named the exact submission_id from the
+                # prior turn's listing, but nothing structured carried it
+                # forward, so the generated SQL fell back to a generic
+                # ORDER BY/LIMIT 1 instead of filtering on that exact id. Only
+                # happened to return the right (empty) answer because that
+                # particular audit had zero corrective actions at all —
+                # a different audit with multiple findings and CAs would have
+                # silently picked the wrong one.
+                if row.get("submission_id") and row.get("answer_text"):
+                    row_titles.append(str(row["answer_text"]))
+                    row_ids.append(str(row["submission_id"]))
+                    row_id_columns.append("submission_id")
+                    if not row_entity_type:
+                        row_entity_type = "observation"
+                    continue
+                # Priority 1: the row's own identifier columns — these are
+                # the grammatical subject of a list question ("show all
+                # AUDITS" -> audit_id) even when a joined PARENT's title
+                # (e.g. "plan_title" on an audits-under-a-plan listing) is
+                # also present on the same row. Must be checked before the
+                # title-suffix match below, or the parent's title wins by
+                # accident whenever it isn't literally named "title" (see
+                # test_row_ids_paired_with_row_titles_multi_row_list).
+                for col in ("audit_id", "schedule_id", "inspection_id",
+                            "corrective_action_id"):
                     v = row.get(col)
                     if v and str(v).strip():
                         row_titles.append(str(v))
                         row_ids.append(str(row.get(f"{col}__id", "") or ""))
+                        row_id_columns.append("id")
+                        if not row_entity_type:
+                            row_entity_type = _ROW_ID_COL_TYPES[col]
+                        _matched = True
+                        break
+                if _matched:
+                    continue
+                # Priority 1.5: audit_cycle/inspection_cycle composite display
+                # (date range + status) — cycles have NO name/title column at
+                # all. Gated on the "<alias>_cycle_row__id" sibling actually
+                # being present (i.e. inject_row_identity()'s cycle branch —
+                # see validation/identity.py's _CYCLE_TABLES — fired for this
+                # row) rather than on a bare "status" column, so this can
+                # never misfire on some other joined table's own status
+                # column.
+                _cycle_id_key = next(
+                    (c for c in row if isinstance(c, str) and c.endswith("_cycle_row__id")),
+                    None,
+                )
+                if _cycle_id_key:
+                    _sd, _ed, _st = row.get("start_date"), row.get("end_date"), row.get("status")
+                    if _sd and _ed and _st:
+                        row_titles.append(f"{_sd} to {_ed} ({_st})")
+                        row_ids.append(str(row.get(_cycle_id_key) or ""))
+                        row_id_columns.append("id")
+                        if not row_entity_type:
+                            row_entity_type = "cycle"
+                        _matched = True
+                if _matched:
+                    continue
+                # Priority 2: bare "title" or *_title (e.g. "audit_plan_title"
+                # once aliased) — matches the plan_titles fix above via the
+                # SAME suffix logic. Only reached when no identifier column
+                # from priority 1 exists on the row at all, which is exactly
+                # the case for entities like audit_plan that have no separate
+                # business-id display column. Confirmed live 2026-07-30: a
+                # plans listing selected ap.title AS audit_plan_title with no
+                # audit_id/schedule_id/etc present; the old exact-match-only
+                # whitelist never matched "audit_plan_title", so row_titles
+                # stayed empty for that turn, the ordinal-resolution block in
+                # session.py had nothing to point at, and a later "the third
+                # one in the list" follow-up fell back to the LLM guessing its
+                # own ORDER BY/OFFSET from scratch — which it got wrong (ASC
+                # instead of matching the list's actual DESC display order),
+                # silently returning the wrong row.
+                for col in row:
+                    if isinstance(col, str) and (col == "title" or col.endswith("_title")):
+                        v = row.get(col)
+                        if v and str(v).strip():
+                            row_titles.append(str(v))
+                            row_ids.append(str(row.get(f"{col}__id", "") or ""))
+                            row_id_columns.append("id")
+                            if not row_entity_type:
+                                row_entity_type = "plan"
+                            _matched = True
+                        break
+                if _matched:
+                    continue
+                for col in ("name", "facility_name", "auditor_name", "inspector_name"):
+                    v = row.get(col)
+                    if v and str(v).strip():
+                        row_titles.append(str(v))
+                        row_ids.append(str(row.get(f"{col}__id", "") or ""))
+                        row_id_columns.append("id")
+                        if not row_entity_type and col in _ROW_NAME_COL_TYPES:
+                            row_entity_type = _ROW_NAME_COL_TYPES[col]
                         break
 
         # If only 1 row, store all values for maximum context
@@ -338,13 +503,24 @@ class SynthesisMixin:
             # last happened to pass it along.
             if not active_subject_type and session.current_scope:
                 _cs = session.current_scope
-                active_subject_type = _cs["type"]
-                active_subject_value = _cs["value"]
-                active_subject_label = _cs["label"]
-                active_subject_table = _cs["table"]
-                active_subject_alias = _cs["alias"]
-                active_subject_domain = _cs["domain"]
-                active_subject_id = _cs.get("id", "") or ""
+                if _sql_still_relevant_to_scope(last_sql, _cs["type"]):
+                    active_subject_type = _cs["type"]
+                    active_subject_value = _cs["value"]
+                    active_subject_label = _cs["label"]
+                    active_subject_table = _cs["table"]
+                    active_subject_alias = _cs["alias"]
+                    active_subject_domain = _cs["domain"]
+                    active_subject_id = _cs.get("id", "") or ""
+                else:
+                    # This turn's own SQL shows no sign of relating to the
+                    # stale scope — a real topic change, not a drilldown.
+                    # Clear it instead of letting it perpetuate onto the
+                    # NEXT unrelated turn too (add_turn() alone won't clear
+                    # a pre-existing current_scope just because this turn
+                    # sets no subject of its own). Doesn't lose the ability
+                    # to return to it later — entity_memory already exists
+                    # for recalling something named explicitly again.
+                    session.current_scope = None
 
         if session is not None:
             # MT-03 fix: if we have a facility name but no inspection_id (e.g. MT-01
@@ -487,6 +663,8 @@ class SynthesisMixin:
                 single_row_values=single_row_vals,
                 row_titles=row_titles,
                 row_ids=row_ids,
+                row_id_columns=row_id_columns,
+                row_entity_type=row_entity_type,
                 active_subject_type=active_subject_type,
                 active_subject_value=active_subject_value,
                 active_subject_label=active_subject_label,
@@ -517,7 +695,31 @@ class SynthesisMixin:
         r'\b(how\s+many|count|number\s+of|total)\b', re.IGNORECASE)
 
 
-    def _synthesize(self, question, tool_name, tool_result, max_display_rows=20, sql=""):
+    def _synthesize(self, question, tool_name, tool_result, max_display_rows=20, sql="", session=None):
+        """Thin wrapper around _synthesize_body(): prepends
+        session.pending_resolved_disclosure (set by
+        ConversationSession.build_context_block() when this turn's question
+        resolved an ordinal/back-reference — see session.py) to whatever
+        _synthesize_body() returns.
+
+        This has to live here, wrapping the return value, rather than as a
+        prompt instruction to the LLM, because most answers below are built
+        by plain Python string formatting ("Found N result(s): ...", "The
+        query returned no results.") — never composed by the LLM at all.
+        Confirmed live 2026-07-31: telling the LLM via the system prompt to
+        "state what you resolved" had zero effect on these answers, even
+        though the LLM's OWN internal thought correctly named the resolved
+        row — that reasoning never reaches this deterministic formatter, so
+        it can't appear in what the user sees unless injected here instead.
+        """
+        answer = self._synthesize_body(question, tool_name, tool_result,
+                                        max_display_rows=max_display_rows, sql=sql)
+        disclosure = getattr(session, "pending_resolved_disclosure", "") if session else ""
+        if disclosure:
+            return f"{disclosure}\n\n{answer}"
+        return answer
+
+    def _synthesize_body(self, question, tool_name, tool_result, max_display_rows=20, sql=""):
         data = tool_result.get("result", {})
         q_lower = question.lower()
 
@@ -776,7 +978,15 @@ class SynthesisMixin:
                               # audit-domain raw UUID FKs (see schema_introspector.py's
                               # AUDIT_FK_RESOLUTION) that would otherwise leak as UUIDs
                               "auditor_id", "auditee_id", "audit_cycle_id",
-                              "internal_stakeholder_id"}
+                              "internal_stakeholder_id",
+                              # deterministically injected by
+                              # inject_observation_submission_id() (see
+                              # validation/identity.py) whenever answer_text is
+                              # selected — a raw correlation key, not something
+                              # a human needs to read; still available in the
+                              # underlying row dict for row_titles/row_ids
+                              # capture in _finish(), which runs separately.
+                              "submission_id"}
                 # Confirmed live 2026-07-30 (eval run, 18/74 questions):
                 # inject_row_identity()'s __id-suffixed columns (see
                 # validation/identity.py) leaked a raw UUID straight into this
