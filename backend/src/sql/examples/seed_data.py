@@ -343,10 +343,31 @@ WHERE active = true AND target_close_out_date IS NOT NULL;
         'limit':  None,
     },
     {
-        'nl':     'list all cycles show inspection cycles what cycles are available inspection frequency cycles cycle types',
+        # DEFAULT for bare "cycles" — real inspection_cycle INSTANCES (a
+        # period with a start/end date and status), not the frequency/cadence
+        # types below. Confirmed live: a user asking "list all inspection
+        # cycles" plainly wants cycle instances, not Daily/Weekly cadence
+        # types — only route to frequency_definition when "frequency" is
+        # said explicitly (see the sibling example immediately below).
+        'nl':     'list all cycles show inspection cycles what cycles are available cycle types list all inspection cycles',
         'sql':    """\
--- "cycles" = inspection frequency/cadence types from frequency_definition
--- (Daily, Weekly, Quarterly Twice, etc.) — NOT inspection_cycle (cycle INSTANCES).
+-- inspection_cycle has NO name/title column — identify by date range + status.
+SELECT id, start_date, end_date, status
+FROM inspection_cycle
+WHERE active = true
+ORDER BY start_date DESC;
+""",
+        'domain': 'general',
+        'intent': 'filter',
+        'limit':  None,
+    },
+    {
+        # EXPLICIT-FREQUENCY variant — only when the user actually says
+        # "frequency" — cadence types (Daily, Weekly, Quarterly Twice, etc.),
+        # NOT inspection_cycle instances. See the DEFAULT example above for
+        # the bare "cycles" case, which now means instances instead.
+        'nl':     'list all frequency cycles what frequency types are available inspection frequency cycles frequency cadence types',
+        'sql':    """\
 -- frequency_definition columns: id, name, repeat_count, repeat_interval, repeat_unit, active
 -- NO 'description' column — do not select fd.description (hallucinated column)
 SELECT name AS frequency_name, repeat_count, repeat_interval, repeat_unit
@@ -2067,6 +2088,8 @@ ORDER BY schedule_count DESC;
     {
         'nl':     'show the inspection schedule for a specific facility',
         'sql':    """\
+-- inspection_schedule has NO inspection_report_id column — the FK runs the
+-- OTHER way (inspection_report.schedule_id -> inspection_schedule.id).
 SELECT isched.due_date, isched.status AS schedule_status,
        fd.name AS frequency_name,
        ir.inspection_id, ir.submitted_on
@@ -2074,7 +2097,7 @@ FROM inspection_schedule isched
 JOIN inspector_portfolio_details ipd ON isched.portfolio_details_id = ipd.id
 JOIN frequency_definition fd ON ipd.frequency_definition_id = fd.id
 JOIN facility fac ON isched.facility_id = fac.id
-LEFT JOIN inspection_report ir ON isched.inspection_report_id = ir.id
+LEFT JOIN inspection_report ir ON ir.schedule_id = isched.id
 WHERE fac.name ILIKE '%facility_name%'
 ORDER BY isched.due_date DESC LIMIT 50;
 """,
@@ -3950,14 +3973,25 @@ ORDER BY avg_score DESC;
 -- Scatter: capex_generated (x) vs capex_converted (y) per FM manager.
 -- Each point = one FM manager. Shows conversion efficiency.
 -- FM Manager = inspectee_user_id (NOT inspector_user_id).
+-- inspection_corrective_action's FK to inspection_report is inspection_id,
+-- NOT inspection_report_id (no such column). po_details links to the MA via
+-- mitigative_action_uuid, NOT a bare ica_id column (no such column either).
+-- Pre-aggregate po_details in a CTE first — a direct LEFT JOIN into this
+-- GROUP BY would fan out ica rows and double-count ica.capex whenever an MA
+-- has more than one PO row (confirmed bug elsewhere in this file: 2 POs + 1
+-- PR returned half the real capex).
+WITH po_agg AS (
+    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po
+    FROM po_details WHERE active = true GROUP BY 1
+)
 SELECT
-    COALESCE(SUM(ica.capex), 0)                                              AS capex_generated,
-    COALESCE(SUM(CASE WHEN pd.po_amount IS NOT NULL THEN pd.po_amount END), 0) AS capex_converted
+    COALESCE(SUM(ica.capex), 0)    AS capex_generated,
+    COALESCE(SUM(po.total_po), 0)  AS capex_converted
 FROM inspection_report ir
 JOIN users u ON ir.inspectee_user_id = u.id
 LEFT JOIN inspection_corrective_action ica
-       ON ica.inspection_report_id = ir.id AND ica.active = true
-LEFT JOIN po_details pd ON pd.ica_id = ica.id
+       ON ica.inspection_id = ir.id AND ica.active = true
+LEFT JOIN po_agg po ON po.ica_id = ica.id
 WHERE ir.active = true
   AND ir.status != 'DRAFT'
 GROUP BY u.id

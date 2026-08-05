@@ -49,6 +49,14 @@ def _entity_noun_tables(domain):
         (r"\bmitigative\s+actions?\b", "inspection_corrective_action", "corrective_action"),
         (r"\bschedules?\b", "inspection_schedule", "schedule"),
         (r"\bportfolios?\b", "inspector_portfolio", "portfolio"),
+        # Bare "cycle(s)" (no "inspection" prefix required) — the tail-only
+        # noun snippet passed here is just what follows the ordinal number
+        # ("the 3rd cycle" -> tail is "cycle", NOT "inspection cycle"; the
+        # word "inspection" sits earlier in the sentence, outside the tail
+        # this function ever sees). Confirmed live: bare "cycle" is exactly
+        # how this phrasing occurs in practice — same reason schedules?/
+        # portfolios? above are bare too, not "inspection schedules?".
+        (r"\bcycles?\b", "inspection_cycle", "cycle"),
     ] + _people
 
 

@@ -13,6 +13,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.engine import Engine
 
 from src.sql.validation import SQLValidator
+from src.llm.base import extract_token_counts
 
 
 _schema_cache: Optional[str] = None
@@ -264,20 +265,39 @@ def generate_sql(
             "{dynamic_examples}", dynamic_examples
         )
 
-        # Log the full prompt sent to deepseek if debug enabled
+        # "deepseek" in these labels is a hardcoded legacy name, not the
+        # actual configured model — this project moved off DeepSeek to Ollama
+        # (sqlcoder/qwen) and now optionally Claude (see llm_provider) long
+        # ago without the label ever being updated, so it stopped reflecting
+        # what really produced the output. sql_llm.model is a real field on
+        # both llm/ollama.py's and llm/anthropic.py's client objects, so this
+        # stays accurate across any future provider swap too.
+        _sql_model_name = getattr(sql_llm, "model", "?")
+
+        # Log the full prompt sent to the SQL-gen model if debug enabled
         if _debug_logger:
             _debug_logger.debug(
-                f"\n{'='*70}\n>>> DEEPSEEK PROMPT (question={question!r})\n"
+                f"\n{'='*70}\n>>> SQL-GEN PROMPT ({_sql_model_name}) (question={question!r})\n"
                 f"{'='*70}\n{prompt[-3000:]}\n"  # last 3000 chars — schema_hint is at end
             )
 
+        # Accumulated across every sql_llm.complete() call this invocation
+        # makes (initial + up to 3 guard retries below) — each is a real,
+        # separately-billed API call, so the total returned to the caller
+        # must be the sum, not just the last call's count.
+        _prompt_tok_total = 0
+        _completion_tok_total = 0
+
         response = sql_llm.complete(prompt)
         raw_sql = str(response).strip()
+        _pt, _ct = extract_token_counts(getattr(response, "raw", {}) or {})
+        _prompt_tok_total += _pt
+        _completion_tok_total += _ct
 
-        # Log raw deepseek output
+        # Log raw SQL-gen model output
         if _debug_logger:
             _debug_logger.debug(
-                f"\n{'='*70}\n>>> DEEPSEEK RAW OUTPUT\n{'='*70}\n{raw_sql}\n"
+                f"\n{'='*70}\n>>> SQL-GEN RAW OUTPUT ({_sql_model_name})\n{'='*70}\n{raw_sql}\n"
             )
 
         # ── Ordinal-offset guard: when schema_hint resolves "the Nth one"
@@ -335,9 +355,12 @@ def generate_sql(
                         )
                     response_og = sql_llm.complete(forced_prompt)
                     raw_sql = str(response_og).strip()
+                    _pt, _ct = extract_token_counts(getattr(response_og, "raw", {}) or {})
+                    _prompt_tok_total += _pt
+                    _completion_tok_total += _ct
                     if _debug_logger:
                         _debug_logger.debug(
-                            f"\n{'='*70}\n>>> DEEPSEEK RAW OUTPUT (offset-guard retry)"
+                            f"\n{'='*70}\n>>> SQL-GEN RAW OUTPUT ({_sql_model_name}) (offset-guard retry)"
                             f"\n{'='*70}\n{raw_sql}\n"
                         )
 
@@ -407,6 +430,9 @@ def generate_sql(
                         )
                     response2 = sql_llm.complete(forced_prompt)
                     raw_sql = str(response2).strip()
+                    _pt, _ct = extract_token_counts(getattr(response2, "raw", {}) or {})
+                    _prompt_tok_total += _pt
+                    _completion_tok_total += _ct
 
                     # Re-check: did the retry actually fix what triggered it?
                     # Without this, a small model ignoring the forced instruction
@@ -486,9 +512,12 @@ def generate_sql(
                     _debug_logger.debug(f"  [uuid-guard] firing retry — missing={_missing_uuid}")
                 response3 = sql_llm.complete(forced_prompt)
                 raw_sql = str(response3).strip()
+                _pt, _ct = extract_token_counts(getattr(response3, "raw", {}) or {})
+                _prompt_tok_total += _pt
+                _completion_tok_total += _ct
                 if _debug_logger:
                     _debug_logger.debug(
-                        f"\n{'='*70}\n>>> DEEPSEEK RAW OUTPUT (uuid-guard retry)\n{'='*70}\n{raw_sql}\n"
+                        f"\n{'='*70}\n>>> SQL-GEN RAW OUTPUT ({_sql_model_name}) (uuid-guard retry)\n{'='*70}\n{raw_sql}\n"
                     )
 
                 # Re-check: did the retry actually pin the required UUID filter(s)?
@@ -622,7 +651,7 @@ def generate_sql(
             else:
                 status = f"✗ FAILED: {vresult.retry_message()}"
             _debug_logger.debug(
-                f"\n{'='*70}\n>>> DEEPSEEK CLEANED SQL — {status}\n"
+                f"\n{'='*70}\n>>> SQL-GEN CLEANED SQL ({_sql_model_name}) — {status}\n"
                 f"{'='*70}\n{sql}\n"
             )
             if sem_warns:
@@ -644,12 +673,27 @@ def generate_sql(
                     # _vresult: structured object for orchestrator retry_message()
                     "_vresult": vresult,
                 },
+                # Internal-only, mirrors _vresult above — summed across every
+                # sql_llm.complete() call this invocation made (initial + any
+                # offset/table/uuid-guard retries), so the caller (loop.py)
+                # can fold real SQL-gen spend into QueryStats alongside the
+                # reasoning role's tokens.
+                "_token_usage": {
+                    "prompt_tokens": _prompt_tok_total,
+                    "completion_tokens": _completion_tok_total,
+                },
             },
             "error": None,
         }
     except Exception as exc:
         return {
             "success": False,
-            "result": {"sql": "", "validation": {"passed": False, "errors": [str(exc)]}},
+            "result": {
+                "sql": "", "validation": {"passed": False, "errors": [str(exc)]},
+                "_token_usage": {
+                    "prompt_tokens": _prompt_tok_total if "_prompt_tok_total" in locals() else 0,
+                    "completion_tokens": _completion_tok_total if "_completion_tok_total" in locals() else 0,
+                },
+            },
             "error": str(exc),
         }

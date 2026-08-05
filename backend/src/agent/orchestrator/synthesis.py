@@ -19,6 +19,7 @@ from src.api.response_formatting import strip_row_identity_columns
 
 from src.agent.orchestrator.models import AgentStep, QueryStats, ConversationTurn, AgentResult
 from src.agent.orchestrator.debug import _ilike_escape, _has_uuid_leak, _dbg, _detect_truncation
+from src.llm.base import extract_token_counts
 
 
 # Maps each ACTIVE CONTEXT scope type to the SQL keyword(s) that indicate
@@ -1193,8 +1194,7 @@ class SynthesisMixin:
             stats.total_llm_calls += 1
             stats.total_llm_latency_ms += latency_ms
             raw = getattr(response, "raw", {}) or {}
-            _prompt_tok = raw.get("prompt_eval_count", 0)
-            _completion_tok = raw.get("eval_count", 0)
+            _prompt_tok, _completion_tok = extract_token_counts(raw)
             stats.total_prompt_tokens += _prompt_tok
             stats.total_completion_tokens += _completion_tok
 
@@ -1205,8 +1205,17 @@ class SynthesisMixin:
         if self._debug:
             trunc = _detect_truncation(content)
             trunc_note = f"\n⚠ {trunc}" if trunc else ""
+            # Real configured model name, not a hardcoded "LLAMA" label — this
+            # codebase moved from Llama to Qwen (Ollama) and now optionally to
+            # Claude (see llm_provider) long ago without anyone updating this
+            # string, so the label had stopped meaning anything about what
+            # actually produced the output. self.reasoning_llm.model is a
+            # real field on both llm/ollama.py's and llm/anthropic.py's client
+            # objects, so this stays accurate across any future provider swap
+            # too, with no further edit needed here.
+            _model_name = getattr(self.reasoning_llm, "model", "?")
             _dbg(self._debug,
-                 f"LLAMA RAW OUTPUT [{latency_ms}ms]{trunc_note}",
+                 f"REASONING LLM RAW OUTPUT ({_model_name}) [{latency_ms}ms]{trunc_note}",
                  content, iteration)
 
         return content

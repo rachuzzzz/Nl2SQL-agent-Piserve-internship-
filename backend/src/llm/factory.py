@@ -11,6 +11,7 @@ changing the functions below, not every call site.
 from __future__ import annotations
 
 from src.llm.ollama import build_ollama_client
+from src.llm.anthropic import build_anthropic_client
 
 
 def get_reasoning_llm(model: str, base_url: str):
@@ -68,9 +69,56 @@ def get_sql_llm(model: str, base_url: str):
     )
 
 
+def get_reasoning_llm_anthropic(model: str, api_key: str):
+    """
+    Claude equivalent of get_reasoning_llm above — same role tuning intent
+    (deterministic, thinking disabled so a tight max_tokens can't be
+    silently consumed by it), same model as get_sql_llm_anthropic per
+    current setup (Sonnet for both roles) rather than Ollama's split
+    between a small SQL-specialized model and a general chat model —
+    Claude has no equivalent specialized-SQL-model distinction to mirror.
+    """
+    return build_anthropic_client(
+        model=model,
+        api_key=api_key,
+        temperature=0.0,
+        max_tokens=1024,
+        thinking=False,
+    )
+
+
+def get_sql_llm_anthropic(model: str, api_key: str):
+    """
+    Claude equivalent of get_sql_llm above. stop_sequences is the Anthropic
+    Messages API's name for what Ollama calls `stop` — same values, same
+    purpose (cut off trailing chatter after the query ends).
+
+    No top_p — confirmed live: Claude Sonnet 5 (and the rest of the
+    4.6+/5 family) rejects it outright with a 400 ("top_p is deprecated for
+    this model"), unlike Ollama where top_p is a normal sampling knob.
+    temperature=0.0 is accepted fine; it's specifically top_p/top_k that
+    4.6+ models reject.
+    """
+    return build_anthropic_client(
+        model=model,
+        api_key=api_key,
+        temperature=0.0,
+        max_tokens=1024,
+        thinking=False,
+        additional_kwargs={
+            "stop_sequences": [";", "[/SQL]", "This query", "Note:", "-- Note", "/*"],
+        },
+    )
+
+
 _ROLE_FACTORIES = {
     "reasoning": get_reasoning_llm,
     "sql": get_sql_llm,
+}
+
+_ROLE_FACTORIES_ANTHROPIC = {
+    "reasoning": get_reasoning_llm_anthropic,
+    "sql": get_sql_llm_anthropic,
 }
 
 
@@ -80,3 +128,13 @@ def get_llm_client(role: str, model: str, base_url: str):
     except KeyError:
         raise ValueError(f"Unknown LLM role: {role!r}. Expected one of {sorted(_ROLE_FACTORIES)}.")
     return factory(model, base_url)
+
+
+def get_llm_client_anthropic(role: str, model: str, api_key: str):
+    try:
+        factory = _ROLE_FACTORIES_ANTHROPIC[role]
+    except KeyError:
+        raise ValueError(
+            f"Unknown LLM role: {role!r}. Expected one of {sorted(_ROLE_FACTORIES_ANTHROPIC)}."
+        )
+    return factory(model, api_key)

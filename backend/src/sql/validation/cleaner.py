@@ -543,6 +543,154 @@ class CleanerMixin:
                                     )
                             sel.set("group", exp.Group(expressions=kept_g) if kept_g else None)
 
+        # ── 7. Inject missing ai_questions join for a dangling aq-style alias ──
+        # Weak SQL-gen models sometimes compress the well-established 2-table
+        # ai_answers/ai_audit_answers + ai_questions pattern (10+ seed examples
+        # in both seed_data.py and audit_seed_data.py: "JOIN ai_questions aq ON
+        # aa.element_id = aq.element_id") into a single JOIN, folding the
+        # ai_questions filter (e.g. `aq.label = 'Findings / Remarks'`) into the
+        # ai_answers/ai_audit_answers JOIN's own ON clause while dropping the
+        # ai_questions JOIN entirely — leaving `aq` referenced but never
+        # introduced. Confirmed live 2026-08-04 (MULTI-03 regression):
+        # qwen2.5-coder repeated this exact malformed pattern 6 times in a row
+        # despite the [UNDEFINED_ALIAS] validator blocking it every time,
+        # exhausting the retry budget and forcing a fallback to a synthesized
+        # prose answer instead of real rows. The element_id join key is a
+        # single well-known FK used identically everywhere in this codebase's
+        # own seed data, so — unlike the general undefined-alias case (left
+        # to the validator/retry loop, see UNSAFE note above on JOIN/WHERE
+        # repairs) — this exact, narrow shape is safe to repair
+        # deterministically instead of relying on the model to self-correct.
+        # Gated to fire only when there's exactly one ai_answers/
+        # ai_audit_answers table and exactly one dangling `.label` reference
+        # in the same SELECT, so it can't misfire on an unrelated undefined
+        # alias (e.g. AP_ALIAS_COLLISION-style mistakes elsewhere).
+        #
+        # First attempt (2026-08-04) just appended the new ai_questions JOIN
+        # at the end of the joins list — it passed this validator's
+        # order-agnostic alias-existence check, but confirmed live against a
+        # real re-run that Postgres itself still rejected it with "missing
+        # FROM-clause entry for table aq": JOIN ON-clause resolution is
+        # strictly left-to-right, so a join appearing AFTER the one whose ON
+        # clause references its alias is not visible there yet. The fix must
+        # both (a) extract the dangling predicate out of the
+        # ai_answers/ai_audit_answers join's own ON clause and (b) insert the
+        # new ai_questions join immediately after it — not merely add a join
+        # somewhere valid in isolation.
+        _answers_tables = {"ai_answers", "ai_audit_answers"}
+
+        def _inject_missing_ai_questions_join(sel: exp.Select) -> exp.Select:
+            joins = sel.args.get("joins") or []
+            if not joins:
+                return sel
+
+            from_clause = sel.args.get("from_") or sel.args.get("from")
+            _introduced_local: set = set()
+            if from_clause and isinstance(from_clause.this, exp.Table):
+                if from_clause.this.alias:
+                    _introduced_local.add(from_clause.this.alias.lower())
+                if from_clause.this.name:
+                    _introduced_local.add(from_clause.this.name.lower())
+            for j in joins:
+                t = j.this
+                if isinstance(t, exp.Table):
+                    if t.alias:
+                        _introduced_local.add(t.alias.lower())
+                    if t.name:
+                        _introduced_local.add(t.name.lower())
+
+            # Locate the single ai_answers/ai_audit_answers JOIN whose own ON
+            # clause carries exactly one predicate referencing a dangling
+            # `<alias>.label` column — the confirmed shape of this bug.
+            _answers_join_idx = None
+            _answers_alias = None
+            _dangling_alias = None
+            _dangling_pred = None
+
+            for idx, j in enumerate(joins):
+                t = j.this
+                if not (isinstance(t, exp.Table) and t.name
+                        and t.name.lower() in _answers_tables):
+                    continue
+                on_cond = j.args.get("on")
+                if on_cond is None:
+                    continue
+                preds = list(on_cond.flatten()) if isinstance(on_cond, exp.And) else [on_cond]
+                _local_dangling = [
+                    p for p in preds
+                    if any(
+                        isinstance(c, exp.Column) and c.table
+                        and c.table.lower() not in _introduced_local
+                        and c.name.lower() == "label"
+                        for c in p.find_all(exp.Column)
+                    )
+                ]
+                if len(_local_dangling) == 1 and _answers_join_idx is None:
+                    _answers_join_idx = idx
+                    _answers_alias = (t.alias or t.name).lower()
+                    _dangling_pred = _local_dangling[0]
+                    _dangling_alias = next(
+                        c.table.lower() for c in _dangling_pred.find_all(exp.Column)
+                        if c.table and c.table.lower() not in _introduced_local
+                    )
+                elif _local_dangling:
+                    # A second candidate join makes this ambiguous — bail out
+                    # conservatively rather than guess which one to fix.
+                    return sel
+
+            if _answers_join_idx is None:
+                return sel
+
+            # Extract the dangling predicate out of the answers-table join's
+            # own ON clause, preserving any sibling conditions.
+            _answers_join = joins[_answers_join_idx]
+            on_cond = _answers_join.args.get("on")
+            remaining = [
+                p for p in (list(on_cond.flatten()) if isinstance(on_cond, exp.And) else [on_cond])
+                if p is not _dangling_pred
+            ]
+            if not remaining:
+                return sel  # the join's own key condition should always survive
+            new_on = remaining[0]
+            for p in remaining[1:]:
+                new_on = exp.And(this=new_on, expression=p)
+            _answers_join.set("on", new_on)
+
+            # New ai_questions join, inserted immediately after the
+            # answers-table join so its alias is valid at that point in the
+            # left-to-right JOIN chain — carries both the element_id key and
+            # the extracted label predicate.
+            new_join = exp.Join(
+                this=exp.Table(
+                    this=exp.Identifier(this="ai_questions"),
+                    alias=exp.TableAlias(this=exp.Identifier(this=_dangling_alias)),
+                ),
+                on=exp.And(
+                    this=exp.EQ(
+                        this=exp.Column(this=exp.Identifier(this="element_id"),
+                                         table=exp.Identifier(this=_answers_alias)),
+                        expression=exp.Column(this=exp.Identifier(this="element_id"),
+                                               table=exp.Identifier(this=_dangling_alias)),
+                    ),
+                    expression=_dangling_pred,
+                ),
+                kind="INNER",
+            )
+            new_joins = joins[:_answers_join_idx + 1] + [new_join] + joins[_answers_join_idx + 1:]
+            sel.set("joins", new_joins)
+            mutations.append(
+                f"Injected missing JOIN ai_questions {_dangling_alias} ON "
+                f"{_answers_alias}.element_id = {_dangling_alias}.element_id "
+                f"immediately after {_answers_alias}'s JOIN, moving the dangling "
+                f"{_dangling_alias}.label filter there too (preserves left-to-right "
+                f"JOIN alias visibility)"
+            )
+            return sel
+
+        tree = tree.transform(
+            lambda n: _inject_missing_ai_questions_join(n) if isinstance(n, exp.Select) else n
+        )
+
         if not mutations:
             return sql, []
 

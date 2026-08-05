@@ -19,7 +19,10 @@ from llama_index.core import Settings
 from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-from src.llm.factory import get_reasoning_llm, get_sql_llm
+from src.llm.factory import (
+    get_reasoning_llm, get_sql_llm,
+    get_reasoning_llm_anthropic, get_sql_llm_anthropic,
+)
 from src.retrieval import SemanticQuestionIndex, SeedExampleIndex, text_similarity
 from src.sql.validation import SQLValidator
 from src.agent.domains import get_domain_config
@@ -60,7 +63,8 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                  chat_model="qwen2.5:14b-instruct-q4_K_M",
                  embedding_model="BAAI/bge-small-en-v1.5",
                  domain: str = "inspection",
-                 db_engine=None, embed_model=None, reasoning_llm=None):
+                 db_engine=None, embed_model=None, reasoning_llm=None,
+                 llm_provider: str = "ollama", anthropic_api_key: str = ""):
         print(f"Initialising AgentOrchestrator (domain={domain})...")
         self.domain = domain
         self._domain_cfg = get_domain_config(domain)
@@ -137,16 +141,28 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         self.chat_model_name = chat_model
         self.sql_model_name  = sql_model
 
+        # llm_provider is the single switch between Ollama and Anthropic —
+        # every call site downstream (generate_sql, the reasoning loop, etc.)
+        # only ever calls .complete(prompt) per the LLMClient protocol
+        # (llm/base.py), so neither knows or cares which provider built it.
         if reasoning_llm is not None:
             self.reasoning_llm = reasoning_llm
             print("  ✓ Reasoning LLM reused from another domain instance")
+        elif llm_provider == "anthropic":
+            print(f"  Configuring reasoning LLM (Claude): {chat_model}...")
+            self.reasoning_llm = get_reasoning_llm_anthropic(chat_model, anthropic_api_key)
+            print(f"  ✓ Reasoning LLM ({chat_model})")
         else:
             print(f"  Configuring reasoning LLM: {chat_model}...")
             self.reasoning_llm = get_reasoning_llm(chat_model, ollama_url)
             print(f"  ✓ Reasoning LLM ({chat_model})")
 
-        print(f"  Configuring SQL LLM: {sql_model}...")
-        self.sql_llm = get_sql_llm(sql_model, ollama_url)
+        if llm_provider == "anthropic":
+            print(f"  Configuring SQL LLM (Claude): {sql_model}...")
+            self.sql_llm = get_sql_llm_anthropic(sql_model, anthropic_api_key)
+        else:
+            print(f"  Configuring SQL LLM: {sql_model}...")
+            self.sql_llm = get_sql_llm(sql_model, ollama_url)
         print(f"  ✓ SQL LLM ({sql_model})")
 
         self._debug = _make_debug_logger()
@@ -718,6 +734,20 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                           int((time.time()-t0)*1000))
             steps.append(s); _emit(s)
 
+            # generate_sql's LLM calls (initial + up to 3 guard retries, see
+            # sql/generation.py) were never folded into stats before — only
+            # the reasoning role's _call_llm did this — so tokens=X/Y in
+            # [QUERY] END undercounted real spend on every query that
+            # actually generated SQL. Both success and failure results carry
+            # _token_usage (see generation.py's two return dicts); only the
+            # dispatcher's own outer-exception fallback lacks a "result" dict
+            # at all, hence the None-guard.
+            if tool == "generate_sql":
+                _sql_tok = (result.get("result") or {}).get("_token_usage")
+                if _sql_tok:
+                    stats.total_prompt_tokens += _sql_tok.get("prompt_tokens", 0)
+                    stats.total_completion_tokens += _sql_tok.get("completion_tokens", 0)
+
             # Path A: generate_sql → auto-execute
             if tool == "generate_sql" and result.get("success"):
                 sql_data = result.get("result", {})
@@ -976,6 +1006,15 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         from dotenv import load_dotenv; load_dotenv(env_path)
         from src.config.settings import get_settings
         settings = get_settings()
+        # llm_provider="anthropic" repurposes sql_model/chat_model to carry
+        # the Claude model id (same value for both roles — see
+        # settings.anthropic_model's docstring) instead of Ollama model
+        # names; ollama_url is simply unused by the Anthropic factories.
+        if settings.llm_provider == "anthropic":
+            sql_model = chat_model = settings.anthropic_model
+        else:
+            sql_model = settings.ollama_sql_model
+            chat_model = settings.ollama_chat_model
         return cls(
             db_connection_string=(
                 f"postgresql://{settings.db_user}:{settings.db_password}@"
@@ -983,12 +1022,14 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             ),
             db_schema=settings.db_schema,
             ollama_url=settings.ollama_url,
-            sql_model=settings.ollama_sql_model,
-            chat_model=settings.ollama_chat_model,
+            sql_model=sql_model,
+            chat_model=chat_model,
             embedding_model=settings.embedding_model,
             domain=domain,
             db_engine=db_engine,
             embed_model=embed_model,
             reasoning_llm=reasoning_llm,
+            llm_provider=settings.llm_provider,
+            anthropic_api_key=settings.anthropic_api_key,
         )
 

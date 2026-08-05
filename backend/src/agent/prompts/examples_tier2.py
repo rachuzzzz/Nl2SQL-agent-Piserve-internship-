@@ -32,17 +32,26 @@ NEVER: WHERE org.name ILIKE '%[COMPANY]%' — silently returns 0 rows since the
 """,
     },
     {
-        "title": "list all cycles — frequency_definition, NOT inspection_cycle",
-        # New pattern — no prior INJECT rule covered "cycle" vocabulary directly
-        # (block_cycle_frequency_missing_subquery / block_inspection_cycle_name
-        # are SQL-shape BLOCK rules, not question-level INJECT rules).
+        "title": "list all cycles — inspection_cycle INSTANCES by default, frequency_definition only if 'frequency' is explicit",
+        # Was frequency_definition-by-default until 2026-08-04 — confirmed live
+        # this silently misinterpreted the natural phrasing "show inspection
+        # cycles" as asking for cadence types, requiring the user to explicitly
+        # correct it ("not frequency cycles i mean inspection cycles") to get
+        # real inspection_cycle rows. Inverted: bare "cycle(s)" now defaults to
+        # instances; frequency_definition only fires when "frequency" is
+        # explicit in the question, taught side-by-side below so the model
+        # discriminates on the actual wording rather than pattern-matching
+        # exclusivity between two separate blocks.
         "question_pattern": (
             r"(?i)\bcycles?\b|\binspection\s+frequenc\w*"
         ),
         "text": """\
-─── "list all cycles" — frequency_definition, NOT inspection_cycle ───
-User: "list all cycles" / "show inspection cycles" / "what cycles are available"
-Turn 1: {"thought": "'cycles' here means inspection frequency/cadence types (Daily, Weekly, Quarterly Twice, etc.) from frequency_definition — NOT inspection_cycle instances. frequency_definition columns are id, name, repeat_count, repeat_interval, repeat_unit, active — there is NO description column, do not invent one.", "tool": "generate_sql", "args": {"question": "list all inspection frequency cycles", "schema_hint": "SELECT name AS frequency_name, repeat_count, repeat_interval, repeat_unit FROM frequency_definition WHERE active = true ORDER BY name;"}}
+─── "cycle(s)" — inspection_cycle INSTANCES by default; frequency_definition ONLY when "frequency" is explicit ───
+User: "list all cycles" / "show inspection cycles" / "what cycles are available" / "cycle types"
+Turn 1: {"thought": "Bare 'cycles' means inspection_cycle INSTANCES (a period with a start/end date and status) — NOT frequency_definition. inspection_cycle has no name/title column — identify it by start_date/end_date/status instead.", "tool": "generate_sql", "args": {"question": "list all inspection cycles", "schema_hint": "SELECT id, start_date, end_date, status FROM inspection_cycle WHERE active = true ORDER BY start_date DESC;"}}
+
+User: "list all frequency cycles" / "what frequency types are available" / "inspection frequency cycles"
+Turn 1: {"thought": "The user explicitly said 'frequency' — this means inspection frequency/cadence types (Daily, Weekly, Quarterly Twice, etc.) from frequency_definition, NOT inspection_cycle instances. frequency_definition columns are id, name, repeat_count, repeat_interval, repeat_unit, active — there is NO description column, do not invent one.", "tool": "generate_sql", "args": {"question": "list all inspection frequency cycles", "schema_hint": "SELECT name AS frequency_name, repeat_count, repeat_interval, repeat_unit FROM frequency_definition WHERE active = true ORDER BY name;"}}
 """,
     },
     {
