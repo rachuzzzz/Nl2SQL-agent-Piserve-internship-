@@ -4,6 +4,7 @@
 # LlamaIndex core + integrations
 llama-index-core>=0.12.0
 llama-index-llms-ollama>=0.5.0
+llama-index-llms-anthropic>=0.6.0
 llama-index-embeddings-huggingface>=0.5.0
 
 # Web framework (FastAPI backend + legacy Flask server)

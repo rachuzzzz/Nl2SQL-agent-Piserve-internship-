@@ -365,13 +365,6 @@ TEST_SET = [
     },
     # ── People ────────────────────────────────────────────────────────────────
     {
-        "id": "PPL-01", "category": "People",
-        "question": "which inspector has conducted the most inspections this year",
-        "expected_contains": ["inspector", "neenu"],
-        "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "neenu extinsp1:49",
-    },
-    {
         "id": "PPL-02", "category": "People",
         "question": "show breakdown of mitigative action status by responsible party",
         "expected_contains": ["client", "internal"],

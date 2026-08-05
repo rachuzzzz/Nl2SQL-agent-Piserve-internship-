@@ -37,6 +37,15 @@ class Settings:
     ollama_chat_model: str
     embedding_model: str
 
+    # Anthropic (Claude) — optional alternative LLM provider, see llm/anthropic.py
+    anthropic_api_key: str
+    anthropic_model: str
+
+    # Which provider AgentOrchestrator.from_env() builds reasoning_llm/sql_llm
+    # from — "ollama" (default) or "anthropic". The single switch for the
+    # whole app; no other setting needs to change to flip providers.
+    llm_provider: str
+
     # Debug
     debug_llm: bool
 
@@ -70,6 +79,13 @@ def get_settings() -> Settings:
         ollama_sql_model=g("OLLAMA_SQL_MODEL", "sqlcoder:7b"),
         ollama_chat_model=g("OLLAMA_CHAT_MODEL", "qwen2.5:14b-instruct-q4_K_M"),
         embedding_model=g("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
+        anthropic_api_key=g("ANTHROPIC_API_KEY", "").strip(),
+        # Same model for both the reasoning and sql roles (llm/factory.py's
+        # get_reasoning_llm_anthropic/get_sql_llm_anthropic) — user's explicit
+        # choice; Claude has no equivalent to Ollama's separate small
+        # SQL-specialized model, so one model does both jobs.
+        anthropic_model=g("ANTHROPIC_MODEL", "claude-sonnet-5"),
+        llm_provider=g("LLM_PROVIDER", "ollama").strip().lower(),
         # NOTE: no .lower() here — matches the original orchestrator.py check
         # exactly, which only recognizes lowercase "true"/"yes" (or "1").
         debug_llm=g("DEBUG_LLM", "").strip() in ("1", "true", "yes"),

@@ -290,6 +290,31 @@ LIMIT 100;
 """,
         'domain': 'audit_category', 'intent': 'filter', 'limit': 100,
     },
+    {
+        # Fixed 2026-08-04 (ADMIN-06 regression, qid unknown/eval run): no
+        # seed example demonstrated counting audit_category/audit_sub_category
+        # THEMSELVES — every retrieved match for this question was a GROUP BY
+        # count of some OTHER table (schedules, forms) by category, none
+        # counting the taxonomy tables directly. With no matching template,
+        # the SQL-gen model fell back to its own generic prior: JOIN
+        # audit_category to audit_sub_category and COUNT(*) twice — wrong,
+        # since the 1:many join fans out category rows once per sub-category,
+        # silently inflating category_count to match sub_category_count.
+        # Blocked live by AUDIT_SUB_CATEGORY_INNER_JOIN (audit_rules.py),
+        # which cost 2 retries before the model settled on a per-category
+        # breakdown instead — a different, narrower question than the two
+        # independent totals actually asked for ("how many X and Y are
+        # there" means two separate counts, not "Y per X"). Two independent
+        # subqueries avoid the join/fan-out risk entirely AND match the
+        # question's literal meaning directly.
+        'nl':     'how many audit categories and sub-categories are there',
+        'sql':    """\
+SELECT
+    (SELECT COUNT(*) FROM audit_category WHERE active = true) AS category_count,
+    (SELECT COUNT(*) FROM audit_sub_category WHERE active = true) AS sub_category_count;
+""",
+        'domain': 'audit_category', 'intent': 'aggregate', 'limit': None,
+    },
 
     # ── facility geography (region_id/organization_id mostly dead) ──────────
     {

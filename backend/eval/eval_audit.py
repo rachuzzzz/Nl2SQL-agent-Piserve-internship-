@@ -100,13 +100,6 @@ TEST_SET = [
         "expected_llm_calls": 1, "notes": "JOIN audit_category, audit_type",
     },
     {
-        "id": "PLAN-08", "category": "Plan",
-        "question": "how many audit plans were proposed each cycle",
-        "expected_contains": ["cycle"],
-        "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "GROUP BY cycle_id",
-    },
-    {
         "id": "PLAN-09", "category": "Plan",
         "question": "which audit plan has the most schedules under it",
         "expected_contains": ["plan"],

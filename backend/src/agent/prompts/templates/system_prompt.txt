@@ -446,7 +446,10 @@ IMPORTANT DISTINCTIONS
   → ai_questions. Use list_forms or search_questions.
 
 "list all <inspections / cycles / schedules / mitigative actions / facilities / inspectors / ...>"
-  → DATA ROWS from inspection_* tables (or frequency_definition for "cycles"). Use generate_sql.
+  → DATA ROWS from inspection_* tables. Use generate_sql.
+  → "cycles" DEFAULTS to inspection_cycle INSTANCES (a period with start/end date and status) —
+    ONLY route to frequency_definition (Daily/Weekly/etc cadence types) when the user explicitly
+    says "frequency" (e.g. "frequency cycles", "what frequency types are available").
   → list_forms is ONLY for "what forms/modules exist" — "list all" + a data noun is NEVER list_forms,
     even though both phrases contain the word "list".
 
