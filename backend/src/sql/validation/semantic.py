@@ -1,6 +1,11 @@
 """
-SemanticMixin: validate_semantic() -- SOFT_WARN-only advisory heuristics.
-Extracted verbatim from the original core/validator.py.
+SemanticMixin: validate_semantic() -- advisory heuristics, SOFT_WARN by
+default. Extracted verbatim from the original core/validator.py.
+
+Confirmed live 2026-08-07 (debug_llm_20260807_153128): one narrow,
+allowlisted exception exists — see _ENFORCED_GLOSSARY_IDS below. Every
+OTHER check in this file remains SOFT_WARN-only, observability only, never
+forwarded to the LLM retry prompt, never causing retries.
 """
 
 import re
@@ -17,6 +22,34 @@ try:
     _HAS_GLOSSARY = True
 except ImportError:
     _HAS_GLOSSARY = False
+
+# Glossary entries whose severity (business_glossary.py's GlossaryTerm.severity)
+# is actually honoured — every other glossary hit is forced to SOFT_WARN
+# regardless of its own tag. The direct analogue of engine.py's
+# _CONSUMED_RULE_IDS gotcha for BLOCK/WARN rules: an explicit opt-in so a
+# `"severity": "HARD_FAIL"` tag in business_glossary.py never silently
+# starts blocking production just by being set. See business_glossary.py's
+# module docstring for why only these two ids are here (exact-literal
+# checks against a 4-value enum from a single source of truth) and why the
+# 5 CAPEX/OPEX HARD_FAIL-tagged entries are deliberately NOT here yet
+# (heuristic phrase-matchers, not proven stable).
+_ENFORCED_GLOSSARY_IDS: frozenset = frozenset({
+    "conducted_audits",
+    "completed_audits",
+})
+
+# Exemption for the domain's own canonical two-bucket summary form (see
+# semantics_registry.py's case_category_expr(), rendered in
+# audit_report_status_block()) — it satisfies the 'completed' half of the
+# conducted/completed distinction but contains no 'status = SUBMITTED' at
+# all, so it would otherwise trip conducted_audits's required_pattern and
+# HARD_FAIL-block the system's own recommended answer to a "conducted vs
+# completed" question. Downgrades to SOFT_WARN (not suppressed) so it stays
+# observable.
+_TWO_BUCKET_CASE_RE = re.compile(
+    r"CASE\s+WHEN\b.*?THEN\s+'completed'.*?ELSE\s+'conducted'",
+    re.IGNORECASE | re.DOTALL,
+)
 
 try:
     from src.knowledge.semantics_registry import (
@@ -41,12 +74,16 @@ class SemanticMixin:
         """
         Advisory heuristics.
 
-        Returns SOFT_WARN issues only.
-        These are for observability (logs, stats) only.
-        They must NEVER be forwarded to the LLM retry prompt.
-        They must NEVER cause retries.
+        SOFT_WARN by default — for observability (logs, stats) only, never
+        forwarded to the LLM retry prompt, never causing retries.
 
-        Callers: log these, count them via ValidatorStats, then discard.
+        ONE allowlisted exception: glossary violations whose entry id is in
+        _ENFORCED_GLOSSARY_IDS return HARD_FAIL instead (see that constant's
+        comment). Callers (sql/generation.py) merge those into the same
+        vresult a HARD_FAIL from validate() would produce — see
+        generation.py's comment near where sem_warns is computed for the
+        merge point. Every other issue from this method: log, count via
+        ValidatorStats, discard.
         """
         warns: list[ValidationIssue] = []
         sql_lower = sql.lower()
@@ -157,12 +194,22 @@ class SemanticMixin:
 
         # ── Business glossary term checks ─────────────────────────────────────
         if _HAS_GLOSSARY:
-            for severity, msg in _check_glossary(question, sql):
+            for entry, msg in _check_glossary(question, sql):
+                sev = (
+                    entry.severity
+                    if entry.id in _ENFORCED_GLOSSARY_IDS
+                    and not _TWO_BUCKET_CASE_RE.search(sql)
+                    else "SOFT_WARN"
+                )
+                # message stays short (models.py: HARD_FAILs join up to 3
+                # into the LLM retry prompt, no extended hint prose there);
+                # the full business_glossary prose goes in detail, logs only.
                 warns.append(ValidationIssue(
-                    "SOFT_WARN", "GLOSSARY_VIOLATION", msg,
-                    detail="business_glossary check",
-                    retryable=False,
+                    sev, "GLOSSARY_VIOLATION",
+                    f"'{entry.label}' requires {entry.correct_sql}",
+                    detail=msg,
+                    retryable=(sev == "HARD_FAIL"),
                 ))
-                ValidatorStats.record("GLOSSARY_VIOLATION", is_retry_trigger=False)
+                ValidatorStats.record("GLOSSARY_VIOLATION", is_retry_trigger=(sev == "HARD_FAIL"))
 
         return warns

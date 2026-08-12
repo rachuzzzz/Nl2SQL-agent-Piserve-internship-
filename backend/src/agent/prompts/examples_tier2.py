@@ -541,4 +541,70 @@ User follow-up after "i mean FM managers": "most capex converted" (DO NOT ask ag
 Turn 1: {"thought": "User answered metric. Entity already confirmed (FM managers = inspectee_user_id). Metric = capex converted = SUM(po_details.po_amount). Must NOT ask again.", "tool": "generate_sql", "args": {"question": "top FM managers by capex converted using po_details", "schema_hint": "WITH po_by_ica AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po FROM po_details WHERE active = true GROUP BY 1) SELECT u.first_name || ' ' || u.last_name AS fm_manager, COALESCE(SUM(ica.capex), 0) AS capex_generated, COALESCE(SUM(p.total_po), 0) AS capex_converted FROM inspection_corrective_action ica JOIN inspection_report ir ON ica.inspection_id = ir.id AND ir.active = true JOIN users u ON ir.inspectee_user_id = u.id AND u.active = true LEFT JOIN po_by_ica p ON p.ica_id = ica.id WHERE ica.active = true AND ica.capex > 0 GROUP BY u.id, u.first_name, u.last_name ORDER BY capex_converted DESC LIMIT 10;"}}
 """,
     },
+    # ── Moved out of the always-on SYSTEM_PROMPT WORKED EXAMPLES section
+    # (token-usage audit, 2026-08-06) — these 4 entries replace 6 former
+    # Tier-1 examples (~5.4K chars), gated on their own narrow topics
+    # instead of firing on every single question regardless of relevance.
+    # The former "Partial facility name disambiguation" and the entire
+    # 6-example "Name disambiguation" cluster were REMOVED rather than
+    # moved — both are pure duplicates of the always-on AMBIGUOUS REFERENCE
+    # RULE prose block (STEP 1/2a/2b/3/3b), which already fully specifies
+    # the same protocol; the worked examples just re-demonstrated it in
+    # filled-in JSON form.
+    {
+        "title": "Total/count inspections in a period, conducted vs completed drilldown",
+        "question_pattern": (
+            r"(?i)\bhow\s+many\s+inspections?\b.{0,40}\b(this|last|march|april|"
+            r"january|february|june|july|august|september|october|november|"
+            r"december|month|year|\d{4})\b"
+            r"|\btotal\s+inspections?\b.{0,30}\b(this|last)\s+(year|month)\b"
+            r"|\bonly\s+the\s+(conducted|completed)\s+ones?\b"
+            r"|\bhow\s+many\s+(conducted|completed)\s+inspections?\b"
+        ),
+        "text": """\
+─── Total / count inspections in a month or period ───
+User: "how many inspections in March 2026?" / "how many inspections were done this year?"
+Turn 1: {"thought": "Total inspections = conducted + completed two-row summary. conducted = SUBMITTED/UNDER_REVIEW/RETURN_FOR_MODIFICATION, completed = CLOSED. NEVER flat COUNT(*) with status != DRAFT — always use CASE grouping.", "tool": "generate_sql", "args": {"question": "count of inspections in March 2026 by category", "schema_hint": "SELECT CASE WHEN ir.status = 'CLOSED' THEN 'completed' ELSE 'conducted' END AS category, COUNT(*) AS inspection_count FROM inspection_report ir WHERE ir.active = true AND ir.status != 'DRAFT' AND EXTRACT(MONTH FROM ir.submitted_on) = 3 AND EXTRACT(YEAR FROM ir.submitted_on) = 2026 GROUP BY category ORDER BY category DESC;"}}
+
+─── Drill into conducted only / completed only ───
+User: "show me only the conducted ones" / "how many conducted inspections in March 2026?"
+Turn 1: {"thought": "User is drilling into conducted category. conducted = IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION'). NEVER use status != 'DRAFT' AND status != 'CLOSED' — Deepseek drops the second condition. Always use explicit IN list.", "tool": "generate_sql", "args": {"question": "count of conducted inspections in March 2026", "schema_hint": "SELECT COUNT(*) AS conducted_count FROM inspection_report ir WHERE ir.active = true AND ir.status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION') AND EXTRACT(MONTH FROM ir.submitted_on) = 3 AND EXTRACT(YEAR FROM ir.submitted_on) = 2026;"}}
+User: "show me only the completed ones" / "how many completed inspections in March 2026?"
+Turn 1: {"thought": "User is drilling into completed category. completed = status = 'CLOSED' only.", "tool": "generate_sql", "args": {"question": "count of completed inspections in March 2026", "schema_hint": "SELECT COUNT(*) AS completed_count FROM inspection_report ir WHERE ir.active = true AND ir.status = 'CLOSED' AND EXTRACT(MONTH FROM ir.submitted_on) = 3 AND EXTRACT(YEAR FROM ir.submitted_on) = 2026;"}}
+""",
+    },
+    {
+        "title": "Cross-domain join — risk level answers for inspections at a facility",
+        "question_pattern": r"(?i)\brisk\s+level\b.{0,40}\b(inspections?|facility|facilities)\b",
+        "text": """\
+─── Cross-domain join ───
+User: "risk level answers for inspections at [FACILITY] facility"
+Turn 1: {"thought": "Need ai_answers + inspection_report + facility — use generate_sql.", "tool": "generate_sql", "args": {"question": "risk level answers at [FACILITY]", "schema_hint": "FROM ai_answers aa JOIN ai_questions aq ON aa.element_id = aq.element_id JOIN inspection_report ir ON aa.inspection_report_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE aq.label = 'Risk Level' AND fac.name ILIKE '%[FACILITY]%'"}}
+""",
+    },
+    {
+        "title": "Inspector AND FM manager in same query — two user FK columns",
+        "question_pattern": (
+            r"(?i)\binspect(?:or|ed)\b.{0,40}\b(fm|facility)\s*manager\b"
+            r"|\b(fm|facility)\s*manager\b.{0,40}\binspect(?:or|ed)\b"
+        ),
+        "text": """\
+─── Inspector AND FM manager in same query ───
+User: "who inspected [FACILITY] and who is the FM manager there?"
+ROUTING RULE: inspection_report has TWO user FK columns. Use distinct aliases — never join one and filter the other.
+Turn 1: {"thought": "Need both inspector (inspector_user_id) and FM manager (inspectee_user_id) from the same inspection. Must alias both separately.", "tool": "generate_sql", "args": {"question": "inspector and FM manager for inspections at [FACILITY]", "schema_hint": "SELECT ir.inspection_id, ir.submitted_on, u_insp.first_name || ' ' || u_insp.last_name AS inspector, u_fm.first_name || ' ' || u_fm.last_name AS fm_manager FROM inspection_report ir JOIN users u_insp ON ir.inspector_user_id  = u_insp.id JOIN users u_fm   ON ir.inspectee_user_id = u_fm.id JOIN facility fac ON ir.facility_id = fac.id WHERE fac.name ILIKE '%[FACILITY]%' AND ir.status != 'DRAFT' ORDER BY ir.submitted_on DESC LIMIT 10;"}}
+""",
+    },
+    {
+        "title": "MAs with multiple status filters combined — status + progress_stage + risk_level are independent axes, AND them all",
+        "question_pattern": MA_WORKFLOW_TOPIC,
+        "text": """\
+─── MAs matching several status filters at once (timeliness + schedule health + severity) ───
+User: "show mitigative actions that are overdue, at risk, and have medium risk"
+Turn 1: {"thought": "Three independent ica axes in one question, all must be ANDed — NOT the same column: status='OVERDUE' (system timeliness), progress_stage='AT_RISK' (self-reported schedule health, NOT severity), risk_level_id via a JOIN to risk_level where name='Medium' (severity, a separate lookup table). Do not conflate 'at risk' with risk_level, and do not drop the risk_level JOIN just because 'medium risk' looks like a plain column value.", "tool": "generate_sql", "args": {"question": "mitigative actions overdue and at risk with medium risk level", "schema_hint": "SELECT ica.corrective_action_id, ica.cause, ica.status, ica.progress_stage, rl.name AS risk_level, fac.name AS facility_name FROM inspection_corrective_action ica JOIN risk_level rl ON ica.risk_level_id = rl.id JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id WHERE ica.status = 'OVERDUE' AND ica.progress_stage = 'AT_RISK' AND rl.name = 'Medium' AND ica.active = true AND ir.active = true LIMIT 100;"}}
+NEVER: WHERE ica.status = 'OVERDUE' AND ica.progress_stage = 'AT_RISK' with no risk_level JOIN at all when
+  the question also names a severity level ('medium risk', 'high risk') — that silently drops the third
+  filter instead of narrowing to it.
+""",
+    },
 ]

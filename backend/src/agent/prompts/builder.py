@@ -21,6 +21,8 @@ import re
 from pathlib import Path
 
 from src.knowledge.question_patterns import MA_WORKFLOW_TOPIC
+from src.agent.tool_defs import declared_tools as _declared_tools
+from src.knowledge.schema_introspector import INSPECTION_RULE_TOPIC_TEXT
 
 _log_prompts = logging.getLogger("inspectai.prompts")
 
@@ -47,10 +49,18 @@ except ImportError:
     _MA_WORKFLOW_BLOCK = _read_template("ma_workflow_block_fallback.txt")
     _COLUMNS_BLOCK = _read_template("columns_block_fallback.txt")
 
+# Tools declared via agent/tool_defs (see that package's docstring) instead
+# of hand-edited into system_prompt.txt directly — appended after the
+# static numbered tool list, which is never itself regenerated.
+_DYNAMIC_TOOLS_BLOCK = "".join(
+    t.doc for t in _declared_tools() if "inspection" in t.domains
+)
+
 SYSTEM_PROMPT = (
     _read_template("system_prompt.txt")
     .replace("<<<STATUS_BLOCK>>>", _STATUS_BLOCK)
     .replace("<<<COLUMNS_BLOCK>>>", _COLUMNS_BLOCK)
+    .replace("<<<DYNAMIC_TOOLS_BLOCK>>>", _DYNAMIC_TOOLS_BLOCK)
 )
 
 FORCE_SUMMARY_PROMPT = _read_template("force_summary_prompt.txt")
@@ -158,11 +168,46 @@ def build_worked_examples(
 # workflow columns (status/progress_stage/implementation_status/capex_status/
 # timeliness) and is only relevant when the question is about mitigative
 # actions at all.
+# ── Topic-gated business-rules/table-relationships remainder (2026-08 token
+# audit) — see knowledge/schema_introspector.py's "Topic-gated core/topical
+# split" for what moved here and why (BUSINESS_RULES/TABLE_RELATIONSHIPS
+# were previously spliced in FULL and unconditionally by orchestrator/loop.py;
+# now only the CORE subset is always-on and this narrow-topic remainder is
+# surfaced only when the question matches, same as MA_WORKFLOW_BLOCK below).
+# Patterns are deliberately broad — a false positive only costs tokens, a
+# false negative silently drops a "confirmed live" bug-fix rule.
+#
+# NOTE: "observation_ma" (OBSERVATION -> MITIGATIVE ACTION join rule) was
+# gated here originally but reverted to core 2026-08-10 — see
+# knowledge/schema_introspector.py's matching note for the eval regression
+# (FLT-02/FLT-03) that motivated the revert.
+_USER_ROLES_TOPIC = (
+    r"(?i)\brole\b|\binspector\b|\bfm\s+(manager|engineer|admin|supervisor)\b"
+    r"|\basst\s+fm\b|\bhse\s+officer\b"
+)
+_APPROVAL_WORKFLOW_TOPIC = r"(?i)\bapprov|\breview\b|\breject|\bcompleted\b|\bapproval\s+levels?\b"
+_COMMUNICATION_GROUPS_TOPIC = r"(?i)\bcommunication\s+group|\bnotif|\brecipients?\b"
+
 CONDITIONAL_BLOCKS = [
     {
         "title": "MA workflow columns",
         "question_pattern": MA_WORKFLOW_TOPIC,
         "get_text": lambda: _MA_WORKFLOW_BLOCK,
+    },
+    {
+        "title": "User roles",
+        "question_pattern": _USER_ROLES_TOPIC,
+        "get_text": lambda: INSPECTION_RULE_TOPIC_TEXT["user_roles"],
+    },
+    {
+        "title": "Approval workflow",
+        "question_pattern": _APPROVAL_WORKFLOW_TOPIC,
+        "get_text": lambda: INSPECTION_RULE_TOPIC_TEXT["approval_workflow"],
+    },
+    {
+        "title": "Communication groups",
+        "question_pattern": _COMMUNICATION_GROUPS_TOPIC,
+        "get_text": lambda: INSPECTION_RULE_TOPIC_TEXT["communication_groups"],
     },
 ]
 

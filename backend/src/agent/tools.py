@@ -185,6 +185,7 @@ def get_answers(
     inspection_id: Optional[str] = None,
     answer_value: Optional[str] = None,
     limit: int = 50,
+    offset: int = 0,
     scope_filter: str = '',
     domain: str = "inspection",
 ) -> dict[str, Any]:
@@ -198,6 +199,10 @@ def get_answers(
     inspection_id: for audit domain this matches audit_report.audit_id (the
       display code) instead — same parameter name kept for one call-site
       contract shared by both domains' ToolRegistry dispatch.
+    offset: for the "show more" pagination fast-path (loop.py's Path B) —
+      previously absent entirely (no param, no OFFSET clause), so every
+      repeated "show more" on a get_answers-sourced turn silently re-fetched
+      the identical first `limit` rows forever instead of advancing.
     """
     try:
         if scope_filter == 'BLOCK':
@@ -211,7 +216,7 @@ def get_answers(
         display_id_col = "audit_id"         if is_audit else "inspection_id"
 
         filters = ["1=1"]
-        params: dict[str, Any] = {"limit": limit}
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
 
         if form_name:
             filters.append("aq.module_name ILIKE :form_name")
@@ -271,8 +276,8 @@ def get_answers(
             LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id
             {_report_join}
             WHERE {where}
-            ORDER BY aa.submitted_on DESC
-            LIMIT :limit
+            ORDER BY aa.submitted_on DESC, aa.id
+            LIMIT :limit OFFSET :offset
         """)
 
         with db_engine.connect() as conn:
@@ -530,7 +535,8 @@ class ToolRegistry:
                  validator: SQLValidator, sql_llm, sql_prompt: str = "",
                  debug_logger=None, seed_index=None, db_schema=None,
                  core_context: str | None = None, build_core_context_fn=None,
-                 join_graph_module=None, domain: str = "inspection") -> None:
+                 join_graph_module=None, rules_engine=None,
+                 domain: str = "inspection") -> None:
         self._db_engine = db_engine
         self._semantic_index = semantic_index
         self._validator = validator
@@ -545,12 +551,32 @@ class ToolRegistry:
         self._core_context = core_context
         self._build_core_context_fn = build_core_context_fn
         self._join_graph_module = join_graph_module
+        # The SAME per-domain RulesEngine instance loop.py already computes
+        # (self._rules_engine, via DomainConfig.rules_engine_getter) — passed
+        # through to generate_sql()'s post-generation table/pattern guard so
+        # it checks fired INJECT rule ids against the domain they actually
+        # came from, not always the inspection registry (see generation.py's
+        # _rules_engine param docstring for the bug this fixes).
+        self._rules_engine = rules_engine
         # Threaded into get_answers/get_answer_stats so they route to
         # ai_answers/inspection_report or ai_audit_answers/audit_report —
         # added 2026-07-29 when ai_audit_answers was confirmed live for audit.
         self._domain = domain
 
     def call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        # Tools declared via agent/tool_defs (see that package's docstring)
+        # take a separate, additive dispatch path — checked first so a
+        # declared tool's name never needs to also join KNOWN_TOOLS below.
+        # The 8 tools in the if/elif chain further down stay exactly as-is:
+        # several (get_answers, generate_sql, search_questions) carry
+        # tool-specific arg-cleaning (alias fallbacks, "none"-string
+        # normalization, limit clamping) that a generic fn(**args) call
+        # would silently break, so they are deliberately NOT migrated.
+        from src.agent.tool_defs import get_declared
+        declared = get_declared(name)
+        if declared is not None:
+            return self._call_declared(declared, args)
+
         if name not in self.KNOWN_TOOLS:
             return {
                 "success": False, "result": None,
@@ -621,6 +647,11 @@ class ToolRegistry:
                         return max(1, min(n, 500))
                     except (TypeError, ValueError):
                         return default
+                def _offset(v, default=0):
+                    try:
+                        return max(0, int(v))
+                    except (TypeError, ValueError):
+                        return default
                 return get_answers(
                     self._db_engine,
                     form_name=_clean(args.get("form_name")),
@@ -629,6 +660,7 @@ class ToolRegistry:
                     inspection_id=_clean(args.get("inspection_id")),
                     answer_value=_clean(ans_filter),
                     limit=_limit(args.get("limit", 50)),
+                    offset=_offset(args.get("offset", 0)),
                     scope_filter=str(args.get("scope_filter", "")),
                     domain=self._domain,
                 )
@@ -662,10 +694,29 @@ class ToolRegistry:
                     _retry_attempt = int(args.get("_retry_attempt", 0))
                 except (TypeError, ValueError):
                     _retry_attempt = 0
+                # tables supersedes relevant_tables in name only (Item 3 of
+                # the generation-quality plan) — accept either, tables wins
+                # if both are somehow present. Same defensive isinstance
+                # guard as relevant_tables always had: this is the only
+                # list-typed tool argument in this codebase and arrives
+                # malformed often enough that _select_schema_block needs
+                # the None-if-not-a-list fallback rather than trusting it.
+                _tables = args.get("tables")
+                if not isinstance(_tables, list):
+                    _tables = args.get("relevant_tables")
+                if not isinstance(_tables, list):
+                    _tables = None
+                _business_rules = args.get("business_rules")
+                if not isinstance(_business_rules, (list, str)):
+                    _business_rules = None
                 return generate_sql(
                     self._sql_llm, self._validator,
                     question=str(args["question"]),
                     schema_hint=str(args.get("schema_hint", "")),
+                    draft_sql=str(args.get("draft_sql", "")),
+                    join_path=str(args.get("join_path", "")),
+                    business_rules=_business_rules,
+                    _mandatory_hint=str(args.get("_mandatory_hint", "")),
                     db_engine=self._db_engine,
                     sql_prompt_template=self._sql_prompt,
                     _debug_logger=self._debug_logger,
@@ -674,11 +725,11 @@ class ToolRegistry:
                     _db_schema=self._db_schema,
                     _active_cycle_uuid=str(args.get("_active_cycle_uuid", "")),
                     _retry_attempt=_retry_attempt,
-                    relevant_tables=args.get("relevant_tables")
-                        if isinstance(args.get("relevant_tables"), list) else None,
+                    relevant_tables=_tables,
                     _core_context=self._core_context,
                     _build_core_context_fn=self._build_core_context_fn,
                     _join_graph_module=self._join_graph_module,
+                    _rules_engine=self._rules_engine,
                 )
 
             if name == "execute_sql":
@@ -704,3 +755,18 @@ class ToolRegistry:
             return {"success": False, "result": None,
                     "error": f"Tool '{name}' raised an exception: {exc}"}
         return {"success": False, "result": None, "error": "Unhandled routing case"}
+
+    def _call_declared(self, tool, args: dict[str, Any]) -> dict[str, Any]:
+        """Dispatch for tools registered via agent/tool_defs. `args` here is
+        already the dispatch_args dict built by loop.py — it may carry extra
+        keys (e.g. `_session`, `_domain`) merged in via the tool's
+        context_provider on top of the LLM-supplied args; tool.fn's own
+        signature is the source of truth for which keys it actually reads."""
+        try:
+            return tool.fn(**args)
+        except TypeError as exc:
+            return {"success": False, "result": None,
+                    "error": f"Bad arguments for '{tool.name}': {exc}"}
+        except Exception as exc:
+            return {"success": False, "result": None,
+                    "error": f"Tool '{tool.name}' raised an exception: {exc}"}

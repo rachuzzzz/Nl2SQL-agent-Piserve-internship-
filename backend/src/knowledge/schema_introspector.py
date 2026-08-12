@@ -83,7 +83,44 @@ BUSINESS_RULES = [
     "(cast the UUID side to varchar — NEVER aa.submission_id::uuid = ica.observation_id, NEVER ::text). "
     "PATH 2 — ALL MAs for an inspection: JOIN ica ON ica.inspection_id = ir.id. "
     "Use PATH 1 only when the user references a SPECIFIC observation; "
-    "use PATH 2 for 'mitigative actions for this inspection' generally.",
+    "use PATH 2 for 'mitigative actions for this inspection' generally. "
+    "PATH 3 — the REVERSE of PATH 1 (singular): the observation a SPECIFIC MA was raised "
+    "against ('what was the observation for this MA', 'observation text for MA <id>'): "
+    "JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar (same cast rule as "
+    "PATH 1), then filter WHERE aq.label = 'Observation' after joining ai_questions aq ON "
+    "aa.element_id = aq.element_id — inspection's free-text finding field is literally "
+    "labeled 'Observation' (unlike audit, which uses 'Findings / Remarks'). NEVER use "
+    "get_answers(inspection_id=...) for this — it returns the whole form, not the one "
+    "observation. "
+    "PATH 4 — ALL answers for the whole inspection report (reconstructing the full "
+    "filled-out form): JOIN ai_answers aa ON aa.inspection_report_id = ir.id, then GROUP BY "
+    "aa.submission_id since each distinct submission_id is one repeatable entry (e.g. one "
+    "observation) within the form. MUST also filter aa.module_name = 'Inspection Form' — "
+    "confirmed live 2026-08-10 that ai_answers rows for one inspection_report_id span "
+    "multiple modules (MA-workflow submodules like Client Details Entry/PR Entry/Completion/ "
+    "Report Approval-Rejection share the same inspection_report_id) — omitting this pulls in "
+    "workflow noise, not the form. Use PATH 4 for 'reconstruct this inspection's form' / "
+    "'all answers for this inspection' questions; NEVER get_answers for this (flat/"
+    "LIMIT=50/ungrouped — loses the submission_id grouping and can silently truncate a form).",
+    "RISK LEVEL / IMPACT — OBSERVATION vs MITIGATIVE ACTION (confirmed live 2026-08-10, "
+    "user-supplied business fact, extended same day to Impact): BOTH are FORM ANSWERS — Risk "
+    "Level is auto-derived from Impact/etc. entered on the SAME submission as the observation "
+    "text, and Impact is itself a directly-entered multi-select form answer in that identical "
+    "submission group. Both live in ai_answers, in the SAME submission_id group as the "
+    "observation, NOT on inspection_corrective_action (which has NO compliance_id at all — "
+    "that axis is audit-only). 'high risk observations', 'risk/impact mappings for these "
+    "observations', 'findings that are high risk' always mean aa.answer_text WHERE aq.label "
+    "IN ('Risk Level','Impact'), matched to their sibling Observation answer via submission_id "
+    "(NEVER via inspection_report_id/ir.id — that pairs answers from ANY entry in the report, "
+    "not necessarily the SAME one; two prior seed examples in this codebase made exactly that "
+    "mistake for Risk Level before this fix, and audit's mirror confirmed live the same day "
+    "that Impact needs the identical treatment — a follow-up asking for 'risk mappings' fell "
+    "back to the CA's own risk_level_id/impact_id instead). ica.risk_level_id/impact_id are "
+    "SEPARATE, later values that only exist once a MA is actually raised against the "
+    "observation — use them ONLY for questions specifically about the mitigative ACTION's own "
+    "classification ('high risk mitigative actions', 'impact of this MA'), never as a stand-in "
+    "for the observation's own form answers — using them for a question about OBSERVATIONS "
+    "silently excludes every observation that never had a MA raised.",
     "Use LEFT JOIN (not INNER JOIN) for optional lookups like inspection_sub_type, "
     "entity, and inspection_report_remark.",
     "VOCABULARY — mitigative action status: "
@@ -424,9 +461,14 @@ USEFUL_COLUMNS = {
         # JOIN: ON pr.mitigative_action_uuid = ica.id
     ],
     "ai_answers": [
-        "inspection_id", "inspection_report_id", "element_id", "module_name",
+        "id", "inspection_id", "inspection_report_id", "element_id", "module_name",
         "answer_text", "answer_text_raw", "answer_numeric", "score", "score_type", "max_score",
-        "submitted_on",
+        "submitted_on", "submission_id", "created_on",
+        # id/submission_id/created_on confirmed live 2026-08-10 (information_schema.columns) —
+        # previously missing from this list despite being used in the OBSERVATION -> MA join
+        # rule (submission_id) elsewhere in this file; created_on/id needed for a deterministic
+        # ORDER BY when reconstructing a whole form (see AUDIT_USEFUL_COLUMNS' ai_audit_answers
+        # entry, which mirrors this table and already lists them).
     ],
     "review": [
         "entity_id", "entity_type", "review_type", "level", "status", "action",
@@ -590,7 +632,37 @@ AUDIT_BUSINESS_RULES = [
     "JOIN ai_audit_answers aaa ON aaa.audit_report_id = arep.id, then GROUP BY aaa.submission_id "
     "since each distinct submission_id is one repeatable entry (e.g. one observation) within "
     "the form. Use PATH 1 only when the user references a SPECIFIC CA/observation; use PATH 2 "
-    "for 'reconstruct this audit's form' / 'all answers for this audit' questions.",
+    "for 'reconstruct this audit's form' / 'all answers for this audit' questions. "
+    "PATH 3 — the REVERSE of PATH 1 (forward, plural): ALL corrective actions raised against a "
+    "SPECIFIC observation ('corrective actions for this observation', 'CAs raised against this "
+    "finding'). Same join/cast as PATH 1 (aaa.submission_id = aca.observation_id::varchar, same "
+    "aq.label = 'Findings / Remarks' anchor) but NOT filtered to one corrective_action_id — this "
+    "returns every CA tied to that one observation_id. NOT aca.audit_id = arep.id (that returns "
+    "ALL CAs in the whole report, unrelated to which observation raised them). Added 2026-08-10 — "
+    "this had no worked example anywhere despite PATH 1 being seeded twice; it is the unresolved "
+    "half of the 2026-07-31 incident that only ever got the whole-report-observations fix.",
+    "RISK LEVEL / IMPACT / COMPLIANCE — OBSERVATION vs CORRECTIVE ACTION (confirmed live "
+    "2026-08-10, user-supplied business fact, extended same day to Impact/Compliance): all "
+    "THREE are FORM ANSWERS — Risk Level is auto-derived from Impact/Compliance/etc. entered "
+    "on the SAME submission as the Findings/Remarks text, and Impact/Compliance are themselves "
+    "directly-entered form answers in that identical submission group (confirmed in the "
+    "observation group's label list: Audit Checkpoint, Compliance, Impact, Requirement, "
+    "Requirement Type, Risk Level, ...). All three live in ai_audit_answers, in the SAME "
+    "submission_id group as the observation, NOT on audit_corrective_action. 'high risk "
+    "observations', 'risk/impact/compliance mappings for these observations', 'findings that "
+    "are high risk' always mean aaa.answer_text WHERE aq.label IN ('Risk Level','Impact',"
+    "'Compliance'), matched to their sibling Findings/Remarks answer via submission_id (NEVER "
+    "via audit_report_id/arep.id — that pairs answers from ANY entry in the report, not "
+    "necessarily the SAME one; two prior seed examples in this codebase made exactly that "
+    "mistake for Risk Level before this fix, and a live follow-up asking for 'risk mappings' "
+    "immediately reproduced the identical mistake via aca.risk_level_id/impact_id/"
+    "compliance_id instead). aca.risk_level_id/impact_id/compliance_id are SEPARATE, later "
+    "values that only exist once a CA is actually raised against the observation — use them "
+    "ONLY for questions specifically about the corrective ACTION's own classification ('high "
+    "risk corrective actions', 'risk level of this CA', 'impact of this CA'), never as a "
+    "stand-in for the observation's own form answers — using them for a question about "
+    "OBSERVATIONS silently excludes every observation that never had a CA raised, and can "
+    "show a DIFFERENT value than what the auditor actually entered for that observation.",
     "audit_schedule.audit_status is a DEAD column — always NULL (confirmed live). "
     "The real schedule status is audit_schedule.schedule_status. NEVER filter/select audit_status.",
     "audit_report has NO facility_id or project_id column of its own — TWO-HOP via "
@@ -881,6 +953,155 @@ TIMELINESS:
   Schedule: use schedule_status, never audit_status (dead).
 """
 
+# ---------------------------------------------------------------------------
+# Topic-gated core/topical split (2026-08 token audit)
+# ---------------------------------------------------------------------------
+# BUSINESS_RULES/TABLE_RELATIONSHIPS/AUDIT_BUSINESS_RULES/AUDIT_TABLE_RELATIONSHIPS
+# above are left completely unchanged — for_system_prompt()/for_schema_hint()
+# and anything else that wants the full content still gets it verbatim. The
+# reasoning-LLM system prompt (agent/orchestrator/loop.py's __init__), which
+# previously spliced ALL of BUSINESS_RULES/TABLE_RELATIONSHIPS in
+# unconditionally on every question, now uses only the CORE subset below;
+# the narrow-topic remainder is surfaced per-question via
+# agent/prompts/builder.py's/builder_audit.py's CONDITIONAL_BLOCKS (same
+# mechanism already used for MA_WORKFLOW_BLOCK) instead of paying its full
+# token cost on every call. Audit's AUDIT_BUSINESS_RULES alone measured
+# 29,014 chars (~7,250 tokens), unconditionally, on a domain where the
+# reasoning prompt was observed at ~67K chars total.
+#
+# What stays CORE (never gated): anything that guards the MODEL's own
+# hallucination risk regardless of what the user asked — dead columns,
+# join-hop traps, alias collisions, naming traps, the hub-and-spoke FK map.
+# There's no reliable question-text signal for "the model is about to
+# invent this column," so those rules must fire on every question. Only
+# rules whose relevance genuinely follows from the QUESTION's own wording
+# (risk level, who approved, communication group, portfolio status, ...)
+# are moved to topic gating below.
+#
+# Extraction is done by filtering the EXISTING lists/string (never by
+# retyping prose), so the extracted text is byte-identical to the source.
+
+def _partition_rules(rules: list, marker_groups: dict) -> tuple:
+    """Split `rules` into (core, {topic: [matched rules]}) by rule-prefix
+    match against marker_groups = {topic: [prefix, ...]}."""
+    prefix_to_topic = {
+        m: topic for topic, markers in marker_groups.items() for m in markers
+    }
+    core = []
+    topical = {topic: [] for topic in marker_groups}
+    for rule in rules:
+        hit = next((t for m, t in prefix_to_topic.items() if rule.startswith(m)), None)
+        if hit:
+            topical[hit].append(rule)
+        else:
+            core.append(rule)
+    return core, topical
+
+
+def _extract_tr_section(text: str, start_marker: str, end_marker) -> tuple:
+    """Cut [start_marker, end_marker) out of `text`. end_marker=None cuts to
+    the end of the string. Returns (remainder, chunk)."""
+    i = text.index(start_marker)
+    j = len(text) if end_marker is None else text.index(end_marker, i + len(start_marker))
+    return text[:i] + text[j:], text[i:j]
+
+
+# NOTE: "observation_ma" (the OBSERVATION -> MITIGATIVE ACTION multi-path
+# join rule + RISK LEVEL/IMPACT rule) was gated here originally but reverted
+# to always-core 2026-08-10 — eval regression (FLT-02/FLT-03 in eval.py,
+# reproduced on 2 separate reruns): with this rule gated, the reasoning LLM's
+# own draft_sql stopped following the documented submission_id/aq.label join
+# pattern (e.g. drafted `JOIN risk_level rl ON obs.answer_text = rl.name`
+# instead) even though the rule text was confirmed present in the assembled
+# prompt — moving it from its fixed position (embedded right after schema)
+# to an appended end-of-prompt CONDITIONAL_BLOCKS section, stacked alongside
+# other same-topic content (MA_WORKFLOW_BLOCK + a Tier-2 worked example),
+# was enough to make the model stop reliably applying it. This is the
+# largest, most structurally complex rule in BUSINESS_RULES (~2.5-3K chars,
+# multi-path join logic) — too fragile to gate given the demonstrated risk;
+# the smaller/simpler topics below (user_roles, approval_workflow) showed no
+# such regression across the same eval run.
+_INSPECTION_RULE_TOPICS = {
+    "user_roles": [
+        "USER ROLES — users have multiple roles",
+    ],
+    "approval_workflow": [
+        "APPROVAL WORKFLOW — 'review' is a shared",
+        "'COMPLETED' ON review IS NOT 'APPROVED'",
+        "review_level IS NOT RELIABLE for 'how many levels",
+    ],
+}
+BUSINESS_RULES_CORE, _INSPECTION_RULES_TOPICAL = _partition_rules(
+    BUSINESS_RULES, _INSPECTION_RULE_TOPICS)
+
+_tr_rest, _TR_COMMUNICATION_GROUPS = _extract_tr_section(
+    TABLE_RELATIONSHIPS, "COMMUNICATION GROUPS:\n", "USER ROLES:\n")
+_tr_rest, _TR_USER_ROLES = _extract_tr_section(
+    _tr_rest, "USER ROLES:\n", "CRITICAL ai_* JOIN PATTERN:\n")
+_tr_rest, _TR_APPROVAL_WORKFLOW = _extract_tr_section(
+    _tr_rest, "APPROVAL WORKFLOW (review table", None)
+TABLE_RELATIONSHIPS_CORE = _tr_rest
+del _tr_rest
+
+INSPECTION_RULE_TOPIC_TEXT = {
+    "user_roles": (
+        "\n".join(f"  - {r}" for r in _INSPECTION_RULES_TOPICAL["user_roles"])
+        + "\n\n" + _TR_USER_ROLES
+    ),
+    "approval_workflow": (
+        "\n".join(f"  - {r}" for r in _INSPECTION_RULES_TOPICAL["approval_workflow"])
+        + "\n\n" + _TR_APPROVAL_WORKFLOW
+    ),
+    "communication_groups": _TR_COMMUNICATION_GROUPS,
+}
+
+_AUDIT_RULE_TOPICS = {
+    "form_answers": [
+        "AUDIT FORM-ANSWER LAYER — corrected 2026-07-29",
+        "OBSERVATION → CORRECTIVE ACTION — two distinct paths",
+        "RISK LEVEL / IMPACT / COMPLIANCE — OBSERVATION vs CORRECTIVE ACTION",
+        "risk_level, impact, and compliance are THREE separate",
+    ],
+    "approval_workflow": [
+        "APPROVAL WORKFLOW — the 'review' table is a shared",
+        "'COMPLETED' ON review IS NOT 'APPROVED' — confirmed live",
+        "review_level IS NOT A RELIABLE SOURCE",
+    ],
+    "who_questions": [
+        "'auditor' as a ROLE NAME is unreliable",
+        "WHO ON audit_corrective_action — FOUR different columns",
+        "STAKEHOLDER/AUDITOR GRAIN MISMATCH",
+    ],
+    "cycle": [
+        "audit_cycle HAS NO name/cycle_name/title/code COLUMN",
+        "audit_cycle.status is a STRICT 3-value CHECK constraint",
+    ],
+    "portfolio": [
+        "auditor_portfolio.status is a STRICT 4-value CHECK constraint",
+        "POST-APPROVAL PORTFOLIO EDITS are a real",
+    ],
+    "universe": [
+        "audit_universe_id lives ONLY on audit_schedule",
+    ],
+    "date_conducted": [
+        "DATE FOR 'WHEN AN AUDIT WAS CONDUCTED'",
+    ],
+}
+AUDIT_BUSINESS_RULES_CORE, _AUDIT_RULES_TOPICAL = _partition_rules(
+    AUDIT_BUSINESS_RULES, _AUDIT_RULE_TOPICS)
+
+# AUDIT_TABLE_RELATIONSHIPS is left fully core (not split) — unlike
+# inspection's, it's almost entirely hub-and-spoke FK map + TRAP warnings
+# (dead columns, multi-hop joins), which per the policy above can't be
+# safely question-text-gated.
+AUDIT_TABLE_RELATIONSHIPS_CORE = AUDIT_TABLE_RELATIONSHIPS
+
+AUDIT_RULE_TOPIC_TEXT = {
+    topic: "\n".join(f"  - {r}" for r in rules)
+    for topic, rules in _AUDIT_RULES_TOPICAL.items()
+}
+
+
 AUDIT_LOOKUP_TABLES = {
     "audit_universe":      {"name_expr": None, "name_col": "name"},
     "audit_category":      {"name_expr": None, "name_col": "name"},
@@ -1118,6 +1339,14 @@ class DatabaseSchema:
     _suppress_columns: set = field(default_factory=lambda: set(_SUPPRESS_COLUMNS), repr=False)
     _business_rules: list = field(default_factory=lambda: list(BUSINESS_RULES), repr=False)
     _table_relationships: str = field(default=TABLE_RELATIONSHIPS, repr=False)
+    # Core-only (topic-gated remainder surfaced via CONDITIONAL_BLOCKS instead)
+    # — see the "Topic-gated core/topical split" section above. Used only by
+    # orchestrator/loop.py's reasoning-system-prompt splice; _business_rules/
+    # _table_relationships above are untouched for every other consumer
+    # (for_system_prompt, for_schema_hint).
+    _business_rules_core: list = field(
+        default_factory=lambda: list(BUSINESS_RULES_CORE), repr=False)
+    _table_relationships_core: str = field(default=TABLE_RELATIONSHIPS_CORE, repr=False)
     _section_title: str = field(default="INSPECTION WORKFLOW TABLES", repr=False)
     _has_ai_section: bool = field(default=True, repr=False)
     _ai_join_pattern: str = field(
@@ -1520,6 +1749,8 @@ def introspect_audit_schema(db_engine: Engine) -> DatabaseSchema:
             _suppress_columns=set(_AUDIT_SUPPRESS_COLUMNS),
             _business_rules=list(AUDIT_BUSINESS_RULES),
             _table_relationships=AUDIT_TABLE_RELATIONSHIPS,
+            _business_rules_core=list(AUDIT_BUSINESS_RULES_CORE),
+            _table_relationships_core=AUDIT_TABLE_RELATIONSHIPS_CORE,
             _section_title="AUDIT WORKFLOW TABLES",
             _has_ai_section=True,
             _ai_join_pattern=(

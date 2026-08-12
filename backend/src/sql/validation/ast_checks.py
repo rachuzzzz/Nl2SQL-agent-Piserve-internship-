@@ -22,6 +22,34 @@ from src.sql.validation.models import ValidationIssue, ValidatorStats
 # AST helpers (sqlglot) — used when available, regex fallback otherwise
 # ---------------------------------------------------------------------------
 
+def _extract_top_level_limit(sql: str) -> "int | None":
+    """
+    The generated SQL's outermost LIMIT value (e.g. 5 for "... LIMIT 5"),
+    or None if there isn't one / it isn't a plain integer literal. AST-first
+    (sqlglot correctly distinguishes the OUTER LIMIT from one buried in a
+    CTE/subquery, unlike a regex scan); falls back to the LAST `LIMIT n` in
+    the raw text when sqlglot is unavailable or fails to parse — a
+    reasonable approximation since this codebase's own generated SQL always
+    places the query's real limit last (see generation.py's LIMIT-append
+    convention), not a general guarantee for arbitrary SQL.
+    """
+    if _HAS_SQLGLOT:
+        try:
+            tree = sqlglot.parse_one(sql, dialect="postgres")
+            limit_node = tree.args.get("limit") if tree else None
+            if limit_node is not None:
+                expr = limit_node.expression
+                if isinstance(expr, exp.Literal) and expr.is_int:
+                    return int(expr.this)
+            return None
+        except Exception:
+            pass
+    m = None
+    for m in re.finditer(r"\bLIMIT\s+(\d+)\b", sql, re.IGNORECASE):
+        pass
+    return int(m.group(1)) if m else None
+
+
 def _strip_nested_parens(sql: str) -> str:
     """
     Replace content inside balanced parentheses with spaces, preserving string length.

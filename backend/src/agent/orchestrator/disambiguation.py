@@ -63,13 +63,17 @@ def _entity_noun_tables(domain):
 def entity_type_for_ordinal_noun(noun_snippet: str, domain: str) -> str:
     """Entity-type label for the first recognized noun in `noun_snippet`.
 
-    Callers (session.py's ordinal resolver) must pass only the few words
-    immediately following an ordinal phrase ("the 6th ___"), NOT the whole
-    question — so an unrelated entity noun elsewhere in the sentence ("list
-    all audit PLANS under the 6th AUDITOR") can't be mistaken for the noun
-    THIS ordinal is actually about. Returns "" when nothing recognized —
-    e.g. a bare ordinal ("the 4th one") — callers must preserve today's
-    untyped-match behavior in that case, not silently skip resolution.
+    Caller: agent/orchestrator/ordinal.py's resolve_ordinal_reference (the
+    resolve_ordinal_reference tool's implementation), which normalizes the
+    reasoning LLM's own `entity_type_hint` argument through this same
+    vocabulary rather than re-deriving a noun by regex from question text.
+    Previously called by session.py's ordinal resolver with a regex-carved
+    question tail ("the 6th ___") — that block was retired once ordinal
+    resolution became an explicit tool call; the LLM now supplies a clean
+    hint directly, so there is no question-tail text left to mis-scan.
+    Returns "" when nothing recognized (a bare hint, or no hint at all) —
+    callers treat that as an untyped/bare-ordinal reference, not silently
+    skip resolution.
     """
     for pat, _table, etype in _entity_noun_tables(domain):
         if re.search(pat, noun_snippet, re.IGNORECASE):

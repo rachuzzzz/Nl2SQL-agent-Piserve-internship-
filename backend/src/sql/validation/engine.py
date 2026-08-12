@@ -5,7 +5,9 @@ Architecture
 ============
   clean_sql()         — formatting normalization only; minimal semantic mutation
   validate()          — returns ValidationResult; HARD_FAIL vs SOFT_WARN separated
-  validate_semantic() — SOFT_WARN only; NEVER blocks execution; NEVER in retry prompts
+  validate_semantic() — SOFT_WARN by default (advisory, never blocks/retries); one
+                        allowlisted HARD_FAIL exception exists, see semantic.py's
+                        _ENFORCED_GLOSSARY_IDS (confirmed live 2026-08-07)
   ValidatorStats      — lightweight rule-hit counters for observability
 
 Hard fails block execution and appear in retry prompts (concise codes only).
@@ -47,6 +49,7 @@ from src.sql.validation.ast_checks import (
     _check_uuid_leaks_ast,
     _check_uuid_leaks_regex,
     _check_ungrouped_select_columns_ast,
+    _extract_top_level_limit,
 )
 from src.sql.validation.cleaner import CleanerMixin
 from src.sql.validation.identity import IdentityMixin
@@ -502,6 +505,26 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
         # 2026-08-03, qid=eee602ce/d73988fb) — same overbroad-status-list trap
         # shape as Group M's audit_block_overdue_status_overbroad.
         "audit_block_portfolio_submitted_status_overbroad",
+        # Group T — sibling of Group I/K (ILIKE-text-search wrong-path guards), for the
+        # ALREADY-RESOLVED-id direction instead: a uuid-guard retry re-inserting a dropped
+        # aca.id/ica.id filter can silently swap the join to the whole-report/whole-
+        # inspection path, returning unrelated form answers with no error (confirmed live
+        # 2026-08-10, qid=5c9922a3 — see audit_block_ca_id_for_observation_wrong_path's
+        # own docstring for the exact incident).
+        "audit_block_ca_id_for_observation_wrong_path", "block_ma_id_for_observation_wrong_path",
+        # Group U — self-join wrong-grain guard: combining two question labels (e.g. Risk
+        # Level + Observation/Findings-Remarks) from the SAME repeatable entry requires
+        # matching on submission_id, not report_id — confirmed live 2026-08-10 that two
+        # existing seed examples got this wrong (see block_ai_answers_self_join_wrong_grain's
+        # own docstring). No prior guard existed for this mistake shape in either domain.
+        "block_ai_answers_self_join_wrong_grain", "audit_block_ai_audit_answers_self_join_wrong_grain",
+        # Group V — a different failure mode of Group T's same uuid-guard-retry class: the
+        # retry hardcoded a resolved uuid as a bare constant on the answers-table JOIN's ON
+        # clause instead of using it as the *_corrective_action.observation_id value,
+        # deleting the actual join predicate entirely (unintentional cross join, no error
+        # raised — confirmed live 2026-08-10, qid=328ca155, see
+        # audit_block_ai_audit_answers_constant_join_wrong_path's own docstring).
+        "audit_block_ai_audit_answers_constant_join_wrong_path", "block_ai_answers_constant_join_wrong_path",
     })
 
 
@@ -1059,6 +1082,42 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
                            "SELECT SUM(pr.pr_amount)",
                 ))
                 ValidatorStats.record("OPEX_WRONG_TABLE", is_retry_trigger=True)
+
+        # ── 10h. Requested row count vs. actual LIMIT — SOFT_WARN ────────────
+        # loop.py's LIMIT-preservation hint ("user asked for exactly N
+        # results — use LIMIT N", appended to schema_hint before generate_sql)
+        # is unenforced prose the SQL-gen model can ignore. SOFT_WARN, not
+        # HARD_FAIL: a top-level LIMIT mismatch isn't always wrong — a
+        # legitimate query can need a LIMIT inside a CTE/subquery to control
+        # join fan-out, with no matching top-level LIMIT at all (e.g. "the
+        # last 5 inspections and their corrective actions" may need `LIMIT 5`
+        # scoped to the inspections CTE, not the final joined row count).
+        # HARD_FAILing on that shape would block correct SQL — exactly what
+        # this whole validator redesign exists to avoid. Reuses the same
+        # (already date-window-excluding) regex loop.py's hint itself uses,
+        # so this check can never fire on a case the hint wouldn't also have
+        # fired on.
+        _limit_hint_q = re.search(
+            r'\b(?:last|top|first|recent|latest)\s+(\d+)'
+            r'(?!\s*(?:days?|weeks?|months?|hours?|minutes?|years?)\b)\b',
+            question, re.IGNORECASE,
+        ) or re.search(
+            r'\b(\d+)\s+(?:most\s+recent|latest|last|inspections?|actions?|reports?)\b',
+            question, re.IGNORECASE,
+        ) if question else None
+        if _limit_hint_q:
+            _requested_n = int(_limit_hint_q.group(1))
+            if 1 <= _requested_n <= 500:
+                _actual_limit = _extract_top_level_limit(sql)
+                if _actual_limit is not None and _actual_limit != _requested_n:
+                    issues.append(ValidationIssue(
+                        "SOFT_WARN", "LIMIT_MISMATCH",
+                        f"User asked for exactly {_requested_n} results but SQL's "
+                        f"top-level LIMIT is {_actual_limit}",
+                        detail=f"schema_hint requested LIMIT {_requested_n}",
+                        retryable=False,
+                    ))
+                    ValidatorStats.record("LIMIT_MISMATCH", is_retry_trigger=False)
 
         hard_fails = [i for i in issues if i.severity == "HARD_FAIL"]
         passed = len(hard_fails) == 0

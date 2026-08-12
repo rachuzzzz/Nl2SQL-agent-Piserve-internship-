@@ -848,6 +848,66 @@ LIMIT 100;
         'domain': 'audit_corrective_action', 'intent': 'filter', 'limit': 100,
     },
     {
+        # Added 2026-08-10 — audit previously had ZERO documented path for "high risk
+        # OBSERVATIONS/findings" independent of a corrective action (confirmed absent
+        # everywhere: every prior 'risk level' example here goes through
+        # audit_corrective_action.risk_level_id, which only exists once a CA is raised).
+        # Risk Level is a form answer, auto-derived from Impact/Compliance/etc. on the
+        # SAME submission as the Findings/Remarks text — read it from ai_audit_answers,
+        # NEVER aca.risk_level_id, which is the CA's own separate, later workflow value
+        # and would silently exclude every observation with no CA raised. See
+        # AUDIT_BUSINESS_RULES' RISK LEVEL note. Mirrors inspection's identical fix
+        # (sql/examples/seed_data.py, 'show high risk observations').
+        'nl':     'show high risk observations findings that are high risk list observations with high risk level',
+        'sql':    """\
+-- Self-join on findings.submission_id = risk.submission_id — NOT audit_report_id, which
+-- would pair this Risk Level answer with an unrelated Findings/Remarks entry from a
+-- DIFFERENT observation in the same report. Target output is the finding TEXT itself;
+-- Risk Level is only a filter, not a result column.
+SELECT findings.answer_text AS observation_text, arep.audit_id, arep.submitted_on
+FROM ai_audit_answers risk
+JOIN ai_questions risk_aq ON risk.element_id = risk_aq.element_id
+JOIN ai_audit_answers findings ON findings.submission_id = risk.submission_id
+JOIN ai_questions findings_aq ON findings.element_id = findings_aq.element_id
+JOIN audit_report arep ON risk.audit_report_id = arep.id
+WHERE risk_aq.label = 'Risk Level' AND risk.answer_text ILIKE '%High%'
+  AND findings_aq.label = 'Findings / Remarks'
+  AND arep.active = true
+ORDER BY arep.submitted_on DESC LIMIT 100;
+""",
+        'domain': 'ai_audit_answers', 'intent': 'filter', 'limit': 100,
+    },
+    {
+        # Added 2026-08-10 — confirmed live the same day as the Risk Level fix above:
+        # "risk mappings for these observations" fell back to
+        # aca.risk_level_id/impact_id/compliance_id (the CORRECTIVE ACTION's own, separate,
+        # later classification) instead of the observations' own form answers, silently
+        # excluding any observation with no CA raised. Risk Level, Impact, AND Compliance
+        # are ALL form answers in the SAME submission_id group as Findings/Remarks — see
+        # AUDIT_BUSINESS_RULES' RISK LEVEL / IMPACT / COMPLIANCE note.
+        # Conditional-aggregation pivot (GROUP BY submission_id, MAX(CASE WHEN label=...))
+        # instead of a multi-way self-join — pulling 3+ labels from one entry this way
+        # guarantees every value comes from the SAME submission_id with a single scan, no
+        # self-join-grain risk at all (preferred over self-joining ai_audit_answers to
+        # itself once for each label).
+        'nl':     'risk impact and compliance mappings for these observations classification for these findings',
+        'sql':    """\
+SELECT arep.audit_id,
+       MAX(CASE WHEN aq.label = 'Findings / Remarks' THEN aaa.answer_text END) AS observation_text,
+       MAX(CASE WHEN aq.label = 'Risk Level' THEN aaa.answer_text END) AS risk_level,
+       MAX(CASE WHEN aq.label = 'Impact' THEN aaa.answer_text END) AS impact,
+       MAX(CASE WHEN aq.label = 'Compliance' THEN aaa.answer_text END) AS compliance
+FROM ai_audit_answers aaa
+JOIN ai_questions aq ON aaa.element_id = aq.element_id
+JOIN audit_report arep ON aaa.audit_report_id = arep.id
+WHERE aq.label IN ('Findings / Remarks', 'Risk Level', 'Impact', 'Compliance')
+  AND arep.active = true
+GROUP BY aaa.submission_id, arep.audit_id
+ORDER BY arep.audit_id;
+""",
+        'domain': 'ai_audit_answers', 'intent': 'filter', 'limit': None,
+    },
+    {
         'nl':     'what is the cause, correction, and corrective action for this',
         'sql':    """\
 -- THREE SEPARATE TEXT COLUMNS on audit_corrective_action, confirmed live via DB
@@ -1289,6 +1349,37 @@ LIMIT 100;
         'domain': 'ai_audit_answers', 'intent': 'join', 'limit': 100,
     },
     {
+        # FORWARD direction (plural) — the counterpart to the two REVERSE (CA -> observation)
+        # examples above. Added 2026-08-10: this direction had NO seeded example anywhere
+        # (confirmed via full-repo search) despite the reverse direction being seeded twice —
+        # mirrors inspection's forward seed (sql/examples/seed_data.py, "show mitigative
+        # actions linked to a specific observation"), swapped ica->aca/ai_answers->
+        # ai_audit_answers, plus the mandatory aq.label filter audit needs (no single
+        # 'Observation' label exists here — see the OTHER examples in this cluster).
+        'nl':     'show corrective actions raised against a specific observation CAs for this observation corrective actions for this finding what CAs came from this observation',
+        'sql':    """-- OBSERVATION -> CA PATH (forward, plural): aaa.submission_id = aca.observation_id::varchar
+-- Cast UUID side to varchar — NOT aaa.submission_id::uuid (submission_id is varchar, observation_id is UUID)
+-- This is the DIRECT link — NOT aca.audit_id = arep.id (that returns ALL CAs in the report)
+-- aq.label = 'Findings / Remarks' anchors to the free-text finding for THIS observation
+-- (audit has no single 'Observation' label, unlike inspection — confirmed live)
+SELECT aca.corrective_action_id,
+       aca.cause,
+       aca.corrective_action,
+       aca.correction,
+       aca.responsible,
+       aca.status
+FROM audit_corrective_action aca
+JOIN ai_audit_answers aaa ON aaa.submission_id = aca.observation_id::varchar
+JOIN ai_questions aq ON aaa.element_id = aq.element_id
+WHERE aca.observation_id IS NOT NULL
+  AND aca.active = true
+  AND aq.label = 'Findings / Remarks'
+  AND aaa.answer_text ILIKE '%observation_text%'
+ORDER BY aca.corrective_action_id;
+""",
+        'domain': 'ai_audit_answers', 'intent': 'filter', 'limit': None,
+    },
+    {
         'nl':     'which observation triggered the most corrective actions observation with most CAs',
         'sql':    """-- CAST direction: aaa.submission_id = aca.observation_id::varchar
 -- submission_id is varchar, observation_id is UUID — cast UUID to varchar, NOT varchar to uuid
@@ -1311,6 +1402,9 @@ ORDER BY ca_count DESC LIMIT 10;
         'nl':     'reconstruct the form for this audit show all answers for this audit report full filled out form',
         'sql':    """-- PATH 2: whole-report reconstruction — aaa.audit_report_id = arep.id
 -- Group by submission_id: each distinct value is one repeatable entry (e.g. one observation)
+-- Tiebreak on aaa.id (real uuid PK, confirmed live 2026-08-10) — all answers of one
+-- submission are written in a single batch and commonly share the same aaa.created_on,
+-- so submission_id+created_on alone doesn't reliably order rows within one entry.
 SELECT aq.label,
        aaa.answer_text,
        aaa.answer_numeric,
@@ -1319,9 +1413,55 @@ FROM ai_audit_answers aaa
 JOIN ai_questions aq ON aaa.element_id = aq.element_id
 JOIN audit_report arep ON aaa.audit_report_id = arep.id
 WHERE arep.audit_id = '<AUDIT_DISPLAY_ID>'
-ORDER BY aaa.submission_id, aaa.created_on
+ORDER BY aaa.submission_id, aaa.created_on, aaa.id
 LIMIT 200;
 """,
         'domain': 'ai_audit_answers', 'intent': 'join', 'limit': 200,
+    },
+    {
+        'nl':     'list all audits plans schedules conducted and completed combined show every audit regardless of status all of the above',
+        'sql':    """\
+-- 'all' audits = plan UNION schedule (not yet conducted) UNION conducted UNION completed.
+-- audit_plan, audit_schedule, and audit_report are THREE SEPARATE tables. The
+-- NOT EXISTS guard on the AUDIT_SCHEDULE branch is REQUIRED: audit_schedule.
+-- schedule_status can itself reach ONGOING/COMPLETED once the underlying audit
+-- has actually happened — without the guard, an audit whose schedule already has
+-- a submitted/closed audit_report would be counted TWICE (once as AUDIT_SCHEDULE,
+-- again as CONDUCTED_AUDIT/COMPLETED_AUDIT).
+SELECT 'AUDIT_PLAN' AS entity_type, ap.id AS id, ap.title AS name,
+       ap.status AS status, ap.created_on AS ref_date
+FROM audit_plan ap
+WHERE ap.active = true AND ap.status != 'DRAFT'
+
+UNION ALL
+
+SELECT 'AUDIT_SCHEDULE' AS entity_type, asch.id AS id, asch.schedule_id AS name,
+       asch.schedule_status AS status, asch.created_on AS ref_date
+FROM audit_schedule asch
+WHERE asch.active = true
+  AND asch.schedule_status != 'DRAFT'
+  AND NOT EXISTS (
+      SELECT 1 FROM audit_report arep2
+      WHERE arep2.schedule_id = asch.id AND arep2.active = true
+  )
+
+UNION ALL
+
+SELECT 'CONDUCTED_AUDIT' AS entity_type, arep.id AS id, arep.audit_id AS name,
+       arep.status AS status, arep.submitted_on AS ref_date
+FROM audit_report arep
+WHERE arep.active = true AND arep.status = 'SUBMITTED'
+
+UNION ALL
+
+SELECT 'COMPLETED_AUDIT' AS entity_type, arep.id AS id, arep.audit_id AS name,
+       arep.status AS status, arep.submitted_on AS ref_date
+FROM audit_report arep
+WHERE arep.active = true AND arep.status IN ('CLOSED','CLOSED_WITH_EXCEPTION')
+
+ORDER BY ref_date DESC
+LIMIT 100;
+""",
+        'domain': 'audit_report', 'intent': 'listing', 'limit': 100,
     },
 ]

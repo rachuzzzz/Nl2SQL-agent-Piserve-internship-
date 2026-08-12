@@ -456,6 +456,11 @@ app-dashboard-display {
   border-radius: 999px; font-size: 10px; font-weight: 500; font-family: var(--font-mono);
 }
 .msg-pill-warn { background: var(--red-bg); color: var(--red); border-color: color-mix(in srgb, var(--err) 30%, transparent); }
+.msg-pill-domain { background: var(--gray-100); color: var(--gray-600); border-color: var(--gray-200); }
+.msg-recap {
+  font-size: 12px; font-style: italic; color: var(--gray-500);
+  margin: 0 0 4px 2px;
+}
 
 /* Typing */
 .typing-bub {

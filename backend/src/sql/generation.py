@@ -12,7 +12,7 @@ from typing import Any, Optional
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.engine import Engine
 
-from src.sql.validation import SQLValidator
+from src.sql.validation import SQLValidator, ValidationResult
 from src.llm.base import extract_token_counts
 
 
@@ -66,6 +66,110 @@ def _extract_table_names_from_sql(text: str) -> list[str]:
         if name not in seen:
             seen.append(name)
     return seen
+
+
+_SQL_START_RE = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
+
+
+def _looks_like_sql(text: str) -> bool:
+    """Cheap classifier for the legacy schema_hint compat path: does this
+    freeform string look like a runnable SQL draft, or is it prose notes
+    (e.g. "table=inspection_report, metric=avg(...)")? Deliberately
+    permissive — a false positive just means a non-SQL string renders
+    under the "Planner draft" heading instead of being treated as notes,
+    which is harmless (the coder model already treats that section as
+    editable/possibly-wrong)."""
+    return bool(_SQL_START_RE.match(text or ""))
+
+
+def _resolve_planner_contract(
+    schema_hint: str, draft_sql: str, join_path: str, business_rules,
+) -> tuple[str, str]:
+    """
+    Resolve the legacy single-string schema_hint shape and the new
+    structured planner fields (draft_sql/join_path/business_rules) into one
+    combined llm_hint string, plus the actual SQL draft text alone (for
+    table-name extraction and guard-scanning — join_path/business_rules
+    prose is never valid SQL and shouldn't be scanned as if it were).
+
+    Compat rule:
+      - draft_sql supplied  -> that's the draft; schema_hint (if any) is
+        additional freeform notes alongside it.
+      - draft_sql absent, schema_hint looks like SQL -> schema_hint IS the
+        draft (today's only shape, before this plan's Item 3).
+      - neither -> no draft; schema_hint (if any) is notes-only, e.g. the
+        "table=X, metric=avg(...)" shorthand some worked examples use.
+
+    Returns (llm_hint, draft_sql_only) — llm_hint is what renders under
+    "Planner draft" in the coder prompt; draft_sql_only is the resolved SQL
+    text alone, used for _extract_table_names_from_sql and (by the caller)
+    guard-scan fidelity checks.
+    """
+    if draft_sql:
+        resolved_draft = draft_sql
+        notes = schema_hint
+    elif _looks_like_sql(schema_hint):
+        resolved_draft = schema_hint
+        notes = ""
+    else:
+        resolved_draft = ""
+        notes = schema_hint
+
+    lines = []
+    if notes:
+        lines.append(notes)
+    if join_path:
+        lines.append(f"Suggested join path: {join_path}")
+    if business_rules:
+        _rules_text = (business_rules if isinstance(business_rules, str)
+                        else "; ".join(str(r) for r in business_rules))
+        lines.append(
+            "Planner-noted business rules (verify against the schema "
+            f"reference and Required section above): {_rules_text}"
+        )
+    if resolved_draft:
+        lines.append(resolved_draft)
+
+    return "\n".join(lines), resolved_draft
+
+
+def _build_additional_context(auto_schema: str, llm_hint: str, mandatory_hint: str) -> str:
+    """
+    Render the three registers that make up "{schema_hint}" in the prompt
+    template as separately labelled sub-sections, instead of one
+    undifferentiated blob.
+
+    Confirmed live 2026-08-07 (qid=e63f03af): before this split, a genuinely
+    mandatory INJECT-rule hint ("USE THIS EXACT SQL ... do not deviate")
+    and the reasoning model's own freeform guess sat in the same
+    concatenated string with no way for the coder model to tell which was
+    which. A blanket "this is all editable" note would have told the model
+    it could ignore the mandatory part too — the actual fix is telling it
+    which part is which, not softening everything uniformly.
+
+    auto_schema     — factual, always correct (curated schema/join block).
+    llm_hint        — the reasoning model's own draft; may be wrong.
+    mandatory_hint  — deterministic requirements (INJECT rules, LIMIT-N);
+                       must be followed exactly.
+    """
+    parts: list[str] = []
+    if auto_schema:
+        parts.append(f"#### Schema reference — factual\n{auto_schema}")
+    if mandatory_hint:
+        parts.append(f"#### Required — follow exactly, do not deviate\n{mandatory_hint}")
+    if llm_hint:
+        parts.append(
+            "#### Planner draft — editable, may be wrong\n"
+            "The block below is the planning model's first attempt at this "
+            "query. It is a STARTING POINT, not a specification. You may "
+            "rewrite its joins, substitute different tables, add or remove "
+            "predicates, and restructure it entirely if the schema "
+            "reference above or the PRIMARY EXAMPLE below shows a better "
+            "fit. Resolved literals in it (UUIDs, exact IDs, LIMIT/OFFSET "
+            "values) were resolved deliberately — keep those.\n"
+            f"{llm_hint}"
+        )
+    return "\n\n".join(parts) if parts else "No additional context provided."
 
 
 def _select_schema_block(
@@ -157,10 +261,50 @@ def _join_path_hints(relevant_tables: list, join_graph_module=None) -> str:
     return "".join(hints)
 
 
+def _build_guard_retry_prompt(question: str, additional_context: str, raw_sql: str, mandatory_block: str) -> str:
+    """
+    Minimal reconstructed prompt for a guard-forced retry (offset/table/uuid
+    guards below) — deliberately NOT the full original `prompt`. A guard
+    fires because the model dropped or violated one specific, already-
+    diagnosed instruction; fixing that doesn't need the full skeleton
+    template's naming/style rules, CORE_CONTEXT, or the 4 retrieved few-shot
+    examples again — the model already used all of that correctly enough to
+    produce `raw_sql` in the first place, it just needs the schema/join
+    context (additional_context — the same three-sub-section rendering
+    built by _build_additional_context for the main prompt, see
+    generate_sql above) and the one specific fix.
+
+    Confirmed live (token-usage audit, 2026-08-06): reusing the FULL
+    original prompt on every retry was the single largest contributor to
+    this app's worst-case 56-80K-token queries — 2-3 guard retries in one
+    turn meant re-sending the same ~7-8K-token prompt 2-3 times over for
+    what's usually a single dropped clause. Previously each guard also
+    re-appended its instruction onto the tail of the ORIGINAL prompt (one
+    guard's own "collapse schema_hint" step was silently dead code — its
+    regex matched a header, "### Schema Hint (follow this guidance)", that
+    neither real template actually uses; both say "### Additional context"
+    — so that retry was sending MORE tokens than the initial call, not
+    fewer). This replaces all three guards' prompt-reuse with one shared,
+    genuinely small reconstruction instead of patching that regex, since
+    the smaller prompt is strictly better once schema_hint is included.
+    """
+    return (
+        f"### Schema context\n{additional_context or 'No additional context provided.'}\n\n"
+        f"### Question\n{question}\n\n"
+        f"### Your previous SQL (needs correction)\n{raw_sql}\n\n"
+        f"{mandatory_block}\n"
+        f"[SQL]\n"
+    )
+
+
 def generate_sql(
     sql_llm, validator: SQLValidator, question: str,
     schema_hint: str = "", db_engine=None,
     sql_prompt_template: str = "",
+    draft_sql: str = "",
+    join_path: str = "",
+    business_rules: list | str | None = None,
+    _mandatory_hint: str = "",
     _debug_logger=None,
     _inject_rule_ids: list | None = None,
     _seed_index=None,
@@ -171,15 +315,31 @@ def generate_sql(
     _core_context: str | None = None,
     _build_core_context_fn=None,
     _join_graph_module=None,
+    _rules_engine=None,
 ) -> dict[str, Any]:
     try:
+        # Planner->SQL structured contract (generation-quality plan Item 3):
+        # resolve draft_sql/join_path/business_rules plus the legacy
+        # single-string schema_hint shape into one combined llm_hint text
+        # (schema_hint local var is reassigned to it below, so every
+        # downstream use of "schema_hint" — additional_context, the guard
+        # scans, the debug prompt log — automatically covers the new
+        # fields with no further plumbing) and the resolved SQL draft
+        # alone, for table extraction and fidelity checks.
+        schema_hint, _draft_sql_only = _resolve_planner_contract(
+            schema_hint, draft_sql, join_path, business_rules,
+        )
+
         # Captured BEFORE the auto_schema concatenation below so the
         # schema-hint-fidelity guard (further down) can extract table names
         # from exactly what the reasoning model itself proposed — the
         # curated auto_schema block appended next is a general column
         # reference, not a specific table requirement, and would pollute
-        # the extraction with unrelated tables if included.
-        _llama_schema_hint = schema_hint
+        # the extraction with unrelated tables if included. Uses the
+        # resolved SQL draft alone (not the combined llm_hint, which may
+        # also carry join_path/business_rules prose that isn't SQL and
+        # shouldn't be scanned for FROM/JOIN table references).
+        _llama_schema_hint = _draft_sql_only
 
         # Schema block — the slim version keeps context under ~600 tokens.
         # A full introspected column dump for every table (~2000+ tokens) inflates
@@ -197,8 +357,24 @@ def generate_sql(
             fallback_tables=_extract_table_names_from_sql(_llama_schema_hint),
         )
 
-        if auto_schema and not schema_hint.startswith("Use"):
-            schema_hint = f"{auto_schema}\n{schema_hint}" if schema_hint else auto_schema
+        # Three registers, three authorities — rendered as separately
+        # labelled sub-sections instead of one concatenated blob (see
+        # _build_additional_context's docstring for the qid=e63f03af
+        # incident this fixes). _guard_scan_text is what the offset/uuid
+        # guards below scan for resolved literals the coder model must
+        # preserve — auto_schema is deliberately excluded (it's a factual
+        # column/table reference, never carries a resolved OFFSET/UUID).
+        #
+        # schema_hint.startswith("Use"): preserves the pre-existing
+        # suppression of auto_schema when the reasoning model's own draft
+        # already opens with its own "Use ..." guidance — behavior-
+        # preserving, not new: inject/mandatory hints were always appended
+        # after the LLM's own text (never prepended), so this check has
+        # only ever tested the LLM's own hint, both before and after the
+        # _mandatory_hint split.
+        _auto_schema_for_context = "" if schema_hint.startswith("Use") else auto_schema
+        additional_context = _build_additional_context(_auto_schema_for_context, schema_hint, _mandatory_hint)
+        _guard_scan_text = "\n".join(filter(None, [schema_hint, _mandatory_hint]))
 
         if not sql_prompt_template:
             from src.sql.prompts import SQL_GENERATION_PROMPT
@@ -245,13 +421,15 @@ def generate_sql(
                 # example (missing a JOIN its WHERE clause still referenced)
                 # reappeared in the prompt every time. Capped at 3 so at
                 # least one example always survives at top_k=4.
-                retrieved = _seed_index.format_for_prompt(
+                retrieved, _primary_example_key = _seed_index.retrieve_with_primary_key(
                     question, top_k=4, skip_top_n=min(_retry_attempt, 3)
                 )
             except Exception:
                 retrieved = ""
+                _primary_example_key = ""
         else:
             retrieved = ""
+            _primary_example_key = ""
         # Substitute <CYCLE_UUID> placeholder with actual active cycle UUID if available
         if _active_cycle_uuid and retrieved:
             retrieved = retrieved.replace("<CYCLE_UUID>", _active_cycle_uuid)
@@ -260,7 +438,7 @@ def generate_sql(
         prompt = sql_prompt_template.replace(
             "{question}", question
         ).replace(
-            "{schema_hint}", schema_hint or "No additional context provided."
+            "{schema_hint}", additional_context
         ).replace(
             "{dynamic_examples}", dynamic_examples
         )
@@ -331,20 +509,18 @@ def generate_sql(
         # bad query still legitimately touched audit_cycle, it just dropped
         # the row-selector that pinned it to one specific row. ────────────
         try:
-            if re.search(r'\bOFFSET\s+\d+', _llama_schema_hint or "", re.IGNORECASE):
+            if re.search(r'\bOFFSET\s+\d+', _guard_scan_text or "", re.IGNORECASE):
                 if not re.search(r'\bOFFSET\s+\d+', raw_sql, re.IGNORECASE):
-                    _base_prompt = re.sub(r"\[SQL\]\s*$", "", prompt).rstrip()
-                    forced_prompt = (
-                        _base_prompt
-                        + f"\n\n### MANDATORY (do not deviate)\n"
-                        f"Your schema_hint above resolves \"the Nth one\" via a LIMIT 1 OFFSET "
-                        f"clause on audit_cycle — your query MUST include that same LIMIT/OFFSET "
-                        f"row-selection (directly, or via a subquery/CTE using it to pin the "
-                        f"specific cycle). Do NOT drop it and query across every cycle instead, "
-                        f"and do NOT substitute a different table structure copied from one of "
-                        f"the examples.\n"
-                        f"[SQL]\n"
+                    _mandatory = (
+                        "### MANDATORY (do not deviate)\n"
+                        "Your schema_hint above resolves \"the Nth one\" via a LIMIT 1 OFFSET "
+                        "clause on audit_cycle — your query MUST include that same LIMIT/OFFSET "
+                        "row-selection (directly, or via a subquery/CTE using it to pin the "
+                        "specific cycle). Do NOT drop it and query across every cycle instead, "
+                        "and do NOT substitute a different table structure copied from one of "
+                        "the examples."
                     )
+                    forced_prompt = _build_guard_retry_prompt(question, additional_context, raw_sql, _mandatory)
                     import logging as _logging
                     _logging.getLogger("inspectai").warning(
                         "[offset-guard] retry fired — schema_hint has OFFSET, raw_sql doesn't"
@@ -383,8 +559,22 @@ def generate_sql(
         # This turns INJECT rules from suggestions into contracts. ───────────
         if _inject_rule_ids:
             try:
-                from src.sql.rules import get_engine as _get_rules_engine
-                _guard_engine = _get_rules_engine()   # singleton — no re-init cost
+                # Domain-correct engine, threaded from the caller (loop.py
+                # already computes self._rules_engine per-domain via
+                # DomainConfig.rules_engine_getter — see domains.py). Falls
+                # back to the inspection singleton only when no engine was
+                # passed at all, preserving old behavior for any caller that
+                # doesn't thread this through yet. Confirmed live bug this
+                # fixes: _inject_rule_ids for the AUDIT domain (e.g.
+                # "audit_inject_auditor_auditee_from_ca") were being looked
+                # up in the INSPECTION registry, which has no such ids —
+                # required_tables_for/forbidden_patterns_for silently
+                # returned [] every time, so the guard never enforced
+                # anything for audit-domain questions.
+                _guard_engine = _rules_engine
+                if _guard_engine is None:
+                    from src.sql.rules import get_engine as _get_rules_engine
+                    _guard_engine = _get_rules_engine()   # singleton — no re-init cost
                 required = _guard_engine.required_tables_for(_inject_rule_ids)
                 forbidden = _guard_engine.forbidden_patterns_for(_inject_rule_ids)
                 missing_req = [t for t in required if t.lower() not in raw_sql.lower()]
@@ -404,21 +594,20 @@ def generate_sql(
                         guard_msg_parts.append(f"DO NOT USE: {', '.join(violated_forbidden)}")
                     guard_prefix = " | ".join(guard_msg_parts)
                     forced_question = f"[{guard_prefix}] {question}"
-                    # Replace both the question AND collapse the schema_hint to
-                    # just the guard message — avoids token overflow on retry
-                    # when the original schema_hint is long (e.g. FM CTE hints).
-                    forced_prompt = prompt.replace(
-                        f"[QUESTION]{question}[/QUESTION]",
-                        f"[QUESTION]{forced_question}[/QUESTION]",
-                    )
-                    # Also slim the schema_hint section to the guard message only
-                    # so deepseek focuses on the constraint, not the original hint
-                    forced_prompt = re.sub(
-                        r'(### Schema Hint \(follow this guidance\)\n).*?(\n### Examples)',
-                        r'\1-- ' + guard_prefix + r'\2',
-                        forced_prompt,
-                        flags=re.DOTALL,
-                    )
+                    # Minimal reconstructed prompt (see _build_guard_retry_prompt) —
+                    # replaces the old approach of reusing the full original `prompt`
+                    # and trying to "slim" its schema_hint section via a regex that
+                    # matched a header ("### Schema Hint (follow this guidance)")
+                    # neither real template actually has (both say "### Additional
+                    # context") — that regex silently no-op'd, so the old retry sent
+                    # MORE tokens than the initial call, not fewer. An f-string here
+                    # (not a regex-replacement template) also sidesteps the old
+                    # backslash-escape concern entirely: guard_prefix can contain raw
+                    # regex text from a rule's forbidden_patterns (e.g.
+                    # "\baca\.audit_id\s*=..."), which only breaks re.sub's template
+                    # parsing, not plain string interpolation.
+                    _mandatory = f"### MANDATORY (do not deviate)\n{guard_prefix}"
+                    forced_prompt = _build_guard_retry_prompt(forced_question, additional_context, raw_sql, _mandatory)
                     # Always log table-guard fires — doubles deepseek latency, important to track
                     import logging as _logging
                     _logging.getLogger("inspectai").warning(
@@ -466,13 +655,34 @@ def generate_sql(
         # filters. Force one retry pinning the UUID if it's missing from the
         # generated SQL. ─────────────────────────────────────────────────────
         try:
-            _hint_uuid_filters = re.findall(
-                r"([a-zA-Z_]\w*\.\w+)\s*=\s*'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
-                r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'",
-                schema_hint,
+            _UUID_RE_FRAG = (
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
             )
+            _hint_uuid_filters = [
+                (col, uid, "eq") for col, uid in re.findall(
+                    r"([a-zA-Z_]\w*\.\w+)\s*=\s*'(" + _UUID_RE_FRAG + r")'",
+                    _guard_scan_text,
+                )
+            ]
+            # Same identity-filter shape, but IN (...) — resolve_selected_rows
+            # (agent/orchestrator/row_selection.py) emits "WHERE x.id IN
+            # ('u1','u2',...)" for a multi-row checkbox selection, which the
+            # "=" pattern above never matched. Confirmed live 2026-08-06: the
+            # coder model silently dropped the entire IN clause and fell back
+            # to a generic unfiltered listing (18 rows instead of the 2 the
+            # user actually selected) — this guard never fired to catch/retry
+            # it because it only recognized single-uuid "=" filters.
+            for _col, _uid_blob in re.findall(
+                r"([a-zA-Z_]\w*\.\w+)\s*IN\s*\(\s*((?:'" + _UUID_RE_FRAG
+                + r"'\s*,?\s*)+)\)",
+                _guard_scan_text, re.IGNORECASE,
+            ):
+                for _uid in re.findall(_UUID_RE_FRAG, _uid_blob):
+                    _hint_uuid_filters.append((_col, _uid, "in"))
+
             _missing_uuid = [
-                (col, uid) for col, uid in _hint_uuid_filters
+                (col, uid, src) for col, uid, src in _hint_uuid_filters
                 if uid.lower() not in raw_sql.lower()
             ]
             if _missing_uuid:
@@ -481,29 +691,46 @@ def generate_sql(
                 # must be OR'd, not AND'd, or the filter demands a row where X is
                 # simultaneously both roles and the query returns 0 rows. Different
                 # uuids (genuinely separate resolved entities) still combine with AND.
+                #
+                # IN-sourced pairs are handled separately and grouped by COLUMN,
+                # not by uuid — several DIFFERENT uuids for the SAME column (a
+                # multi-row selection) mean "any of these", i.e. a single
+                # "col IN (u1, u2, ...)" clause, never "col = u1 AND col = u2"
+                # (which can't match any row at all).
+                _eq_missing = [(c, u) for c, u, s in _missing_uuid if s == "eq"]
+                _in_missing = [(c, u) for c, u, s in _missing_uuid if s == "in"]
+
                 _cols_by_uuid: dict[str, list[str]] = {}
-                for col, uid in _missing_uuid:
+                for col, uid in _eq_missing:
                     _cols_by_uuid.setdefault(uid, []).append(col)
                 _clause_parts = [
                     f"{cols[0]} = '{uid}'" if len(cols) == 1
                     else "(" + " OR ".join(f"{c} = '{uid}'" for c in cols) + ")"
                     for uid, cols in _cols_by_uuid.items()
                 ]
+
+                _uuids_by_col: dict[str, list[str]] = {}
+                for col, uid in _in_missing:
+                    _uuids_by_col.setdefault(col, []).append(uid)
+                _clause_parts += [
+                    f"{col} = '{uids[0]}'" if len(uids) == 1
+                    else f"{col} IN (" + ", ".join(f"'{u}'" for u in uids) + ")"
+                    for col, uids in _uuids_by_col.items()
+                ]
+
                 _filter_clause = " AND ".join(_clause_parts)
-                # Strip the base template's trailing "[SQL]" completion marker before
-                # appending our own instructions — otherwise the prompt ends up with
-                # two "[SQL]" markers (one mid-prompt, one at the true end), which can
-                # confuse a small completion-style model about where to actually start
-                # writing SQL.
-                _base_prompt = re.sub(r"\[SQL\]\s*$", "", prompt).rstrip()
-                forced_prompt = (
-                    _base_prompt
-                    + f"\n\n### MANDATORY FILTER (do not deviate)\n"
+                # Minimal reconstructed prompt (see _build_guard_retry_prompt) —
+                # not the full original `prompt` (see that helper's docstring for
+                # why: the full-prompt-reuse pattern used across all three guards
+                # was the single largest contributor to this app's worst-case
+                # 56-80K-token queries).
+                _mandatory = (
+                    "### MANDATORY FILTER (do not deviate)\n"
                     f"Your query MUST include this exact filter, verbatim: {_filter_clause}\n"
-                    f"This identity has already been resolved to a UUID — do NOT substitute "
-                    f"an ILIKE/name search, and do NOT change the column/table it's joined on.\n"
-                    f"[SQL]\n"
+                    "This identity has already been resolved to a UUID — do NOT substitute "
+                    "an ILIKE/name search, and do NOT change the column/table it's joined on."
                 )
+                forced_prompt = _build_guard_retry_prompt(question, additional_context, raw_sql, _mandatory)
                 import logging as _logging
                 _logging.getLogger("inspectai").warning(
                     f"[uuid-guard] retry fired — missing={_missing_uuid}"
@@ -526,7 +753,7 @@ def generate_sql(
                 # execution as if the guard had succeeded — potentially returning
                 # a different person's data than the one already resolved.
                 _still_missing_uuid = [
-                    (col, uid) for col, uid in _missing_uuid
+                    (col, uid, src) for col, uid, src in _missing_uuid
                     if uid.lower() not in raw_sql.lower()
                 ]
                 if _still_missing_uuid:
@@ -600,10 +827,19 @@ def generate_sql(
         # validate() returns ValidationResult — hard fails block, soft warns are advisory only.
         vresult = validator.validate(sql, question)
 
-        # validate_semantic() returns SOFT_WARN issues only.
+        # validate_semantic() returns SOFT_WARN issues by default.
         # These are logged for observability but NEVER injected into the retry prompt.
         # This is the core fix for validator poisoning: semantic heuristics must not
         # cause retries or appear in the errors list that the orchestrator reads.
+        #
+        # ONE narrow, allowlisted exception, confirmed live 2026-08-07
+        # (debug_llm_20260807_153128): glossary entries in semantic.py's
+        # _ENFORCED_GLOSSARY_IDS (conducted_audits/completed_audits) return
+        # HARD_FAIL — exact-literal checks against a 4-value enum sourced
+        # from semantics_registry.py's single source of truth, not the
+        # regex-heuristic-matching validator poisoning was originally about
+        # (BLOCK rules in sql/rules/block_rules.py are regex-based too —
+        # "regex" was never the real discriminator). See the merge below.
         sem_warns = validator.validate_semantic(sql, question)
 
         # validate_shape() — AST shape enforcement (HARD_FAIL if violated).
@@ -614,6 +850,20 @@ def generate_sql(
             if not shape_result.passed:
                 # Merge shape failure into vresult
                 vresult = shape_result
+
+        # Merge any allowlisted semantic HARD_FAILs into vresult — same
+        # pattern as the validate_shape() merge just above, reusing the
+        # SAME orchestrator retry path (loop.py reads _vresult/
+        # retry_message()); generate_sql() has no retry loop of its own.
+        # Must run AFTER the validate_shape() merge (so a shape failure
+        # isn't silently overwritten) and BEFORE the row-identity injection
+        # block below (so a synthetic __id column is never added to SQL
+        # that's about to be retried/discarded — see that block's own
+        # invariant, documented in its comment).
+        _sem_hard = [w for w in sem_warns if w.severity == "HARD_FAIL"]
+        _sem_soft = [w for w in sem_warns if w.severity != "HARD_FAIL"]
+        if _sem_hard and vresult.passed:
+            vresult = ValidationResult(passed=False, issues=vresult.issues + _sem_hard)
 
         # Row-identity injection (sqlglot AST, see validation/identity.py):
         # append a hidden <alias>.id sibling alongside any display column
@@ -654,14 +904,46 @@ def generate_sql(
                 f"\n{'='*70}\n>>> SQL-GEN CLEANED SQL ({_sql_model_name}) — {status}\n"
                 f"{'='*70}\n{sql}\n"
             )
-            if sem_warns:
+            if _sem_soft:
                 _debug_logger.debug(
                     f"  Semantic warns (not forwarded to LLM): "
-                    f"{'; '.join(str(w) for w in sem_warns)}"
+                    f"{'; '.join(str(w) for w in _sem_soft)}"
+                )
+            if _sem_hard:
+                _debug_logger.debug(
+                    f"  Semantic HARD_FAILs (forwarded to LLM via retry, allowlisted): "
+                    f"{'; '.join(str(w) for w in _sem_hard)}"
                 )
 
+        # Planner/generator attribution — Item 3 of the generation-quality
+        # plan (qid=e63f03af). planner_tables comes from whatever the
+        # reasoning model actually declared (relevant_tables/tables, or a
+        # fallback extraction from its own draft_sql if it didn't); this is
+        # NOT a validation gate, purely a diagnostic — see the docstring on
+        # "_diagnostics" below for why it's never forwarded to the LLM.
+        _planner_tables = relevant_tables or _extract_table_names_from_sql(_draft_sql_only)
+        _generated_tables = _extract_table_names_from_sql(sql)
+        _table_drift = [t for t in _generated_tables if t not in _planner_tables]
+        _table_overlap = len(set(_planner_tables) & set(_generated_tables))
+
+        if _debug_logger:
+            _debug_logger.debug(
+                f"\n{'='*70}\n>>> SQL-GEN PLANNER CONTRACT ({_sql_model_name})\n"
+                f"{'='*70}\n"
+                f"draft_sql_supplied={bool(draft_sql)} "
+                f"resolved_from='{'draft_sql' if draft_sql else ('schema_hint' if _draft_sql_only else 'none')}'\n"
+                f"join_path={join_path!r}\n"
+                f"business_rules={business_rules!r}\n"
+                f"primary_example={_primary_example_key or '(none matched)'}\n"
+                f"planner_tables={_planner_tables} generated_tables={_generated_tables} "
+                f"overlap={_table_overlap} drift={_table_drift}\n"
+            )
+
         # errors: concise hard-fail codes only — no soft warn prose, no semantic hints.
-        # warnings: soft warns + semantic warns — logged by caller, never in retry prompt.
+        # warnings: soft warns + soft semantic warns — logged by caller, never in
+        # retry prompt. Uses _sem_soft, not sem_warns — an escalated HARD_FAIL
+        # already landed in vresult.hard_fails via the merge above; including it
+        # here too would duplicate it into both errors AND warnings.
         return {
             "success": True,
             "result": {
@@ -669,7 +951,7 @@ def generate_sql(
                 "validation": {
                     "passed": vresult.passed,
                     "errors": [str(i) for i in vresult.hard_fails],
-                    "warnings": [str(i) for i in vresult.soft_warns + sem_warns],
+                    "warnings": [str(i) for i in vresult.soft_warns + _sem_soft],
                     # _vresult: structured object for orchestrator retry_message()
                     "_vresult": vresult,
                 },
@@ -681,6 +963,23 @@ def generate_sql(
                 "_token_usage": {
                     "prompt_tokens": _prompt_tok_total,
                     "completion_tokens": _completion_tok_total,
+                },
+                # Internal-only, human-debugging attribution data (Item 3 of
+                # the generation-quality plan) — answers "did the planner or
+                # the coder model make the mistake" from a single log line
+                # instead of manually diffing two prompt blobs. Deliberately
+                # NEVER forwarded into validation["errors"/"warnings"] or any
+                # LLM-facing retry message — same hard-won rule as semantic
+                # warnings below (see sem_warns: "logged for observability
+                # but NEVER injected into the retry prompt... the core fix
+                # for validator poisoning"). Diagnostics are for humans only.
+                "_diagnostics": {
+                    "primary_example_key": _primary_example_key,
+                    "planner_tables": _planner_tables,
+                    "generated_tables": _generated_tables,
+                    "table_drift": _table_drift,
+                    "draft_sql_supplied": bool(draft_sql),
+                    "join_path": join_path,
                 },
             },
             "error": None,

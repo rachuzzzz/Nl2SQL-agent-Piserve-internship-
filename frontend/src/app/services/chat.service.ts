@@ -36,7 +36,7 @@ export class ChatService {
     this.lastDebug$.next(last?.debug ?? null);
   }
 
-  sendMessage(text: string): Observable<ChatResponse> {
+  sendMessage(text: string, selectedPositions?: number[]): Observable<ChatResponse> {
     const conv = this.activeConversation$.value!;
     conv.messages.push({ id: uuid(), role: 'user', text, timestamp: new Date() });
     if (conv.messages.length === 1) {
@@ -46,8 +46,9 @@ export class ChatService {
     this.loading$.next(true);
 
     return this.http.post<ChatResponse>(this.API + '/chat', {
-      message:    text,
-      session_id: conv.id,
+      message:            text,
+      session_id:         conv.id,
+      selected_positions: selectedPositions?.length ? selectedPositions : undefined,
     }).pipe(
       tap({
         next: res => {
@@ -60,6 +61,8 @@ export class ChatService {
             text:           cleanText,
             timestamp:      new Date(),
             debug:          res,
+            domain:         res.domain ?? null,
+            intentRecap:    res.intent_recap ?? null,
             resultData:     res.result_data ?? null,
             chartConfig:    res.chart_config ?? null,
             chartSignal:    chartSignal,

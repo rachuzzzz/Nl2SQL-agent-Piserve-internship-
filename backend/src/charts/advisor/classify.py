@@ -88,6 +88,36 @@ _RADAR_DIM_KW = {
     'inspection', 'audit', 'check', 'survey', 'assessment',
 }
 
+# Urgency classification for a status/workflow CATEGORY VALUE (not a column
+# name — see _WORKFLOW_RE above for that). Keyword-substring, not an exact
+# enum whitelist, since inspection and audit each have their own differently
+# named but similarly shaped workflow enums (confirmed live via
+# knowledge/semantics_registry.py: OVERDUE / CLOSE_WITH_DEFERRED /
+# RETURN_FOR_MODIFICATION / PENDING_FOR_REVIEW / APPROVE vs DRAFT / SUBMITTED
+# / RETURNED_FOR_MODIFICATION / APPROVED — matching substrings like "RETURN"/
+# "APPROV" covers both spellings without hardcoding either domain's exact
+# strings. Ordered — checked in this order, first match wins, so a value
+# like "RETURN_FOR_MODIFICATION" hits the critical "RETURN" match before any
+# broader/later pattern could apply.
+_STATUS_SEVERITY_KW = (
+    ("critical", ("OVERDUE", "REJECT", "RETURN")),
+    ("warning",  ("PENDING", "DRAFT", "SUBMIT", "UNDER_REVIEW", "OPEN", "DEFER")),
+    ("ok",       ("CLOSED", "APPROV", "ACCEPT", "COMPLETE")),
+)
+
+
+def _status_severity(value) -> str | None:
+    """Urgency bucket ("critical"/"warning"/"ok") for a status-column VALUE,
+    or None when it doesn't match any known workflow vocabulary — callers
+    must treat None as "no special styling", never default it to "ok"."""
+    v = str(value or "").upper()
+    if not v:
+        return None
+    for severity, keywords in _STATUS_SEVERITY_KW:
+        if any(kw in v for kw in keywords):
+            return severity
+    return None
+
 
 def _is_date_col(col, vals):
     if _DATE_RE.search(col): return True

@@ -108,6 +108,21 @@ Turn 1: {"thought": "'impact' = business dimension affected, use impact_id. impa
 """,
     },
     {
+        "title": "CAs with multiple status filters combined — status + progress_stage + risk_level are independent axes, AND them all",
+        "question_pattern": (
+            r"(?i)\bcorrective\s+actions?\b.{0,60}\b(overdue|at\s+risk|behind|risk\s*level|(?:medium|high|low)\s+risk)\b"
+            r"|\b(overdue|at\s+risk|behind|risk\s*level|(?:medium|high|low)\s+risk)\b.{0,60}\bcorrective\s+actions?\b"
+        ),
+        "text": """\
+─── CAs matching several status filters at once (timeliness + progress + severity) ───
+User: "show corrective actions that are overdue, at risk, and have medium risk"
+Turn 1: {"thought": "Three independent aca axes in one question, all must be ANDed — NOT the same column: status='OVERDUE' (system timeliness), progress_stage='AT_RISK' (internal stakeholder's self-reported progress, NOT severity), risk_level_id via a JOIN to risk_level where name='Medium' (severity, a separate lookup table). Do not conflate 'at risk' with risk_level, and do not drop the risk_level JOIN just because 'medium risk' looks like a plain column value.", "tool": "generate_sql", "args": {"question": "corrective actions overdue and at risk with medium risk level", "schema_hint": "SELECT aca.corrective_action_id, aca.correction, aca.status, aca.progress_stage, rl.name AS risk_level FROM audit_corrective_action aca JOIN risk_level rl ON aca.risk_level_id = rl.id WHERE aca.status = 'OVERDUE' AND aca.progress_stage = 'AT_RISK' AND rl.name = 'Medium' AND aca.active = true LIMIT 100;"}}
+NEVER: WHERE aca.status = 'OVERDUE' AND aca.progress_stage = 'AT_RISK' with no risk_level JOIN at all when
+  the question also names a severity level ('medium risk', 'high risk') — that silently drops the third
+  filter instead of narrowing to it.
+""",
+    },
+    {
         "title": "Who proposed/raised a CA — created_by, not responsible or pending_with",
         "question_pattern": (
             r"(?i)\bwho\s+(proposed|raised|raised\s+it|logged|created|filed|reported)\b.{0,30}"

@@ -8,14 +8,16 @@ one" resolved to the STRING 'Delegation testing', and a subsequent
 WHERE ap.title = 'Delegation testing' filter would silently match BOTH
 rows, merging two different plans' data into one answer.
 
-After the fix, build_context_block() must resolve "the third one" straight
-to the SPECIFIC row's real id (captured via row_ids, paired 1:1 with
-row_titles by inject_row_identity()'s __id columns) — not to the
-ambiguous title.
+Ported onto resolve_ordinal_reference (agent/orchestrator/ordinal.py) —
+the LLM now supplies an explicit 1-based `position` directly as a tool
+argument instead of the retired session.py regex parsing an ordinal word
+out of question text; the resolution logic itself (real row id over
+ambiguous title, duplicate-title WARNING) is otherwise unchanged.
 """
 
 from src.agent.orchestrator.session import ConversationSession
 from src.agent.orchestrator.models import ConversationTurn
+from src.agent.orchestrator.ordinal import resolve_ordinal_reference
 
 # Real titles/order from the live-caught 7-plan list.
 _PLAN_TITLES = [
@@ -48,21 +50,19 @@ def _session_after_plan_listing() -> ConversationSession:
 
 def test_third_one_resolves_to_the_specific_duplicate_titled_plan():
     session = _session_after_plan_listing()
-    ctx = session.build_context_block(
-        current_question="for the third one what is the review status",
-        current_domain="audit",
-    )
-    assert f"id '{_PLAN_A_ID}'" in ctx
-    assert "ORDINAL RESOLVED" in ctx
-    assert _PLAN_B_ID not in ctx  # must not conflate with the OTHER duplicate
-    assert "WHERE ... = 'Delegation testing'" not in ctx  # no title-based filter
+    r = resolve_ordinal_reference(session, "audit", position=3, entity_type_hint=None)
+    result = r["result"]
+    assert result["resolved"] is True
+    assert result["target_id"] == _PLAN_A_ID
+    assert result["target_id"] != _PLAN_B_ID
+    assert result["target_column"] == "id"
+    assert result["warning"] is not None
+    assert "MORE THAN ONCE" in result["warning"]
 
 
 def test_sixth_one_resolves_to_the_other_duplicate_titled_plan():
-    session = _session_after_plan_listing()
-    # No "sixth" in _ORDINAL_WORD_TO_IDX (only 1st-5th) — use an in-range
-    # ordinal instead to confirm position, not just title, drives resolution.
-    # Swap plan A/B into positions 1 and 2 for this check.
+    # Swap plan A/B into positions 1 and 2 to confirm POSITION, not title,
+    # drives resolution.
     session2 = ConversationSession()
     session2.add_turn(ConversationTurn(
         question="list all plans under this cycle",
@@ -73,22 +73,16 @@ def test_sixth_one_resolves_to_the_other_duplicate_titled_plan():
         row_titles=["Delegation testing", "Delegation testing"],
         row_ids=[_PLAN_A_ID, _PLAN_B_ID],
     ))
-    ctx_first = session2.build_context_block(
-        current_question="for the first one what is the review status",
-        current_domain="audit",
-    )
-    ctx_second = session2.build_context_block(
-        current_question="for the second one what is the review status",
-        current_domain="audit",
-    )
-    assert f"id '{_PLAN_A_ID}'" in ctx_first and _PLAN_B_ID not in ctx_first
-    assert f"id '{_PLAN_B_ID}'" in ctx_second and _PLAN_A_ID not in ctx_second
+    r_first = resolve_ordinal_reference(session2, "audit", position=1, entity_type_hint=None)
+    r_second = resolve_ordinal_reference(session2, "audit", position=2, entity_type_hint=None)
+    assert r_first["result"]["target_id"] == _PLAN_A_ID
+    assert r_second["result"]["target_id"] == _PLAN_B_ID
 
 
 def test_falls_back_to_warning_when_no_id_was_captured():
     """Same duplicate-title shape, but row_ids empty (e.g. the query had a
-    GROUP BY and inject_row_identity() skipped it) — must fall back to the
-    duplicate-detection WARNING, not silently produce a title filter."""
+    GROUP BY and inject_row_identity() skipped it) — must still surface the
+    duplicate-detection WARNING, not silently claim a resolved id."""
     session = ConversationSession()
     session.add_turn(ConversationTurn(
         question="list all plans under this cycle",
@@ -99,11 +93,10 @@ def test_falls_back_to_warning_when_no_id_was_captured():
         row_titles=list(_PLAN_TITLES),
         row_ids=["", "", "", "", "", "", ""],
     ))
-    ctx = session.build_context_block(
-        current_question="for the third one what is the review status",
-        current_domain="audit",
-    )
-    assert "ORDINAL RESOLVED" not in ctx
-    assert "ORDINAL REFERENCE DETECTED" in ctx
-    assert "WARNING" in ctx
-    assert "appears MORE THAN ONCE" in ctx
+    r = resolve_ordinal_reference(session, "audit", position=3, entity_type_hint=None)
+    result = r["result"]
+    assert result["resolved"] is True
+    assert result["target_id"] == ""
+    assert result["target_column"] == ""
+    assert result["warning"] is not None
+    assert "MORE THAN ONCE" in result["warning"]

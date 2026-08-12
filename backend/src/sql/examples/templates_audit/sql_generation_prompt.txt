@@ -81,6 +81,16 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
   pick the source table from what the question is actually asking about, never from the
   label text alone.
 
+  These axes belong to the CORRECTIVE ACTION, not the observation — use them ONLY for
+  questions specifically about the ACTION's own classification ("high risk corrective
+  actions", "impact of this CA"). For "high risk observations"/"findings", "risk/impact/
+  compliance mappings for these observations" — ANY question about the OBSERVATION itself
+  — Risk Level/Impact/Compliance are FORM ANSWERS instead: ai_audit_answers WHERE aq.label
+  IN ('Risk Level','Impact','Compliance'), in the SAME submission_id group as the
+  Findings/Remarks text, NEVER aca.risk_level_id/impact_id/compliance_id (a separate,
+  later value that only exists once a CA is raised — confirmed live 2026-08-10, see
+  AUDIT_BUSINESS_RULES).
+
 ### PLAIN STRING ENUMS — NOT FOREIGN KEYS:
   audit_corrective_action.responsible IN ('KHIDMAH', 'KHIDMAH_AND_CLIENT', 'CLIENT',
     'SERVICE_PROVIDER_CONTRACTOR', 'CONSULTANT') — WHICH PARTY executes the fix, not a person
@@ -155,12 +165,18 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
     FROM ai_audit_answers aaa
     JOIN ai_questions aq ON aaa.element_id = aq.element_id
     WHERE aaa.audit_report_id = arep.id
-    ORDER BY aaa.submission_id, aaa.created_on
+    ORDER BY aaa.submission_id, aaa.created_on, aaa.id
+    -- aaa.id tiebreak: all answers of one submission are written in one batch and
+    -- commonly share the same created_on (confirmed live 2026-08-10) — without id,
+    -- ordering within one repeatable entry is not deterministic.
 
 ### Additional context
 {schema_hint}
 
 ### Examples
+The first example below is marked PRIMARY: it is the closest retrieved
+match to this question and is the pattern to follow. The rest are
+secondary references.
 {dynamic_examples}
 
 ### Answer

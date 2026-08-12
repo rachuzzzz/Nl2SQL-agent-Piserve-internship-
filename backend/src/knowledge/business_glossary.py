@@ -15,8 +15,28 @@ Each entry defines:
   - severity: HARD_FAIL (blocks) or SOFT_WARN (logs only)
 
 The GlossaryValidator is called from validate_semantic() so violations
-appear as SOFT_WARN by default — observable but non-blocking.
-Flip to HARD_FAIL for production enforcement once eval confirms stability.
+appear as SOFT_WARN by default — observable but non-blocking, REGARDLESS
+of an entry's own `severity` field.
+
+Confirmed live 2026-08-07 (debug_llm_20260807_153128): "list all conducted
+audits" generated status IN ('SUBMITTED','CLOSED','CLOSED_WITH_EXCEPTION')
+— wrong per AUDIT_REPORT_SEMANTICS's own conducted=SUBMITTED-only
+definition. The glossary caught it exactly right (conducted_audits fired),
+but the SOFT_WARN-always behavior meant nothing blocked or corrected the
+query — 18 rows shipped instead of the correct 13, silently.
+
+Enforcement is now opt-in per entry id, via sql/validation/semantic.py's
+_ENFORCED_GLOSSARY_IDS allowlist — the direct analogue of engine.py's
+_CONSUMED_RULE_IDS gotcha for BLOCK/WARN rules, so a `"severity":
+"HARD_FAIL"` tag here never silently starts blocking production on its
+own. Only conducted_audits/completed_audits are currently allowlisted
+(exact-literal checks against a 4-value enum from a single source of
+truth). The 5 CAPEX/OPEX entries also tagged HARD_FAIL below (search
+capex_conversion_rate, capex_converted, opex_incurred, fm_manager_capex,
+capex_row_multiplication) are DELIBERATELY left off that allowlist —
+they're heuristic phrase-matchers (e.g. bare "rate"/"percent"), not yet
+proven stable enough to block on. Their severity tag is real, just dormant
+until they're added to the allowlist after their own eval.
 """
 
 from __future__ import annotations
@@ -97,6 +117,13 @@ class GlossaryTerm:
     correct_sql: str                    # shown in violation message
     message: str                        # violation message
     severity: str = "SOFT_WARN"        # SOFT_WARN or HARD_FAIL
+    # Human-readable name for LLM-facing messages when this entry is
+    # actually enforced (HARD_FAIL) — defaults to terms[0] in _build() below
+    # if not set explicitly, but terms[0] is often a raw regex (e.g.
+    # r"conducted\s+audits?\b(?!\s+plans?\b)"), not fit to show the model.
+    # Set explicitly on any entry that gets allowlisted for enforcement in
+    # sql/validation/semantic.py's _ENFORCED_GLOSSARY_IDS.
+    label: str = ""
     # Pre-compiled — populated at load time
     _term_re: Optional[re.Pattern] = field(default=None, repr=False, compare=False)
     _required_re: Optional[re.Pattern] = field(default=None, repr=False, compare=False)
@@ -245,6 +272,7 @@ _RAW: list[dict] = [
         # anchor on what follows), which would wrongly fire this
         # report-scoped entry on a plan-scoped question too. Confirmed live.
         "terms": [r"completed\s+audits?\b(?!\s+plans?\b)"],
+        "label": "completed audits",
         "required_pattern": _AUDIT_REPORT_COMPLETED_REQUIRED,
         "forbidden_patterns": [],
         "correct_sql": _AUDIT_REPORT_COMPLETED_SQL,
@@ -254,7 +282,13 @@ _RAW: list[dict] = [
             f"'conducted' (audit done, report submitted, not yet closed) — not "
             f"completed. This is about audit_report, NOT audit_plan.status."
         ),
-        "severity": "SOFT_WARN",
+        # Enforced (HARD_FAIL) — see sql/validation/semantic.py's
+        # _ENFORCED_GLOSSARY_IDS. Confirmed live 2026-08-07
+        # (debug_llm_20260807_153128): the mirror-image conducted_audits
+        # entry below was caught firing on real wrong SQL, silently, while
+        # SOFT_WARN-only. Escalated alongside it — same table, same
+        # registry source, same question class.
+        "severity": "HARD_FAIL",
     },
     {
         "id": "conducted_audits",
@@ -263,6 +297,7 @@ _RAW: list[dict] = [
         # with any "audit plan(s)" phrasing so stay plain.
         "terms": [r"conducted\s+audits?\b(?!\s+plans?\b)", "in-flight audit",
                    "in-flight audits", "audits in progress"],
+        "label": "conducted audits",
         "required_pattern": _AUDIT_REPORT_CONDUCTED_REQUIRED,
         "forbidden_patterns": [],
         "correct_sql": _AUDIT_REPORT_CONDUCTED_SQL,
@@ -273,7 +308,17 @@ _RAW: list[dict] = [
             f"CLOSED_WITH_EXCEPTION (completed). This is about audit_report, "
             f"NOT audit_plan.status."
         ),
-        "severity": "SOFT_WARN",
+        # Enforced (HARD_FAIL) — see sql/validation/semantic.py's
+        # _ENFORCED_GLOSSARY_IDS. Confirmed live 2026-08-07
+        # (debug_llm_20260807_153128, qid=88b9c71e): "list all conducted
+        # audits" generated status IN ('SUBMITTED','CLOSED',
+        # 'CLOSED_WITH_EXCEPTION') — 18 rows instead of the correct 13 — and
+        # this entry fired correctly but the SOFT_WARN-always behavior meant
+        # nothing blocked it. Requires semantics_registry.py's
+        # conducted_required_regex() len==1 fix (accepts both '=' and
+        # 'IN (single)') to avoid an unfixable retry loop — see that
+        # function's docstring.
+        "severity": "HARD_FAIL",
     },
     {
         "id": "completed_audit_plans",
@@ -536,6 +581,7 @@ def _build() -> list[GlossaryTerm]:
             correct_sql=raw["correct_sql"],
             message=raw["message"],
             severity=raw.get("severity", "SOFT_WARN"),
+            label=raw.get("label") or raw["terms"][0],
         ).compile()
         entries.append(entry)
     return entries
@@ -548,12 +594,15 @@ GLOSSARY: list[GlossaryTerm] = _build()
 # Public interface
 # ---------------------------------------------------------------------------
 
-def check_glossary(question: str, sql: str) -> list[tuple[str, str]]:
+def check_glossary(question: str, sql: str) -> list[tuple[GlossaryTerm, str]]:
     """
     Check SQL against all glossary terms that match the question.
 
-    Returns list of (severity, message) tuples for any violations.
-    Empty list = no violations.
+    Returns list of (entry, message) tuples for any violations — the full
+    entry (not just its severity) so the one caller (sql/validation/
+    semantic.py) can check entry.id against its enforcement allowlist and
+    use entry.label/correct_sql for a clean retry message. Empty list = no
+    violations.
     """
     violations = []
     for entry in GLOSSARY:
@@ -561,5 +610,5 @@ def check_glossary(question: str, sql: str) -> list[tuple[str, str]]:
             continue
         msg = entry.violation(sql)
         if msg:
-            violations.append((entry.severity, msg))
+            violations.append((entry, msg))
     return violations

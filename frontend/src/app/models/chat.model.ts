@@ -25,6 +25,17 @@ export interface ResultData {
   has_more?:       boolean;
   sql:             string | null;
   disambiguation?: DisambiguationMeta | null;
+  // True only when this turn's rows are resolvable server-side against a
+  // checkbox selection (see resolve_selected_rows) — false for stats-style
+  // tables and always false on anything fetched via /api/page.
+  row_selectable?: boolean;
+}
+
+// ── Row selection (checkbox pick -> scoped follow-up) ──────────────────────
+
+export interface SelectedRow {
+  position: number;  // 1-based, matches backend ChatRequest.selected_positions
+  label:    string;  // first-column display value, for the chip UI
 }
 
 // ── Chart types ───────────────────────────────────────────────────────────────
@@ -77,8 +88,13 @@ export interface DashboardCard {
   label:   string;
   value:   number;
   value2?: number;          // max value for 'range' cards
-  kind:    'avg' | 'sum' | 'range' | 'distinct';
-  icon:    'star' | 'list' | 'range' | 'hash';
+  kind:    'avg' | 'sum' | 'range' | 'distinct' | 'status';
+  icon:    'star' | 'list' | 'range' | 'hash' | 'status';
+  // 'status'-kind cards only (see backend/src/charts/advisor/kpi.py's
+  // _status_breakdown_cards) — one card per status VALUE (e.g. "Overdue: 5")
+  // instead of a single generic sum, for a status-breakdown-shaped result.
+  severity?:     'critical' | 'warning' | 'ok' | null;  // drives card coloring
+  filter_value?: string;    // raw status value, for click-to-drill filtering
 }
 
 export interface DashboardData {
@@ -98,6 +114,13 @@ export interface ChatResponse {
   answer:            string;
   sql:               string | null;
   reasoning:         string | null;
+  // Which domain answered this turn — "inspection" | "audit" | null
+  // (ambiguous / no orchestrator ran for this reply).
+  domain?:           string | null;
+  // Short "here's what I understood" recap shown above the answer — see
+  // backend/src/api/intent_recap.py. Null when a recap doesn't make sense
+  // for this turn (a /chart-followup reply, a domain-ambiguity reply).
+  intent_recap?:     string | null;
   prompt_tokens:     number;
   completion_tokens: number;
   total_tokens:      number;
@@ -119,6 +142,8 @@ export interface Message {
   text:            string;
   timestamp:       Date;
   debug?:          ChatResponse | null;
+  domain?:         string | null;   // "inspection" | "audit" | null — which domain answered this turn
+  intentRecap?:    string | null;   // "here's what I understood" recap shown above the bubble
   resultData?:     ResultData | null;
   chartConfig?:    ChartConfig | null;
   chartSignal?:    ChartSignal | null;   // parsed from __CHART_AVAILABLE__ signal

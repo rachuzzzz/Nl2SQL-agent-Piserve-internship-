@@ -8,6 +8,11 @@ from pydantic import BaseModel, Field
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
+    # 1-based positions of rows the user checked in the UI on the last
+    # rendered table (page 1 only — see ResultData.row_selectable and
+    # agent/orchestrator/row_selection.py). None/empty when nothing was
+    # selected for this message.
+    selected_positions: list[int] | None = None
 
 class PageRequest(BaseModel):
     session_id: str
@@ -42,6 +47,13 @@ class ResultData(BaseModel):
     has_more: bool = False
     sql: str | None = None   # base SQL — sent back with every /api/page call
     disambiguation: DisambiguationMeta | None = None
+    # True only when this turn's rows were actually captured into
+    # ConversationTurn.row_titles/row_ids (see synthesis.py's turn-finish
+    # capture) — i.e. checkbox selection + resolve_selected_rows can
+    # resolve against them. False for e.g. get_answer_stats tables (never
+    # captured) and always false from /api/page (bypasses session/turns
+    # entirely — see routes/chat.py's get_page).
+    row_selectable: bool = False
 
 class ChartConfig(BaseModel):
     chart_type: str | None
@@ -72,6 +84,17 @@ class ChatResponse(BaseModel):
     answer: str
     sql: str | None
     reasoning: str | None
+    # Which domain answered this turn — "inspection" | "audit" | None
+    # (ambiguous domain / no orchestrator ran for this reply). Lets the
+    # frontend show a small label so a silent mid-conversation domain
+    # switch (see agent/domain_router.py's classify(), re-run fresh on
+    # every message) isn't invisible to the user.
+    domain: str | None = None
+    # Short "here's what I understood" sentence shown alongside the answer —
+    # see api/intent_recap.py. None on turns where a recap doesn't make
+    # sense (a /chart-followup reply, or a domain-ambiguity clarification
+    # that already explains itself).
+    intent_recap: str | None = None
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int

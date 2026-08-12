@@ -725,15 +725,16 @@ LIMIT 100;
     {
         'nl':     'which month had the most high risk observations this year',
         'sql':    """\
+-- Single scan, no self-join — counting entries doesn't need the paired Observation
+-- text, only the Risk Level answer. A self-join here (joining ai_answers to itself
+-- to also pull the Observation text) is a wrong-grain trap unless matched on
+-- submission_id — confirmed live 2026-08-10, see BUSINESS_RULES' RISK LEVEL note.
 SELECT TO_CHAR(date_trunc('month', ir.submitted_on), 'Month YYYY') AS month,
-       COUNT(*) AS high_risk_count
+       COUNT(DISTINCT aa.submission_id) AS high_risk_count
 FROM ai_answers aa
 JOIN ai_questions aq ON aa.element_id = aq.element_id
-JOIN ai_answers risk_aa ON risk_aa.inspection_report_id = aa.inspection_report_id
-JOIN ai_questions risk_aq ON risk_aa.element_id = risk_aq.element_id
 JOIN inspection_report ir ON aa.inspection_report_id = ir.id
-WHERE aq.label = 'Observation'
-  AND risk_aq.label = 'Risk Level' AND risk_aa.answer_text ILIKE '%High%'
+WHERE aq.label = 'Risk Level' AND aa.answer_text ILIKE '%High%'
   AND EXTRACT(YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE)
 GROUP BY date_trunc('month', ir.submitted_on)
 ORDER BY high_risk_count DESC LIMIT 1;
@@ -1419,20 +1420,56 @@ ORDER BY aa.module_name, aq.label LIMIT 200;
         'nl':     'show high risk observations',
         'sql':    """\
 -- Form answer risk — use ai_answers WHERE aq.label = 'Risk Level', NOT risk_level table
-SELECT aa.inspection_id, obs.answer_text AS observation, ir.submitted_on
+-- (risk_level_id lives on the CORRECTIVE ACTION, a separate later workflow value —
+-- confirmed live 2026-08-10 that Risk Level is auto-derived from Impact/Compliance/etc.
+-- on the SAME form submission as the observation text, so it must be read from there).
+-- Self-join on obs.submission_id = aa.submission_id — NOT inspection_report_id/ir.id,
+-- which would pair this Risk Level answer with an unrelated Observation from a
+-- DIFFERENT entry in the same report. The target output is the observation TEXT
+-- itself; Risk Level is only a filter, not a result column.
+SELECT obs.answer_text AS observation_text, ir.inspection_id, ir.submitted_on
 FROM ai_answers aa
 JOIN ai_questions aq ON aa.element_id = aq.element_id
-JOIN inspection_report ir ON aa.inspection_report_id = ir.id
-JOIN ai_answers obs ON obs.inspection_report_id = ir.id
+JOIN ai_answers obs ON obs.submission_id = aa.submission_id
 JOIN ai_questions obs_q ON obs.element_id = obs_q.element_id
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
 WHERE aq.label = 'Risk Level' AND aa.answer_text ILIKE '%High%'
   AND obs_q.label = 'Observation'
-  AND ir.status != 'DRAFT'
+  AND ir.status != 'DRAFT' AND ir.active = true
 ORDER BY ir.submitted_on DESC LIMIT 100;
 """,
         'domain': 'form_answers',
         'intent': 'filter',
         'limit':  100,
+    },
+    {
+        # Added 2026-08-10 — audit's mirror confirmed live the same day: "risk mappings for
+        # these observations" fell back to inspection_corrective_action.risk_level_id/
+        # impact_id (a SEPARATE, later value on the mitigative action) instead of the
+        # observations' own form answers, silently excluding any observation with no MA
+        # raised. Risk Level AND Impact are BOTH form answers in the SAME submission_id
+        # group as Observation — see BUSINESS_RULES' RISK LEVEL / IMPACT note.
+        # Conditional-aggregation pivot (GROUP BY submission_id, MAX(CASE WHEN label=...))
+        # instead of a multi-way self-join — pulling 2+ labels from one entry this way
+        # guarantees every value comes from the SAME submission_id with a single scan, no
+        # self-join-grain risk at all.
+        'nl':     'risk and impact mappings for these observations classification for these findings',
+        'sql':    """\
+SELECT ir.inspection_id,
+       MAX(CASE WHEN aq.label = 'Observation' THEN aa.answer_text END) AS observation_text,
+       MAX(CASE WHEN aq.label = 'Risk Level' THEN aa.answer_text END) AS risk_level,
+       MAX(CASE WHEN aq.label = 'Impact' THEN aa.answer_text END) AS impact
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+WHERE aq.label IN ('Observation', 'Risk Level', 'Impact')
+  AND ir.active = true AND ir.status != 'DRAFT'
+GROUP BY aa.submission_id, ir.inspection_id
+ORDER BY ir.inspection_id;
+""",
+        'domain': 'form_answers',
+        'intent': 'filter',
+        'limit':  None,
     },
     {
         'nl':     'what did inspectors write in the observation field for a specific facility',
@@ -1621,6 +1658,40 @@ ORDER BY aa.score DESC LIMIT 10;
         'limit':  10,
     },
     {
+        # Whole-form reconstruction — added 2026-08-10, mirroring audit's equivalent
+        # (sql/examples/audit_seed_data.py, "reconstruct the form for this audit"). This
+        # direction previously had NO seed/prompt path at all for inspection — get_answers
+        # was the only documented route (system_prompt.txt), same flat/LIMIT=50/ungrouped
+        # shape that already broke a follow-up on the audit side (2026-07-31 incident) before
+        # audit got this generate_sql path. module_name filter confirmed REQUIRED live
+        # 2026-08-10: ai_answers rows for one inspection_report_id span multiple modules
+        # ('Inspection Form' plus MA-workflow submodules like 'Inspection Mitigative Action
+        # Entry'/'...PR Entry'/'...Completion'/'Inspection Report Approval' etc.) — omitting
+        # it pulls in workflow noise, not the form. (Unlike audit, whose reconstruction query
+        # needs no module filter — one audit_report is filled from exactly one form template.)
+        'nl':     'reconstruct the form for this inspection show all answers for this inspection report full filled out form',
+        'sql':    """-- Whole-report reconstruction — aa.inspection_report_id = ir.id
+-- Group by submission_id: each distinct value is one repeatable entry (e.g. one observation)
+-- module_name filter REQUIRED (confirmed live) — ai_answers also holds MA-workflow rows
+-- sharing the same inspection_report_id, not just the canonical form's own answers
+-- Tiebreak on aa.id (real uuid PK, confirmed live 2026-08-10) — all answers of one
+-- submission are written in a single batch and commonly share the same aa.created_on,
+-- so submission_id+created_on alone doesn't reliably order rows within one entry.
+SELECT aq.label,
+       aa.answer_text,
+       aa.answer_numeric,
+       aa.submission_id
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+WHERE ir.inspection_id = '<INSPECTION_DISPLAY_ID>'
+  AND aa.module_name = 'Inspection Form'
+ORDER BY aa.submission_id, aa.created_on, aa.id
+LIMIT 200;
+""",
+        'domain': 'form_answers', 'intent': 'join', 'limit': 200,
+    },
+    {
         'nl':     'show mitigative actions linked to a specific observation MAs for observation mitigative actions for this observation mitigative actions for first observation mitigative actions raised from this finding',
         'sql':    """-- OBSERVATION → MA PATH: aa.submission_id = ica.observation_id::varchar
 -- Cast UUID side to varchar — NOT aa.submission_id::uuid (submission_id is varchar, observation_id is UUID)
@@ -1645,6 +1716,54 @@ ORDER BY ica.corrective_action_id;
         'domain': 'corrective_action',
         'intent': 'filter',
         'limit':  None,
+    },
+    {
+        # REVERSE direction (singular) — the counterpart to the forward PATH1 example above.
+        # Added 2026-08-10: this direction previously only existed as prose (see system_prompt.txt's
+        # "REVERSE PATH — observation for a MA"), no seed example — mirrors audit's reverse seed
+        # (sql/examples/audit_seed_data.py, "what was the observation for this corrective action"),
+        # swapped aca->ica/ai_audit_answers->ai_answers, aq.label='Findings / Remarks'->'Observation'
+        # (inspection's free-text finding field IS literally labeled 'Observation', unlike audit).
+        'nl':     'what was the observation for this mitigative action observation text for a specific MA what triggered this mitigative action',
+        'sql':    """-- MA -> OBSERVATION PATH (reverse): aa.submission_id = ica.observation_id::varchar
+-- Cast UUID side to varchar — NOT aa.submission_id::uuid (submission_id is varchar, observation_id is UUID)
+-- Filter to the free-text finding itself — omitting aq.label returns every form field in the
+-- submission (Risk Level, Impact, etc.), not just the observation.
+SELECT ica.corrective_action_id,
+       aa.answer_text AS observation_text
+FROM inspection_corrective_action ica
+JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+WHERE ica.corrective_action_id = '<MA_ID>'
+  AND ica.observation_id IS NOT NULL
+  AND ica.active = true
+  AND aq.label = 'Observation'
+LIMIT 1;
+""",
+        'domain': 'corrective_action',
+        'intent': 'join',
+        'limit':  1,
+    },
+    {
+        'nl':     'show the full submission everything filled out for this observation entry that triggered this mitigative action',
+        'sql':    """-- Full-submission variant — every form field for the observation entry
+-- this MA was raised against, not just the free-text finding. Use when the
+-- question asks to see everything filled out, not "what observation" alone.
+SELECT ica.corrective_action_id,
+       aq.label AS field,
+       aa.answer_text AS value
+FROM inspection_corrective_action ica
+JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+WHERE ica.corrective_action_id = '<MA_ID>'
+  AND ica.observation_id IS NOT NULL
+  AND ica.active = true
+ORDER BY aq.label
+LIMIT 100;
+""",
+        'domain': 'corrective_action',
+        'intent': 'join',
+        'limit':  100,
     },
     {
         'nl':     'which observation triggered the most mitigative actions observation with most MAs',
@@ -3511,14 +3630,17 @@ ORDER BY quarter_start;
     {
         'nl':     'high risk observations raised this month count risk level observations month',
         'sql':    """\
--- High-risk OBSERVATIONS = mitigative actions with risk_level JOIN — NOT ai_answers
--- NEVER: ai_answers WHERE label='Observation' AND answer_text ILIKE '%High%'
-SELECT COUNT(*) AS high_risk_observation_count
-FROM inspection_corrective_action ica
-JOIN inspection_report ir ON ica.inspection_id = ir.id
-JOIN risk_level rl ON ica.risk_level_id = rl.id
-WHERE rl.name = 'High'
-  AND ir.active = true AND ica.active = true
+-- Risk Level is a form answer (auto-derived from Impact/Compliance/etc. on the SAME
+-- submission as the observation) — NOT inspection_corrective_action.risk_level_id,
+-- which is a separate, later, action-level value that only exists once a MA is raised
+-- and would silently exclude every observation with no MA (confirmed live 2026-08-10,
+-- see BUSINESS_RULES' RISK LEVEL note). Single scan, no self-join needed for a count.
+SELECT COUNT(DISTINCT aa.submission_id) AS high_risk_observation_count
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
+WHERE aq.label = 'Risk Level' AND aa.answer_text ILIKE '%High%'
+  AND ir.active = true AND ir.status != 'DRAFT'
   AND date_trunc('month', ir.submitted_on) = date_trunc('month', CURRENT_DATE);
 """,
         'domain': 'form_answers',
@@ -3528,14 +3650,17 @@ WHERE rl.name = 'High'
     {
         'nl':     'which facility most critical high risk deviations risk by facility critical',
         'sql':    """\
--- NEVER use ai_answers for risk counts — use risk_level table
-SELECT fac.name AS facility_name, COUNT(ica.id) AS high_risk_count
-FROM inspection_corrective_action ica
-JOIN inspection_report ir ON ica.inspection_id = ir.id
+-- Risk Level is a form answer (ai_answers, same submission as the observation) — NOT
+-- inspection_corrective_action.risk_level_id (a separate action-level value that only
+-- exists once a MA is raised — confirmed live 2026-08-10, see BUSINESS_RULES). Single
+-- scan, no self-join needed for a count.
+SELECT fac.name AS facility_name, COUNT(DISTINCT aa.submission_id) AS high_risk_count
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
 JOIN facility fac ON ir.facility_id = fac.id
-JOIN risk_level rl ON ica.risk_level_id = rl.id
-WHERE rl.name = 'High'
-  AND ir.active = true AND ica.active = true AND fac.active = true
+WHERE aq.label = 'Risk Level' AND aa.answer_text ILIKE '%High%'
+  AND ir.active = true AND fac.active = true AND ir.status != 'DRAFT'
 GROUP BY fac.id, fac.name
 ORDER BY high_risk_count DESC LIMIT 10;
 """,
@@ -3799,17 +3924,19 @@ ORDER BY overdue_count DESC LIMIT 10;
     {
         'nl':     'which inspection type raises most high risk deviations inspection type risk',
         'sql':    """\
--- High-risk deviations by inspection type — use risk_level table JOIN, NOT ai_answers
--- NEVER: ai_answers WHERE label='Risk Level' AND answer_text ILIKE '%High%'
+-- Risk Level is a form answer (ai_answers, same submission as the observation) — NOT
+-- inspection_corrective_action.risk_level_id (a separate action-level value that only
+-- exists once a MA is raised — confirmed live 2026-08-10, see BUSINESS_RULES). Single
+-- scan, no self-join needed for a count.
 SELECT
     it.name AS inspection_type_name,
-    COUNT(*) AS high_risk_count
-FROM inspection_corrective_action ica
-JOIN inspection_report ir ON ica.inspection_id = ir.id
+    COUNT(DISTINCT aa.submission_id) AS high_risk_count
+FROM ai_answers aa
+JOIN ai_questions aq ON aa.element_id = aq.element_id
+JOIN inspection_report ir ON aa.inspection_report_id = ir.id
 JOIN inspection_type it ON ir.inspection_type_id = it.id
-JOIN risk_level rl ON ica.risk_level_id = rl.id
-WHERE rl.name = 'High'
-  AND ir.active = true AND ica.active = true AND it.active = true
+WHERE aq.label = 'Risk Level' AND aa.answer_text ILIKE '%High%'
+  AND ir.active = true AND it.active = true AND ir.status != 'DRAFT'
 GROUP BY it.id, it.name
 ORDER BY high_risk_count DESC LIMIT 10;
 """,
@@ -4089,5 +4216,54 @@ WHERE DATE_FORMAT(i.inspection_date, '%Y-%m') = DATE_FORMAT(CURDATE(), '%Y-%m');
         'domain': 'inspection',
         'intent': 'single_value',
         'limit':  None,
+    },
+    {
+        'nl':     'list all inspections scheduled conducted and completed combined show every inspection regardless of status all of the above',
+        'sql':    """\
+-- 'all' inspections = scheduled (not yet conducted) UNION conducted UNION completed.
+-- inspection_schedule and inspection_report are SEPARATE tables — a schedule that
+-- hasn't produced a report yet has NO inspection_report row at all, so querying
+-- inspection_report alone silently drops every not-yet-conducted inspection.
+-- The NOT EXISTS guard is REQUIRED on the SCHEDULED branch: once a schedule's
+-- inspection is conducted, it already appears via inspection_report — without the
+-- guard the SAME inspection would be double-counted (once as SCHEDULED, again as
+-- CONDUCTED/COMPLETED).
+-- inspection_schedule has NO human-readable code column (only the UUID 'id') —
+-- MUST cast to text so its type matches inspection_report.inspection_id
+-- (varchar) below, or the UNION fails at execution: "UNION types uuid and
+-- character varying cannot be matched" (confirmed live).
+SELECT 'SCHEDULED' AS entity_type, isched.id::text AS id, fac.name AS facility_name,
+       isched.status AS status, isched.due_date AS ref_date
+FROM inspection_schedule isched
+JOIN facility fac ON isched.facility_id = fac.id
+WHERE isched.active = true
+  AND isched.status NOT IN ('CANCELLED')
+  AND NOT EXISTS (
+      SELECT 1 FROM inspection_report ir2
+      WHERE ir2.schedule_id = isched.id AND ir2.active = true
+  )
+
+UNION ALL
+
+SELECT 'CONDUCTED' AS entity_type, ir.inspection_id AS id, fac.name AS facility_name,
+       ir.status AS status, ir.submitted_on AS ref_date
+FROM inspection_report ir
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE ir.active = true AND ir.status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION')
+
+UNION ALL
+
+SELECT 'COMPLETED' AS entity_type, ir.inspection_id AS id, fac.name AS facility_name,
+       ir.status AS status, ir.submitted_on AS ref_date
+FROM inspection_report ir
+JOIN facility fac ON ir.facility_id = fac.id
+WHERE ir.active = true AND ir.status = 'CLOSED'
+
+ORDER BY ref_date DESC
+LIMIT 100;
+""",
+        'domain': 'inspection',
+        'intent': 'listing',
+        'limit':  100,
     },
 ]

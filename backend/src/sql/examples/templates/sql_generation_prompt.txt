@@ -83,82 +83,6 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
           AND ir.active = true AND ir.status != 'DRAFT'
     )
 
-### CAPEX CONVERSION — CRITICAL DEFINITIONS:
-  CAPEX Generated  = SUM(ica.capex)              — the FM manager's quoted/estimated amount on each ICA
-  CAPEX Converted  = SUM(po_details.po_amount)   — what the client actually paid via PO (money HAS moved)
-  CAPEX Lost       = SUM(ica.capex) - COALESCE(SUM(po.po_amount), 0)
-                     — the arithmetic gap between quoted and paid. This is NOT capex_status='REJECTED'.
-                     — user phrases that mean CAPEX Lost: "didn't get converted", "not converted",
-                       "unconverted capex", "capex gap", "capex shortfall", "wasted capex",
-                       "how much capex was lost", "capex that wasn't paid"
-  OPEX Incurred    = SUM(pr_details.pr_amount)   — Khidmah's own internal spend via PR (bad: org paying itself)
-  Conversion Rate  = SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100
-
-  CAPEX GROUPING — "entity" and "facility" are DIFFERENT tables, NEVER treat as synonyms:
-    Facility: JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id
-    Entity:   JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN entity ent ON ir.entity_id = ent.id
-    Region:   ... → facility → region
-    Project:  JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN project proj ON ir.project_id = proj.id
-    FM Mgr:   JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN users u ON ir.inspectee_user_id = u.id
-  If the user says "by entity", GROUP BY ent.name (entity table) — do NOT substitute facility.
-
-  ica.expenditure is a CATEGORY FLAG ('CAPEX','OPEX','CAPEX_AND_OPEX','NO_EXPENDITURE')
-  NEVER use ica.expenditure to compute any financial amount — it is a category string, not a number
-  NEVER use capex_status='ACCEPTED' as a proxy for conversion — use po_details
-  NEVER use capex_status='REJECTED' to compute CAPEX Lost — use the arithmetic difference above
-  CAPEX Lost ≠ rejected CAPEX: a user asking about "wasted" or "unconverted" capex means the
-    arithmetic gap, not the subset where capex_status='REJECTED'. Only use capex_status='REJECTED'
-    when the user explicitly says "rejected" and wants to see those specific MA rows.
-
-  FAN-OUT RULE — ALWAYS pre-aggregate po_details and pr_details in CTEs before joining to ica.
-  One ICA can have MULTIPLE POs and MULTIPLE PRs — a direct LEFT JOIN multiplies rows silently.
-  NEVER: LEFT JOIN po_details p ON p.mitigative_action_uuid = ica.id  (causes fan-out)
-  ALWAYS use CTE pre-aggregation (or scalar subqueries for single-row totals):
-    WITH po_agg AS (SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po
-                    FROM po_details WHERE active = true GROUP BY 1)
-    LEFT JOIN po_agg po ON po.ica_id = ica.id
-
-### P&L (PROFIT & LOSS) MODEL — CRITICAL:
-  INCOME / CAPEX Converted = SUM(po_details.po_amount)   — client paid Khidmah (PO = Purchase Order)
-  COST   / OPEX Incurred   = SUM(pr_details.pr_amount)   — Khidmah paid out internally (PR = Payment Request)
-  PROFIT                   = SUM(po.po_amount) - SUM(pr.pr_amount)
-  LOSS                     = when COST > INCOME (negative profit)
-
-  "OPEX" in user language always means SUM(pr_details.pr_amount) — the PR spend.
-  "income" / "revenue" in user language always means SUM(po_details.po_amount).
-  NEVER use ica.capex as income or revenue — it is a QUOTE/ESTIMATE, no money has moved.
-
-  These totals are NOT fixed — they change as new POs/PRs are entered.
-  ALWAYS compute Income/Cost/Profit LIVE via SUM(). NEVER state remembered/previous totals.
-
-  P&L JOIN PATTERN — always pre-aggregate in CTEs to avoid row fan-out:
-    WITH po_agg AS (
-        SELECT mitigative_action_uuid AS ica_id,
-               SUM(po_amount) AS total_income
-        FROM po_details WHERE active = true GROUP BY 1
-    ),
-    pr_agg AS (
-        SELECT mitigative_action_uuid AS ica_id,
-               SUM(pr_amount) AS total_cost
-        FROM pr_details WHERE active = true GROUP BY 1
-    )
-    SELECT ...,
-           COALESCE(SUM(po.total_income), 0) AS income,
-           COALESCE(SUM(pr.total_cost),  0) AS cost,
-           COALESCE(SUM(po.total_income), 0) - COALESCE(SUM(pr.total_cost), 0) AS profit
-    FROM inspection_corrective_action ica
-    LEFT JOIN po_agg po ON po.ica_id = ica.id
-    LEFT JOIN pr_agg pr ON pr.ica_id = ica.id
-    ...GROUP BY ...
-
-  P&L GROUPING — can be broken down by:
-    Facility:   JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id
-    FM Manager: JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN users u ON ir.inspectee_user_id = u.id
-    Region:     ... → facility → region
-    Entity:     JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN entity ent ON ir.entity_id = ent.id
-    Project:    JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN project proj ON ir.project_id = proj.id
-    Country:    JOIN inspection_report ir ON ica.inspection_id = ir.id JOIN facility fac ON ir.facility_id = fac.id JOIN country c ON fac.country_id = c.id
-
 ### INSPECTION_REPORT — TWO USER FK COLUMNS (different people, NEVER mix):
   inspector_user_id  → person who CONDUCTED the inspection (Inspector)
   inspectee_user_id  → person being inspected (FM Manager / facility manager)
@@ -190,6 +114,21 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
 
   NEVER confuse: one observation ≠ all observations in an inspection.
 
+  "reconstruct the form" / "all answers for this inspection report":
+    SELECT aq.label, aa.answer_text, aa.answer_numeric, aa.submission_id
+    FROM ai_answers aa
+    JOIN ai_questions aq ON aa.element_id = aq.element_id
+    WHERE aa.inspection_report_id = ir.id
+      AND aa.module_name = 'Inspection Form'
+    ORDER BY aa.submission_id, aa.created_on, aa.id
+    -- aa.module_name filter REQUIRED (confirmed live 2026-08-10): ai_answers also holds
+    -- MA-workflow submodule rows (Client Details Entry, PR Entry, Completion, Progress
+    -- Tracking, Report/Portfolio Approval-Rejection, etc.) sharing the same
+    -- inspection_report_id — omitting this pulls in workflow noise, not the form.
+    -- aa.id tiebreak: a submission's answers are written in one batch and commonly share
+    -- the same created_on — without id, ordering within one repeatable entry is not
+    -- deterministic.
+
 ### AI FLAT TABLES — use these for all form question/answer data:
 
   ai_questions EXACT columns (use ONLY these — nothing else exists):
@@ -214,6 +153,11 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
     score_type           varchar
     max_score            numeric  ← maximum possible points for this question
     module_name          text
+    submission_id        text     ← groups ALL answers for one repeatable entry (e.g. one Observation)
+    created_on            timestamp without time zone  ← confirmed live 2026-08-10, needed for
+                          ORDER BY when reconstructing a whole form (see below) — id tiebreak
+                          required too: a submission's answers are written in one batch and
+                          commonly share the same created_on
 
   aa.score vs inspection_report.inspection_score:
     aa.score              = points earned for ONE answer to ONE question (weighted per question)
@@ -231,11 +175,27 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
                            Higher score = more/higher-weight categories selected
                            NEVER treat Impact as High/Medium/Low severity — it is category-based
                            To filter by category: aa.answer_text ILIKE '%Health & Safety%'
+                           NEVER inspection_corrective_action.impact_id for "impact of this
+                           OBSERVATION" — that's a SEPARATE, later value on the mitigative
+                           action itself (only exists once a MA is raised). Use ica.impact_id
+                           only for "impact of this MA" — a question about the ACTION, not the
+                           observation. Confirmed live 2026-08-10 alongside the identical
+                           Risk Level fix below.
       'Risk Level'       — FORM CONFIG ARTIFACT: score is set at form publication time, NOT by the inspector's answer
                            Current forms always score=4; legacy forms always score=1 regardless of answer
                            NEVER use aa.score WHERE label='Risk Level' for severity analysis — it is meaningless
                            To analyse actual risk level: use aa.answer_text ILIKE '%High%' / '%Medium%' etc.
                            answer_text values: 'High', 'Medium', 'Low', 'No Active Risk'
+                           NEVER inspection_corrective_action.risk_level_id for this — that's a
+                           SEPARATE, later value on the mitigative action itself (only exists once
+                           a MA is raised), not the observation's own Risk Level answer.
+                           To pull the paired Observation TEXT alongside the Risk Level filter,
+                           self-join ai_answers to itself matched on submission_id (the value that
+                           identifies "same repeatable entry") — NEVER on inspection_report_id,
+                           which pairs answers from ANY entry in the report, not necessarily the
+                           SAME one a High-risk Risk Level answer came from. Confirmed live
+                           2026-08-10 (see BUSINESS_RULES' RISK LEVEL note): two seed examples in
+                           this codebase had exactly this bug before being fixed.
       'Observation Type' — type score (range observed: 1, also a form config artifact — not meaningful)
                            answer_text values: 'Deviation', 'Good Practice'
     'Observation' (free-text) has NO score — NEVER use WHERE aq.label = 'Observation' AND aa.score IS NOT NULL
@@ -290,6 +250,9 @@ Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
 {schema_hint}
 
 ### Examples
+The first example below is marked PRIMARY: it is the closest retrieved
+match to this question and is the pattern to follow. The rest are
+secondary references.
 {dynamic_examples}
 
 ### Answer

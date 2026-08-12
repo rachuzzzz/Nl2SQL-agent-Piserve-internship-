@@ -28,16 +28,33 @@ from src.sql.validation import SQLValidator
 from src.agent.domains import get_domain_config
 from src.agent.tools import ToolRegistry
 from src.agent.tool_dispatcher import parse_tool_call, dispatch
+from src.agent.tool_defs import get_declared, declared_tools
 from src.security.rbac import build_scope_filter
 from src.sql.result_shape import is_disambiguation_result, is_entity_disambiguation_result
+from src.knowledge.fuzzy_vocab import fuzzy_augment
 
 from src.agent.orchestrator.models import AgentStep, QueryStats, ConversationTurn, AgentResult
-from src.agent.orchestrator.debug import _make_debug_logger, _dbg, _build_constraint_notes, _CONSTRAINT_NOTE_MAP
+from src.agent.orchestrator.debug import _make_debug_logger, _dbg, _build_constraint_notes, _CONSTRAINT_NOTE_MAP, _cap_text
 from src.agent.orchestrator.synthesis import SynthesisMixin
 from src.agent.orchestrator.disambiguation import DisambiguationMixin
+from src.agent.orchestrator.session import _COUNT_FOLLOWUP_RE, _SELECTION_FOLLOWUP_RE
 
 
 _PG_ERROR_CLASS_RE = re.compile(r"psycopg2\.errors\.(\w+)")
+
+# Detector (not resolver) for the resolve_ordinal_reference backstop below —
+# only decides whether the question PLAUSIBLY needs positional resolution,
+# never derives a position/entity-type from it (the LLM does that itself,
+# as structured tool args). No noun-capturing group, unlike the retired
+# session.py._ORDINAL_RE this replaces — there is deliberately nothing left
+# here to mis-scan.
+_ORDINAL_BACKSTOP_RE = re.compile(
+    r"\b(the\s+)?(\d+\s*(?:st|nd|rd|th)|first|second|third|fourth|fifth|"
+    r"sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|"
+    r"fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|"
+    r"twentieth)\b(?!-?\s*part(?:y|ies)\b)",
+    re.IGNORECASE,
+)
 
 
 def _failure_signature(error_text: str) -> frozenset:
@@ -55,6 +72,67 @@ def _failure_signature(error_text: str) -> frozenset:
     """
     m = _PG_ERROR_CLASS_RE.search(error_text or "")
     return frozenset([m.group(1) if m else (error_text or "")[:80]])
+
+
+# Extracts the first single-quoted identifier out of a ValidationIssue.message
+# (e.g. "Table alias 'proj' is used..." -> "proj"). See _validation_issue_signature.
+_QUOTED_IDENT_RE = re.compile(r"'([^']{1,100})'")
+
+
+def _validation_issue_signature(issue) -> str:
+    """
+    Refines a validator HARD_FAIL's bare .code into a signature that also
+    captures WHICH identifier it complained about, for the _sql_retry_signal
+    "stuck on the same wall" comparison below (NOT for anything else — see
+    the note below).
+
+    Confirmed live 2026-08-07 (qid=e63f03af): a capex/opex question failed
+    UNDEFINED_ALIAS on attempt 2 (alias 'ir' missing) and again on attempt 3
+    (alias 'proj' missing) — two unrelated bugs the coder model introduced
+    fresh each time, not the same wall twice. Comparing by bare .code alone
+    treated both as identical, escalated _sql_retry_signal as if the model
+    were stuck, and that escalation (see retrieval/examples.py's skip_top_n)
+    dropped the #1-ranked worked example — which was actually the correct
+    CTE pattern for the question — from the next attempt's prompt. Folding
+    the quoted identifier into the signature means two different aliases no
+    longer collide; a genuinely repeated identical alias failure still does.
+
+    Deliberately does NOT touch issue.code or .message — only builds a
+    separate string for this comparison. ValidatorStats.record() (aggregates
+    by bare code), retry_message() (the LLM-facing text), and
+    orchestrator/debug.py's _build_constraint_notes() (substring-matches
+    .code against _CONSTRAINT_NOTE_MAP keys) all still see the unmodified
+    code/message and are unaffected.
+    """
+    m = _QUOTED_IDENT_RE.search(issue.message or "")
+    return f"{issue.code}:{m.group(1)}" if m else issue.code
+
+
+_TOOL_NAME_RE = re.compile(r'"tool"\s*:\s*"(\w+)"')
+
+
+def _summarize_dropped_messages(dropped: list[ChatMessage]) -> str:
+    """
+    Mechanical, purely-textual summary of round-trips being proactively
+    trimmed out of `messages` (see the proactive context trim in query()) —
+    a breadcrumb so the model retains SOME memory of what it already tried
+    instead of silently losing it and potentially repeating an already-
+    completed tool call. Deliberately conservative: extracts just the tool
+    name (regex over the raw ASSISTANT tool-call JSON) and the first ~150
+    chars of its paired USER-role result, rather than a per-tool-shape
+    summarizer — a real one can be built later from actual debug_llm_*.log
+    traces if this proves too thin in practice.
+    """
+    parts: list[str] = []
+    for m in dropped:
+        if m.role == MessageRole.ASSISTANT:
+            tm = _TOOL_NAME_RE.search(m.content or "")
+            if tm:
+                parts.append(tm.group(1))
+        elif m.role == MessageRole.USER and parts:
+            snippet = (m.content or "")[:150].replace("\n", " ")
+            parts[-1] = f"{parts[-1]} → {snippet}"
+    return "; ".join(parts)
 
 
 class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
@@ -92,17 +170,25 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # not the full per-column dump (for_system_prompt) — the full dump pushed
         # this prompt to 19953/20000 num_ctx tokens, causing truncated tool-call
         # JSON (see debug_llm_*.log "TRUNCATED — unclosed brace(s)" warnings).
-        # The domain's business rules/table relationships (already embedded in
-        # for_reasoning_prompt() via DatabaseSchema's injected constant set —
-        # see knowledge/schema_introspector.py's DomainConfig fields) are
-        # re-appended verbatim since routing logic still relies on them.
+        #
+        # business_rules/table_relationships here use the CORE-only subset
+        # (DatabaseSchema._business_rules_core/_table_relationships_core), not
+        # the full BUSINESS_RULES/TABLE_RELATIONSHIPS — 2026-08 token audit:
+        # the full audit-domain content alone measured ~34K chars (~8.5K
+        # tokens), unconditionally, on every question regardless of topic.
+        # The narrow-topic remainder (observation/MA paths, risk/impact,
+        # approval workflow, user roles, communication groups, ...) is
+        # surfaced per-question instead via build_dynamic_prompt_additions'
+        # CONDITIONAL_BLOCKS below — same question_pattern-gate mechanism
+        # already used for MA_WORKFLOW_BLOCK. See knowledge/schema_introspector.py's
+        # "Topic-gated core/topical split" section for what stayed core vs why.
         _rules_block = "BUSINESS_RULES:\n" + "\n".join(
-            f"  - {r}" for r in self.db_schema._business_rules
+            f"  - {r}" for r in self.db_schema._business_rules_core
         )
         self._system_prompt = self._domain_cfg.system_prompt.replace(
             self._domain_cfg.schema_placeholder,
             self.db_schema.for_reasoning_prompt() + "\n\n" + _rules_block
-            + "\n\n" + self.db_schema._table_relationships
+            + "\n\n" + self.db_schema._table_relationships_core
         )
         # {inspection_schema_sql}/{audit_schema_sql} removed — injecting full DDL
         # exceeded num_ctx:16384, causing Ollama to truncate the prompt from the
@@ -132,10 +218,16 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             db_engine=self.db_engine, embed_model=self.embed_model)
         self.validator = SQLValidator(domain=self.domain)
 
-        # Build seed example index — embeds NL questions for retrieval-based injection
+        # Build seed example index — embeds NL questions for retrieval-based injection.
+        # query_domain_tags/query_domain_fallback: None for inspection (keeps
+        # SeedExampleIndex's built-in inspection-tuned keyword map); audit
+        # passes explicit neutral overrides via DomainConfig — see that
+        # dataclass's field comment and SeedExampleIndex.__init__'s docstring.
         self.seed_index = SeedExampleIndex(
             embed_model=self.embed_model,
             examples=self._domain_cfg.seed_examples,
+            query_domain_tags=self._domain_cfg.seed_query_domain_tags,
+            query_domain_fallback=self._domain_cfg.seed_query_domain_fallback,
         )
 
         self.chat_model_name = chat_model
@@ -185,8 +277,17 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             core_context=self._domain_cfg.core_context,
             build_core_context_fn=self._domain_cfg.build_core_context_additions_fn,
             join_graph_module=self._domain_cfg.join_graph_module,
+            rules_engine=self._rules_engine,
             domain=self.domain,
         )
+
+        # Instance attribute shadows the class-level _TERMINAL_TOOLS set,
+        # unioned with any declared tool (agent/tool_defs) that opts into
+        # terminal=True — avoids a manual edit to the class-level set for
+        # every future declared tool.
+        self._TERMINAL_TOOLS = self._TERMINAL_TOOLS | {
+            t.name for t in declared_tools() if t.terminal
+        }
 
         # ── Join graph startup validation ─────────────────────────────────
         # Validates every FK edge in the domain's join graph against the live
@@ -257,6 +358,19 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             question[:120],
         )
 
+        # Typo/abbreviation-tolerant variant of `question`, used ONLY for
+        # the regex-gated CONDITIONAL_BLOCKS/EXAMPLES_TIER2 and INJECT-rule
+        # matching below (knowledge/fuzzy_vocab.py) — those regexes require
+        # exact literal wording with no fallback, so "mit actions" /
+        # "crrctive action" silently lost their domain-vocabulary guidance
+        # before this. Appends matched canonical phrases rather than
+        # rewriting anything, so every OTHER use of `question` in this
+        # method (display, logging, session/ordinal regexes, the
+        # reasoning-LLM prompt itself) deliberately keeps using the raw,
+        # unmodified text — only these two matchers below get the
+        # augmented version.
+        question_for_matching = fuzzy_augment(question)
+
         # Rank/budget-cap Tier-2 worked-examples and conditional blocks when
         # 2+ match the same question, instead of concatenating every match
         # unconditionally — see agent/prompts.py's _select_within_budget.
@@ -264,7 +378,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # retrieval, via the shared retrieval.text_similarity scorer.
         _tier2_score_fn = lambda q, title: text_similarity(self.embed_model, q, title)
         system_content = self._system_prompt + self._builder_module.build_dynamic_prompt_additions(
-            question, score_fn=_tier2_score_fn
+            question_for_matching, score_fn=_tier2_score_fn
         )
         if visibility_scope and visibility_scope.get('sub'):
             system_content += (
@@ -305,10 +419,26 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             ChatMessage(role=MessageRole.USER, content=question),
         ]
         steps = []
+        # Counts BOTH validation failures (generate_sql's SQLValidator rejecting
+        # the SQL) and execution failures (SQL that passed validation but errored
+        # against Postgres) — a repeated failure of either kind means the model
+        # is stuck, and "never show the user an unverified answer" (see
+        # _refuse_or_clarify_after_failures below) needs to catch both, not just
+        # the validation-failure half. Previously execution failures didn't
+        # increment this at all and could loop all the way to max_iterations,
+        # falling into the "forced summary" fallback further down — which lets
+        # the model improvise a final answer with no successful execution EITHER
+        # — the same unverified-answer problem via a different path.
         gen_sql_failures = 0
-        # Separate from gen_sql_failures (which gates the "force-execute after
-        # 3 validation failures" safety valve) — this only signals generate_sql
-        # to drop the seed example it's fixating on. Incremented on BOTH
+        # Full history of failure signatures (not just the last one), so
+        # _refuse_or_clarify_after_failures can tell "stuck on the same wall
+        # every attempt" (refuse — rephrasing won't fix a genuine technical
+        # problem) apart from "flip-flopping between different walls" (ask a
+        # clarifying question instead of guessing) once gen_sql_failures hits 3.
+        _failure_signatures: list[frozenset] = []
+        # Separate from gen_sql_failures (which gates the refuse/clarify
+        # terminal path above) — this only signals generate_sql to drop the
+        # seed example it's fixating on. Incremented on BOTH
         # validation failures and execution failures (the latter includes bugs
         # invisible to the static validator, e.g. an ORDER BY/GROUP BY term
         # referencing a SELECT alias the model dropped).
@@ -432,15 +562,38 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                             ))
                         return AgentResult(question, ans, steps, 1, True, stats)
 
-                # Path B: last turn used get_answers — re-call it with same inspection_id
+                # Path B: last turn used get_answers — re-call it with same
+                # inspection_id, advancing OFFSET by prev.page_offset (same
+                # "NEXT window, not the same first rows again" fix as Path A
+                # above — get_answers previously had no offset parameter at
+                # all, so every repeated "show more" here silently re-fetched
+                # the identical first 500 rows forever instead of advancing).
                 elif prev.tool_used == "get_answers" and prev.inspection_ids:
                     insp_id = prev.inspection_ids[0]
-                    ga_args = {"inspection_id": insp_id, "limit": 500, "scope_filter": scope_filter}
+                    ga_args = {
+                        "inspection_id": insp_id, "limit": 500,
+                        "offset": prev.page_offset, "scope_filter": scope_filter,
+                    }
                     er = self.registry.call("get_answers", ga_args)
                     s = AgentStep(1, "[auto] pagination get_answers",
                                   "get_answers", ga_args, er, 0)
                     steps.append(s); _emit(s)
                     if er.get("success"):
+                        _ga_rows = er.get("result", {}).get("rows", [])
+                        if not _ga_rows:
+                            # OFFSET ran past the true result count — nothing
+                            # more to show (mirrors Path A's identical guard).
+                            ans = "No more results to show."
+                            stats.total_wall_ms = int((time.time() - query_start) * 1000)
+                            if session is not None:
+                                session.add_turn(ConversationTurn(
+                                    question=question, answer=ans, domain=self.domain,
+                                    tool_used="get_answers", sql="",
+                                    inspection_ids=prev.inspection_ids,
+                                    page_offset=prev.page_offset,
+                                ))
+                            return AgentResult(question, ans, steps, 1, True, stats)
+
                         ans = self._synthesize(question, "get_answers", er, max_display_rows=100, session=session)
                         stats.total_wall_ms = int((time.time() - query_start) * 1000)
                         if session is not None:
@@ -448,13 +601,130 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                                 question=question, answer=ans[:300], domain=self.domain,
                                 tool_used="get_answers", sql="",
                                 inspection_ids=prev.inspection_ids,
+                                page_offset=prev.page_offset + len(_ga_rows),
                             ))
                         return AgentResult(question, ans, steps, 1, True, stats)
 
+        def _refuse_or_clarify_after_failures():
+            """
+            Terminal, Python-authored return once gen_sql_failures hits 3 —
+            called from BOTH the execution-failure branch and the
+            validation-failure branch below. Deliberately mirrors the
+            scope_filter=='BLOCK' / enforce_scope ValueError hard-stops
+            elsewhere in this method (construct AgentResult directly, return
+            immediately) rather than the disambiguation/ordinal pattern of
+            injecting a message and trusting the model's next tool call —
+            "never show an unverified answer" needs a guarantee the model
+            can't route around by calling generate_sql one more time.
+
+            Refuses when the last 3 recorded failure signatures share a
+            common code — the model hit the exact same wall every attempt,
+            which means a genuine technical problem (missing data, schema
+            mismatch) that asking the user to rephrase won't fix. Asks a
+            clarifying question instead when the signatures varied — that
+            pattern means the model itself was unsure/flip-flopping on how
+            to interpret the question, not stuck on one wall, so a better-
+            specified question from the user is what's actually needed.
+
+            Reuses the exact signature values already computed by both
+            failure branches for _sql_retry_signal/_last_retry_signature
+            (frozensets of psycopg2 error-class names or validator hard-fail
+            codes) via the shared _failure_signatures history — no new
+            signature scheme.
+            """
+            _recent = _failure_signatures[-3:]
+            _common = frozenset.intersection(*_recent) if len(_recent) == 3 else frozenset()
+            if _common:
+                ans = (
+                    "I wasn't able to build a reliable answer to this — every attempt "
+                    "hit the same problem, which usually means the data or filters "
+                    "involved aren't available the way the question expects. I don't "
+                    "want to guess, so I'm stopping here rather than showing an "
+                    "unverified result. Could you double-check the details (dates, "
+                    "names, filters) and try again?"
+                )
+                _log_sql.warning(
+                    "[SQL ] %srefuse — stable failure signature after %d attempts: %s",
+                    _pfx, len(_failure_signatures), sorted(_common),
+                )
+                _tool_used = "refuse_unvalidated_sql"
+            else:
+                ans = (
+                    "I'm not confident I understood this question the way you meant "
+                    "it — my attempts took a few different approaches without "
+                    "converging. Could you rephrase it, or add more detail (e.g. "
+                    "which facility, inspector, or time period you mean)?"
+                )
+                _log_sql.warning(
+                    "[SQL ] %sclarify — varying failure signatures after %d attempts: %s",
+                    _pfx, len(_failure_signatures), _recent,
+                )
+                _tool_used = "clarify_after_failures"
+
+            s = AgentStep(iteration, "[auto] refuse/clarify after repeated failures",
+                          "final_answer", {"answer": ans}, {"answer": ans}, 0)
+            steps.append(s); _emit(s)
+            stats.total_wall_ms = int((time.time() - query_start) * 1000)
+            if session is not None:
+                session.add_turn(ConversationTurn(
+                    question=question, answer=ans[:300], domain=self.domain,
+                    tool_used=_tool_used,
+                ))
+            return AgentResult(question, ans, steps, iteration, True, stats)
+
         _consecutive_empty = 0
+        # One-shot flag for the count-followup final_answer backstop below
+        # (2026-08-07, debug_llm_20260807_153128) — unlike the other
+        # backstops in this loop (ordinal/observations/disambiguation-reply),
+        # this one has no resolve_* tool call landing in `steps` to mark
+        # itself consumed, so without this flag a stubborn model could keep
+        # calling final_answer and get redirected every single time, up to
+        # max_iterations.
+        _count_followup_redirected = False
+        # Proactive context trim thresholds — fires BEFORE num_ctx actually
+        # overflows, unlike the reactive trim further below (which only
+        # fires AFTER 2 consecutive EMPTY completions have already been
+        # wasted — a "the model already choked" reaction, not prevention).
+        # Placeholders reasoning from max_iterations=8 (a typical 2-4
+        # iteration question never trips this at all); tune against real
+        # debug_llm_*.log traces rather than guessing tighter values here —
+        # this codebase already logs a size warning at 60K chars (see
+        # system_content's own check above) as a rough "approaching
+        # trouble" proxy.
+        _PROACTIVE_TRIM_AFTER_ITER = 5
+        _PROACTIVE_TRIM_KEEP_PAIRS = 3
+        _PROACTIVE_TRIM_CHAR_BUDGET = 40_000
+
         for iteration in range(1, max_iterations + 1):
             t0 = time.time()
             _emit({"_event": "thinking", "iteration": iteration})
+
+            # messages[2:] excludes SYSTEM(system_content) + USER(question) —
+            # only the accumulated round-trip history counts toward either
+            # trigger. Mirrors the reactive trim's shape (keep system+
+            # question, keep a recent tail) but fires earlier and inserts a
+            # mechanical breadcrumb of what was dropped (see
+            # _summarize_dropped_messages) instead of silently discarding
+            # it — an early get_schema result still needed several
+            # iterations later shouldn't just vanish without a trace.
+            _hist_chars = sum(len(m.content or "") for m in messages[2:])
+            if (iteration > _PROACTIVE_TRIM_AFTER_ITER
+                    or _hist_chars > _PROACTIVE_TRIM_CHAR_BUDGET):
+                _keep_tail = 2 * _PROACTIVE_TRIM_KEEP_PAIRS
+                if len(messages) > 2 + _keep_tail:
+                    _dropped = messages[2:-_keep_tail]
+                    _summary_text = _summarize_dropped_messages(_dropped)
+                    _bridge = (
+                        [ChatMessage(role=MessageRole.USER, content=
+                            f"[Earlier this turn, already covered — do not repeat: {_summary_text}]")]
+                        if _summary_text else []
+                    )
+                    messages = messages[:2] + _bridge + messages[-_keep_tail:]
+                    _log_llm.warning(
+                        "[LLM ] %siter=%d proactive context-trim — dropped %d older "
+                        "messages (%d chars), kept last %d round-trips",
+                        _pfx, iteration, len(_dropped), _hist_chars, _PROACTIVE_TRIM_KEEP_PAIRS,
+                    )
 
             raw = self._call_llm(messages, stats, iteration=iteration)
 
@@ -519,17 +789,132 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                           int((time.time() - t0) * 1000),
                           tool, _thought_excerpt)
 
+            # Disambiguation-reply backstop — STATE-based, not regex-based:
+            # unlike an ordinal reference, a disambiguation pick ("George
+            # Smith") often has no lexical marker distinguishing it from a
+            # fresh question at all; the only reliable signal is
+            # conversation STATE (a pending disambiguation on the previous
+            # turn), not a text pattern. Blocks generate_sql outright (stops
+            # a hallucinated WHERE id=.../ILIKE guess from ever reaching the
+            # database) and blocks final_answer UNLESS the answer text
+            # itself contains "?" — reusing the codebase's own existing
+            # "this is a clarifying question, not an assertion" signal (see
+            # clarification_origin_question's identical check further below,
+            # line ~632), so a legitimate "still ambiguous, please clarify
+            # further" answer passes through unblocked, while a direct "I
+            # think you mean X" assertion without resolving does not.
+            # Checked before the ordinal backstop — a hallucinated IDENTITY
+            # is worse than a hallucinated position.
+            _pending_disambig = bool(
+                session and session.turns
+                and (session.turns[-1].disambiguation_name
+                     or session.turns[-1].entity_disambiguation_candidates)
+            )
+            if (_pending_disambig
+                    and not any(s.tool == "resolve_disambiguation_reply" for s in steps)
+                    and (tool == "generate_sql"
+                         or (tool == "final_answer" and "?" not in str(args.get("answer", ""))))):
+                messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
+                messages.append(ChatMessage(role=MessageRole.USER, content=(
+                    "The previous turn asked \"which one did you mean?\" and this "
+                    "message looks like the user's pick, not a new question. Call "
+                    "resolve_disambiguation_reply FIRST with picked_name or "
+                    "picked_position — do NOT guess the id yourself via ILIKE/"
+                    "substring matching, and do NOT answer directly without "
+                    "resolving it.\n"
+                    f'Original question: "{question}"'
+                )))
+                s = AgentStep(iteration, "[auto] blocked for unresolved disambiguation reply",
+                              "[blocked]", args,
+                              {"error": "redirected to resolve_disambiguation_reply"}, 0)
+                steps.append(s); _emit(s)
+                continue
+
+            # Block final_answer when the question is a count/aggregate
+            # follow-up over a previous result ("how many of the ones listed
+            # above are completed") and this turn hasn't run any query yet.
+            # Confirmed live 2026-08-07 (debug_llm_20260807_153128,
+            # qid=3dbcdaf3): the model answered directly via final_answer —
+            # ZERO tool calls, no SQL — based on its own fabricated
+            # recollection of the previous turn's filter (itself wrong).
+            #
+            # MUST be checked here, before the `if tool == "final_answer":`
+            # terminal-return block below (it returns immediately) — not
+            # further down near the ordinal/table backstops, which only run
+            # for non-terminal tools and would never see a final_answer call
+            # at all.
+            #
+            # Same shape/rationale as the disambiguation-reply/ordinal
+            # backstops above: the CONTEXT block injected by session.py (see
+            # is_count_followup/_COUNT_FOLLOWUP_RE there) is the primary
+            # mechanism, this is only the backstop for when the LLM tries
+            # to skip straight to final_answer anyway — a prompt instruction
+            # alone has already been shown insufficient for this exact
+            # failure (zero tool calls, not even a wrong query). One-shot
+            # via _count_followup_redirected (see its init above) — unlike
+            # the ordinal/observations backstops, there's no resolve_* tool
+            # call landing in `steps` to mark this consumed. The "?" escape
+            # reuses this same disambiguation-reply backstop's "clarifying
+            # question, not an assertion" signal just above.
+            if (tool == "final_answer" and session and session.turns
+                    and not _count_followup_redirected
+                    and not any(s.tool == "execute_sql" for s in steps)
+                    and _COUNT_FOLLOWUP_RE.search(question)
+                    and session.turns[-1].sql
+                    and session.turns[-1].total_count > 0
+                    and "?" not in str(args.get("answer", ""))):
+                _count_followup_redirected = True
+                messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
+                messages.append(ChatMessage(role=MessageRole.USER, content=(
+                    "This question asks how many/what count of a PREVIOUS result meet "
+                    "some condition — you have NOT run any query this turn, and you "
+                    "cannot answer from the previous turn's total-row count or your own "
+                    "memory of its filters (that memory has been wrong before). Call "
+                    "generate_sql, reusing the previous query's FROM/JOIN/WHERE with a "
+                    "fresh COUNT(*) for the new condition. Do NOT call final_answer "
+                    "without querying the database first.\n"
+                    f"Original question: \"{question}\""
+                )))
+                s = AgentStep(iteration, "[auto] blocked final_answer for unqueried count follow-up",
+                              "[blocked]", args,
+                              {"error": "redirected to generate_sql"}, 0)
+                steps.append(s); _emit(s)
+                continue
+
             # Auto-inject targeted hints for generate_sql calls via business_rules registry.
             if tool == "generate_sql":
                 # ── Business rules inject hints ───────────────────────────────
                 # Apply INJECT rules from business_rules.py registry.
-                # Also collect matching rule IDs for dynamic example selection.
+                # Also collect matching rule IDs — consumed by generation.py's
+                # post-generation table/pattern guard (required_tables_for/
+                # forbidden_patterns_for), which forces a corrective retry
+                # when the generated SQL violates what a fired rule requires
+                # or forbids. NOT used for dynamic example selection — no
+                # such consumer exists (SeedExampleIndex.retrieve()'s actual
+                # params never include rule ids; that was this comment's
+                # stale, inaccurate claim before this fix).
                 try:
                     _rules = self._rules_engine
-                    _inject_hint = _rules.hint_for_question(question)
-                    _inject_ids  = _rules.matching_inject_ids(question)
+                    # question_for_matching (fuzzy_vocab.py), not the raw
+                    # question — same typo/abbreviation-tolerance rationale
+                    # as the CONDITIONAL_BLOCKS call above. matching_inject_ids'
+                    # result also drives generate_sql()'s post-generation
+                    # table/pattern guard, so this fix covers that too.
+                    _inject_hint = _rules.hint_for_question(question_for_matching)
+                    _inject_ids  = _rules.matching_inject_ids(question_for_matching)
                     if _inject_hint:
-                        args["schema_hint"] = (args.get("schema_hint", "") + _inject_hint)
+                        # Written to _mandatory_hint, NOT concatenated into
+                        # schema_hint — confirmed live 2026-08-07 (qid=e63f03af):
+                        # generation.py renders schema_hint as the reasoning
+                        # model's own editable draft (see Item 2 of the
+                        # generation-quality plan), so a genuinely mandatory
+                        # INJECT rule ("USE THIS EXACT SQL ... do not deviate")
+                        # can't share that string without reading as equally
+                        # optional. _mandatory_hint follows the same
+                        # internal-key convention as _inject_rule_ids/
+                        # _active_cycle_uuid/_retry_attempt below — never
+                        # LLM-supplied, invisible to the tool-call contract.
+                        args["_mandatory_hint"] = (args.get("_mandatory_hint", "") + _inject_hint)
                     args["_inject_rule_ids"] = _inject_ids
                 except Exception:
                     args["_inject_rule_ids"] = []
@@ -539,9 +924,21 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 # (see SeedExampleIndex.retrieve's skip_top_match).
                 args["_retry_attempt"] = _sql_retry_signal
 
-                # Preserve explicit LIMIT from user question
+                # Preserve explicit LIMIT from user question.
+                # Negative lookahead after the digit excludes time-window
+                # phrasing ("the last 30 DAYS") — confirmed live-testable:
+                # without it, "show inspections from the last 30 days" (a
+                # pure date filter) silently injected a bogus "use LIMIT 30"
+                # row-count hint, identical to how "the last 30 inspections"
+                # is (correctly) handled. Only needed on the first
+                # alternative — the second requires the digit to be followed
+                # by a specific noun (most recent/latest/last/inspections/
+                # actions/reports), none of which are time units, so "30
+                # days" was never reachable through that branch.
                 limit_match = re.search(
-                    r'\b(?:last|top|first|recent|latest)\s+(\d+)\b', question, re.IGNORECASE
+                    r'\b(?:last|top|first|recent|latest)\s+(\d+)'
+                    r'(?!\s*(?:days?|weeks?|months?|hours?|minutes?|years?)\b)\b',
+                    question, re.IGNORECASE
                 ) or re.search(
                     r'\b(\d+)\s+(?:most\s+recent|latest|last|inspections?|actions?|reports?)\b',
                     question, re.IGNORECASE
@@ -549,8 +946,13 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 if limit_match:
                     n = int(limit_match.group(1))
                     if 1 <= n <= 500:
-                        args["schema_hint"] = (
-                            args.get("schema_hint", "") +
+                        # Also _mandatory_hint, not schema_hint — see the
+                        # comment on the INJECT-rule branch above. This is a
+                        # deterministic, regex-derived requirement, not a
+                        # suggestion the coder model should feel free to
+                        # rewrite away.
+                        args["_mandatory_hint"] = (
+                            args.get("_mandatory_hint", "") +
                             f"\nIMPORTANT: user asked for exactly {n} results — use LIMIT {n}."
                         )
                 # Inject active cycle UUID for seed substitution — "cycle" is
@@ -564,6 +966,37 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                     if _cs["type"] == "cycle" and _cs["value"] and _cs["domain"] == self.domain:
                         args["_active_cycle_uuid"] = _cs["value"]
                 tc["args"] = args
+
+            # final_answer and redirect_domain both return immediately below
+            # (they're the two terminal escape hatches, handled outside the
+            # generic tool dispatch), so the generate_sql-only backstop
+            # further down — which only runs for tools that fall through to
+            # the rest of this loop — can never catch a model that skips
+            # straight to one of THESE instead of resolving a pending
+            # selection. Confirmed live 2026-08-10 (debug_llm_20260810_100933):
+            # "list all audits under this" with 1 row checked went straight
+            # to redirect_domain asking the user to clarify what "this"
+            # meant, entirely bypassing resolve_selected_rows — the later
+            # backstop's `tool == "generate_sql"` check never saw it because
+            # this branch had already returned. Same _SELECTION_FOLLOWUP_RE/
+            # pending-selection/not-yet-resolved gating as that backstop.
+            if (tool in ("final_answer", "redirect_domain") and session
+                    and session.pending_selected_positions
+                    and not any(s.tool == "resolve_selected_rows" for s in steps)
+                    and _SELECTION_FOLLOWUP_RE.search(question)):
+                messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
+                messages.append(ChatMessage(role=MessageRole.USER, content=(
+                    "The user selected specific rows via checkboxes before asking this "
+                    "question. Do NOT ask them to clarify what 'this'/'that'/'these' "
+                    "means and do NOT redirect domains — call resolve_selected_rows "
+                    "FIRST to get the exact row ids, then answer using them.\n"
+                    f"Original question: \"{question}\""
+                )))
+                s = AgentStep(iteration, f"[auto] blocked {tool} for unresolved row selection",
+                              "[blocked]", args,
+                              {"error": "redirected to resolve_selected_rows"}, 0)
+                steps.append(s); _emit(s)
+                continue
 
             if tool == "final_answer":
                 ans = args.get("answer", "")
@@ -660,6 +1093,23 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                     ))
                 return AgentResult(question, ans, steps, iteration, True, stats)
 
+            # Stage 4b of the 2026-08-07 generation-quality plan (qid=e63f03af):
+            # execute_sql was removed from both system prompts' tool declarations
+            # (Item 4a — no worked example or prose ever explained why this direct,
+            # unguarded-by-generate_sql's-coder-model-safeguards path existed at
+            # all), but the branch below stays fully intact so a model that still
+            # emits it from habit or a stale cached prompt keeps working exactly as
+            # before. This warning is purely observational — greppable via the
+            # same "[deprecated]"-style prefix convention as [offset-guard]/
+            # [table-guard]/[uuid-guard] — to measure whether it's genuinely dead
+            # before considering the hard removal (Stage 4c: reject instead of
+            # dispatch) in a future, separate commit.
+            if tool == "execute_sql":
+                _log_query.warning(
+                    "[deprecated] %sLLM emitted direct execute_sql — sql=%.200s",
+                    _pfx, args.get("sql", ""),
+                )
+
             # Any direct execute_sql call the LLM emits only ever carries {"sql": "..."}
             # (see system_prompt.txt's tool schema) — it never supplies "question". Without
             # this, validator.validate(sql, question) receives question="" and every
@@ -723,13 +1173,107 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 steps.append(s); _emit(s)
                 continue
 
+            # Redirect generate_sql -> resolve_selected_rows when the user
+            # checked specific rows in the UI (session.pending_selected_
+            # positions, set fresh from the request in chat.py) and this
+            # question plausibly refers back to that selection. Same shape
+            # as the ordinal/observations backstops just below/above — the
+            # SELECTED ROWS context block (session.py, now rendered FIRST —
+            # see its own comment) is the primary mechanism, this is only
+            # the backstop for when the LLM tries to skip straight to
+            # generate_sql anyway.
+            #
+            # Confirmed live 2026-08-07: a user checked specific boxes, then
+            # asked "internal stakeholders for these" — the model ignored
+            # the selection and answered over the FULL previous result set
+            # instead, using a "this is the COMPLETE result set... Filter by
+            # X IN (...)" context line further down that offered a
+            # ready-made filter with no extra tool call needed, while the
+            # SELECTED ROWS prose (further up at the time) asked for one.
+            # Reordering the prose fixes the common case; this backstop is
+            # what actually guarantees it regardless of read order.
+            #
+            # Uses _SELECTION_FOLLOWUP_RE (imported from session.py) rather
+            # than the plain _FOLLOWUP_RE other backstops reuse — this one
+            # also catches a bare "this"/"that" standing in for the
+            # selection ("list all audits under this"), which _FOLLOWUP_RE
+            # deliberately excludes elsewhere (see its own docstring) but is
+            # safe to catch here since this whole branch is already gated on
+            # a pending selection existing. Gating on it (not firing on
+            # EVERY turn pending_selected_positions happens to be non-empty)
+            # avoids a false trigger if the frontend ever sends a stale
+            # selection alongside an unrelated fresh question.
+            if (tool == "generate_sql" and session
+                    and session.pending_selected_positions
+                    and not any(s.tool == "resolve_selected_rows" for s in steps)
+                    and _SELECTION_FOLLOWUP_RE.search(question)):
+                messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
+                messages.append(ChatMessage(role=MessageRole.USER, content=(
+                    "The user selected specific rows via checkboxes before asking this "
+                    "question. Call resolve_selected_rows FIRST to get the exact row ids "
+                    "— do NOT guess by re-using an id list from earlier conversation "
+                    "context or by title/ILIKE matching.\n"
+                    f"Original question: \"{question}\""
+                )))
+                s = AgentStep(iteration, "[auto] blocked generate_sql for unresolved row selection",
+                              "[blocked]", args,
+                              {"error": "redirected to resolve_selected_rows"}, 0)
+                steps.append(s); _emit(s)
+                continue
+
+            # Redirect generate_sql -> resolve_ordinal_reference when the
+            # question refers to a prior result by position ("the first
+            # one", "the 2nd item") and that tool hasn't been called yet
+            # this turn. Same shape as the observations redirect above —
+            # the tool call + its prompt doc are the primary mechanism, this
+            # is only the backstop for when the LLM tries to skip straight
+            # to generate_sql anyway (confirmed live for the equivalent
+            # get_answers/observations case: a prompt instruction alone is
+            # not reliably obeyed). Deliberately NO noun-capturing group —
+            # unlike the retired session.py regex, this one only needs to
+            # DETECT that a positional reference exists, not resolve it, so
+            # there is no question-tail text here to mis-scan. The
+            # party/parties lookahead is carried over from that retired
+            # regex's own confirmed-live false-positive fix ("Second Party
+            # audit" / "Third-party inspection" are real domain values, not
+            # ordinal references, in both domains).
+            if (tool == "generate_sql" and session and session.turns
+                    and not any(s.tool == "resolve_ordinal_reference" for s in steps)
+                    and _ORDINAL_BACKSTOP_RE.search(question)):
+                messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
+                messages.append(ChatMessage(role=MessageRole.USER, content=(
+                    "This question refers to a specific item from a previous list by "
+                    "position (\"the first one\", \"the 2nd item\") rather than by name. "
+                    "Call resolve_ordinal_reference FIRST to get that row's real id — "
+                    "do NOT guess it via title/ILIKE matching in generate_sql.\n"
+                    f"Original question: \"{question}\""
+                )))
+                s = AgentStep(iteration, "[auto] blocked generate_sql for unresolved ordinal reference",
+                              "[blocked]", args,
+                              {"error": "redirected to resolve_ordinal_reference"}, 0)
+                steps.append(s); _emit(s)
+                continue
+
             # Pass scope through to get_answers so the tool enforces data visibility.
             # scope_filter is never 'BLOCK' here — BLOCK is returned before this loop.
             if tool == "get_answers":
                 args["scope_filter"] = scope_filter
                 tc["args"] = args
 
-            result = dispatch(tc, self.registry)
+            # Declared tools (agent/tool_defs) may need per-call orchestrator
+            # context (e.g. the live ConversationSession) that isn't part of
+            # the LLM-supplied args. Built as a SEPARATE dict rather than
+            # mutating args/tc["args"] in place (unlike the get_answers
+            # pattern above) — args is stored verbatim on AgentStep and
+            # assumed JSON-safe/loggable elsewhere, and a ConversationSession
+            # object must never land there.
+            dispatch_args = None
+            _declared_tool = get_declared(tool)
+            if _declared_tool is not None and _declared_tool.context_provider is not None:
+                _loop_locals = {"session": session, "domain": self.domain}
+                dispatch_args = {**args, **_declared_tool.context_provider(_loop_locals)}
+
+            result = dispatch(tc, self.registry, override_args=dispatch_args)
             s = AgentStep(iteration, thought, tool, args, result,
                           int((time.time()-t0)*1000))
             steps.append(s); _emit(s)
@@ -790,8 +1334,12 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                     steps.append(auto); _emit(auto)
 
                     if not er.get("success"):
-                        _log_sql.warning("[SQL ] %siter=%d execution FAIL in %dms — %s",
-                                         _pfx, iteration, _exec_ms, er.get("error", "?")[:200])
+                        _diag = sql_data.get("_diagnostics") or {}
+                        _log_sql.warning(
+                            "[SQL ] %siter=%d execution FAIL in %dms — %s | primary_example=%s table_drift=%s",
+                            _pfx, iteration, _exec_ms, er.get("error", "?")[:200],
+                            _diag.get("primary_example_key", "?"), _diag.get("table_drift", []),
+                        )
                         _cur_sig = _failure_signature(er.get("error", ""))
                         # Intersection, not exact equality — confirmed live 2026-07-29
                         # (qid=4f892604): a persistent root-cause code (here,
@@ -811,6 +1359,16 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                         else:
                             _sql_retry_signal = 0
                         _last_retry_signature = _cur_sig
+
+                        # Counts toward the same refuse/clarify threshold as
+                        # validation failures below — see gen_sql_failures'
+                        # docstring at initialization for why execution-only
+                        # failure runs must not be exempt from it.
+                        gen_sql_failures += 1
+                        _failure_signatures.append(_cur_sig)
+                        if gen_sql_failures >= 3:
+                            return _refuse_or_clarify_after_failures()
+
                         messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
                         hint = self._schema_hint_for_error(er.get("error", ""))
                         err_msg = er.get("error", "")
@@ -838,7 +1396,11 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                         if is_disambiguation_result(_dcols, sql) or is_entity_disambiguation_result(_dcols, sql):
                             followup = self._disambiguation_followup_message(question, sql, exec_data)
                         else:
-                            rows_preview = json.dumps(exec_data.get("rows", [])[:10], default=str)
+                            # Row COUNT is already capped to 10 above, but each
+                            # row's own width isn't — a wide result (many/long
+                            # columns) can still blow this up; cap the serialized
+                            # bytes too (see debug.py's _cap_text docstring).
+                            rows_preview = _cap_text(json.dumps(exec_data.get("rows", [])[:10], default=str), 3000)
                             followup = (
                                 f"SQL: {sql}\nResult: {exec_data.get('row_count',0)} rows, "
                                 f"columns={exec_data.get('columns',[])}\n"
@@ -862,7 +1424,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                     vresult = val_data.get("_vresult")
                     if vresult is not None:
                         retry_reason = vresult.retry_message()
-                        _cur_sig = frozenset(f.code for f in vresult.hard_fails)
+                        _cur_sig = frozenset(_validation_issue_signature(f) for f in vresult.hard_fails)
                     else:
                         # Legacy path: filter out WARNING: prefixed strings
                         hard_errs = [e for e in errs if not e.startswith("WARNING:")]
@@ -880,9 +1442,14 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                     else:
                         _sql_retry_signal = 0
                     _last_retry_signature = _cur_sig
+                    _failure_signatures.append(_cur_sig)
 
-                    _log_sql.warning("[SQL ] %siter=%d validation FAIL (attempt %d/3) — %s",
-                                     _pfx, iteration, gen_sql_failures, retry_reason)
+                    _diag = sql_data.get("_diagnostics") or {}
+                    _log_sql.warning(
+                        "[SQL ] %siter=%d validation FAIL (attempt %d/3) — %s | primary_example=%s table_drift=%s",
+                        _pfx, iteration, gen_sql_failures, retry_reason,
+                        _diag.get("primary_example_key", "?"), _diag.get("table_drift", []),
+                    )
 
                     # Log soft warnings for observability — never send to LLM
                     soft_warns = val_data.get("warnings", [])
@@ -892,42 +1459,19 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
 
                     messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
 
+                    # Never execute still-unvalidated SQL just because we're out
+                    # of patience — that shows the user an answer nothing ever
+                    # confirmed was correct. Refuse or ask for clarification
+                    # instead (see _refuse_or_clarify_after_failures) once this
+                    # is the 3rd failure of either kind (validation OR
+                    # execution — gen_sql_failures is shared with that branch
+                    # above). This used to force=True execute_sql the
+                    # unvalidated SQL here and return it as a normal answer on
+                    # success, with no caveat; on repeat failure the counter
+                    # was never reset, so every failure afterward re-entered
+                    # this same branch and force-executed again, unbounded.
                     if gen_sql_failures >= 3:
-                        sql = sql_data.get("sql", "")
-                        if sql:
-                            _log_sql.warning("[SQL ] %sforced execution after %d validation failures",
-                                             _pfx, gen_sql_failures)
-                            # force=True: let Postgres itself be the final arbiter for any
-                            # RETRYABLE validation issue (logical-correctness guards like
-                            # UNDEFINED_ALIAS/CAPEX_LEFT_JOIN_MULT) instead of looping
-                            # forever — execute_sql() still hard-blocks non-retryable
-                            # issues (DML_BLOCKED, EMPTY_SQL) regardless of force=True.
-                            # Confirmed live: without force=True this call re-validates
-                            # the SAME sql, fails identically every time, and "forced
-                            # execution" never actually forced anything — one real trace
-                            # looped 8 iterations / 76s / ~172K tokens past this exact
-                            # point because of it.
-                            er = self.registry.call("execute_sql",
-                                                     {"sql": sql, "question": question, "force": True})
-                            auto = AgentStep(iteration, "[auto] forced exec after 3 failures",
-                                             "execute_sql", {"sql": sql}, er, 0)
-                            steps.append(auto); _emit(auto)
-                            if er.get("success"):
-                                ans = self._synthesize(question, "execute_sql", er, sql=sql, session=session)
-                                return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
-
-                            # Forced execution still failed — either a genuine Postgres
-                            # error (the real DB confirming the SQL is actually broken,
-                            # not a validator false-positive — much stronger signal than
-                            # the same validator message the model already saw 3x) or a
-                            # non-retryable safety block. Surface whichever it was.
-                            _forced_err = er.get("error", "") or retry_reason
-                            messages.append(ChatMessage(role=MessageRole.USER, content=
-                                f"Forced execution after {gen_sql_failures} failures also failed: {_forced_err}\n"
-                                f"Original question: \"{question}\"\n"
-                                f"This came from the real database, not just the validator — rewrite the SQL "
-                                f"from scratch to actually fix this, don't assume it's a false positive."))
-                            continue
+                        return _refuse_or_clarify_after_failures()
 
                     # Build a focused, actionable retry note.
                     _constraint_notes = _build_constraint_notes(retry_reason, domain=self.domain)

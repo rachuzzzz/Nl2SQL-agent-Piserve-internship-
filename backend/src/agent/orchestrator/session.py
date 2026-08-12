@@ -10,9 +10,90 @@ from typing import Optional
 
 from src.agent.orchestrator.models import ConversationTurn
 from src.agent.orchestrator.debug import _ilike_escape
-from src.agent.orchestrator.disambiguation import entity_type_for_ordinal_noun
 
 
+
+
+# NOTE: bare "that"/"this" are deliberately excluded — they double as
+# relative pronouns/determiners in ordinary questions ("mitigative actions
+# THAT are overdue", "show me THIS month's data") and caused the sticky
+# active-context gate below to false-positive-match plain global questions.
+# Demonstrative reference to a specific entity is still caught via the
+# explicit "that/this <entity>" phrases.
+# "here" IS included unconditionally (unlike bare "there", left out below) —
+# "here" is almost never anything but a location follow-up in this app's
+# question shapes ("was any audit conducted here last month").
+#
+# Module-level (not local to build_context_block) — confirmed live
+# 2026-08-07 (debug_llm_20260807_153128): needed at module scope so
+# loop.py's final_answer backstop (see _COUNT_FOLLOWUP_RE below) can import
+# and reuse it, same as _ORDINAL_BACKSTOP_RE already lives at module level
+# next to its own consumer.
+#
+# Broadened same date: "these"/"those" added — the "that"/"this" exclusion
+# above does NOT apply to them (no relative-pronoun/determiner reading in
+# English), yet they were previously unmatchable despite being named in this
+# module's own re-aggregate warning text and in the "how many of these"
+# worked example title. "ones" (plural) and "listed/shown/mentioned/
+# displayed/returned above" added for the same reason — "the ones listed
+# above" (a real live question) matched neither "the\s+above" (needs "the"
+# immediately before "above") nor "one\s+above" (needs singular "one").
+_FOLLOWUP_CUES = (
+    r"it|its|them|they|she|he|her|his|their|here|these|those|"
+    r"(?:that|this)\s+(?:inspection|site|facility|form|inspector|cycle|"
+    r"person|project|client|action|schedule)|"
+    r"the\s+same|the\s+above|ones?\s+above|"
+    r"(?:listed|shown|mentioned|displayed|returned)\s+above|"
+    r"that\s+one|this\s+one|\bones\b|"
+    r"from\s+there|more|rest|remaining|"
+    r"continue|next|previous|last\s+one|back\s+to|go\s+back"
+)
+_FOLLOWUP_RE = re.compile(rf"\b(?:{_FOLLOWUP_CUES})\b", re.IGNORECASE)
+
+# SEPARATE from _FOLLOWUP_RE, same reason _COUNT_FOLLOWUP_RE below stays
+# separate rather than folding in: _FOLLOWUP_RE deliberately excludes bare
+# "this"/"that" (see note above) because they double as ordinary determiners
+# ("this month's data") and would reintroduce the exact false-positive the
+# ACTIVE CONTEXT gate was already burned by. This variant is ONLY consumed
+# by the SELECTED-ROWS backstops in loop.py, which are already gated on
+# session.pending_selected_positions being non-empty — in that narrower
+# context a bare "this"/"that" NOT immediately followed by another word
+# ("...list audits under this", not "...this month") safely reads as a
+# pronoun standing in for the checked row(s), so it's fine to catch here
+# even though it isn't safe for the general-purpose _FOLLOWUP_RE. Confirmed
+# live 2026-08-10: "list all audits under this" (1 row checked) matched
+# neither the "this <noun>" phrases nor "this one" above, so neither the
+# SELECTED ROWS prose nor its backstop fired, and the model asked a
+# needless clarifying question instead of resolving the checked row.
+_SELECTION_FOLLOWUP_RE = re.compile(
+    rf"\b(?:{_FOLLOWUP_CUES}|(?:this|that)(?!\s+\w))\b",
+    re.IGNORECASE,
+)
+
+# Dedicated, deliberately CONJUNCTIVE count/aggregate-follow-up detector —
+# added 2026-08-07 (debug_llm_20260807_153128) alongside _FOLLOWUP_RE above,
+# but kept SEPARATE rather than folded into it: _FOLLOWUP_RE also gates
+# ACTIVE CONTEXT scope injection (see build_context_block below), and
+# broadening it further risks the exact stale-scope-leak regression that
+# module already guards against. Requiring BOTH an aggregate cue AND a
+# backward-reference cue (either order) keeps false positives near zero — a
+# fresh "how many audits were conducted last month" has no backref cue, a
+# bare "show me those" has no aggregate cue — which is what makes it safe
+# to attach a forceful instruction to (see loop.py's final_answer backstop).
+_AGG_CUE = (
+    r"how\s+many|how\s+much|number\s+of|count\s+of|what\s+(?:number|count)|"
+    r"total\s+(?:number|count)|percentage\s+of|what\s+(?:proportion|share|fraction)"
+)
+_BACKREF_CUE = (
+    r"these|those|them|the\s+above|"
+    r"(?:listed|shown|mentioned|displayed|returned)\s+above|ones?\s+above|"
+    r"the\s+ones|that\s+list|previous(?:\s+(?:list|result|query))?"
+)
+_COUNT_FOLLOWUP_RE = re.compile(
+    rf"\b(?:{_AGG_CUE})\b.{{0,80}}?\b(?:{_BACKREF_CUE})\b"
+    rf"|\b(?:{_BACKREF_CUE})\b.{{0,80}}?\b(?:{_AGG_CUE})\b",
+    re.IGNORECASE,
+)
 
 
 # Domain-exclusive active_subject_type values — the underlying ID only means
@@ -28,6 +109,26 @@ _DOMAIN_EXCLUSIVE = frozenset({"inspection", "audit", "cycle", "plan"})
 # small labeled records (no raw text), not full turns. Bounds a very long
 # session without limiting name-based recall to only the last few messages.
 _ENTITY_MEMORY_CAP = 30
+
+
+def _dup_stop_line(active_label: str, kind_label: str, dup_ids: list[str],
+                    extra_hint: str = "") -> str:
+    """Shared wording for the ACTIVE CONTEXT block's ambiguous-duplicate-name
+    hard STOP — facility and entity (project/client/organisation) branches
+    both hit this when _lookup_entity_id() finds MORE THAN ONE row sharing
+    the active label's display name (the same class of bug as audit_plan.title
+    duplicates). Extracted from two previously near-identical, independently
+    hand-written copies to remove the drift risk of editing one and not the
+    other — zero behavior/wording change from what each branch already had."""
+    dup_ids_str = ", ".join(f"'{i}'" for i in dup_ids)
+    return (
+        f"⚠️ STOP — '{active_label}' matches {len(dup_ids)} DIFFERENT {kind_label}"
+        f" records from the previous list (same name, different rows:"
+        f" {kind_label} id IN ({dup_ids_str})).\n"
+        f"  YOU MUST call final_answer NOW asking the user to disambiguate further"
+        f"{extra_hint} — do NOT pick one of these ids arbitrarily and do NOT"
+        f" call generate_sql."
+    )
 
 
 class ConversationSession:
@@ -60,6 +161,14 @@ class ConversationSession:
         # every build_context_block() call so a resolution from an earlier
         # turn never leaks into a later turn's answer that didn't need one.
         self.pending_resolved_disclosure: str = ""
+        # 1-based row positions the user explicitly checked in the UI on the
+        # table from the LAST turn, set fresh by routes/chat.py from the
+        # incoming request on EVERY call (defaults to [] when nothing was
+        # selected) — NOT reset inside build_context_block() like
+        # pending_resolved_disclosure above, because it must still be
+        # readable by resolve_selected_rows' fn later in this same turn's
+        # tool-calling loop. See agent/orchestrator/row_selection.py.
+        self.pending_selected_positions: list[int] = []
 
     def add_turn(self, turn: ConversationTurn):
         self.turns.append(turn)
@@ -107,24 +216,6 @@ class ConversationSession:
         if not self.turns:
             return ""
 
-        # NOTE: bare "that"/"this" are deliberately excluded — they double as
-        # relative pronouns/determiners in ordinary questions ("mitigative actions
-        # THAT are overdue", "show me THIS month's data") and caused the sticky
-        # active-context gate below to false-positive-match plain global questions.
-        # Demonstrative reference to a specific entity is still caught via the
-        # explicit "that/this <entity>" phrases.
-        # "here" IS included unconditionally (unlike bare "there", left out below) —
-        # "here" is almost never anything but a location follow-up in this app's
-        # question shapes ("was any audit conducted here last month").
-        _FOLLOWUP_RE = re.compile(
-            r"\b(it|its|them|they|she|he|her|his|their|here|"
-            r"(?:that|this)\s+(?:inspection|site|facility|form|inspector|cycle|"
-            r"person|project|client|action|schedule)|"
-            r"the\s+same|the\s+above|one\s+above|that\s+one|this\s+one|"
-            r"from\s+there|more|rest|remaining|"
-            r"continue|next|previous|last\s+one|back\s+to|go\s+back)\b",
-            re.IGNORECASE,
-        )
         # A question is "clearly fresh" only when it introduces a wholly new subject.
         # INTENTIONALLY NARROW: question-starters like "how many", "what", "show", "list"
         # appear constantly in follow-ups ("how many are completed", "show the open ones")
@@ -138,13 +229,53 @@ class ConversationSession:
             bool(_FRESH_SUBJECT_RE.search(current_question))
             and not is_followup
         )
+        # Deliberately independent of is_followup/is_clearly_fresh above —
+        # see the standalone re-aggregate block further down (module
+        # docstring on _COUNT_FOLLOWUP_RE) for why this needs its own,
+        # unconditional check rather than living inside the is_followup gate.
+        is_count_followup = bool(_COUNT_FOLLOWUP_RE.search(current_question))
+
+        # Full per-turn detail (SQL, columns, id lists, row_titles preview) is
+        # only rendered for the most recent _RECENT_FULL_DETAIL_TURNS turns —
+        # older turns get a single compact summary line instead. Same
+        # principle as the row_titles render cap below (see
+        # test_row_titles_context_cap.py): this only shrinks what's
+        # TEXTUALLY RENDERED into the prompt, never the underlying
+        # ConversationTurn data — ordinal/disambiguation/"go back to"
+        # resolution all read structured fields (row_titles/row_ids,
+        # active_subject_*, current_scope) directly off self.turns, never
+        # this rendered text, so a reference to something from an "older"
+        # (compacted) turn still resolves correctly.
+        #
+        # Confirmed live (token-usage audit, 2026-08-06): system_content
+        # reached 83,456 chars (~20.9K tokens) by turn ~18 of one real
+        # session — already past num_ctx=20000 before a single tool-call
+        # iteration even ran — with this per-turn block (repeated for up to
+        # MAX_TURNS=8 turns, each with an uncapped question and uncapped
+        # columns list) the largest single contributor.
+        _RECENT_FULL_DETAIL_TURNS = 3
+        _QUESTION_RENDER_CAP = 300
+        _COLUMNS_RENDER_CAP = 12
 
         lines = ["━━━ CONVERSATION HISTORY ━━━"]
         for i, t in enumerate(self.turns, 1):
+            if (len(self.turns) - i) >= _RECENT_FULL_DETAIL_TURNS:
+                _q_short = t.question[:150] + ("…" if len(t.question) > 150 else "")
+                _a_short = t.answer[:120] + ("…" if len(t.answer) > 120 else "")
+                _subj = (
+                    f" (scoped to {t.active_subject_type}: "
+                    f"{t.active_subject_label or t.active_subject_value})"
+                    if t.active_subject_type and t.active_subject_value else ""
+                )
+                lines.append(f"Turn {i}: User: {_q_short!r} → {_a_short}{_subj}")
+                continue
+
             lines.append(f"Turn {i}:")
             if t.domain:
                 lines.append(f"  Domain: {t.domain}")
-            lines.append(f"  User: {t.question}")
+            _q = t.question[:_QUESTION_RENDER_CAP] + (
+                "…" if len(t.question) > _QUESTION_RENDER_CAP else "")
+            lines.append(f"  User: {_q}")
             short = t.answer[:200] + ("..." if len(t.answer) > 200 else "")
             lines.append(f"  Answer: {short}")
             if t.sql:
@@ -152,7 +283,12 @@ class ConversationSession:
             if t.total_count > 0:
                 lines.append(f"  Total rows: {t.total_count}")
             if t.columns:
-                lines.append(f"  Columns: {t.columns}")
+                _cols = t.columns[:_COLUMNS_RENDER_CAP]
+                _cols_more = (
+                    f" (+{len(t.columns) - _COLUMNS_RENDER_CAP} more)"
+                    if len(t.columns) > _COLUMNS_RENDER_CAP else ""
+                )
+                lines.append(f"  Columns: {_cols}{_cols_more}")
             if t.inspection_ids:
                 lines.append(f"  ★ inspection_id(s) from this result: {t.inspection_ids[:5]}")
             if t.audit_ids:
@@ -176,9 +312,10 @@ class ConversationSession:
                 # turn's context for up to MAX_TURNS turns — confirmed live
                 # as a real contributor to a reasoning-LLM prompt hitting
                 # num_ctx and truncating its own tool-call JSON mid-object.
-                # Render-only: ordinal resolution below indexes the full
-                # stored row_titles/row_ids on the ConversationTurn, never
-                # this preview, so "the 47th one" still works unchanged.
+                # Render-only: the resolve_ordinal_reference tool (agent/
+                # orchestrator/ordinal.py) indexes the full stored
+                # row_titles/row_ids on the ConversationTurn directly, never
+                # this preview, so "the 47th one" still resolves correctly.
                 _preview = [str(x)[:80] for x in t.row_titles[:10]]
                 _more = f" (+{len(t.row_titles) - 10} more)" if len(t.row_titles) > 10 else ""
                 lines.append(f"  ★ items from this result, IN ORDER: {_preview}{_more}")
@@ -191,251 +328,65 @@ class ConversationSession:
                 )
         lines.append("")
 
-        # ── Ordinal follow-up ("the first one", "the 2nd one") ────────────────
-        # Confirmed live 2026-07-30: "for the first one show the approval
-        # status" (right after a 7-row audit_plan listing) resolved against a
-        # ◆ ACTIVE SUBJECT pointer that had been silently INHERITED from an
-        # unrelated audit_cycle list 5 turns earlier (that plan-listing turn
-        # set no active_subject_type of its own, since it returned multiple
-        # rows rather than a single entity — see synthesis.py's inheritance
-        # branch). The model picked the first row of that stale cycle list
-        # instead of the first row of the plan list it had just been shown,
-        # answering a different question entirely (portfolio approvals for a
-        # 2030 UPCOMING cycle) than the one asked. An ordinal word almost
-        # always refers to the MOST RECENT listing shown to the user, not to
-        # ACTIVE SUBJECT (which can persist across many unrelated turns) and
-        # not to an older turn's list — regardless of what ACTIVE SUBJECT
-        # says below.
-        # Word-form ordinals up to twentieth — matches the raised row_titles/
-        # row_ids capture cap in synthesis.py (up to 20, the same limit the
-        # deterministic answer formatter actually displays to the user via
-        # max_display_rows). Numeric-suffix ordinals (6th, 10th, 23rd, ...)
-        # are handled generically below via regex, not hardcoded — a fixed
-        # 1st-5th word list was confirmed live 2026-07-31 to silently fail
-        # "show observations for the 10th one" (no match at all, since "10th"
-        # wasn't in the list): the model got no ORDINAL context, fell back to
-        # re-listing the same rows on its own, and the turn ended there
-        # without ever actually answering what was asked.
-        _ORDINAL_WORDS = (
-            "first", "second", "third", "fourth", "fifth", "sixth", "seventh",
-            "eighth", "ninth", "tenth", "eleventh", "twelfth", "thirteenth",
-            "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth",
-            "nineteenth", "twentieth",
-        )
-        _ORDINAL_WORD_TO_IDX = {w: i for i, w in enumerate(_ORDINAL_WORDS)}
-
-        def _ordinal_to_idx(word: str):
-            # \s* between digit and suffix tolerates "2 nd" as well as "2nd"
-            # — confirmed live 2026-07-31: "list all audit plans by the 2 nd
-            # person in the list" had this exact space (a plausible typo, not
-            # contrived), never matched, so NO structured ORDINAL context got
-            # injected at all. Unlike other ordinal misses this session where
-            # the model's own conversation-history fallback still landed on
-            # a reasonable answer, this one sent it into a genuine stuck
-            # reasoning loop — 9 LLM calls, ~165K tokens, 122 seconds,
-            # success=False. Worth the tolerance given a real failure this
-            # severe, not just a theoretical gap.
-            w = re.sub(r"\s+", "", word.lower())
-            m = re.match(r"^(\d+)(?:st|nd|rd|th)$", w)
-            if m:
-                n = int(m.group(1))
-                return n - 1 if n >= 1 else None
-            return _ORDINAL_WORD_TO_IDX.get(w)
-
-        def _ord_suffix(idx0: int) -> str:
-            pos = idx0 + 1
-            if 10 <= pos % 100 <= 20:
-                return "th"
-            return {1: "st", 2: "nd", 3: "rd"}.get(pos % 10, "th")
-
-        # \s* between digit and suffix tolerates "2 nd" as well as "2nd" — see
-        # _ordinal_to_idx's matching comment for why this matters live.
+        # Row-selection priming — the user checked specific rows in the UI
+        # (routes/chat.py sets this fresh from the request before the loop
+        # starts) rather than referring to a position in words. Tells the
+        # LLM to call the dedicated resolver tool instead of treating this
+        # like an ordinal reference or a fresh name search. See
+        # agent/orchestrator/row_selection.py / agent/tool_defs/row_selection.py.
         #
-        # Negative lookahead excludes "First/Second/Third(-)party" — confirmed
-        # live 2026-08-04: "list all schedules under Second party audit"
-        # matched "Second" as an ordinal, resolving against an unrelated
-        # prior turn's list (e.g. the 2nd row of a plans listing) even
-        # though the question is a plain name filter — 'First Party',
-        # 'Second Party', and 'Third party / ISO audit' are real audit_type
-        # values, and 'Third-party inspection' a real inspection_type value
-        # (confirmed against the live DB), so this collision hits BOTH
-        # domains. Only "party"/"parties" is excluded, not the ordinal words
-        # generally — "party" never appears as a genuine ordinal-referenced
-        # noun in this schema, so this can't suppress a real ordinal follow-up.
-        _ORDINAL_RE = re.compile(
-            r"\b(the\s+)?(\d+\s*(?:st|nd|rd|th)|" + "|".join(_ORDINAL_WORDS) + r")"
-            r"(?!-?\s*part(?:y|ies)\b)"
-            r"(\s+(one|row|result|plan|entry|item))?\b",
-            re.IGNORECASE,
-        )
-        _ordinal_match = _ORDINAL_RE.search(current_question)
-        if _ordinal_match:
-            # Noun bound to THIS ordinal — only the few words immediately
-            # AFTER the match ("the 6th AUDITOR"), never the whole question,
-            # so an unrelated noun earlier in the sentence ("list all audit
-            # PLANS under the 6th auditor") isn't mistaken for it. Confirmed
-            # live (qid=081c7a81): without this type check, "the 6th
-            # auditor" silently resolved against the most recent list
-            # turn regardless of type (a CYCLES list, in that case), using
-            # one cycle's UUID as if it were an auditor's id — a
-            # well-formed but empty result, wrong with no error.
-            _ord_tail = current_question[_ordinal_match.end():].strip()
-            _ord_noun_type = entity_type_for_ordinal_noun(
-                " ".join(_ord_tail.split()[:6]), current_domain
+        # Deliberately rendered FIRST — before the ACTIVE CONTEXT gate and
+        # its fallback chain further below — and with an explicit priority
+        # statement. Confirmed live 2026-08-07: a user checked specific
+        # boxes, then asked "internal stakeholders for these" — the model
+        # ignored the selection and answered over the FULL previous result
+        # set instead, because a later "CONTEXT — ... this is the COMPLETE
+        # result set ... Filter by X IN (...)" block (same turn's audit_ids,
+        # rendered ~15 lines further down) gave it a ready-made filter that
+        # needed no extra tool call, and nothing told it that block loses to
+        # an actual pending selection. This block now renders first and says
+        # so explicitly — but see loop.py's matching deterministic backstop
+        # (mirroring resolve_ordinal_reference's) for the layer that
+        # actually GUARANTEES this, independent of whether the model reads
+        # prose ordering correctly; this text alone is not sufficient on its
+        # own (the exact lesson every other backstop in this codebase — the
+        # ordinal/disambiguation-reply/count-followup ones — was already
+        # built to address).
+        if self.pending_selected_positions:
+            _n_sel = len(self.pending_selected_positions)
+            lines.append(
+                f"SELECTED ROWS — the user picked {_n_sel} specific row(s) via checkboxes "
+                f"in the UI before asking this question. If this question refers to "
+                f"'these'/'them'/'the selected ones'/'those' — OR a bare 'this'/'that' "
+                f"standing in for them (e.g. 'list all audits under this') — rather than "
+                f"naming something new, call resolve_selected_rows FIRST — do NOT use "
+                f"resolve_ordinal_reference or re-search by name for this. Do NOT ask the "
+                f"user to clarify what 'this'/'that' means before trying this tool — the "
+                f"checked row(s) are almost always what it refers to.\n"
+                f"  THIS TAKES PRIORITY over any 'Filter by X IN (...)' or 'the conversation "
+                f"is about Y' instruction that appears LATER in this context (e.g. under "
+                f"ACTIVE CONTEXT or CONTEXT below) — those describe the general conversation "
+                f"topic, not what was specifically checked. If the question could mean either "
+                f"the selection or the general context, use the selection."
             )
-
-            if _ord_noun_type:
-                _last_with_items = next(
-                    (t for t in reversed(self.turns)
-                     if t.row_titles and t.row_entity_type == _ord_noun_type),
-                    None,
-                )
-                if _last_with_items is None:
-                    # A noun was named but no matching-type list exists
-                    # anywhere in history — ask, never silently resolve
-                    # against a differently-typed list.
-                    lines.append(
-                        f"ORDINAL REFERENCE NEEDS CLARIFICATION "
-                        f"('{_ordinal_match.group(0).strip()}') — the question "
-                        f"refers to an ordinal position among '{_ord_noun_type}'-"
-                        f"type items, but no earlier turn in this conversation "
-                        f"actually listed items of that type. Do NOT resolve "
-                        f"this against any OTHER list shown above (even if one "
-                        f"exists) — it is a different kind of item, and "
-                        f"guessing would silently answer the wrong question. "
-                        f"YOU MUST call final_answer NOW asking the user to "
-                        f"first show/list the '{_ord_noun_type}' items they "
-                        f"mean — do NOT call generate_sql.\n"
-                    )
-            else:
-                # No recognized noun — bare ordinal ("the 4th one"). Exact
-                # prior behavior, unchanged: most recent turn with any
-                # row_titles, regardless of type.
-                _last_with_items = next(
-                    (t for t in reversed(self.turns) if t.row_titles), None
-                )
-
-            if _last_with_items:
-                _ord_word = _ordinal_match.group(2).lower()
-                _idx = _ordinal_to_idx(_ord_word)
-                _target_id = ""
-                _target_col = "id"
-                if (_idx is not None
-                        and _idx < len(_last_with_items.row_titles)
-                        and _idx < len(_last_with_items.row_ids)):
-                    _target_id = _last_with_items.row_ids[_idx]
-                    if _idx < len(_last_with_items.row_id_columns):
-                        _target_col = _last_with_items.row_id_columns[_idx] or "id"
-
-                if _target_id:
-                    # Deterministic resolution — inject_row_identity() (see
-                    # validation/identity.py) paired this exact row with its
-                    # real id at query time, so there's no ambiguity window
-                    # left to warn about even if the display value below
-                    # happens to be shared by another row (confirmed live:
-                    # 'Delegation testing' appears twice in the same 7-row
-                    # plan listing — two different plans, same title).
-                    self.pending_resolved_disclosure = (
-                        f"Showing results for {_last_with_items.row_titles[_idx]!r} "
-                        f"({_idx + 1}{_ord_suffix(_idx)} item in your previous list):"
-                    )
-                    _non_pk_note = (
-                        # Confirmed live: the reasoning model correctly received
-                        # this exact UUID and correctly resolved "the 1st one",
-                        # but then wrote WHERE arep.audit_id = '<uuid>' instead
-                        # of WHERE arep.id = '<uuid>' — because "id" here is a
-                        # bare, ungrounded token; nowhere ELSE in this same
-                        # prompt does the model ever see a column literally
-                        # named "id" for this row, whereas it has repeatedly
-                        # seen audit_id/schedule_id/corrective_action_id/
-                        # inspection_id as ITS identifying column (★ items
-                        # list, ACTIVE CONTEXT, prior SQL). The query executed
-                        # without error and silently returned 0 rows. Naming
-                        # and ruling out those display columns explicitly
-                        # (rather than just saying "id") is the fix — a
-                        # deterministic AST guardrail
-                        # (DISPLAY_CODE_UUID_COMPARE in ast_checks.py) also
-                        # blocks this shape as a backstop either way.
-                        f" NOTE: '{_target_col}' here means the row's actual "
-                        f"PRIMARY KEY column (<alias>.id) — it is a different "
-                        f"column from audit_id/schedule_id/corrective_action_id/"
-                        f"inspection_id, the human-readable VARCHAR display "
-                        f"codes you may have seen for this same row elsewhere "
-                        f"in this context. A UUID like '{_target_id}' will "
-                        f"never match one of those display columns — it "
-                        f"silently returns 0 rows instead of erroring.\n"
-                        if _target_col == "id" else
-                        f" NOTE: {_target_col} is NOT a table's primary key — it's a "
-                        f"correlation value shared across tables (e.g. "
-                        f"ai_audit_answers.submission_id / ai_answers.submission_id "
-                        f"also matches a corrective action's observation_id, cast as "
-                        f"::varchar). Filter directly on the exact column this value "
-                        f"came from, do not treat it as some table's own .id.\n"
-                    )
-                    lines.append(
-                        f"ORDINAL RESOLVED ('{_ordinal_match.group(0).strip()}') — "
-                        f"row {_idx + 1} of the list from the MOST RECENT turn that "
-                        f"listed multiple rows = {_target_col} '{_target_id}' (display "
-                        f"value {_last_with_items.row_titles[_idx]!r}).\n"
-                        f"  Use WHERE <alias>.{_target_col} = '{_target_id}' — NOT "
-                        f"title/ILIKE, even if this display value appears more than "
-                        f"once in that list. Do NOT resolve against any ◆ ACTIVE "
-                        f"SUBJECT below — that pointer may be stale, carried over "
-                        f"from an unrelated earlier turn.\n"
-                        f"{_non_pk_note}"
-                        f"  (Your answer will automatically be prefixed with a "
-                        f"disclosure naming this resolved item — see "
-                        f"pending_resolved_disclosure — you do not need to restate "
-                        f"it yourself.)\n"
-                    )
-                else:
-                    if _idx is not None and _idx < len(_last_with_items.row_titles):
-                        self.pending_resolved_disclosure = (
-                            f"Showing results for {_last_with_items.row_titles[_idx]!r} "
-                            f"({_idx + 1}{_ord_suffix(_idx)} item in your previous list):"
-                        )
-                    lines.append(
-                        f"ORDINAL REFERENCE DETECTED ('{_ordinal_match.group(0).strip()}') — "
-                        f"resolve it against the ★ items list from the MOST RECENT turn that "
-                        f"listed multiple rows ({_last_with_items.row_titles}), NOT against any "
-                        f"◆ ACTIVE SUBJECT below — that pointer may be stale, carried over from "
-                        f"an unrelated earlier turn. 'the first one' = "
-                        f"{_last_with_items.row_titles[0]!r}.\n"
-                        f"  (Your answer will automatically be prefixed with a disclosure "
-                        f"naming the resolved item, if one could be determined — see "
-                        f"pending_resolved_disclosure — you do not need to restate it "
-                        f"yourself.)\n"
-                    )
-                    # DUPLICATE-WITHIN-LIST TRAP — fallback path only, for
-                    # query shapes inject_row_identity() skips (e.g. GROUP
-                    # BY — see identity.py). Confirmed live 2026-07-30: the
-                    # SAME 7-row plan listing (a single ONGOING cycle)
-                    # contains 'Delegation testing' TWICE, at positions 3
-                    # and 6 — two genuinely different audit_plan rows
-                    # (different audit_type/category) that happen to share
-                    # an identical title. Resolving an ordinal to a title
-                    # string and then filtering follow-up SQL by WHERE
-                    # ap.title = '<that title>' (or ILIKE) would silently
-                    # match BOTH rows and merge two different plans' data
-                    # into one answer — wrong, with no error.
-                    if _idx is not None and _idx < len(_last_with_items.row_titles):
-                        _target = _last_with_items.row_titles[_idx]
-                        if _last_with_items.row_titles.count(_target) > 1:
-                            lines.append(
-                                f"WARNING — '{_target}' appears MORE THAN ONCE in that same "
-                                f"list (not a data error — confirmed live: distinct rows can "
-                                f"share an identical title/name). Filtering by "
-                                f"WHERE ... = '{_target}' alone would match ALL of them and "
-                                f"silently merge multiple different records into one answer. "
-                                f"Do NOT filter by this value alone — either add another "
-                                f"filter from a column also shown in that same row (e.g. "
-                                f"audit_type/category) to pin down this ONE row specifically, "
-                                f"or re-run the LAST SQL with the SAME ORDER BY and "
-                                f"OFFSET {_idx} LIMIT 1 to reselect this exact row by "
-                                f"position instead of by name.\n"
-                            )
+            lines.append("")
 
         # ── Pending clarifying question this turn's answer may be resolving ──
+        # Evaluated for tool conversion in the same effort that produced
+        # resolve_ordinal_reference/resolve_disambiguation_reply — rejected,
+        # even more clearly than the ACTIVE CONTEXT area above (session.py
+        # ~line 235's comment): there is no deterministic resolution
+        # algorithm here AT ALL. Ordinal has position math; disambiguation-
+        # reply has an exact-name/candidate-list lookup; this block has
+        # neither — it's a bare reminder of the LLM's own earlier question,
+        # unconditional on the current question's text, with the actual
+        # "does this reply answer that question" judgment left entirely to
+        # the LLM's own reasoning. Connecting "FM managers" back to "top 5
+        # capex converters" isn't reducible to an int/string a tool could
+        # return — nothing here to convert. See the tool-conversion plan
+        # history for the fuller reasoning; this comment exists so the
+        # question isn't silently reopened from scratch.
+        #
         # Confirmed live 2026-07-29 (qid=c3004b3d → qid=7d5d343d): "top 5 capex
         # converters" got a clarifying question back ("if you mean FM Managers...
         # just say which group and metric"); the reply "FM manafers" should have
@@ -461,6 +412,23 @@ class ConversationSession:
             )
 
         # ── Resolve active subject across all turns ──────────────────────────
+        # Evaluated for tool conversion (agent/tool_defs) in the same effort
+        # that produced resolve_ordinal_reference/resolve_disambiguation_reply
+        # — deliberately kept as prose instead. current_scope is a PERSISTENT
+        # pointer that legitimately stays active for many consecutive turns
+        # (multi-turn drilldowns are the normal case here, not an edge case,
+        # confirmed live surviving 3+ turns unchanged); converting this to a
+        # tool would mean calling it on nearly every follow-up turn in a long
+        # conversation — a real per-turn round-trip added to the COMMON case,
+        # not the rare one ordinal/disambiguation-reply targeted. There is
+        # also nothing here for the LLM to *supply* that this code doesn't
+        # already know (contrast resolve_ordinal_reference's `position` or
+        # resolve_disambiguation_reply's `picked_name`, which only the LLM
+        # can extract from freeform text) — the resolved column/value below
+        # is 100% deterministic from session state already in hand. See the
+        # tool-conversion plan history for the full reasoning; this comment
+        # exists so that hypothesis isn't silently reopened from scratch.
+        #
         # "go back to that inspector" can re-anchor to an earlier turn's subject.
         # Domain-exclusive types (inspection/audit/cycle — see _DOMAIN_EXCLUSIVE)
         # are only usable when they originated in the domain we're currently
@@ -534,9 +502,11 @@ class ConversationSession:
             different facility/project/client/organisation rows sharing a
             display name, same class of bug as audit_plan.title duplicates)
             would resolve to an arbitrary one of them with no warning, unlike
-            the equivalent people-search flow below, which already correctly
-            detects `_ambiguous_duplicate_names` and hard-STOPs instead of
-            guessing. Collect ALL matches so the facility/entity branches can
+            the equivalent people-search flow (see the
+            resolve_disambiguation_reply tool, agent/orchestrator/
+            disambiguation_reply.py), which already correctly hard-STOPs on
+            an ambiguous duplicate name instead of guessing. Collect ALL
+            matches so the facility/entity branches can
             apply the same STOP guard rather than trusting `next()`'s pick.
             """
             for t in reversed(self.turns):
@@ -613,8 +583,7 @@ class ConversationSession:
                 # error. See synthesis.py's plan_ids lookup for how this gets
                 # resolved (or flagged ambiguous) at turn-finish time.
                 # Prefer active_id (M2: captured directly via the __id
-                # sibling column inject_row_identity() attaches, or already
-                # resolved by the ordinal-resolution block above) — only
+                # sibling column inject_row_identity() attaches) — only
                 # fall back to the plan_ids DB round-trip below when
                 # injection didn't run for that turn's query shape (e.g. a
                 # GROUP BY).
@@ -692,15 +661,10 @@ class ConversationSession:
                 if not _fid:
                     _fid, _fid_matches = _lookup_entity_id(active_label)
                 if len(_fid_matches) > 1:
-                    _dup_fids = ", ".join(f"'{f}'" for f in _fid_matches)
-                    lines.append(
-                        f"⚠️ STOP — '{active_label}' matches {len(_fid_matches)} DIFFERENT facility"
-                        f" records from the previous list (same name, different rows:"
-                        f" facility id IN ({_dup_fids})).\n"
-                        f"  YOU MUST call final_answer NOW asking the user to disambiguate further"
-                        f" (e.g. by project, client, or code) — do NOT pick one of these ids"
-                        f" arbitrarily and do NOT call generate_sql."
-                    )
+                    lines.append(_dup_stop_line(
+                        active_label, "facility", _fid_matches,
+                        extra_hint=" (e.g. by project, client, or code)",
+                    ))
                 elif _fid:
                     lines.append(
                         f"ACTIVE CONTEXT — The conversation is scoped to facility '{active_label}'"
@@ -738,14 +702,7 @@ class ConversationSession:
                 if not _eid:
                     _eid, _eid_matches = _lookup_entity_id(active_label)
                 if len(_eid_matches) > 1:
-                    _dup_eids = ", ".join(f"'{e}'" for e in _eid_matches)
-                    lines.append(
-                        f"⚠️ STOP — '{active_label}' matches {len(_eid_matches)} DIFFERENT {_tbl}"
-                        f" records from the previous list (same name, different rows:"
-                        f" {_tbl} id IN ({_dup_eids})).\n"
-                        f"  YOU MUST call final_answer NOW asking the user to disambiguate further"
-                        f" — do NOT pick one of these ids arbitrarily and do NOT call generate_sql."
-                    )
+                    lines.append(_dup_stop_line(active_label, _tbl, _eid_matches))
                 elif _eid:
                     lines.append(
                         f"ACTIVE CONTEXT — The conversation is scoped to {_tbl} '{active_label}'"
@@ -894,6 +851,42 @@ class ConversationSession:
                 else:
                     lines.append(f"CONTEXT — Last query returned a single result: {last.single_row_values}")
 
+        # ── Standalone count/aggregate-follow-up re-aggregate warning ──────
+        # Added 2026-08-07 (debug_llm_20260807_153128, qid=3dbcdaf3): "how
+        # many of the ones listed above are completed" was answered via
+        # final_answer with ZERO tool calls — the model echoed the bare
+        # "Total rows: N" line below as if it were a real count, and
+        # fabricated its own (wrong) recollection of what the previous SQL
+        # filtered on.
+        #
+        # Deliberately NOT nested inside the `elif is_followup and not
+        # is_clearly_fresh:` chain above — that block's own re-aggregate
+        # guidance (the "NOT the full set" messages) needs SIX conditions to
+        # fire (is_followup AND not is_clearly_fresh AND domain-compat AND
+        # non-empty inspection_ids/audit_ids AND len>1 AND total_count >
+        # len(ids)). A previous turn that listed by title only (no id column
+        # selected) captures no audit_ids/inspection_ids at all and gets no
+        # warning today even with a perfect regex. This block is keyed only
+        # on is_count_followup + last.sql + last.total_count>0 — no
+        # dependency on which id lists got captured.
+        if is_count_followup and last.sql and last.total_count > 0:
+            _sample_n = max(len(last.row_titles), len(last.audit_ids), len(last.inspection_ids))
+            _prev_sql_snippet = " ".join(last.sql.split())[:500]
+            lines.append(
+                f"CONTEXT — The previous turn returned {last.total_count} total row(s), but only "
+                f"a CAPPED SAMPLE (~{_sample_n} row(s)) was rendered into this conversation "
+                f"history above — not the full result. You have NOT seen the individual rows.\n"
+                f"  This question asks to count/aggregate over that previous result "
+                f"('how many of these/those/them/the ones listed above are X'). You CANNOT "
+                f"answer this from the 'Total rows' number, from the sampled ids/titles above, "
+                f"or from your own memory of what the previous SQL filtered on — that memory is "
+                f"unreliable and has been wrong before.\n"
+                f"  INSTEAD: call generate_sql, reusing the SAME FROM/JOIN/WHERE filters as the "
+                f"previous query below, add the new condition, and return a fresh COUNT(*). Do "
+                f"NOT call final_answer without running a query first.\n"
+                f"  Previous SQL: {_prev_sql_snippet}"
+            )
+
         # ── Explicit-name recall — reaches further back than current_scope ──
         # current_scope (above) only ever holds the MOST RECENT focus, so it
         # can't answer "wait, what about Facility A again" once the
@@ -924,279 +917,96 @@ class ConversationSession:
                 )
             lines.append("")
 
-        # Disambiguation context — stop the model re-running the same check
+        # Disambiguation context — display-only pointer to the pending
+        # pick. Actual resolution happens via the resolve_disambiguation_reply
+        # tool (agent/orchestrator/disambiguation_reply.py) — retired the old
+        # regex matching here (filler-word stripping, exact/substring tiers,
+        # a separate ordinal-pick regex) since an LLM-supplied picked_name/
+        # picked_position needs none of that; there's no leftover sentence
+        # text to fuzzy-match once the LLM has already extracted the pick
+        # itself. The ambiguous-duplicate-name STOP and the >12-vs-2..12
+        # wording distinction both still exist, just inside the tool/its
+        # format_result instead of resolved here by regex.
         if not is_clearly_fresh and last.disambiguation_name:
             _dn = last.disambiguation_name
             _dc = last.total_count
-            _q_lower = current_question.lower().strip()
-            _q_has_same_name = _dn.lower() in _q_lower
-            # "name pick": short response with no query verbs = user picking from the list
-            _QUERY_VERB_RE = re.compile(
-                r"\b(show|list|find|what|who|which|how|count|display|get|fetch|"
-                r"give|tell|check|search|view|see|compare|rank|sort|filter)\b",
-                re.IGNORECASE,
+            _names_preview = [c.get("name", "") for c in last.disambiguation_candidates[:12]]
+            _too_many_note = (
+                f" ({_dc} was too many to list in full — if picking by name doesn't "
+                f"resolve, ask for a fuller name or email address.)"
+                if _dc > 12 else ""
             )
-            _specific = current_question.strip().rstrip("\t").strip()
-            # Strip trailing sentence punctuation ("George Auditor?", "george auditor.")
-            # so it doesn't break the exact-match comparison against candidate names below.
-            _specific = re.sub(r"[?.!,;:]+$", "", _specific).strip()
-            _is_name_pick = (
-                not bool(_QUERY_VERB_RE.search(current_question))
-                and len(_q_lower.split()) <= 6
-                and _specific.lower() != _dn.lower()  # must be more specific than the original term
+            lines.append(
+                f"PENDING DISAMBIGUATION — the previous turn found {_dc} people matching "
+                f"'{_dn}' and asked which one was meant: {_names_preview}.{_too_many_note}\n"
+                f"  If THIS message is the user picking one (by name or position), call "
+                f"resolve_disambiguation_reply with picked_name or picked_position — do NOT "
+                f"guess the id yourself via ILIKE/substring matching.\n"
+                f"  If the user is instead providing a MORE SPECIFIC name/email (not simply "
+                f"repeating '{_dn}'), run a targeted full-name search via generate_sql instead: "
+                f"WHERE (u.first_name || ' ' || u.last_name) ILIKE '%<full name>%'.\n"
+                f"  If the message just repeats '{_dn}' with no new information, call "
+                f"final_answer and re-list these options rather than re-running the same "
+                f"broad search."
             )
-
-            # Exact-match short-circuit: if the user's text — once filler/verb
-            # words like "ya fetch for" are stripped — is an EXACT match for
-            # one of the candidate names from the previous disambiguation,
-            # resolve it directly. Without this, repeating an exact name (or
-            # wrapping it in "ya fetch for ...") just re-triggers the same
-            # ILIKE search / STOP branch forever whenever that name is a
-            # substring of other candidates.
-            _FILLER_WORDS = {
-                "ya", "yeah", "yep", "please", "pls", "me", "for", "the",
-                "that", "data", "info", "information", "details", "on",
-                "about", "of", "person", "user",
-            }
-
-            def _strip_filler(text: str) -> str:
-                words = text.strip().split()
-                while words and (
-                    words[0].lower() in _FILLER_WORDS
-                    or _QUERY_VERB_RE.fullmatch(words[0])
-                ):
-                    words.pop(0)
-                while words and words[-1].lower() in _FILLER_WORDS:
-                    words.pop()
-                return " ".join(words)
-
-            _cleaned_specific = _strip_filler(_specific)
-            _name_matches = [
-                _cand for _cand in last.disambiguation_candidates
-                if _cand.get("name", "").strip().lower() == _cleaned_specific.lower()
-            ]
-            if not _name_matches:
-                # Full-sentence follow-up (e.g. a drilldown-click "list all
-                # schedules assigned to kavya insp") embeds the resolved
-                # candidate name inside a longer question instead of replying
-                # with just the bare name — the whole-message equality check
-                # above can never match that shape. Fall back to substring
-                # containment against the raw question, preferring the LONGEST
-                # candidate name so a more specific match ("kavya insp") wins
-                # over a shorter coincidental one ("kavya"). Without this, the
-                # question still contains the ORIGINAL search term as a
-                # substring, so it gets misclassified by the _q_has_same_name
-                # STOP-guard below as "same vague query repeated" instead of
-                # "already resolved" — the model then re-runs the broad search
-                # and never reaches the user's actual request.
-                _q_full_lower = current_question.lower()
-                _substr_hits = [
-                    _cand for _cand in last.disambiguation_candidates
-                    if _cand.get("name") and _cand["name"].strip().lower() in _q_full_lower
-                ]
-                if _substr_hits:
-                    _max_len = max(len(_c["name"]) for _c in _substr_hits)
-                    _name_matches = [_c for _c in _substr_hits if len(_c["name"]) == _max_len]
-            # Only auto-resolve when the name uniquely identifies one candidate.
-            # Several distinct accounts can share an identical display name
-            # (e.g. 8 different "George Joseph" users seen in this dataset) —
-            # picking the first one silently would bind the wrong identity.
-            _exact_match = _name_matches[0] if len(_name_matches) == 1 else None
-            _ambiguous_duplicate_names = len(_name_matches) > 1
-
-            # Ordinal short-circuit: "the first one", "option 2", "#3", "the 2nd"
-            # — resolve directly to that position in the previously-shown list.
-            # Without this, an ordinal pick falls through to the generic
-            # _is_name_pick branch below, which can only tell the model to
-            # "use the UUID from previous result" with no way to say WHICH
-            # uuid that is — the model then re-runs the disambiguation SQL
-            # over and over trying to re-derive it from conversation text and
-            # never converges within the iteration budget (observed: 8 wasted
-            # generate_sql calls / ~70s / final_answer giving up).
-            # Gated on _is_name_pick (same short/no-verb/not-the-original-term
-            # shape used for exact-name picks) so it can't misfire on a
-            # legitimate analytical question that happens to contain an
-            # ordinal word (e.g. "what's the second highest score" has a
-            # query verb and fails _is_name_pick).
-            _ordinal_n = None
-            if _is_name_pick:
-                _ORDINAL_WORD_TO_N = {
-                    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
-                    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
-                }
-                _q_for_ordinal = _cleaned_specific.lower()
-                for _word, _n in _ORDINAL_WORD_TO_N.items():
-                    if re.search(rf"\b{_word}\b", _q_for_ordinal):
-                        _ordinal_n = _n
-                        break
-                if _ordinal_n is None:
-                    _om = re.search(
-                        r"\b(?:option|choice|number|#)\s*0*(\d{1,2})\b|\b(\d{1,2})(?:st|nd|rd|th)\b",
-                        _q_for_ordinal,
-                    )
-                    if _om:
-                        _ordinal_n = int(_om.group(1) or _om.group(2))
-            _ordinal_match = (
-                last.disambiguation_candidates[_ordinal_n - 1]
-                if _ordinal_n and 1 <= _ordinal_n <= len(last.disambiguation_candidates)
-                else None
-            )
-
-            # Remind the model what it was ACTUALLY asked for before the name
-            # went ambiguous. Without this, a multi-turn narrowing sequence
-            # ("list schedules for neenu" → too many → "neenu qa inspector")
-            # loses track of "schedules" and settles for just resolving/describing
-            # the person instead of running the original request against them.
-            _origin_q = last.disambiguation_origin_question
-            _origin_note = (
-                f" Once resolved, you MUST go on to actually answer the ORIGINAL"
-                f" request — '{_origin_q}' — not just return the person's info/role."
-                if _origin_q and _origin_q.strip().lower() != _dn.lower() else ""
-            )
-
-            if _exact_match:
-                lines.append(
-                    f"DISAMBIGUATION RESOLVED — '{_cleaned_specific}' is an EXACT match for one of"
-                    f" the {_dc} candidates found previously (user_id="
-                    f"'{_exact_match['user_id']}').\n"
-                    f"  Use WHERE u.id = '{_exact_match['user_id']}' directly to run the"
-                    f" original query now. Do NOT re-run the disambiguation search and"
-                    f" do NOT ask the user to pick again — this name is unambiguous."
-                    f"{_origin_note}"
-                )
-            elif _ordinal_match:
-                lines.append(
-                    f"DISAMBIGUATION RESOLVED — user picked option #{_ordinal_n}"
-                    f" ('{_ordinal_match['name']}') from the {_dc} candidates found"
-                    f" previously (user_id='{_ordinal_match['user_id']}').\n"
-                    f"  Use WHERE u.id = '{_ordinal_match['user_id']}' directly to run the"
-                    f" original query now. Do NOT re-run the disambiguation search and"
-                    f" do NOT ask the user to pick again."
-                    f"{_origin_note}"
-                )
-            elif _ambiguous_duplicate_names:
-                _dup_uids = ", ".join(f"'{c['user_id']}'" for c in _name_matches)
-                lines.append(
-                    f"⚠️ STOP — '{_cleaned_specific}' matches {len(_name_matches)} DIFFERENT"
-                    f" people from the previous list (same display name, different accounts:"
-                    f" user_id IN ({_dup_uids})).\n"
-                    f"  YOU MUST call final_answer NOW asking the user to disambiguate further"
-                    f" by email address — do NOT pick one of these UUIDs arbitrarily and do NOT"
-                    f" call generate_sql."
-                )
-            elif _dc > 12:
-                if _q_has_same_name and not _is_name_pick:
-                    # User re-asked the same partial-name query — hard block, no SQL
-                    lines.append(
-                        f"⚠️ STOP — DISAMBIGUATION ALREADY DONE (MANDATORY RULE):\n"
-                        f"  Turn {len(self.turns)} already searched '{_dn}' → {_dc} matches (threshold=12).\n"
-                        f"  The current question still uses '{_dn}' as a partial name.\n"
-                        f"  YOU MUST call final_answer NOW with:\n"
-                        f'  "I found {_dc} people matching \'{_dn}\' — too many to list. '
-                        f'Please provide a more specific full name (e.g. \'George Smith\') '
-                        f'or their email address so I can narrow it down."\n'
-                        f"  DO NOT call generate_sql. DO NOT run any SQL."
-                    )
-                elif _is_name_pick:
-                    # User is providing a more specific name — allow a targeted full-name lookup
-                    lines.append(
-                        f"DISAMBIGUATION CONTEXT — Previous turn found {_dc} people matching"
-                        f" '{_dn}' (too many to list). The user now appears to be providing"
-                        f" a specific full name: '{_specific}'.\n"
-                        f"  STEP A: Run a targeted lookup using the concatenated full name:\n"
-                        f"    WHERE (u.first_name || ' ' || u.last_name) ILIKE '%{_ilike_escape(_specific)}%'"
-                        f"  — NOT separate first_name OR last_name conditions. If '{_specific}'"
-                        f"  includes a role/descriptor rather than a real name (e.g. 'neenu qa"
-                        f"  inspector'), instead search by the name part alone and use the role"
-                        f"  words to pick among the results via a JOIN to user_roles/role.\n"
-                        f"  STEP B: If exactly 1 match, use WHERE u.id = '<uuid>' to run the"
-                        f"  original query. If still 2–12, list them. If 0, tell user not found."
-                        f"{_origin_note}"
-                    )
-                else:
-                    lines.append(
-                        f"DISAMBIGUATION CONTEXT — Previous turn found {_dc} people"
-                        f" matching '{_dn}' (too many). If the user is providing a specific"
-                        f" full name, use concatenated full-name search:"
-                        f" (u.first_name || ' ' || u.last_name) ILIKE '%<full name>%'."
-                    )
-            elif _dc > 1:
-                if _q_has_same_name and not _is_name_pick:
-                    lines.append(
-                        f"⚠️ STOP — DISAMBIGUATION ALREADY DONE (MANDATORY RULE):\n"
-                        f"  Turn {len(self.turns)} already found {_dc} people matching '{_dn}'.\n"
-                        f"  YOU MUST call final_answer NOW to list those {_dc} options\n"
-                        f"  and ask the user which one they meant.\n"
-                        f"  DO NOT call generate_sql again."
-                    )
-                elif _is_name_pick:
-                    lines.append(
-                        f"DISAMBIGUATION CONTEXT — Previous turn found {_dc} people matching"
-                        f" '{_dn}'. The user now appears to be selecting a specific person:"
-                        f" '{_specific}'. Use the UUID already returned in the previous result"
-                        f" (WHERE u.id = '<uuid>') to run the original query."
-                        f" If UUID is not in history, look up by full name:"
-                        f" WHERE (u.first_name || ' ' || u.last_name) ILIKE '%{_ilike_escape(_specific)}%'."
-                        f"{_origin_note}"
-                    )
-                else:
-                    lines.append(
-                        f"DISAMBIGUATION CONTEXT — Previous turn found {_dc} people"
-                        f" matching '{_dn}'. Use UUID from previous result for exact lookup."
-                    )
 
         # Entity disambiguation context (facility/project/client/organisation) —
-        # the entity-equivalent of the people exact-match block above. Gated on
-        # the IMMEDIATELY PRECEDING turn's entity_disambiguation_candidates
-        # directly (not on active_subject_type — the STEP 2b final_answer
-        # termination path, which is how every 2+-match entity disambiguation
-        # list actually ends, never sets active_subject_type, so the ACTIVE
-        # CONTEXT facility/entity branches above never fire for a same-turn
-        # drilldown-click follow-up). Unlike the people block, the typical
-        # follow-up here is a full sentence with the resolved name embedded
-        # (e.g. drilldown-click text "show mitigative actions at Adnoc
-        # Schools- Ghayathi"), not a bare name reply — so this matches by
-        # substring containment against the whole question, not equality.
+        # the entity-equivalent of the people block above, same tool resolves
+        # both (it auto-detects which candidate list is populated).
         if not is_clearly_fresh and last.entity_disambiguation_candidates:
-            _ent_match = next(
-                (c for c in last.entity_disambiguation_candidates
-                 if c.get("id") and c.get("name")
-                 and c["name"].strip().lower() in current_question.lower()),
-                None
+            _ent_tbl = last.entity_disambiguation_table or "entity"
+            _ent_names_preview = [
+                c.get("name", "") for c in last.entity_disambiguation_candidates[:12]
+            ]
+            lines.append(
+                f"PENDING DISAMBIGUATION — the previous turn found multiple {_ent_tbl} "
+                f"matches and asked which one was meant: {_ent_names_preview}.\n"
+                f"  If THIS message picks one (by name or position), call "
+                f"resolve_disambiguation_reply with picked_name or picked_position — do NOT "
+                f"guess the id yourself via ILIKE on the name.\n"
+                f"  If the message is a fresh, more specific search instead, run generate_sql "
+                f"normally."
             )
-            if _ent_match:
-                _ent_tbl = last.entity_disambiguation_table or "entity"
-                _ent_als = last.entity_disambiguation_alias or "e"
-                lines.append(
-                    f"DISAMBIGUATION RESOLVED — '{_ent_match['name']}' is an EXACT match for one"
-                    f" of the {_ent_tbl} candidates found previously"
-                    f" ({_ent_tbl}_id='{_ent_match['id']}').\n"
-                    f"  Use WHERE {_ent_als}.id = '{_ent_match['id']}' directly to run the"
-                    f" original query now — do NOT use ILIKE on the name."
-                )
 
-        lines.append("")
-        lines.append(
-            "PAGINATION: If the user says 'show more', 'show the rest', 'continue',"
-            " 'remaining', 'next', 'show all' — re-run the LAST SQL with higher LIMIT."
-            " Do NOT generate a new query."
-        )
-        lines.append(
-            "REFINEMENT: If the user says 'filter by X', 'only the Y ones', 'sort by Z'"
-            " — modify the LAST SQL by adding/changing WHERE or ORDER BY."
-        )
-        lines.append(
-            "AUGMENTATION: If the user says 'show along with X', 'also show Y', 'include Z',"
-            " 'add the Y column' — reuse the LAST SQL's FROM/JOIN/WHERE EXACTLY as-is (the"
-            " same filters, the same join directions — a LEFT JOIN stays a LEFT JOIN, do not"
-            " make it an INNER JOIN) and only ADD the newly-requested column/join to the"
-            " SELECT list. Confirmed live 2026-07-29: 'show along with auditees' regenerated"
-            " the query from scratch instead of extending it — it silently dropped the"
-            " previous query's schedule_status != 'COMPLETED' filter and switched the"
-            " auditor/auditee/facility joins from LEFT to INNER, changing the row count from"
-            " 10 to 17 for a question that only asked to add one column. Do NOT change or"
-            " drop any filter, and do NOT change any join's direction, unless the user"
-            " explicitly asked for that change."
-        )
+        # Gated on the current question actually looking like a "modify the
+        # last query" follow-up (token-usage audit, 2026-08-06) — this block
+        # was previously unconditional on every turn from turn 2 onward,
+        # regardless of whether the question was remotely pagination/
+        # refinement/augmentation-shaped. Deliberately broad/inclusive
+        # (matches on a short keyword, not a strict phrase) — a false
+        # positive here just means the instruction shows up when not
+        # strictly needed (cheap); a false negative means a real "show
+        # more"/"also show X" follow-up silently regenerates the query from
+        # scratch instead of extending it, the exact live-caught bug the
+        # AUGMENTATION block documents below.
+        if re.search(
+            r"(?i)\b(show\s+more|show\s+the\s+rest|show\s+all|continue|remaining|next\b"
+            r"|filter\s+by|only\s+the\b|sort\s+by"
+            r"|along\s+with|also\s+show|include\b|add\s+the\b)",
+            current_question,
+        ):
+            lines.append("")
+            lines.append(
+                "PAGINATION: If the user says 'show more', 'show the rest', 'continue',"
+                " 'remaining', 'next', 'show all' — re-run the LAST SQL with higher LIMIT."
+                " Do NOT generate a new query."
+            )
+            lines.append(
+                "REFINEMENT: If the user says 'filter by X', 'only the Y ones', 'sort by Z'"
+                " — modify the LAST SQL by adding/changing WHERE or ORDER BY."
+            )
+            lines.append(
+                "AUGMENTATION: If the user says 'show along with X', 'also show Y', 'include Z',"
+                " 'add the Y column' — reuse the LAST SQL's FROM/JOIN/WHERE EXACTLY as-is (the"
+                " same filters, the same join directions — a LEFT JOIN stays a LEFT JOIN, do not"
+                " make it an INNER JOIN) and only ADD the newly-requested column/join to the"
+                " SELECT list. Confirmed live 2026-07-29: 'show along with auditees' regenerated"
+                " the query from scratch instead of extending it — it silently dropped the"
+                " previous query's schedule_status != 'COMPLETED' filter and switched the"
+                " auditor/auditee/facility joins from LEFT to INNER, changing the row count from"
+                " 10 to 17 for a question that only asked to add one column. Do NOT change or"
+                " drop any filter, and do NOT change any join's direction, unless the user"
+                " explicitly asked for that change."
+            )
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         return "\n".join(lines)
