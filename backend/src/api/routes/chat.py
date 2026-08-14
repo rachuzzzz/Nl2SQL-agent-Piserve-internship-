@@ -284,10 +284,19 @@ async def chat(
             orch.reasoning_llm, _effective_message, sess_data["session"],
         )
 
+        # Only trust the router's decision as authoritative for THIS message
+        # when it resolved via Tier 1 (an unambiguous domain keyword actually
+        # present in the classified text) AND that's the same text being sent
+        # to the orchestrator — the domain-pick carryover path above swaps in
+        # the ORIGIN question, whose wording the router never actually saw
+        # (that's precisely why it needed clarification in the first place).
+        _router_locked_domain = route.tier == 1 and not _is_pending_domain_pick
+
         t0 = time.time()
         result = await asyncio.to_thread(
             orch.query, _effective_message, session=sess_data["session"],
             visibility_scope=visibility_scope, query_id=qid,
+            router_locked_domain=_router_locked_domain,
         )
         elapsed_ms = int((time.time() - t0) * 1000)
         sess_data["message_count"] += 1

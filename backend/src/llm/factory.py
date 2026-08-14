@@ -4,14 +4,17 @@ Role-based LLM client construction.
 Each role's tuning (context window, stop tokens, timeout, temperature) is
 load-bearing — see inline comments — so this factory keeps per-role presets
 rather than exposing one generic client. Consumers (agent/orchestrator) ask
-for a role, not a provider; swapping Ollama for another provider later means
-changing the functions below, not every call site.
+for a role, not a provider; swapping providers means changing the functions
+below, not every call site. Provider selection is independent per role (see
+get_llm_client below) — e.g. reasoning via vLLM and sql via Ollama at the
+same time is a supported combination, not a special case.
 """
 
 from __future__ import annotations
 
 from src.llm.ollama import build_ollama_client
 from src.llm.anthropic import build_anthropic_client
+from src.llm.vllm import build_vllm_client
 
 
 def get_reasoning_llm(model: str, base_url: str):
@@ -43,6 +46,7 @@ def get_reasoning_llm(model: str, base_url: str):
         temperature=0.0,
         request_timeout=120.0,
         thinking=False,
+        json_mode=True,
         additional_kwargs={
             "num_predict": 1024,
             "num_ctx": 20000,
@@ -111,30 +115,94 @@ def get_sql_llm_anthropic(model: str, api_key: str):
     )
 
 
-_ROLE_FACTORIES = {
-    "reasoning": get_reasoning_llm,
-    "sql": get_sql_llm,
+def get_reasoning_llm_vllm(model: str, base_url: str):
+    """
+    vLLM equivalent of get_reasoning_llm above. context_window/max_tokens
+    mirror Ollama's num_ctx/num_predict values for this role.
+
+    extra_body.chat_template_kwargs.enable_thinking=False disables Qwen3.5's
+    thinking mode — confirmed live: without this, qwen3.5-9b-awq on vLLM
+    returns content=null / finish_reason="length" with the entire max_tokens
+    budget consumed by a `reasoning` field instead, the same failure class
+    ollama.py's `thinking` param and anthropic.py's `thinking_dict` guard
+    against for their providers. vLLM's OpenAI-compatible endpoint has no
+    dedicated `thinking` field like those — passing extra_body is required
+    because the openai SDK's create() only accepts its fixed named params
+    directly; unknown keys must go through extra_body to reach the server.
+    """
+    return build_vllm_client(
+        model=model,
+        base_url=base_url,
+        temperature=0.0,
+        max_tokens=1024,
+        context_window=20000,
+        additional_kwargs={
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        },
+    )
+
+
+def get_sql_llm_vllm(model: str, base_url: str):
+    """
+    vLLM equivalent of get_sql_llm above. Same stop tokens/top_p as the
+    Ollama version, passed via additional_kwargs (OpenAI-compatible chat
+    completion params) instead of Ollama's `options` dict. Also disables
+    thinking mode — see get_reasoning_llm_vllm's docstring for why this is
+    needed for Qwen3.5-family models served via vLLM.
+    """
+    return build_vllm_client(
+        model=model,
+        base_url=base_url,
+        temperature=0.0,
+        max_tokens=1024,
+        context_window=16384,
+        additional_kwargs={
+            "top_p": 0.9,
+            "stop": [";", "[/SQL]", "This query", "Note:", "-- Note", "/*"],
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        },
+    )
+
+
+# {provider: {role: factory}} — every (provider, role) combination this app
+# supports. Adding a new provider means adding one entry here, not touching
+# every call site (see llm/base.py's LLMClient protocol).
+_PROVIDER_ROLE_FACTORIES = {
+    "ollama": {
+        "reasoning": get_reasoning_llm,
+        "sql": get_sql_llm,
+    },
+    "anthropic": {
+        "reasoning": get_reasoning_llm_anthropic,
+        "sql": get_sql_llm_anthropic,
+    },
+    "vllm": {
+        "reasoning": get_reasoning_llm_vllm,
+        "sql": get_sql_llm_vllm,
+    },
 }
 
-_ROLE_FACTORIES_ANTHROPIC = {
-    "reasoning": get_reasoning_llm_anthropic,
-    "sql": get_sql_llm_anthropic,
-}
+# Providers whose factory takes an api_key as its second positional arg
+# instead of a base_url (currently just Anthropic's hosted API).
+_API_KEY_PROVIDERS = {"anthropic"}
 
 
-def get_llm_client(role: str, model: str, base_url: str):
+def get_llm_client(provider: str, role: str, model: str, *, base_url: str = "", api_key: str = ""):
+    """
+    Resolve a single (provider, role) pair to a constructed LLM client.
+    Reasoning and sql are resolved independently by callers — this function
+    doesn't assume both roles share a provider.
+    """
     try:
-        factory = _ROLE_FACTORIES[role]
-    except KeyError:
-        raise ValueError(f"Unknown LLM role: {role!r}. Expected one of {sorted(_ROLE_FACTORIES)}.")
-    return factory(model, base_url)
-
-
-def get_llm_client_anthropic(role: str, model: str, api_key: str):
-    try:
-        factory = _ROLE_FACTORIES_ANTHROPIC[role]
+        roles = _PROVIDER_ROLE_FACTORIES[provider]
     except KeyError:
         raise ValueError(
-            f"Unknown LLM role: {role!r}. Expected one of {sorted(_ROLE_FACTORIES_ANTHROPIC)}."
+            f"Unknown LLM provider: {provider!r}. Expected one of {sorted(_PROVIDER_ROLE_FACTORIES)}."
         )
-    return factory(model, api_key)
+    try:
+        factory = roles[role]
+    except KeyError:
+        raise ValueError(f"Unknown LLM role: {role!r}. Expected one of {sorted(roles)}.")
+    if provider in _API_KEY_PROVIDERS:
+        return factory(model, api_key)
+    return factory(model, base_url)

@@ -48,6 +48,45 @@ AUDIT_BLOCK_RULES: list[dict] = [
         "hard_fail": True,
     },
     {
+        # Confirmed live 2026-08-12 (debug_llm_20260812_115240, qid=7a9a1309):
+        # "show all thats returned for modification then" (about audit
+        # schedules) generated asch.schedule_status = 'RETURNED_FOR_MODIFICATION'
+        # — the audit_plan.status spelling (DRAFT/SUBMITTED/APPROVED/
+        # RETURNED_FOR_MODIFICATION), cross-contaminated onto a DIFFERENT
+        # table's DIFFERENTLY-spelled enum. audit_schedule.schedule_status's
+        # real value is RETURN_MODIFICATION (no "ED", no "FOR" — see
+        # AUDIT_ENUM_COLUMNS in schema_introspector.py). The reasoning
+        # model's own draft schema_hint got it right; the downstream SQL-gen
+        # coder model rewrote it wrong, with no seed example anchoring this
+        # exact phrasing to the correct spelling. Same "wrong-but-plausible
+        # literal, UUID/enum-typed so it silently matches zero rows instead
+        # of erroring" trap class as
+        # audit_block_review_entity_type_invalid_literal below, just on a
+        # different pair of confusable enum values.
+        "id":          "audit_block_schedule_status_invalid_literal",
+        "type":        BLOCK,
+        "code":        "AUDIT_SCHEDULE_STATUS_INVALID",
+        "description": (
+            "audit_schedule.schedule_status must be exactly one of DRAFT/PENDING_REVIEW/"
+            "APPROVED/ONGOING/COMPLETED/RETURN_MODIFICATION — audit_plan.status's "
+            "RETURNED_FOR_MODIFICATION (a different table, different spelling) is not a "
+            "valid value here and silently matches zero rows instead of erroring."
+        ),
+        "sql_pattern": (
+            r"\basch\.schedule_status\s*=\s*'"
+            r"(?!(?:DRAFT|PENDING_REVIEW|APPROVED|ONGOING|COMPLETED|RETURN_MODIFICATION)')"
+            r"[A-Za-z_]+'"
+        ),
+        "message": (
+            "BLOCKED: asch.schedule_status must be exactly one of 'DRAFT', 'PENDING_REVIEW', "
+            "'APPROVED', 'ONGOING', 'COMPLETED', or 'RETURN_MODIFICATION' — no other value "
+            "exists on this column. In particular, 'RETURNED_FOR_MODIFICATION' is "
+            "audit_plan.status's spelling, NOT audit_schedule.schedule_status's — the correct "
+            "value here is 'RETURN_MODIFICATION' (no 'ED', no 'FOR')."
+        ),
+        "hard_fail": True,
+    },
+    {
         "id":          "audit_block_dead_report_audit_type",
         "type":        BLOCK,
         "code":        "AUDIT_DEAD_REPORT_AUDIT_TYPE",
@@ -181,6 +220,46 @@ AUDIT_BLOCK_RULES: list[dict] = [
             "primary key), NOT .corrective_action_id (the VARCHAR display code — never "
             "UUID-shaped, casting it to uuid will fail). Correct: "
             "JOIN review rev ON rev.entity_id = aca.id AND rev.entity_type = 'AUDIT_CORRECTIVE_ACTION'"
+        ),
+        "hard_fail": True,
+    },
+    {
+        # Confirmed live 2026-08-12 (debug_llm_20260812_113525, qid=4a85836b):
+        # "who returned this for modification" (about a specific audit_schedule
+        # row) generated rev.entity_type = 'AUDIT_SCHEDULE' — a value that does
+        # not exist in review.entity_type at all. The real value is the bare
+        # 'SCHEDULE' (see schema_introspector.py's AUDIT_BUSINESS_RULES: only
+        # 'AUDIT_PLAN'/'PORTFOLIO'/'SCHEDULE'/'AUDIT_CORRECTIVE_ACTION' are
+        # valid for the audit domain). The wrong literal is NOT a syntax error
+        # — it's UUID-typed like every other entity_type value, so it silently
+        # executes and returns 0 rows regardless of what the real data holds,
+        # exactly the "wrong table target, no error" trap
+        # audit_block_ca_schedule_direct_join above already guards against for
+        # a different join. Anchored to the `rev.` alias specifically (every
+        # seed example and worked example in this codebase aliases the review
+        # table as `rev`) rather than a bare `entity_type` match, since
+        # ai_questions also has its own, unrelated entity_type column
+        # (schema_introspector.py) that this must not false-positive on.
+        "id":          "audit_block_review_entity_type_invalid_literal",
+        "type":        BLOCK,
+        "code":        "AUDIT_REVIEW_ENTITY_TYPE_INVALID",
+        "description": (
+            "review.entity_type on the audit domain must be exactly one of "
+            "'AUDIT_PLAN'/'PORTFOLIO'/'SCHEDULE'/'AUDIT_CORRECTIVE_ACTION' — any other "
+            "literal (e.g. the plausible-looking but nonexistent 'AUDIT_SCHEDULE') is "
+            "UUID-typed like the real values, so it silently matches zero rows instead "
+            "of erroring."
+        ),
+        "sql_pattern": (
+            r"\brev\.entity_type\s*=\s*'"
+            r"(?!(?:AUDIT_PLAN|PORTFOLIO|SCHEDULE|AUDIT_CORRECTIVE_ACTION)')"
+            r"[A-Za-z_]+'"
+        ),
+        "message": (
+            "BLOCKED: rev.entity_type must be exactly one of 'AUDIT_PLAN', 'PORTFOLIO', "
+            "'SCHEDULE', or 'AUDIT_CORRECTIVE_ACTION' — no other value exists on this "
+            "column. For an audit_schedule row, the correct value is the bare 'SCHEDULE' "
+            "(NOT 'AUDIT_SCHEDULE', which does not exist and will silently match zero rows)."
         ),
         "hard_fail": True,
     },

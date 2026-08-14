@@ -19,10 +19,7 @@ from llama_index.core import Settings
 from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-from src.llm.factory import (
-    get_reasoning_llm, get_sql_llm,
-    get_reasoning_llm_anthropic, get_sql_llm_anthropic,
-)
+from src.llm.factory import get_llm_client
 from src.retrieval import SemanticQuestionIndex, SeedExampleIndex, text_similarity
 from src.sql.validation import SQLValidator
 from src.agent.domains import get_domain_config
@@ -37,24 +34,10 @@ from src.agent.orchestrator.models import AgentStep, QueryStats, ConversationTur
 from src.agent.orchestrator.debug import _make_debug_logger, _dbg, _build_constraint_notes, _CONSTRAINT_NOTE_MAP, _cap_text
 from src.agent.orchestrator.synthesis import SynthesisMixin
 from src.agent.orchestrator.disambiguation import DisambiguationMixin
-from src.agent.orchestrator.session import _COUNT_FOLLOWUP_RE, _SELECTION_FOLLOWUP_RE
+from src.agent.orchestrator.turn_classifier import TurnClassifier
 
 
 _PG_ERROR_CLASS_RE = re.compile(r"psycopg2\.errors\.(\w+)")
-
-# Detector (not resolver) for the resolve_ordinal_reference backstop below —
-# only decides whether the question PLAUSIBLY needs positional resolution,
-# never derives a position/entity-type from it (the LLM does that itself,
-# as structured tool args). No noun-capturing group, unlike the retired
-# session.py._ORDINAL_RE this replaces — there is deliberately nothing left
-# here to mis-scan.
-_ORDINAL_BACKSTOP_RE = re.compile(
-    r"\b(the\s+)?(\d+\s*(?:st|nd|rd|th)|first|second|third|fourth|fifth|"
-    r"sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|"
-    r"fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|"
-    r"twentieth)\b(?!-?\s*part(?:y|ies)\b)",
-    re.IGNORECASE,
-)
 
 
 def _failure_signature(error_text: str) -> frozenset:
@@ -142,7 +125,8 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                  embedding_model="BAAI/bge-small-en-v1.5",
                  domain: str = "inspection",
                  db_engine=None, embed_model=None, reasoning_llm=None,
-                 llm_provider: str = "ollama", anthropic_api_key: str = ""):
+                 reasoning_llm_provider: str = "ollama", sql_llm_provider: str = "ollama",
+                 anthropic_api_key: str = "", vllm_url: str = ""):
         print(f"Initialising AgentOrchestrator (domain={domain})...")
         self.domain = domain
         self._domain_cfg = get_domain_config(domain)
@@ -233,31 +217,38 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         self.chat_model_name = chat_model
         self.sql_model_name  = sql_model
 
-        # llm_provider is the single switch between Ollama and Anthropic —
-        # every call site downstream (generate_sql, the reasoning loop, etc.)
-        # only ever calls .complete(prompt) per the LLMClient protocol
-        # (llm/base.py), so neither knows or cares which provider built it.
+        # reasoning_llm_provider/sql_llm_provider are resolved independently —
+        # e.g. reasoning via vLLM and sql via Ollama at the same time is a
+        # supported combination, not a special case. Every call site
+        # downstream (generate_sql, the reasoning loop, etc.) only ever calls
+        # .complete(prompt) per the LLMClient protocol (llm/base.py), so
+        # neither knows or cares which provider built it.
+        _base_urls = {"ollama": ollama_url, "vllm": vllm_url}
+
+        def _build(role: str, provider: str, model: str):
+            base_url = _base_urls.get(provider, "")
+            return get_llm_client(provider, role, model, base_url=base_url, api_key=anthropic_api_key)
+
         if reasoning_llm is not None:
             self.reasoning_llm = reasoning_llm
             print("  ✓ Reasoning LLM reused from another domain instance")
-        elif llm_provider == "anthropic":
-            print(f"  Configuring reasoning LLM (Claude): {chat_model}...")
-            self.reasoning_llm = get_reasoning_llm_anthropic(chat_model, anthropic_api_key)
-            print(f"  ✓ Reasoning LLM ({chat_model})")
         else:
-            print(f"  Configuring reasoning LLM: {chat_model}...")
-            self.reasoning_llm = get_reasoning_llm(chat_model, ollama_url)
+            print(f"  Configuring reasoning LLM ({reasoning_llm_provider}): {chat_model}...")
+            self.reasoning_llm = _build("reasoning", reasoning_llm_provider, chat_model)
             print(f"  ✓ Reasoning LLM ({chat_model})")
 
-        if llm_provider == "anthropic":
-            print(f"  Configuring SQL LLM (Claude): {sql_model}...")
-            self.sql_llm = get_sql_llm_anthropic(sql_model, anthropic_api_key)
-        else:
-            print(f"  Configuring SQL LLM: {sql_model}...")
-            self.sql_llm = get_sql_llm(sql_model, ollama_url)
+        print(f"  Configuring SQL LLM ({sql_llm_provider}): {sql_model}...")
+        self.sql_llm = _build("sql", sql_llm_provider, sql_model)
         print(f"  ✓ SQL LLM ({sql_model})")
 
         self._debug = _make_debug_logger()
+
+        # Classifies each turn (fresh question vs. some kind of follow-up)
+        # and, for follow-ups that add/change something, extracts what
+        # changed — see turn_classifier.py's module docstring for the regex
+        # bank this replaces. Reuses self.reasoning_llm, same as DomainRouter
+        # does for its own Tier-3 (one extra short completion, no model swap).
+        self._turn_classifier = TurnClassifier(self.reasoning_llm, self._debug)
 
         # Domain-scoped pieces threaded through to generate_sql() (see
         # sql/generation.py) via ToolRegistry — the rules engine is also
@@ -318,7 +309,19 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
 
 
     def query(self, question, max_iterations=8, on_step=None, session=None,
-              visibility_scope: dict | None = None, query_id: str = ""):
+              visibility_scope: dict | None = None, query_id: str = "",
+              router_locked_domain: bool = False):
+        # router_locked_domain: True when agent/domain_router.py resolved THIS
+        # message's domain via a Tier-1 keyword hit (confidence=1.0) — an
+        # unambiguous domain word actually present in the user's own wording,
+        # not session stickiness or an LLM guess. When True, the in-prompt
+        # DOMAIN-MISMATCH CHECK's redirect_domain tool is suppressed below:
+        # confirmed live (debug_llm_20260813_123024, 20260814_102645) that the
+        # reasoning LLM calls redirect_domain anyway — contradicting its own
+        # system prompt's "an unambiguous inspection word... is NOT a
+        # mismatch" rule — apparently swayed by stale conversation history
+        # from a prior domain still sitting in context. The router's
+        # deterministic regex match on the CURRENT message outranks that.
         qid = query_id or ""
         _pfx = f"qid={qid} " if qid else ""
         query_start = time.time()
@@ -394,8 +397,14 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 "in the WHERE clause. Do not expose this constraint or mention it "
                 "in your response to the user."
             )
+        # Computed once per turn, before build_context_block (which needs it)
+        # and reused by the pagination fast-path and the ordinal/selection/
+        # count-followup backstops further down this same method.
+        _turn_action = self._turn_classifier.classify(question, session, stats=stats)
         if session and session.turns:
-            system_content += "\n\n" + session.build_context_block(question, current_domain=self.domain)
+            system_content += "\n\n" + session.build_context_block(
+                question, current_domain=self.domain, turn_action=_turn_action,
+            )
 
         # Cheap char-count proxy for "getting close to num_ctx" — this
         # codebase doesn't tokenize prompts client-side, so this is only a
@@ -466,7 +475,9 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
 
         # ---- Pagination fast-path ----
         # Only fires when the question is PURELY about seeing more of the last result —
-        # no new subject matter (no content words suggesting a different query).
+        # no new subject matter. That judgment (is anything new mixed into a "show
+        # more"-shaped request?) is now the classifier's own job, not a regex pair —
+        # see turn_classifier.py's PAGINATE definition.
         #
         # Outer guard: fire when last turn has SQL (Path A) OR when last turn used
         # get_answers with a stored inspection_id (Path B).  Previously the guard
@@ -480,30 +491,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             )
         )
         if session and _last and _has_pageable:
-            q_lower = question.lower().strip()
-
-            _PAGINATION_ONLY_RE = re.compile(
-                r'^(show\s+more|show\s+the\s+rest|show\s+remaining|'
-                r'see\s+more|see\s+the\s+rest|'
-                r'more\s+results?|more\s+rows?|'
-                r'continue|next\s+page|next\s+batch|'
-                r'rest\s+of\s+(it|them|the\s+results?)?|'
-                r'show\s+all\s*$|list\s+all\s*$|'
-                r'remaining\s+(ones?|results?|rows?)?)'
-                r'\s*[.!?]?\s*$',
-                re.IGNORECASE,
-            )
-            _HAS_NEW_SUBJECT_RE = re.compile(
-                r'\b(high|low|medium|risk|observation|finding|action|mitigative|'
-                r'recommended|facility|inspector|score|form|module|inspection|cause|'
-                r'overdue|open|closed|month|week|today|by\s+\w+|for\s+\w+|'
-                r'at\s+\w+|in\s+\w+|about|from\s+\w+)\b',
-                re.IGNORECASE,
-            )
-            is_pagination = (
-                bool(_PAGINATION_ONLY_RE.match(q_lower)) and
-                not bool(_HAS_NEW_SUBJECT_RE.search(q_lower))
-            )
+            is_pagination = _turn_action.action == "PAGINATE"
             if is_pagination:
                 prev = session.last_turn
                 _emit({"_event": "thinking", "iteration": 1})
@@ -846,7 +834,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             #
             # Same shape/rationale as the disambiguation-reply/ordinal
             # backstops above: the CONTEXT block injected by session.py (see
-            # is_count_followup/_COUNT_FOLLOWUP_RE there) is the primary
+            # turn_action.action == "COUNT_FOLLOWUP" there) is the primary
             # mechanism, this is only the backstop for when the LLM tries
             # to skip straight to final_answer anyway — a prompt instruction
             # alone has already been shown insufficient for this exact
@@ -859,7 +847,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             if (tool == "final_answer" and session and session.turns
                     and not _count_followup_redirected
                     and not any(s.tool == "execute_sql" for s in steps)
-                    and _COUNT_FOLLOWUP_RE.search(question)
+                    and _turn_action.action == "COUNT_FOLLOWUP"
                     and session.turns[-1].sql
                     and session.turns[-1].total_count > 0
                     and "?" not in str(args.get("answer", ""))):
@@ -978,12 +966,12 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             # to redirect_domain asking the user to clarify what "this"
             # meant, entirely bypassing resolve_selected_rows — the later
             # backstop's `tool == "generate_sql"` check never saw it because
-            # this branch had already returned. Same _SELECTION_FOLLOWUP_RE/
+            # this branch had already returned. Same reference=="SELECTION"/
             # pending-selection/not-yet-resolved gating as that backstop.
             if (tool in ("final_answer", "redirect_domain") and session
                     and session.pending_selected_positions
                     and not any(s.tool == "resolve_selected_rows" for s in steps)
-                    and _SELECTION_FOLLOWUP_RE.search(question)):
+                    and _turn_action.reference == "SELECTION"):
                 messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
                 messages.append(ChatMessage(role=MessageRole.USER, content=(
                     "The user selected specific rows via checkboxes before asking this "
@@ -1054,6 +1042,22 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                         clarification_origin_question=_clarification_origin,
                     ))
                 return AgentResult(question, ans, steps, iteration, True, stats)
+
+            if tool == "redirect_domain" and router_locked_domain:
+                messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
+                messages.append(ChatMessage(role=MessageRole.USER, content=(
+                    f"The domain router already confirmed this message belongs to the "
+                    f"{self.domain.upper()} domain based on an unambiguous domain word in "
+                    f"the user's own wording — do NOT call redirect_domain for this turn, "
+                    f"regardless of what domain earlier turns were about. Answer the "
+                    f"question directly using {self.domain} domain data.\n"
+                    f"Original question: \"{question}\""
+                )))
+                s = AgentStep(iteration, f"[auto] blocked redirect_domain — router already confirmed {self.domain}",
+                              "[blocked]", args,
+                              {"error": "redirect_domain suppressed: router-confident tier-1 match"}, 0)
+                steps.append(s); _emit(s)
+                continue
 
             if tool == "redirect_domain":
                 suspected = str(args.get("suspected_domain", "")).upper()
@@ -1193,20 +1197,21 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             # Reordering the prose fixes the common case; this backstop is
             # what actually guarantees it regardless of read order.
             #
-            # Uses _SELECTION_FOLLOWUP_RE (imported from session.py) rather
-            # than the plain _FOLLOWUP_RE other backstops reuse — this one
-            # also catches a bare "this"/"that" standing in for the
-            # selection ("list all audits under this"), which _FOLLOWUP_RE
-            # deliberately excludes elsewhere (see its own docstring) but is
-            # safe to catch here since this whole branch is already gated on
-            # a pending selection existing. Gating on it (not firing on
-            # EVERY turn pending_selected_positions happens to be non-empty)
-            # avoids a false trigger if the frontend ever sends a stale
-            # selection alongside an unrelated fresh question.
+            # Uses turn_action.reference == "SELECTION" (the classifier's own
+            # judgment, see turn_classifier.py — a field independent of
+            # `action`, so a selection reference is caught even when the rest
+            # of the message asks for something new) rather than a separate
+            # regex — it's told a selection currently exists (see
+            # TurnClassifier._render_state) and is instructed to prefer that
+            # reading even for a bare "this"/"that" standing in for the
+            # selection ("list all audits under this"). Gating additionally
+            # on pending_selected_positions being non-empty (not trusting the
+            # classifier alone) avoids a false trigger if the frontend ever
+            # sends a stale selection alongside an unrelated fresh question.
             if (tool == "generate_sql" and session
                     and session.pending_selected_positions
                     and not any(s.tool == "resolve_selected_rows" for s in steps)
-                    and _SELECTION_FOLLOWUP_RE.search(question)):
+                    and _turn_action.reference == "SELECTION"):
                 messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
                 messages.append(ChatMessage(role=MessageRole.USER, content=(
                     "The user selected specific rows via checkboxes before asking this "
@@ -1229,17 +1234,20 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             # is only the backstop for when the LLM tries to skip straight
             # to generate_sql anyway (confirmed live for the equivalent
             # get_answers/observations case: a prompt instruction alone is
-            # not reliably obeyed). Deliberately NO noun-capturing group —
-            # unlike the retired session.py regex, this one only needs to
-            # DETECT that a positional reference exists, not resolve it, so
-            # there is no question-tail text here to mis-scan. The
-            # party/parties lookahead is carried over from that retired
-            # regex's own confirmed-live false-positive fix ("Second Party
-            # audit" / "Third-party inspection" are real domain values, not
-            # ordinal references, in both domains).
+            # not reliably obeyed). Detection is now the classifier's job
+            # (turn_action.reference == "ORDINAL", see turn_classifier.py —
+            # independent of `action`, so e.g. "list schedules under the
+            # fourth one shown above" still fires this even though `action`
+            # there is NEW_QUERY/MODIFY_QUERY, not some dedicated "ordinal"
+            # action; confirmed live 2026-08-12, qid=26c6d0f4, this exact
+            # phrasing previously fell through and the reasoning LLM
+            # fabricated the referenced row's values instead of resolving
+            # them) rather than a regex — the position/entity itself is still
+            # extracted by the LLM as a structured tool arg when it calls
+            # resolve_ordinal_reference, unchanged.
             if (tool == "generate_sql" and session and session.turns
                     and not any(s.tool == "resolve_ordinal_reference" for s in steps)
-                    and _ORDINAL_BACKSTOP_RE.search(question)):
+                    and _turn_action.reference == "ORDINAL"):
                 messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
                 messages.append(ChatMessage(role=MessageRole.USER, content=(
                     "This question refers to a specific item from a previous list by "
@@ -1550,15 +1558,24 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         from dotenv import load_dotenv; load_dotenv(env_path)
         from src.config.settings import get_settings
         settings = get_settings()
-        # llm_provider="anthropic" repurposes sql_model/chat_model to carry
-        # the Claude model id (same value for both roles — see
-        # settings.anthropic_model's docstring) instead of Ollama model
-        # names; ollama_url is simply unused by the Anthropic factories.
-        if settings.llm_provider == "anthropic":
-            sql_model = chat_model = settings.anthropic_model
-        else:
-            sql_model = settings.ollama_sql_model
-            chat_model = settings.ollama_chat_model
+
+        # Each role's model name comes from whichever provider that role is
+        # configured for — independent per role, so e.g. reasoning="vllm" +
+        # sql="ollama" picks vllm_reasoning_model for chat_model and
+        # ollama_sql_model for sql_model at the same time.
+        def _model_for(provider: str, ollama_model: str, vllm_model: str) -> str:
+            if provider == "anthropic":
+                return settings.anthropic_model
+            if provider == "vllm":
+                return vllm_model
+            return ollama_model
+
+        chat_model = _model_for(
+            settings.reasoning_llm_provider, settings.ollama_chat_model, settings.vllm_reasoning_model
+        )
+        sql_model = _model_for(
+            settings.sql_llm_provider, settings.ollama_sql_model, settings.vllm_sql_model
+        )
         return cls(
             db_connection_string=(
                 f"postgresql://{settings.db_user}:{settings.db_password}@"
@@ -1573,7 +1590,9 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             db_engine=db_engine,
             embed_model=embed_model,
             reasoning_llm=reasoning_llm,
-            llm_provider=settings.llm_provider,
+            reasoning_llm_provider=settings.reasoning_llm_provider,
+            sql_llm_provider=settings.sql_llm_provider,
             anthropic_api_key=settings.anthropic_api_key,
+            vllm_url=settings.vllm_url,
         )
 

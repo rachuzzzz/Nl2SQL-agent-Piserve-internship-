@@ -10,90 +10,7 @@ from typing import Optional
 
 from src.agent.orchestrator.models import ConversationTurn
 from src.agent.orchestrator.debug import _ilike_escape
-
-
-
-
-# NOTE: bare "that"/"this" are deliberately excluded — they double as
-# relative pronouns/determiners in ordinary questions ("mitigative actions
-# THAT are overdue", "show me THIS month's data") and caused the sticky
-# active-context gate below to false-positive-match plain global questions.
-# Demonstrative reference to a specific entity is still caught via the
-# explicit "that/this <entity>" phrases.
-# "here" IS included unconditionally (unlike bare "there", left out below) —
-# "here" is almost never anything but a location follow-up in this app's
-# question shapes ("was any audit conducted here last month").
-#
-# Module-level (not local to build_context_block) — confirmed live
-# 2026-08-07 (debug_llm_20260807_153128): needed at module scope so
-# loop.py's final_answer backstop (see _COUNT_FOLLOWUP_RE below) can import
-# and reuse it, same as _ORDINAL_BACKSTOP_RE already lives at module level
-# next to its own consumer.
-#
-# Broadened same date: "these"/"those" added — the "that"/"this" exclusion
-# above does NOT apply to them (no relative-pronoun/determiner reading in
-# English), yet they were previously unmatchable despite being named in this
-# module's own re-aggregate warning text and in the "how many of these"
-# worked example title. "ones" (plural) and "listed/shown/mentioned/
-# displayed/returned above" added for the same reason — "the ones listed
-# above" (a real live question) matched neither "the\s+above" (needs "the"
-# immediately before "above") nor "one\s+above" (needs singular "one").
-_FOLLOWUP_CUES = (
-    r"it|its|them|they|she|he|her|his|their|here|these|those|"
-    r"(?:that|this)\s+(?:inspection|site|facility|form|inspector|cycle|"
-    r"person|project|client|action|schedule)|"
-    r"the\s+same|the\s+above|ones?\s+above|"
-    r"(?:listed|shown|mentioned|displayed|returned)\s+above|"
-    r"that\s+one|this\s+one|\bones\b|"
-    r"from\s+there|more|rest|remaining|"
-    r"continue|next|previous|last\s+one|back\s+to|go\s+back"
-)
-_FOLLOWUP_RE = re.compile(rf"\b(?:{_FOLLOWUP_CUES})\b", re.IGNORECASE)
-
-# SEPARATE from _FOLLOWUP_RE, same reason _COUNT_FOLLOWUP_RE below stays
-# separate rather than folding in: _FOLLOWUP_RE deliberately excludes bare
-# "this"/"that" (see note above) because they double as ordinary determiners
-# ("this month's data") and would reintroduce the exact false-positive the
-# ACTIVE CONTEXT gate was already burned by. This variant is ONLY consumed
-# by the SELECTED-ROWS backstops in loop.py, which are already gated on
-# session.pending_selected_positions being non-empty — in that narrower
-# context a bare "this"/"that" NOT immediately followed by another word
-# ("...list audits under this", not "...this month") safely reads as a
-# pronoun standing in for the checked row(s), so it's fine to catch here
-# even though it isn't safe for the general-purpose _FOLLOWUP_RE. Confirmed
-# live 2026-08-10: "list all audits under this" (1 row checked) matched
-# neither the "this <noun>" phrases nor "this one" above, so neither the
-# SELECTED ROWS prose nor its backstop fired, and the model asked a
-# needless clarifying question instead of resolving the checked row.
-_SELECTION_FOLLOWUP_RE = re.compile(
-    rf"\b(?:{_FOLLOWUP_CUES}|(?:this|that)(?!\s+\w))\b",
-    re.IGNORECASE,
-)
-
-# Dedicated, deliberately CONJUNCTIVE count/aggregate-follow-up detector —
-# added 2026-08-07 (debug_llm_20260807_153128) alongside _FOLLOWUP_RE above,
-# but kept SEPARATE rather than folded into it: _FOLLOWUP_RE also gates
-# ACTIVE CONTEXT scope injection (see build_context_block below), and
-# broadening it further risks the exact stale-scope-leak regression that
-# module already guards against. Requiring BOTH an aggregate cue AND a
-# backward-reference cue (either order) keeps false positives near zero — a
-# fresh "how many audits were conducted last month" has no backref cue, a
-# bare "show me those" has no aggregate cue — which is what makes it safe
-# to attach a forceful instruction to (see loop.py's final_answer backstop).
-_AGG_CUE = (
-    r"how\s+many|how\s+much|number\s+of|count\s+of|what\s+(?:number|count)|"
-    r"total\s+(?:number|count)|percentage\s+of|what\s+(?:proportion|share|fraction)"
-)
-_BACKREF_CUE = (
-    r"these|those|them|the\s+above|"
-    r"(?:listed|shown|mentioned|displayed|returned)\s+above|ones?\s+above|"
-    r"the\s+ones|that\s+list|previous(?:\s+(?:list|result|query))?"
-)
-_COUNT_FOLLOWUP_RE = re.compile(
-    rf"\b(?:{_AGG_CUE})\b.{{0,80}}?\b(?:{_BACKREF_CUE})\b"
-    rf"|\b(?:{_BACKREF_CUE})\b.{{0,80}}?\b(?:{_AGG_CUE})\b",
-    re.IGNORECASE,
-)
+from src.agent.orchestrator.turn_classifier import TurnAction
 
 
 # Domain-exclusive active_subject_type values — the underlying ID only means
@@ -211,29 +128,30 @@ class ConversationSession:
                 return t.domain
         return ""
 
-    def build_context_block(self, current_question: str = "", current_domain: str = "") -> str:
+    def build_context_block(
+        self, current_question: str = "", current_domain: str = "",
+        turn_action: Optional[TurnAction] = None,
+    ) -> str:
         self.pending_resolved_disclosure = ""
         if not self.turns:
             return ""
 
-        # A question is "clearly fresh" only when it introduces a wholly new subject.
-        # INTENTIONALLY NARROW: question-starters like "how many", "what", "show", "list"
-        # appear constantly in follow-ups ("how many are completed", "show the open ones")
-        # and must NOT suppress the active context.
-        _FRESH_SUBJECT_RE = re.compile(
-            r"\b(most\s+recent(?!ly)|most\s+common|latest)\b",
-            re.IGNORECASE,
-        )
-        is_followup = bool(_FOLLOWUP_RE.search(current_question))
-        is_clearly_fresh = (
-            bool(_FRESH_SUBJECT_RE.search(current_question))
-            and not is_followup
-        )
-        # Deliberately independent of is_followup/is_clearly_fresh above —
-        # see the standalone re-aggregate block further down (module
-        # docstring on _COUNT_FOLLOWUP_RE) for why this needs its own,
-        # unconditional check rather than living inside the is_followup gate.
-        is_count_followup = bool(_COUNT_FOLLOWUP_RE.search(current_question))
+        # turn_action comes from TurnClassifier (agent/orchestrator/
+        # turn_classifier.py), called once per turn in loop.py before this
+        # method — replaces what used to be several regexes computed inline
+        # here (_FOLLOWUP_RE, _FRESH_SUBJECT_RE, _COUNT_FOLLOWUP_RE). Falls
+        # back to a safe "fresh question" reading if a caller doesn't pass
+        # one (e.g. an old call site not yet updated).
+        if turn_action is None:
+            turn_action = TurnAction(action="NEW_QUERY", reference="NONE")
+        # action and reference are independent (see turn_classifier.py's
+        # module docstring) — a message can be action=NEW_QUERY yet still
+        # identify its target via an earlier turn (reference=ORDINAL/
+        # SELECTION/BACK), so either one on its own means this turn depends
+        # on prior conversation state and the ACTIVE CONTEXT/CONTEXT scope
+        # below is relevant.
+        is_followup = turn_action.action != "NEW_QUERY" or turn_action.reference != "NONE"
+        is_count_followup = turn_action.action == "COUNT_FOLLOWUP"
 
         # Full per-turn detail (SQL, columns, id lists, row_titles preview) is
         # only rendered for the most recent _RECENT_FULL_DETAIL_TURNS turns —
@@ -450,9 +368,10 @@ class ConversationSession:
                 or scope["domain"] == current_domain
             )
 
-        # "go back" or "back to" signals: re-anchor to the earliest matching subject
-        _BACK_RE = re.compile(r"\b(go\s+back|back\s+to|return\s+to)\b", re.IGNORECASE)
-        if _BACK_RE.search(current_question):
+        # reference == "BACK" (TurnClassifier's judgment, see
+        # turn_classifier.py — independent of `action`): re-anchor to the
+        # earliest matching subject instead of the most recent one.
+        if turn_action.reference == "BACK":
             # Look for the first (oldest) DOMAIN-COMPATIBLE active subject in
             # history — skip past an incompatible one rather than stopping dead,
             # so "go back" can still find an earlier, still-usable subject.
@@ -519,14 +438,15 @@ class ConversationSession:
                     return _ids[0], _ids
             return "", []
 
-        # Scope only carries forward when the question is an actual detected
-        # follow-up (pronoun, "that <entity>", "back to", etc.) — NOT merely
-        # whenever the question fails to match a narrow "fresh subject" allowlist.
-        # The previous default (carry forward unless clearly fresh) let stale
-        # entity scope silently leak into unrelated global questions that happened
-        # not to contain "most recent"/"most common"/"latest" (e.g. "which cycle
-        # is currently active" inheriting a facility resolved 2 turns earlier).
-        if is_followup and not is_clearly_fresh and active_type and active_value:
+        # Scope only carries forward when TurnClassifier has actually judged
+        # this turn to be some kind of follow-up (turn_action.action !=
+        # NEW_QUERY) — not merely whenever the question fails to match a
+        # narrow "fresh subject" allowlist. A regex-only version of this
+        # gate used to let stale entity scope silently leak into unrelated
+        # global questions (e.g. "which cycle is currently active" inheriting
+        # a facility resolved 2 turns earlier); the classifier is asked
+        # explicitly to treat that shape of question as NEW_QUERY instead.
+        if is_followup and active_type and active_value:
             if active_type == "cycle":
                 lines.append(
                     f"ACTIVE CONTEXT — The conversation is scoped to cycle "
@@ -725,10 +645,10 @@ class ConversationSession:
                 lines.append(
                     f"ACTIVE CONTEXT — The conversation is about mitigative action '{active_value}'."
                 )
-        elif is_followup and not is_clearly_fresh:
+        elif is_followup:
             # Fallback: legacy single-entity context. Same fix as the primary
             # gate above — only carry this forward on an actual detected
-            # follow-up, not merely whenever the question isn't "clearly fresh".
+            # follow-up, per TurnClassifier's own judgment.
             # inspection_ids/audit_ids are domain-exclusive (same reasoning as
             # _DOMAIN_EXCLUSIVE above — only gate THESE, not facility_names/
             # single_row_values below, which are safe regardless of domain).
@@ -859,16 +779,16 @@ class ConversationSession:
         # fabricated its own (wrong) recollection of what the previous SQL
         # filtered on.
         #
-        # Deliberately NOT nested inside the `elif is_followup and not
-        # is_clearly_fresh:` chain above — that block's own re-aggregate
-        # guidance (the "NOT the full set" messages) needs SIX conditions to
-        # fire (is_followup AND not is_clearly_fresh AND domain-compat AND
-        # non-empty inspection_ids/audit_ids AND len>1 AND total_count >
-        # len(ids)). A previous turn that listed by title only (no id column
-        # selected) captures no audit_ids/inspection_ids at all and gets no
-        # warning today even with a perfect regex. This block is keyed only
-        # on is_count_followup + last.sql + last.total_count>0 — no
-        # dependency on which id lists got captured.
+        # Deliberately NOT nested inside the `elif is_followup:` chain above
+        # — that block's own re-aggregate guidance (the "NOT the full set"
+        # messages) needs several conditions to fire (is_followup AND
+        # domain-compat AND non-empty inspection_ids/audit_ids AND len>1 AND
+        # total_count > len(ids)). A previous turn that listed by title only
+        # (no id column selected) captures no audit_ids/inspection_ids at
+        # all and gets no warning there. This block is keyed only on
+        # is_count_followup (TurnClassifier's own COUNT_FOLLOWUP judgment) +
+        # last.sql + last.total_count>0 — no dependency on which id lists
+        # got captured.
         if is_count_followup and last.sql and last.total_count > 0:
             _sample_n = max(len(last.row_titles), len(last.audit_ids), len(last.inspection_ids))
             _prev_sql_snippet = " ".join(last.sql.split())[:500]
@@ -927,7 +847,15 @@ class ConversationSession:
         # itself. The ambiguous-duplicate-name STOP and the >12-vs-2..12
         # wording distinction both still exist, just inside the tool/its
         # format_result instead of resolved here by regex.
-        if not is_clearly_fresh and last.disambiguation_name:
+        #
+        # Unconditional on last.disambiguation_name alone (not additionally
+        # gated on TurnClassifier's action) — this is display-only prose, not
+        # a forced tool call, and a bare disambiguation-reply message ("John
+        # Smith", a plain name with no pronoun/back-reference) legitimately
+        # doesn't read as any of TurnClassifier's follow-up categories on its
+        # own, so gating on those would hide this reminder for exactly the
+        # messages it exists to help with.
+        if last.disambiguation_name:
             _dn = last.disambiguation_name
             _dc = last.total_count
             _names_preview = [c.get("name", "") for c in last.disambiguation_candidates[:12]]
@@ -952,8 +880,9 @@ class ConversationSession:
 
         # Entity disambiguation context (facility/project/client/organisation) —
         # the entity-equivalent of the people block above, same tool resolves
-        # both (it auto-detects which candidate list is populated).
-        if not is_clearly_fresh and last.entity_disambiguation_candidates:
+        # both (it auto-detects which candidate list is populated). Same
+        # unconditional-on-state reasoning as the people block just above.
+        if last.entity_disambiguation_candidates:
             _ent_tbl = last.entity_disambiguation_table or "entity"
             _ent_names_preview = [
                 c.get("name", "") for c in last.entity_disambiguation_candidates[:12]
@@ -968,23 +897,13 @@ class ConversationSession:
                 f"normally."
             )
 
-        # Gated on the current question actually looking like a "modify the
-        # last query" follow-up (token-usage audit, 2026-08-06) — this block
-        # was previously unconditional on every turn from turn 2 onward,
-        # regardless of whether the question was remotely pagination/
-        # refinement/augmentation-shaped. Deliberately broad/inclusive
-        # (matches on a short keyword, not a strict phrase) — a false
-        # positive here just means the instruction shows up when not
-        # strictly needed (cheap); a false negative means a real "show
-        # more"/"also show X" follow-up silently regenerates the query from
-        # scratch instead of extending it, the exact live-caught bug the
-        # AUGMENTATION block documents below.
-        if re.search(
-            r"(?i)\b(show\s+more|show\s+the\s+rest|show\s+all|continue|remaining|next\b"
-            r"|filter\s+by|only\s+the\b|sort\s+by"
-            r"|along\s+with|also\s+show|include\b|add\s+the\b)",
-            current_question,
-        ):
+        # Gated on turn_action.action (TurnClassifier's own judgment) rather
+        # than a keyword regex. MODIFY_QUERY covers refinement/augmentation/
+        # imperfect-pagination-with-something-new; PAGINATE is included too
+        # as a belt-and-suspenders fallback for the rare case where loop.py's
+        # pagination fast-path's own guard (_has_pageable) doesn't fire even
+        # though the classifier still read this as pure pagination.
+        if turn_action.action in ("MODIFY_QUERY", "PAGINATE"):
             lines.append("")
             lines.append(
                 "PAGINATION: If the user says 'show more', 'show the rest', 'continue',"
@@ -1008,5 +927,28 @@ class ConversationSession:
                 " drop any filter, and do NOT change any join's direction, unless the user"
                 " explicitly asked for that change."
             )
+
+            # Suggested business_rules built from what TurnClassifier extracted
+            # (entity/filters/time_range) — phrased so the reasoning model can
+            # lift it straight into its own generate_sql tool call, reusing the
+            # existing draft_sql/business_rules contract (sql/generation.py)
+            # instead of a brand-new prose channel it has to re-derive structure
+            # from. Still just a suggestion — the reasoning model has the schema
+            # and seed-example context to adjust it, this classifier doesn't.
+            _suggested_rules = []
+            if turn_action.entity.get("value"):
+                _etype = turn_action.entity.get("type") or "entity"
+                _suggested_rules.append(f"{_etype} = {turn_action.entity['value']}")
+            for _fk, _fv in turn_action.filters.items():
+                _suggested_rules.append(f"{_fk} = {_fv}")
+            if turn_action.time_range:
+                _suggested_rules.append(f"time range = {turn_action.time_range}")
+            if _suggested_rules:
+                lines.append(
+                    f"SUGGESTED business_rules for your next generate_sql call: "
+                    f"{_suggested_rules}. Consider passing the previous turn's SQL (above) as "
+                    f"draft_sql and these as business_rules, rather than reconstructing the "
+                    f"query from scratch."
+                )
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         return "\n".join(lines)

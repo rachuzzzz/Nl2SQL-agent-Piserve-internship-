@@ -525,6 +525,25 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
         # raised — confirmed live 2026-08-10, qid=328ca155, see
         # audit_block_ai_audit_answers_constant_join_wrong_path's own docstring).
         "audit_block_ai_audit_answers_constant_join_wrong_path", "block_ai_answers_constant_join_wrong_path",
+        # Group W — rev.entity_type on the audit domain must be exactly one of
+        # AUDIT_PLAN/PORTFOLIO/SCHEDULE/AUDIT_CORRECTIVE_ACTION; any other literal
+        # is UUID-typed like the real ones, so it silently matches zero rows
+        # instead of erroring (confirmed live 2026-08-12, qid=4a85836b: "who
+        # returned this for modification" generated entity_type = 'AUDIT_SCHEDULE',
+        # a value that doesn't exist — the real one is bare 'SCHEDULE' — see
+        # audit_rules.py's audit_block_review_entity_type_invalid_literal and
+        # audit_seed_data.py's now-added 'who returned this audit schedule for
+        # modification' example for the retrieval-side half of this fix).
+        "audit_block_review_entity_type_invalid_literal",
+        # Group X — sibling of Group W's trap, same silent-zero-rows shape,
+        # different pair of confusable enum values: audit_plan.status's
+        # RETURNED_FOR_MODIFICATION cross-contaminated onto
+        # audit_schedule.schedule_status, whose real value is
+        # RETURN_MODIFICATION (confirmed live 2026-08-12, qid=7a9a1309 — see
+        # audit_rules.py's audit_block_schedule_status_invalid_literal and
+        # audit_seed_data.py's now-added 'audit schedules returned for
+        # modification' example for the retrieval-side half of this fix).
+        "audit_block_schedule_status_invalid_literal",
     })
 
 

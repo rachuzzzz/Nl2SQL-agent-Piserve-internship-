@@ -462,6 +462,77 @@ LIMIT 100;
         'domain': 'review', 'intent': 'filter', 'limit': 100,
     },
     {
+        # Confirmed live 2026-08-12 (debug_llm_20260812_113525, qid=4a85836b):
+        # "who returned this for modification" (about a specific SCHEDULE)
+        # generated entity_type = 'AUDIT_SCHEDULE' — a value that does not
+        # exist in review.entity_type at all (the real one is bare 'SCHEDULE',
+        # confirmed in audit_rules.py/schema_introspector.py). The wrong
+        # literal guaranteed zero matches regardless of real data — a false
+        # "no reviewer recorded" answer, not a true one. The nearby seed
+        # example just above uses the correct 'SCHEDULE' value but its
+        # anchor wording ("awaiting auditee acceptance or reschedule
+        # decision") shares no phrasing with "who returned/approved this
+        # schedule" questions, while sibling AUDIT_PLAN/AUDIT_CORRECTIVE_ACTION
+        # examples elsewhere DO contain the literal phrase "returned for
+        # modification" — so retrieval likely favored those wrong-table
+        # examples instead. This example exists specifically to anchor that
+        # "who returned/approved this schedule" phrasing to the correct
+        # entity_type='SCHEDULE' literal.
+        'nl':     'who returned this audit schedule for modification',
+        'sql':    """\
+-- SCHEDULE review = the auditee's accept/reschedule step on the scheduled visit —
+-- entity_type is the bare string 'SCHEDULE', NOT 'AUDIT_SCHEDULE' (that value
+-- does not exist; only 'AUDIT_PLAN'/'PORTFOLIO'/'SCHEDULE'/'AUDIT_CORRECTIVE_ACTION' do).
+-- status='COMPLETED' alone is NOT 'returned' — a completed review can be an
+-- approval (action='APPROVE'). 'who RETURNED it' must also filter
+-- action = 'RETURN_FOR_MODIFICATION'; for "who APPROVED it" use action='APPROVE' instead.
+SELECT asch.schedule_id, rev.status, rev.action, rev.reviewed_on,
+       u.first_name || ' ' || u.last_name AS returned_by
+FROM review rev
+JOIN audit_schedule asch ON rev.entity_id = asch.id AND rev.entity_type = 'SCHEDULE'
+LEFT JOIN users u ON rev.reviewed_by = u.id
+WHERE rev.status = 'COMPLETED' AND rev.action = 'RETURN_FOR_MODIFICATION' AND asch.active = true
+ORDER BY rev.reviewed_on DESC
+LIMIT 100;
+""",
+        'domain': 'review', 'intent': 'filter', 'limit': 100,
+    },
+    {
+        # Confirmed live 2026-08-12 (debug_llm_20260812_115240, qid=7a9a1309):
+        # "show all thats returned for modification" (a follow-up about audit
+        # SCHEDULES, no "who" — just list them) generated
+        # asch.schedule_status = 'RETURNED_FOR_MODIFICATION' — that's
+        # audit_plan.status's spelling (DRAFT/SUBMITTED/APPROVED/
+        # RETURNED_FOR_MODIFICATION), not audit_schedule.schedule_status's
+        # (DRAFT/PENDING_REVIEW/APPROVED/ONGOING/COMPLETED/
+        # RETURN_MODIFICATION — no "ED", no "FOR"). The reasoning model's own
+        # schema_hint draft got the value right; the SQL-gen coder model
+        # rewrote it wrong with no seed example anchoring this exact
+        # phrasing to the correct spelling — the nearby audit_plan sibling
+        # example ("which audit plans were returned for modification")
+        # shares the phrase "returned for modification" and likely won
+        # retrieval instead. This example exists specifically to anchor
+        # "schedules returned for modification" to the correct
+        # schedule_status='RETURN_MODIFICATION' literal — a plain status
+        # filter, no review table needed (see the 'who returned this audit
+        # schedule for modification' example just above for the "who"
+        # variant, which does need the review table).
+        'nl':     'audit schedules returned for modification',
+        'sql':    """\
+-- audit_schedule.schedule_status value is 'RETURN_MODIFICATION' — NOT
+-- 'RETURNED_FOR_MODIFICATION' (that spelling belongs to audit_plan.status,
+-- a different table's enum entirely).
+SELECT asch.schedule_id, asch.schedule_status, asch.follow_up_date,
+       fac.name AS facility_name
+FROM audit_schedule asch
+LEFT JOIN facility fac ON asch.facility_id = fac.id
+WHERE asch.schedule_status = 'RETURN_MODIFICATION' AND asch.active = true
+ORDER BY asch.follow_up_date DESC NULLS LAST
+LIMIT 100;
+""",
+        'domain': 'audit_schedule', 'intent': 'filter', 'limit': 100,
+    },
+    {
         'nl':     'audit schedules awaiting auditee acceptance or reschedule decision',
         'sql':    """\
 -- SCHEDULE review = the auditee's accept/reschedule step on the scheduled visit.

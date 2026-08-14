@@ -41,10 +41,22 @@ class Settings:
     anthropic_api_key: str
     anthropic_model: str
 
+    # vLLM — optional alternative LLM provider, see llm/vllm.py. vLLM's server
+    # exposes an OpenAI-compatible REST API at vllm_url (e.g. http://host:8000/v1);
+    # vllm_api_key is typically a dummy value unless the server enforces auth.
+    vllm_url: str
+    vllm_reasoning_model: str
+    vllm_sql_model: str
+    vllm_api_key: str
+
     # Which provider AgentOrchestrator.from_env() builds reasoning_llm/sql_llm
-    # from — "ollama" (default) or "anthropic". The single switch for the
-    # whole app; no other setting needs to change to flip providers.
-    llm_provider: str
+    # from, independently per role — each is "ollama" (default), "anthropic",
+    # or "vllm". Replaces the old single llm_provider switch that flipped both
+    # roles together; e.g. reasoning_llm_provider="vllm" + sql_llm_provider=
+    # "ollama" runs the reasoning model on vLLM and the SQL model on Ollama
+    # at the same time.
+    reasoning_llm_provider: str
+    sql_llm_provider: str
 
     # Debug
     debug_llm: bool
@@ -85,7 +97,12 @@ def get_settings() -> Settings:
         # choice; Claude has no equivalent to Ollama's separate small
         # SQL-specialized model, so one model does both jobs.
         anthropic_model=g("ANTHROPIC_MODEL", "claude-sonnet-5"),
-        llm_provider=g("LLM_PROVIDER", "ollama").strip().lower(),
+        vllm_url=g("VLLM_URL", "http://localhost:8000/v1"),
+        vllm_reasoning_model=g("VLLM_REASONING_MODEL", ""),
+        vllm_sql_model=g("VLLM_SQL_MODEL", ""),
+        vllm_api_key=g("VLLM_API_KEY", "dummy").strip(),
+        reasoning_llm_provider=g("REASONING_LLM_PROVIDER", "ollama").strip().lower(),
+        sql_llm_provider=g("SQL_LLM_PROVIDER", "ollama").strip().lower(),
         # NOTE: no .lower() here — matches the original orchestrator.py check
         # exactly, which only recognizes lowercase "true"/"yes" (or "1").
         debug_llm=g("DEBUG_LLM", "").strip() in ("1", "true", "yes"),

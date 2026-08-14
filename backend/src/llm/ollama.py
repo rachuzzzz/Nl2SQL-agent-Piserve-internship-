@@ -16,6 +16,7 @@ def build_ollama_client(
     request_timeout: float = 120.0,
     additional_kwargs: dict | None = None,
     thinking: bool | None = None,
+    json_mode: bool = False,
 ) -> Ollama:
     """
     thinking: llama_index's Ollama integration reads this as a genuine
@@ -29,6 +30,19 @@ def build_ollama_client(
     `message.thinking` with zero tokens left for the actual answer content
     (done_reason='length', content=''), for a prompt that additional_kwargs'
     "think": False was supposed to prevent.
+
+    json_mode: another genuine top-level constructor field (base.py's
+    `format = kwargs.pop("format", "json" if self.json_mode else None)`) —
+    same "not part of additional_kwargs/options" shape as thinking above.
+    Forces Ollama's grammar-constrained JSON decoding, so the model is
+    incapable of emitting free-form prose instead of the tool-call JSON —
+    a stronger guarantee than the system prompt's "respond ONLY with JSON"
+    instruction alone. Confirmed live 2026-08-13: ibm/granite4.1:8b (unlike
+    qwen3, which already complied via the text instruction) wrote a full
+    prose reasoning essay straight into `content` on iter 1 of a capex
+    query, failing parse_tool_call and burning an ~11s retry before
+    succeeding on iter 2 — json_mode prevents that failure mode outright
+    rather than just recovering from it after the fact.
     """
     kwargs: dict = {"model": model, "base_url": base_url, "request_timeout": request_timeout}
     if temperature is not None:
@@ -41,4 +55,6 @@ def build_ollama_client(
             kwargs["additional_kwargs"] = additional_kwargs
     if thinking is not None:
         kwargs["thinking"] = thinking
+    if json_mode:
+        kwargs["json_mode"] = json_mode
     return Ollama(**kwargs)
