@@ -38,17 +38,9 @@
 --   Khidmah pays via Purchase Requisitions → pr_details (OPEX Incurred — KHIDMAH pays — BAD)
 --   ai_answers is a complete flattened snapshot — every inspection_report has ai_answers rows
 --
--- FINANCIAL METRICS:
--- CAPEX Generated  = SUM(ica.capex)        — FM manager's proposed cost on the ICA
--- CAPEX Converted  = SUM(po.po_amount)     — actual PO raised by client (good: client paying)
--- CAPEX Lost       = SUM(ica.capex) - SUM(po.po_amount) — arithmetic gap (NOT capex_status='REJECTED')
--- OPEX Incurred    = SUM(pr.pr_amount)     — Khidmah's own spend via PR (bad: org paying itself)
--- po_details JOIN: ON po.mitigative_action_uuid = ica.id  (one ICA can have many POs)
--- pr_details JOIN: ON pr.mitigative_action_uuid = ica.id  (one ICA can have many PRs)
---
--- FM MANAGER PERFORMANCE = high CAPEX conversion rate + low OPEX
---   Conversion rate = SUM(po.po_amount) / NULLIF(SUM(ica.capex), 0) * 100
---   High OPEX means Khidmah is absorbing costs the client should bear — a negative indicator
+-- Full CAPEX/OPEX/P&L formulas, grouping patterns, and fan-out-safe join
+-- shapes: see "### CAPEX CONVERSION" / "### P&L (PROFIT & LOSS) MODEL" below
+-- (sql_generation_prompt.txt) — single source of truth, not repeated here.
 --
 <<<COLUMNS_BLOCK>>>
 --

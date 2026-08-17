@@ -51,16 +51,29 @@ def test_row_ids_paired_with_row_titles_multi_row_list():
     audit_id (identity-injected as audit_id__id) both appear on the same
     row — row_titles must prefer audit_id (the grammatical subject of "show
     all audits"), and row_ids must carry that SAME row's real id, not the
-    facility's."""
+    facility's.
+
+    Field order in these dicts matters and is deliberate: Priority 1 (see
+    synthesis.py) now walks the ROW'S OWN key order — which mirrors the
+    real SQL SELECT list order, since dict(zip(columns, row)) in
+    sql/execution.py/agent/tools.py preserves it — rather than a fixed
+    audit_id > schedule_id > ... sub-priority. audit_id is listed before
+    schedule_id here because a real "show all audits part of this plan"
+    query naturally SELECTs the asked-for entity's own identifier first;
+    schedule_id/facility_name are secondary context columns pulled in via
+    JOINs. See test_row_entity_type_corrective_action_beats_joined_audit_id
+    below for the confirmed-live bug this row-order signal was introduced
+    to fix (the reverse shape: corrective_action_id selected first, with a
+    joined-in audit_id that must NOT win)."""
     rows = [
-        {"plan_title": "Delegation retirement plan", "schedule_id": "SCH001",
-         "facility_name": "ADGM Square", "audit_id": "2026/07/ST034/AUD001",
-         "audit_id__id": "aaaa1111-0000-0000-0000-000000000001"},
-        {"plan_title": "Delegation retirement plan", "schedule_id": "SCH002",
-         "facility_name": "Al Oyoun Village", "audit_id": "2026/07/ST157/AUD001",
-         "audit_id__id": "aaaa2222-0000-0000-0000-000000000002"},
-        {"plan_title": "Delegation retirement plan", "schedule_id": "SCH003",
-         "facility_name": "Al Ghadeer", "audit_id": None, "audit_id__id": None},
+        {"plan_title": "Delegation retirement plan", "audit_id": "2026/07/ST034/AUD001",
+         "audit_id__id": "aaaa1111-0000-0000-0000-000000000001",
+         "schedule_id": "SCH001", "facility_name": "ADGM Square"},
+        {"plan_title": "Delegation retirement plan", "audit_id": "2026/07/ST157/AUD001",
+         "audit_id__id": "aaaa2222-0000-0000-0000-000000000002",
+         "schedule_id": "SCH002", "facility_name": "Al Oyoun Village"},
+        {"plan_title": "Delegation retirement plan", "audit_id": None, "audit_id__id": None,
+         "schedule_id": "SCH003", "facility_name": "Al Ghadeer"},
     ]
     session = _run("show all audits part of this plan", rows)
     turn = session.turns[-1]
@@ -145,6 +158,36 @@ def test_row_entity_type_audit_priority1():
     ]
     session = _run("show all audits part of this plan", rows)
     assert session.turns[-1].row_entity_type == "audit"
+
+
+def test_row_entity_type_corrective_action_beats_joined_audit_id():
+    """Confirmed-live bug (2026-08-06): "list all corrective actions"
+    generated SELECT aca.corrective_action_id, ..., arep.audit_id, ...
+    (audit_id joined in purely for facility/auditor context, not the
+    subject of the question). The old fixed scan order ("audit_id",
+    "schedule_id", "inspection_id", "corrective_action_id") always picked
+    audit_id whenever both were present, regardless of which one the
+    query actually SELECTed first — this silently coarsened a checkbox
+    selection of 3 specific corrective actions into 3 whole audit_report
+    ids, and a follow-up filtering on those ids pulled in 13 corrective
+    actions instead of the 3 actually selected (resolve_selected_rows,
+    row_selection.py). corrective_action_id is listed FIRST in the row
+    (matching the real SELECT order) and must win."""
+    rows = [
+        {"corrective_action_id": "CA_2026/08/ST040/AUD001/001",
+         "corrective_action_id__id": "cccc1111-0000-0000-0000-000000000001",
+         "status": "OPEN", "audit_id": "2026/06/ST041/AUD003",
+         "audit_id__id": "aaaa9999-0000-0000-0000-000000000009"},
+        {"corrective_action_id": "CA_2026/08/ST040/AUD001/002",
+         "corrective_action_id__id": "cccc2222-0000-0000-0000-000000000002",
+         "status": "CLOSED", "audit_id": "2026/07/ST053/AUD001",
+         "audit_id__id": "aaaa8888-0000-0000-0000-000000000008"},
+    ]
+    session = _run("list all corrective actions", rows)
+    turn = session.turns[-1]
+    assert turn.row_entity_type == "corrective_action"
+    assert turn.row_titles == ["CA_2026/08/ST040/AUD001/001", "CA_2026/08/ST040/AUD001/002"]
+    assert turn.row_ids == ["cccc1111-0000-0000-0000-000000000001", "cccc2222-0000-0000-0000-000000000002"]
 
 
 def test_row_entity_type_cycle_priority1_5():

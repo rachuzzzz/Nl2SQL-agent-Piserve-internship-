@@ -48,6 +48,45 @@ AUDIT_BLOCK_RULES: list[dict] = [
         "hard_fail": True,
     },
     {
+        # Confirmed live 2026-08-12 (debug_llm_20260812_115240, qid=7a9a1309):
+        # "show all thats returned for modification then" (about audit
+        # schedules) generated asch.schedule_status = 'RETURNED_FOR_MODIFICATION'
+        # — the audit_plan.status spelling (DRAFT/SUBMITTED/APPROVED/
+        # RETURNED_FOR_MODIFICATION), cross-contaminated onto a DIFFERENT
+        # table's DIFFERENTLY-spelled enum. audit_schedule.schedule_status's
+        # real value is RETURN_MODIFICATION (no "ED", no "FOR" — see
+        # AUDIT_ENUM_COLUMNS in schema_introspector.py). The reasoning
+        # model's own draft schema_hint got it right; the downstream SQL-gen
+        # coder model rewrote it wrong, with no seed example anchoring this
+        # exact phrasing to the correct spelling. Same "wrong-but-plausible
+        # literal, UUID/enum-typed so it silently matches zero rows instead
+        # of erroring" trap class as
+        # audit_block_review_entity_type_invalid_literal below, just on a
+        # different pair of confusable enum values.
+        "id":          "audit_block_schedule_status_invalid_literal",
+        "type":        BLOCK,
+        "code":        "AUDIT_SCHEDULE_STATUS_INVALID",
+        "description": (
+            "audit_schedule.schedule_status must be exactly one of DRAFT/PENDING_REVIEW/"
+            "APPROVED/ONGOING/COMPLETED/RETURN_MODIFICATION — audit_plan.status's "
+            "RETURNED_FOR_MODIFICATION (a different table, different spelling) is not a "
+            "valid value here and silently matches zero rows instead of erroring."
+        ),
+        "sql_pattern": (
+            r"\basch\.schedule_status\s*=\s*'"
+            r"(?!(?:DRAFT|PENDING_REVIEW|APPROVED|ONGOING|COMPLETED|RETURN_MODIFICATION)')"
+            r"[A-Za-z_]+'"
+        ),
+        "message": (
+            "BLOCKED: asch.schedule_status must be exactly one of 'DRAFT', 'PENDING_REVIEW', "
+            "'APPROVED', 'ONGOING', 'COMPLETED', or 'RETURN_MODIFICATION' — no other value "
+            "exists on this column. In particular, 'RETURNED_FOR_MODIFICATION' is "
+            "audit_plan.status's spelling, NOT audit_schedule.schedule_status's — the correct "
+            "value here is 'RETURN_MODIFICATION' (no 'ED', no 'FOR')."
+        ),
+        "hard_fail": True,
+    },
+    {
         "id":          "audit_block_dead_report_audit_type",
         "type":        BLOCK,
         "code":        "AUDIT_DEAD_REPORT_AUDIT_TYPE",
@@ -181,6 +220,46 @@ AUDIT_BLOCK_RULES: list[dict] = [
             "primary key), NOT .corrective_action_id (the VARCHAR display code — never "
             "UUID-shaped, casting it to uuid will fail). Correct: "
             "JOIN review rev ON rev.entity_id = aca.id AND rev.entity_type = 'AUDIT_CORRECTIVE_ACTION'"
+        ),
+        "hard_fail": True,
+    },
+    {
+        # Confirmed live 2026-08-12 (debug_llm_20260812_113525, qid=4a85836b):
+        # "who returned this for modification" (about a specific audit_schedule
+        # row) generated rev.entity_type = 'AUDIT_SCHEDULE' — a value that does
+        # not exist in review.entity_type at all. The real value is the bare
+        # 'SCHEDULE' (see schema_introspector.py's AUDIT_BUSINESS_RULES: only
+        # 'AUDIT_PLAN'/'PORTFOLIO'/'SCHEDULE'/'AUDIT_CORRECTIVE_ACTION' are
+        # valid for the audit domain). The wrong literal is NOT a syntax error
+        # — it's UUID-typed like every other entity_type value, so it silently
+        # executes and returns 0 rows regardless of what the real data holds,
+        # exactly the "wrong table target, no error" trap
+        # audit_block_ca_schedule_direct_join above already guards against for
+        # a different join. Anchored to the `rev.` alias specifically (every
+        # seed example and worked example in this codebase aliases the review
+        # table as `rev`) rather than a bare `entity_type` match, since
+        # ai_questions also has its own, unrelated entity_type column
+        # (schema_introspector.py) that this must not false-positive on.
+        "id":          "audit_block_review_entity_type_invalid_literal",
+        "type":        BLOCK,
+        "code":        "AUDIT_REVIEW_ENTITY_TYPE_INVALID",
+        "description": (
+            "review.entity_type on the audit domain must be exactly one of "
+            "'AUDIT_PLAN'/'PORTFOLIO'/'SCHEDULE'/'AUDIT_CORRECTIVE_ACTION' — any other "
+            "literal (e.g. the plausible-looking but nonexistent 'AUDIT_SCHEDULE') is "
+            "UUID-typed like the real values, so it silently matches zero rows instead "
+            "of erroring."
+        ),
+        "sql_pattern": (
+            r"\brev\.entity_type\s*=\s*'"
+            r"(?!(?:AUDIT_PLAN|PORTFOLIO|SCHEDULE|AUDIT_CORRECTIVE_ACTION)')"
+            r"[A-Za-z_]+'"
+        ),
+        "message": (
+            "BLOCKED: rev.entity_type must be exactly one of 'AUDIT_PLAN', 'PORTFOLIO', "
+            "'SCHEDULE', or 'AUDIT_CORRECTIVE_ACTION' — no other value exists on this "
+            "column. For an audit_schedule row, the correct value is the bare 'SCHEDULE' "
+            "(NOT 'AUDIT_SCHEDULE', which does not exist and will silently match zero rows)."
         ),
         "hard_fail": True,
     },
@@ -563,6 +642,113 @@ AUDIT_BLOCK_RULES: list[dict] = [
         "hard_fail": True,
     },
     {
+        "id":          "audit_block_ca_id_for_observation_wrong_path",
+        "type":        BLOCK,
+        "code":        "AUDIT_CA_ID_OBSERVATION_WRONG_PATH",
+        "description": (
+            "Sibling of audit_block_ca_for_observation_wrong_path — that one guards the "
+            "fresh ILIKE-text-search direction; this one guards the ALREADY-RESOLVED-id "
+            "direction (aca.id = <uuid>, e.g. from resolve_selected_rows/resolve_ordinal_"
+            "reference). When fetching the observation/form-answers for one SPECIFIC "
+            "corrective action, must use observation_id -> submission_id path, not the "
+            "whole-report join (via aca.audit_id, whether directly to aaa.audit_report_id "
+            "or via an intermediate arep join). Confirmed live 2026-08-10: a uuid-guard "
+            "retry re-inserting a dropped aca.id filter silently swapped the join to the "
+            "whole-report path instead, returning 97 unrelated form answers for a "
+            "single-CA question with no error raised — this guard catches that shape."
+        ),
+        # Fires when: ai_audit_answers present + a specific resolved CA id filter (= or IN)
+        # + the wrong path (anywhere via aca.audit_id) but observation_id path is absent.
+        "sql_pattern": (
+            r"(?=.*\bai_audit_answers\b)"                     # ai_audit_answers present
+            r"(?=.*\baca\.id\s*(?:=|in\s*\())"                # a specific resolved CA id filter
+            r"(?=.*\baca\.audit_id\b)"                        # wrong path: anywhere via aca.audit_id
+            r"(?!.*\baca\.observation_id\b)"                  # correct path absent
+        ),
+        "message": (
+            "WRONG PATH: this question already resolved a SPECIFIC corrective action "
+            "(aca.id = <uuid>) and joins ai_audit_answers — that means it's asking about "
+            "THAT CA's linked observation, not the whole audit report's form. Join via "
+            "aaa.submission_id = aca.observation_id::varchar (cast the UUID side to "
+            "varchar) — NOT via aca.audit_id (directly to aaa.audit_report_id, or via an "
+            "intermediate audit_report join), which returns every answer in the whole "
+            "report regardless of which observation raised this CA."
+        ),
+        "hard_fail": True,
+    },
+    {
+        "id":          "audit_block_ai_audit_answers_self_join_wrong_grain",
+        "type":        BLOCK,
+        "code":        "AI_AUDIT_ANSWERS_SELF_JOIN_WRONG_GRAIN",
+        "description": (
+            "Inspection's mirror (block_ai_answers_self_join_wrong_grain) — combining two "
+            "different question labels from the SAME repeatable form entry (e.g. a Risk "
+            "Level answer paired with its sibling Findings/Remarks text) requires "
+            "self-joining ai_audit_answers to itself matched on submission_id, not "
+            "audit_report_id. Confirmed live 2026-08-10 on the inspection side: joining via "
+            "the report instead of the entry lets a High-risk Risk Level answer from one "
+            "observation pair with unrelated Findings/Remarks text from a different "
+            "observation in the same report. Added here pre-emptively so audit doesn't "
+            "have to hit the same incident separately."
+        ),
+        # Fires when: ai_audit_answers appears in both FROM and a separate JOIN (two
+        # aliases, i.e. a self-join) but no submission_id = submission_id equality exists.
+        "sql_pattern": (
+            r"(?=.*\bfrom\s+ai_audit_answers\b)"
+            r"(?=.*\bjoin\s+ai_audit_answers\b)"
+            r"(?!.*\.submission_id\s*=\s*\w+\.submission_id\b)"
+        ),
+        "message": (
+            "WRONG GRAIN: this query self-joins ai_audit_answers to itself but not on "
+            "submission_id — that pairs answers from ANY entry in the same audit report, "
+            "not necessarily the SAME repeatable entry. If combining two question labels "
+            "(e.g. Risk Level + Findings/Remarks) from one entry, add "
+            "<alias2>.submission_id = <alias1>.submission_id to the join condition. If "
+            "you only need to filter/count by one label (not pull a second label's text "
+            "too), you don't need a self-join at all — a single ai_audit_answers scan "
+            "with COUNT(DISTINCT submission_id) or a CASE expression is simpler and correct."
+        ),
+        "hard_fail": True,
+    },
+    {
+        "id":          "audit_block_ai_audit_answers_constant_join_wrong_path",
+        "type":        BLOCK,
+        "code":        "AI_AUDIT_ANSWERS_CONSTANT_JOIN_WRONG_PATH",
+        "description": (
+            "A different failure mode of the same uuid-guard-retry class as "
+            "audit_block_ca_id_for_observation_wrong_path: confirmed live 2026-08-10 "
+            "(qid=328ca155) that when the retry needed to reinsert a dropped "
+            "aaa.submission_id filter, it hardcoded the uuid as a bare constant on the "
+            "JOIN's ON clause (JOIN ai_audit_answers aaa ON aaa.submission_id = "
+            "'<uuid>') instead of using it as aca.observation_id::varchar — eliminating "
+            "the actual join predicate between audit_corrective_action and "
+            "ai_audit_answers entirely (an unintentional cross join: every approved CA "
+            "in the whole table, not just the ones tied to the resolved observation). "
+            "Syntactically valid, executed without error, returned a plausible-looking "
+            "row count (18) — nothing else in the pipeline caught it."
+        ),
+        # Fires when: audit_corrective_action present + ai_audit_answers joined via a
+        # bare UUID-literal constant (not a column reference) + aca.observation_id absent.
+        "sql_pattern": (
+            r"(?=.*\baudit_corrective_action\b)"
+            r"(?=.*\bjoin\s+ai_audit_answers(?:\s+as)?\s+(\w+)\s+on\s+\1\.submission_id\s*"
+            r"=\s*'[0-9a-fA-F-]{36}')"
+            r"(?!.*\baca\.observation_id\b)"
+        ),
+        "message": (
+            "WRONG PATH: ai_audit_answers is joined via a bare UUID CONSTANT "
+            "(<alias>.submission_id = '<uuid>') instead of a real join predicate — this "
+            "eliminates the link to audit_corrective_action entirely, producing an "
+            "unintentional cross join (every corrective action in the table, not just "
+            "the ones tied to the resolved observation). Use the constant as the value "
+            "aca.observation_id must equal instead: JOIN ai_audit_answers aaa ON "
+            "aaa.submission_id = aca.observation_id::varchar WHERE aca.observation_id = "
+            "'<uuid>' (or wherever the resolved id belongs) — never as the ai_audit_"
+            "answers side's own join condition."
+        ),
+        "hard_fail": True,
+    },
+    {
         "id":          "audit_block_degenerate_label_groupby",
         "type":        BLOCK,
         "code":        "AUDIT_DEGENERATE_LABEL_GROUPBY",
@@ -868,7 +1054,24 @@ AUDIT_INJECT_RULES: list[dict] = [
         "type":           INJECT,
         "priority":       75,
         "description":    "Audit type of a report/schedule — three/two-hop via audit_plan, audit_report.audit_type_id is dead.",
-        "question_pattern": r"(?i)\baudit\s+type\b|\b(internal|external|statutory|third.?party|second\s+party|first\s+party)\s+audit",
+        # Whole-string negative lookahead (requires the ^ anchor + re.search
+        # trying position 0 first) excludes any question mentioning
+        # form(s)/template(s) — audit_forms has its OWN live, direct
+        # audit_type_id column (confirmed live: aform.audit_type_id = aty.id
+        # passes validation), so this rule's premise (audit_report's
+        # audit_type_id being dead, audit_plan being the only real path)
+        # doesn't apply there at all. Before this, "list all audit form
+        # templates by universe and audit type" fired this rule, forced a
+        # guard retry demanding audit_plan, and the retry could never
+        # succeed since audit_forms has no join path to audit_plan —
+        # confirmed live via eval run debug_llm_20260805_171956.log
+        # (FORMS-01/FORMS-03 both fired+failed this way; wasted one LLM
+        # call each, no correctness impact since the model just ignored
+        # the bogus instruction and both still passed).
+        "question_pattern": (
+            r"(?i)^(?!.*\b(?:forms?|templates?)\b).*(?:\baudit\s+type\b|"
+            r"\b(?:internal|external|statutory|third.?party|second\s+party|first\s+party)\s+audit)"
+        ),
         "hint": (
             "\nAUDIT TYPE RESOLUTION — audit_report.audit_type_id is DEAD (always NULL, "
             "confirmed live). The real path is via audit_plan:\n"

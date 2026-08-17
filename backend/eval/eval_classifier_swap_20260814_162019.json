@@ -1,0 +1,175 @@
+{
+  "timestamp": "20260814_162019",
+  "base_url": "http://10.77.20.13:11434",
+  "model": "qwen3.5:0.8b",
+  "turn_match_rate": 0.18181818181818182,
+  "router_match_rate": 0.0,
+  "turn_rows": [
+    {
+      "kind": "turn",
+      "question_snippet": "YEAR FROM ir.submitted_on) = EXTRACT(YEAR FROM CURRENT_DATE) GROUP BY DATE_TRUNC('month', ir.submitted_on) ORDER BY month;\nLast query's total row count: 3\n\nCURRENT MESSAGE: show top 5 capex converters",
+      "expected_action": "NEW_QUERY",
+      "actual_action": "MODIFY_QUERY",
+      "expected_reference": "NONE",
+      "actual_reference": "NONE",
+      "action_match": false,
+      "reference_match": true,
+      "full_match": false,
+      "actual_raw": "{\"action\": \"MODIFY_QUERY\", \"reference\": \"NONE\", \"entity\": {\"type\": \"inspection\", \"value\": \"inspection_report\"}, \"filters\": {\"active\": true, \"status\": \"NOT DRAFT\"}, \"time_range\": \"2026-08\", \"confidence\": 1.0}"
+    },
+    {
+      "kind": "turn",
+      "question_snippet": "this \u2014 every attempt hit the same problem, which usually means the data or filters involved aren't availab\u2026\"\nCurrent active scope: (none)\n\nCURRENT MESSAGE: show all mitigative actions that are at risk",
+      "expected_action": "NEW_QUERY",
+      "actual_action": "NEW_QUERY",
+      "expected_reference": "NONE",
+      "actual_reference": "AUDIT_CORRECTIVE_ACTION",
+      "action_match": true,
+      "reference_match": false,
+      "full_match": false,
+      "actual_raw": "{\"action\": \"NEW_QUERY\", \"reference\": \"audit_corrective_action\", \"entity\": {\"type\": \"audit_corrective_action\", \"value\": \"audit_corrective_action\"}, \"filters\": {\"aca.status\": \"OVERDUE\"}, \"time_range\": \"2026-08-13\", \"confidence\": 1.0}"
+    },
+    {
+      "kind": "turn",
+      "question_snippet": "aud.id AS auditor_name__id, u_ee.id AS auditee_name__id FROM audit_schedule AS asch LEFT JOIN facility AS fac ON \nLast query's total row count: 50\n\nCURRENT MESSAGE: show all overdue corrective actions",
+      "expected_action": "COUNT_FOLLOWUP",
+      "actual_action": "MODIFY_QUERY",
+      "expected_reference": "NONE",
+      "actual_reference": "NONE",
+      "action_match": false,
+      "reference_match": true,
+      "full_match": false,
+      "actual_raw": "{\"action\": \"MODIFY_QUERY\", \"reference\": \"NONE\", \"entity\": {\"type\": \"audit\", \"value\": \"audit\"}, \"filters\": {\"schedule_status\": \"PENDING_REVIEW\"}, \"time_range\": \"\", \"confidence\": 0.9}"
+    },
+    {
+      "kind": "turn",
+      "question_snippet": "audit_id = arep.id JOIN audit_schedule AS asch ON arep.schedule_id = asch.id LEFT JOIN risk_level AS rl ON aca.risk_level_id = rl\nLast query's total row count: 3\n\nCURRENT MESSAGE: show all inspections",
+      "expected_action": "NEW_QUERY",
+      "actual_action": "NEW_QUERY",
+      "expected_reference": "NONE",
+      "actual_reference": "NONE",
+      "action_match": true,
+      "reference_match": true,
+      "full_match": true,
+      "actual_raw": "{\"action\": \"NEW_QUERY\", \"reference\": \"NONE\", \"entity\": {\"type\": \"inspection\", \"value\": \"inspections\"}, \"filters\": {\"<short filter description>\": \"none\"}, \"time_range\": \"\", \"confidence\": 0.99}"
+    },
+    {
+      "kind": "turn",
+      "question_snippet": "AS asch ON arep.schedule_id = asch.id LEFT JOIN risk_level AS rl ON aca.risk_level_id = rl\nLast query's total row count: 3\n\nCURRENT MESSAGE: show all mitigative actioms having high risk and is overdue",
+      "expected_action": "MODIFY_QUERY",
+      "actual_action": "MODIFY_QUERY",
+      "expected_reference": "NONE",
+      "actual_reference": "NONE",
+      "action_match": true,
+      "reference_match": true,
+      "full_match": true,
+      "actual_raw": "{\"action\": \"MODIFY_QUERY\", \"reference\": \"NONE\", \"entity\": {\"type\": \"audit\", \"value\": \"audit_corrective_action\"}, \"filters\": {\"active\": true, \"status\": \"OVERDUE\"}, \"time_range\": \"\", \"confidence\": 0.95}"
+    },
+    {
+      "kind": "turn",
+      "question_snippet": "pection_report ir WHERE ir.active = true AND ir.status != 'DRAFT' AND ir.inspection_score IS NOT NULL;\nLast query's total row count: 1\n\nCURRENT MESSAGE: show all overdue inspections that are high risk",
+      "expected_action": "NEW_QUERY",
+      "actual_action": "MODIFY_QUERY",
+      "expected_reference": "NONE",
+      "actual_reference": "NONE",
+      "action_match": false,
+      "reference_match": true,
+      "full_match": false,
+      "actual_raw": "{\"action\": \"MODIFY_QUERY\", \"reference\": \"NONE\", \"entity\": {\"type\": \"inspection\", \"value\": \"inspection\"}, \"filters\": {\"status\": \"OVERDUE\", \"risk_level\": \"HIGH\"}, \"time_range\": \"\", \"confidence\": 0.95}"
+    },
+    {
+      "kind": "turn",
+      "question_snippet": "d AS auditor_name__id, u_ee.id AS auditee_name__id FROM audit_report AS arep JOIN audit_schedu\nLast query's total row count: 13\n\nCURRENT MESSAGE: Show all high risk corrective actions that are overdue",
+      "expected_action": "NEW_QUERY",
+      "actual_action": "MODIFY_QUERY",
+      "expected_reference": "NONE",
+      "actual_reference": "NONE",
+      "action_match": false,
+      "reference_match": true,
+      "full_match": false,
+      "actual_raw": "{\"action\": \"MODIFY_QUERY\", \"reference\": \"NONE\", \"entity\": {\"type\": \"audit\", \"value\": \"audit_corrective_action\"}, \"filters\": {\"status\": \"OVERDUE\"}, \"time_range\": \"2026-08-14\", \"confidence\": 0.95}"
+    },
+    {
+      "kind": "turn",
+      "question_snippet": "= arep.id JOIN audit_schedule AS asch ON arep.schedule_id = asch.id LEFT JOIN risk_level AS rl ON aca.risk_level_id = rl\nLast query's total row count: 2\n\nCURRENT MESSAGE: show inspections at aldar HQ\n",
+      "expected_action": "NEW_QUERY",
+      "actual_action": "MODIFY_QUERY",
+      "expected_reference": "NONE",
+      "actual_reference": "NONE",
+      "action_match": false,
+      "reference_match": true,
+      "full_match": false,
+      "actual_raw": "{\"action\": \"MODIFY_QUERY\", \"reference\": \"NONE\", \"entity\": {\"type\": \"inspection\", \"value\": \"aldar HQ\"}, \"filters\": {\"inspection_cycle\": \"4\"}, \"time_range\": \"2026-08-14\", \"confidence\": 0.95}"
+    },
+    {
+      "kind": "turn",
+      "question_snippet": "UNT(*) AS count_no_progress_stage FROM inspection_corrective_action ica WHERE ica.progress_stage IS NULL AND ica.active = true;\nLast query's total row count: 1\n\nCURRENT MESSAGE: show details for these",
+      "expected_action": "MODIFY_QUERY",
+      "actual_action": "MODIFY_QUERY",
+      "expected_reference": "SELECTION",
+      "actual_reference": "INSPECTION_CORRECTIVE_ACTION",
+      "action_match": true,
+      "reference_match": false,
+      "full_match": false,
+      "actual_raw": "{\"action\": \"MODIFY_QUERY\", \"reference\": \"inspection_corrective_action\", \"entity\": {\"type\": \"inspector\", \"value\": \"neenu inspector4\"}, \"filters\": {\"progress_stage\": \"NOT_STARTED\"}, \"time_range\": \"\", \"confidence\": 0.98}"
+    },
+    {
+      "kind": "turn",
+      "question_snippet": "__id, u_aud.id AS auditor_name__id, u_ee.id AS auditee_name__id FROM audit_schedule AS asch LEFT JOIN facility AS fac ON \nLast query's total row count: 50\n\nCURRENT MESSAGE: show top 5 capex converters",
+      "expected_action": "NEW_QUERY",
+      "actual_action": "MODIFY_QUERY",
+      "expected_reference": "NONE",
+      "actual_reference": "NONE",
+      "action_match": false,
+      "reference_match": true,
+      "full_match": false,
+      "actual_raw": "{\"action\": \"MODIFY_QUERY\", \"reference\": \"NONE\", \"entity\": {\"type\": \"audit\", \"value\": \"audit_schedule\"}, \"filters\": {\"facility_name\": \"Earth\"}, \"time_range\": \"2026-09-30 to present\", \"confidence\": 0.95}"
+    },
+    {
+      "kind": "turn",
+      "question_snippet": "dit plans (proposed / authorized, not yet scheduled)\\n\u2022 Audit schedules (assigned / dated, not yet conducted)\\n\u2022 Conducted audits (repo\u2026'\nCurrent active scope: (none)\n\nCURRENT MESSAGE: Audit schedules",
+      "expected_action": "NEW_QUERY",
+      "actual_action": "MODIFY_QUERY",
+      "expected_reference": "NONE",
+      "actual_reference": "NONE",
+      "action_match": false,
+      "reference_match": true,
+      "full_match": false,
+      "actual_raw": "{\"action\": \"MODIFY_QUERY\", \"reference\": \"NONE\", \"entity\": {\"type\": \"audit\", \"value\": \"Audit schedules\"}, \"filters\": {\"columns\": [\"Audit Schedule ID\", \"Audit Date\", \"Status\", \"Auditor Name\", \"Audit Type\"]}, \"time_range\": \"\", \"confidence\": 1.0}"
+    }
+  ],
+  "router_rows": [
+    {
+      "kind": "router",
+      "question": "Hi",
+      "expected_domain": "AMBIGUOUS",
+      "actual_domain": "INSPECTION",
+      "full_match": false,
+      "actual_raw": "{\"domain\": \"INSPECTION\", \"clarifying_question\": \"Are you referring to a facility inspection or an audit?\", \"confidence\": 0.9}"
+    },
+    {
+      "kind": "router",
+      "question": "Hello",
+      "expected_domain": "AMBIGUOUS",
+      "actual_domain": "INSPECTION",
+      "full_match": false,
+      "actual_raw": "{\"domain\": \"INSPECTION\", \"clarifying_question\": \"What type of inspection or action are you referring to?\", \"confidence\": 0.9}"
+    },
+    {
+      "kind": "router",
+      "question": "hello",
+      "expected_domain": "AMBIGUOUS",
+      "actual_domain": "INSPECTION",
+      "full_match": false,
+      "actual_raw": "{\"domain\": \"INSPECTION\", \"clarifying_question\": \"Are you referring to a facility inspection or an audit?\", \"confidence\": 0.9}"
+    },
+    {
+      "kind": "router",
+      "question": "hi",
+      "expected_domain": "AMBIGUOUS",
+      "actual_domain": "INSPECTION",
+      "full_match": false,
+      "actual_raw": "{\"domain\": \"INSPECTION\", \"clarifying_question\": \"Are you referring to a facility inspection or an audit?\", \"confidence\": 0.9}"
+    }
+  ]
+}

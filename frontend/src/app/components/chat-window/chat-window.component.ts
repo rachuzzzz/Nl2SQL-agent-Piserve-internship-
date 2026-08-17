@@ -8,7 +8,7 @@ import { HttpClient } from '@angular/common/http';
 import { Subscription } from 'rxjs';
 import { ChatService } from '../../services/chat.service';
 import { AuthService } from '../../services/auth.service';
-import { Message, ResultData, ChartConfig } from '../../models/chat.model';
+import { Message, ResultData, ChartConfig, SelectedRow } from '../../models/chat.model';
 import { ChartDisplayComponent } from '../chart-display/chart-display.component';
 import { ResultTableComponent } from '../result-table/result-table.component';
 import { DashboardDisplayComponent } from '../dashboard-display/dashboard-display.component';
@@ -75,6 +75,7 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
         </div>
 
         <div *ngFor="let msg of messages; trackBy: trackMsg"
+             [attr.id]="'msg-' + msg.id"
              class="msg"
              [class.msg-user]="msg.role === 'user'"
              [class.msg-wide]="(msg.role === 'ai' && !!msg.dashboard?.show) || expandedChartMsgs.has(msg.id)">
@@ -89,6 +90,9 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
             <span *ngIf="msg.role === 'user'">{{ userInitial }}</span>
           </div>
           <div class="msg-content">
+            <div *ngIf="msg.role === 'ai' && msg.intentRecap" class="msg-recap">
+              {{ msg.intentRecap }}
+            </div>
             <div class="bubble"
               [class.bubble-ai]="msg.role === 'ai' && !msg.dashboard?.show"
               [class.bubble-user]="msg.role === 'user'"
@@ -104,7 +108,12 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
               [resultData]="msg.resultData!"
               [chartConfig]="msg.chartConfig!"
               [sessionId]="sessionId"
-              [messageId]="msg.id">
+              [messageId]="msg.id"
+              [sourceQuestion]="msg.sourceQuestion"
+              [selectable]="!!msg.resultData.row_selectable && msg.id === lastAiMessageId"
+              [resetSelection]="selectionResetCounter"
+              (selectionChange)="pendingSelection = $event"
+              (drilldown)="send($event)">
             </app-dashboard-display>
 
             <!-- Non-dashboard path: table/chart, side-by-side when both present -->
@@ -136,7 +145,9 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
                     [mode]="msg.chartMode ?? 'quick'"
                     [noOverlay]="true"
                     [resizeTrigger]="chartResizeTriggers.get(msg.id) ?? 0"
-                    (fullscreenChange)="onMsgChartFullscreen(msg.id, $event)">
+                    [sourceQuestion]="msg.sourceQuestion"
+                    (fullscreenChange)="onMsgChartFullscreen(msg.id, $event)"
+                    (drilldown)="send($event)">
                   </app-chart-display>
                 </div>
 
@@ -159,7 +170,10 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
                     [sessionId]="sessionId"
                     [messageId]="msg.id"
                     [sourceQuestion]="msg.sourceQuestion"
-                    (drilldown)="send($event)">
+                    [selectable]="!!msg.resultData?.row_selectable && msg.id === lastAiMessageId"
+                    [resetSelection]="selectionResetCounter"
+                    (drilldown)="send($event)"
+                    (selectionChange)="pendingSelection = $event">
                   </app-result-table>
                 </div>
 
@@ -172,7 +186,10 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
                 [sessionId]="sessionId"
                 [messageId]="msg.id"
                 [sourceQuestion]="msg.sourceQuestion"
-                (drilldown)="send($event)">
+                [selectable]="!!msg.resultData?.row_selectable && msg.id === lastAiMessageId"
+                [resetSelection]="selectionResetCounter"
+                (drilldown)="send($event)"
+                (selectionChange)="pendingSelection = $event">
               </app-result-table>
 
               <!-- Chart only (no table rows) -->
@@ -183,7 +200,9 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
                 [mode]="msg.chartMode ?? 'quick'"
                 [noOverlay]="true"
                 [resizeTrigger]="chartResizeTriggers.get(msg.id) ?? 0"
-                (fullscreenChange)="onMsgChartFullscreen(msg.id, $event)">
+                [sourceQuestion]="msg.sourceQuestion"
+                (fullscreenChange)="onMsgChartFullscreen(msg.id, $event)"
+                (drilldown)="send($event)">
               </app-chart-display>
 
             </ng-container>
@@ -198,6 +217,9 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
                 {{ ttsLoadingId === msg.id ? '⏳' : ttsPlayingId === msg.id ? '⏹' : '🔊' }}
               </button>
               <span class="msg-time">{{ msg.timestamp | date:'shortTime' }}</span>
+              <span *ngIf="msg.role === 'ai' && msg.domain" class="msg-pill msg-pill-domain">
+                {{ msg.domain === 'audit' ? '📋 Audit' : '🏢 Inspection' }}
+              </span>
               <span *ngIf="msg.debug as d" class="msg-pill"
                 [class.msg-pill-warn]="(d.sql_errors || 0) > 0">
                 ✓ {{ d.llm_calls || 1 }} call{{ (d.llm_calls || 1) !== 1 ? 's' : '' }}
@@ -244,6 +266,13 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
       <div class="chat-input-area">
         <div class="mic-error" *ngIf="micError" (click)="micError=''">
           ⚠ {{ micError }}
+        </div>
+        <div class="selection-chip" *ngIf="pendingSelection.length">
+          <svg viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+            <path d="M13.485 1.929a1 1 0 00-1.414 0L6.15 7.85 3.929 5.629a1 1 0 10-1.414 1.414l3 3a1 1 0 001.414 0l6.556-6.556a1 1 0 000-1.414z"/>
+          </svg>
+          <span>{{ pendingSelection.length }} row{{ pendingSelection.length !== 1 ? 's' : '' }} selected</span>
+          <button type="button" class="chip-clear" title="Clear selection" (click)="clearSelection()">✕</button>
         </div>
         <div class="input-wrap" [class.focused]="focused" style="position: relative">
           <app-slash-autocomplete
@@ -419,6 +448,23 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
       line-height: 1.5;
     }
 
+    /* ── Row selection chip ── */
+    .selection-chip {
+      display: flex; align-items: center; gap: 7px;
+      width: fit-content;
+      font-size: 12px; font-weight: 600; color: var(--accent);
+      background: var(--blue-50); border: 1px solid var(--blue-100);
+      border-radius: 999px; padding: 5px 8px 5px 12px; margin-bottom: 8px;
+    }
+    .selection-chip svg { flex-shrink: 0; }
+    .chip-clear {
+      display: flex; align-items: center; justify-content: center;
+      width: 18px; height: 18px; border-radius: 50%; border: none;
+      background: transparent; color: var(--accent); font-size: 11px;
+      cursor: pointer; line-height: 1;
+    }
+    .chip-clear:hover { background: var(--accent); color: #fff; }
+
     /* ── Mic / ASR button ── */
     .btn-mic {
       width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0;
@@ -526,6 +572,18 @@ export class ChatWindowComponent implements AfterViewChecked {
   private lastMsgCount     = 0;
   private lastLoadingState = false;
   private authSub          = Subscription.EMPTY;
+  // Set by the scrollToMessage$ subscription below when something (e.g. the
+  // Dashboard gallery) requested a jump to a specific past message; consumed
+  // and cleared once ngAfterViewChecked can find that message's element in
+  // the (by-then-rendered) DOM. See ChatService.jumpToMessage().
+  private pendingScrollMsgId: string | null = null;
+
+  // Row selection — checkboxes are only ever shown on the LATEST AI
+  // message's table (sidesteps resolving against a stale/evicted turn —
+  // see agent/orchestrator/row_selection.py's docstring for why).
+  lastAiMessageId: string | null = null;
+  pendingSelection: SelectedRow[] = [];
+  selectionResetCounter = 0;
 
   get greeting(): string {
     const h = new Date().getHours();
@@ -573,6 +631,7 @@ export class ChatWindowComponent implements AfterViewChecked {
       this.sessionId = c?.id ?? '';
       const lastAi = [...this.messages].reverse().find(m => m.role === 'ai' && m.resultData);
       this.lastResultData = lastAi?.resultData ?? null;
+      this.lastAiMessageId = lastAi?.id ?? null;
       this.cdr.markForCheck();
     });
     svc.loading$.subscribe(l => {
@@ -595,8 +654,14 @@ export class ChatWindowComponent implements AfterViewChecked {
       }
       this.cdr.markForCheck();
     });
+    // BehaviorSubject, not a plain Subject — replays the last requested jump
+    // to a freshly (re)constructed instance, since *ngSwitchCase destroys
+    // this component when the user leaves the Chat tab (see app.component.ts).
+    svc.scrollToMessage$.subscribe(id => {
+      if (id) this.pendingScrollMsgId = id;
+    });
   }
-  
+
   ngOnDestroy() {
     this.authSub.unsubscribe();
     if (this.loadingInterval) clearInterval(this.loadingInterval);
@@ -606,6 +671,23 @@ export class ChatWindowComponent implements AfterViewChecked {
   ngAfterViewChecked(): void {
     const el = this.msgsEl?.nativeElement;
     if (!el) return;
+
+    if (this.pendingScrollMsgId) {
+      const target = el.querySelector('#msg-' + this.pendingScrollMsgId) as HTMLElement | null;
+      if (target) {
+        this.pendingScrollMsgId = null;
+        this.svc.scrollToMessage$.next(null); // consumed — don't re-trigger on a later remount
+        requestAnimationFrame(() => {
+          target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          target.classList.add('msg-highlight');
+          setTimeout(() => target.classList.remove('msg-highlight'), 1600);
+        });
+      }
+      // Skip bottom-autoscroll this cycle either way — either we just jumped
+      // elsewhere, or the target isn't rendered yet and we'll retry next tick.
+      return;
+    }
+
     const changed = this.messages.length !== this.lastMsgCount
                  || this.loading          !== this.lastLoadingState;
     if (changed) {
@@ -794,12 +876,19 @@ export class ChatWindowComponent implements AfterViewChecked {
       this.handleSlashCommand(text.trim());
       return;
     }
-    this.svc.sendMessage(text).subscribe();
+    const positions = this.pendingSelection.map(s => s.position);
+    this.svc.sendMessage(text, positions).subscribe();
+    this.clearSelection();
     this.inputText = '';
     if (this.inputEl) this.inputEl.nativeElement.style.height = 'auto';
   }
 
   sendInput(): void { this.send(this.inputText); }
+
+  clearSelection(): void {
+    this.pendingSelection = [];
+    this.selectionResetCounter++;
+  }
   onEnter(e: any): void { if (!e.shiftKey) { e.preventDefault(); this.sendInput(); } }
   autoResize(e: Event): void {
     const el = e.target as HTMLTextAreaElement;

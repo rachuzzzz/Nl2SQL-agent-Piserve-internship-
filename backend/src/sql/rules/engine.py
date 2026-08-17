@@ -202,23 +202,59 @@ class RulesEngine:
 
     # ── Question-level hint injection ─────────────────────────────────────────
 
-    def hint_for_question(self, question: str) -> str:
+    # Sized the same way agent/prompts/builder.py's _DEFAULT_BLOCK_BUDGET_CHARS
+    # was — "roughly what one large block already costs alone" — see that
+    # module's own comment for the identical failure shape this mirrors.
+    _DEFAULT_HINT_BUDGET_CHARS = 4500
+
+    def hint_for_question(self, question: str, budget_chars: int = _DEFAULT_HINT_BUDGET_CHARS) -> str:
         """
         Return combined schema_hint for all INJECT rules matching the question.
-        Rules fire in priority order (highest first) and hints are concatenated.
+        Rules fire in priority order (highest first) and hints are concatenated,
+        up to budget_chars — the single highest-priority match is always
+        included in full regardless of its own size; lower-priority matches
+        that would push the total over budget are dropped.
+
+        This caps only the PROSE half of the mechanism. matching_inject_ids()
+        (and the table/pattern guard built on it, sql/generation.py's
+        required_tables_for/forbidden_patterns_for) is a separate method that
+        does its own independent match — never gated by this budget — so a
+        rule whose explanatory hint text got dropped for space still has its
+        required_tables/forbidden_patterns enforced. The safety-critical half
+        (enforcement) stays fully intact; only the guidance text is capped.
 
         If a matching rule declares ``"suppresses": ["rule_id", ...]``, those
         lower-priority rules are silenced even if their own pattern matches.
         This prevents contradictory hints from being concatenated.
+
+        Confirmed live (direct testing, not just this docstring's claim):
+        real audit questions can fire 2-4 rules whose hints, uncapped, run
+        3,300-4,600+ chars combined — several rule pairs' question_patterns
+        overlap heavily (both matching generic words like "details"/
+        "correction"/"cause"), so almost any "show details"/"what's the
+        correction" question fires multiple large hints simultaneously.
+        Identical failure shape to the one agent/prompts/builder.py's Tier-2
+        worked-example selection already hit and fixed with its own
+        _select_within_budget/_DEFAULT_BLOCK_BUDGET_CHARS (documented there:
+        2 blocks = 8,764 chars for one real "capex" query, contributing to a
+        reasoning-LLM prompt that nearly filled its context window and
+        produced an empty completion) — same fix, smaller budget, since this
+        text has to share room with auto_schema + seed examples on the
+        SQL-gen LLM's smaller num_ctx, not the reasoning LLM's larger one.
         """
         suppressed: set[str] = set()
         parts: list[str] = []
+        used = 0
         for rule in self._inject_rules:
             rid = rule["id"]
             if rid in suppressed:
                 continue
             if rule["_q_re"].search(question):
-                parts.append(rule["hint"])
+                hint = rule["hint"]
+                if parts and used + len(hint) > budget_chars:
+                    continue
+                parts.append(hint)
+                used += len(hint)
                 for sid in rule.get("suppresses", []):
                     suppressed.add(sid)
         return "".join(parts)

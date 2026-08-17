@@ -462,6 +462,77 @@ LIMIT 100;
         'domain': 'review', 'intent': 'filter', 'limit': 100,
     },
     {
+        # Confirmed live 2026-08-12 (debug_llm_20260812_113525, qid=4a85836b):
+        # "who returned this for modification" (about a specific SCHEDULE)
+        # generated entity_type = 'AUDIT_SCHEDULE' — a value that does not
+        # exist in review.entity_type at all (the real one is bare 'SCHEDULE',
+        # confirmed in audit_rules.py/schema_introspector.py). The wrong
+        # literal guaranteed zero matches regardless of real data — a false
+        # "no reviewer recorded" answer, not a true one. The nearby seed
+        # example just above uses the correct 'SCHEDULE' value but its
+        # anchor wording ("awaiting auditee acceptance or reschedule
+        # decision") shares no phrasing with "who returned/approved this
+        # schedule" questions, while sibling AUDIT_PLAN/AUDIT_CORRECTIVE_ACTION
+        # examples elsewhere DO contain the literal phrase "returned for
+        # modification" — so retrieval likely favored those wrong-table
+        # examples instead. This example exists specifically to anchor that
+        # "who returned/approved this schedule" phrasing to the correct
+        # entity_type='SCHEDULE' literal.
+        'nl':     'who returned this audit schedule for modification',
+        'sql':    """\
+-- SCHEDULE review = the auditee's accept/reschedule step on the scheduled visit —
+-- entity_type is the bare string 'SCHEDULE', NOT 'AUDIT_SCHEDULE' (that value
+-- does not exist; only 'AUDIT_PLAN'/'PORTFOLIO'/'SCHEDULE'/'AUDIT_CORRECTIVE_ACTION' do).
+-- status='COMPLETED' alone is NOT 'returned' — a completed review can be an
+-- approval (action='APPROVE'). 'who RETURNED it' must also filter
+-- action = 'RETURN_FOR_MODIFICATION'; for "who APPROVED it" use action='APPROVE' instead.
+SELECT asch.schedule_id, rev.status, rev.action, rev.reviewed_on,
+       u.first_name || ' ' || u.last_name AS returned_by
+FROM review rev
+JOIN audit_schedule asch ON rev.entity_id = asch.id AND rev.entity_type = 'SCHEDULE'
+LEFT JOIN users u ON rev.reviewed_by = u.id
+WHERE rev.status = 'COMPLETED' AND rev.action = 'RETURN_FOR_MODIFICATION' AND asch.active = true
+ORDER BY rev.reviewed_on DESC
+LIMIT 100;
+""",
+        'domain': 'review', 'intent': 'filter', 'limit': 100,
+    },
+    {
+        # Confirmed live 2026-08-12 (debug_llm_20260812_115240, qid=7a9a1309):
+        # "show all thats returned for modification" (a follow-up about audit
+        # SCHEDULES, no "who" — just list them) generated
+        # asch.schedule_status = 'RETURNED_FOR_MODIFICATION' — that's
+        # audit_plan.status's spelling (DRAFT/SUBMITTED/APPROVED/
+        # RETURNED_FOR_MODIFICATION), not audit_schedule.schedule_status's
+        # (DRAFT/PENDING_REVIEW/APPROVED/ONGOING/COMPLETED/
+        # RETURN_MODIFICATION — no "ED", no "FOR"). The reasoning model's own
+        # schema_hint draft got the value right; the SQL-gen coder model
+        # rewrote it wrong with no seed example anchoring this exact
+        # phrasing to the correct spelling — the nearby audit_plan sibling
+        # example ("which audit plans were returned for modification")
+        # shares the phrase "returned for modification" and likely won
+        # retrieval instead. This example exists specifically to anchor
+        # "schedules returned for modification" to the correct
+        # schedule_status='RETURN_MODIFICATION' literal — a plain status
+        # filter, no review table needed (see the 'who returned this audit
+        # schedule for modification' example just above for the "who"
+        # variant, which does need the review table).
+        'nl':     'audit schedules returned for modification',
+        'sql':    """\
+-- audit_schedule.schedule_status value is 'RETURN_MODIFICATION' — NOT
+-- 'RETURNED_FOR_MODIFICATION' (that spelling belongs to audit_plan.status,
+-- a different table's enum entirely).
+SELECT asch.schedule_id, asch.schedule_status, asch.follow_up_date,
+       fac.name AS facility_name
+FROM audit_schedule asch
+LEFT JOIN facility fac ON asch.facility_id = fac.id
+WHERE asch.schedule_status = 'RETURN_MODIFICATION' AND asch.active = true
+ORDER BY asch.follow_up_date DESC NULLS LAST
+LIMIT 100;
+""",
+        'domain': 'audit_schedule', 'intent': 'filter', 'limit': 100,
+    },
+    {
         'nl':     'audit schedules awaiting auditee acceptance or reschedule decision',
         'sql':    """\
 -- SCHEDULE review = the auditee's accept/reschedule step on the scheduled visit.
@@ -677,6 +748,43 @@ LIMIT 100;
         'domain': 'audit_corrective_action', 'intent': 'filter', 'limit': 100,
     },
     {
+        # Added to fix a live recurring failure, not a hypothetical one:
+        # "show all high risk corrective actions that are overdue" retrieved
+        # the 'list open overdue corrective actions with risk level and
+        # facility' example above as its #1 nearest neighbor — that example's
+        # own NL text mentions "risk level", so it out-competes the
+        # single-status 'list all corrective actions that are overdue'
+        # example (which never mentions risk level) on cosine similarity for
+        # any question that also says "high risk". The SQL-gen model then
+        # copied that #1 example's status IN ('OPEN', 'OVERDUE') filter
+        # almost verbatim — even dropping the rl.name filter its own
+        # schema_hint had already supplied — tripping the
+        # AUDIT_OVERDUE_INCLUDES_OPEN guard identically on all 3 retries and
+        # refusing every time (confirmed live 2026-08-14, two separate
+        # sessions, qid=b0a083b4 and qid=50c6d3f3). retrieve()'s skip_top_n
+        # retry-diversification can't recover from this: rank #1 is NEVER
+        # dropped on retry by design (see that method's INVARIANT docstring),
+        # so once a genuinely-wrong example lands at #1, no amount of
+        # retrying escapes it — the fix has to be giving retrieval a
+        # closer-matching CORRECT #1 candidate for this phrasing instead.
+        'nl':     'high risk corrective actions that are overdue',
+        'sql':    """\
+SELECT aca.corrective_action_id, aca.cause, aca.status, rl.name AS risk_level_name,
+       fac.name AS facility_name, aca.target_close_out_date
+FROM audit_corrective_action aca
+JOIN audit_report arep ON aca.audit_id = arep.id
+JOIN audit_schedule asch ON arep.schedule_id = asch.id
+LEFT JOIN risk_level rl ON aca.risk_level_id = rl.id
+LEFT JOIN facility fac ON asch.facility_id = fac.id
+WHERE aca.status = 'OVERDUE' AND rl.name ILIKE '%High%' AND aca.active = true
+  AND arep.active = true AND asch.active = true
+  AND aca.adequacy_status = 'APPROVE'
+ORDER BY aca.target_close_out_date ASC NULLS LAST
+LIMIT 100;
+""",
+        'domain': 'audit_corrective_action', 'intent': 'filter', 'limit': 100,
+    },
+    {
         'nl':     'corrective actions that are at risk behind schedule progress stage',
         'sql':    """\
 -- 'at risk' = progress_stage = 'AT_RISK' ONLY — do NOT OR in NULL/NOT_STARTED.
@@ -846,6 +954,66 @@ ORDER BY aca.created_on DESC
 LIMIT 100;
 """,
         'domain': 'audit_corrective_action', 'intent': 'filter', 'limit': 100,
+    },
+    {
+        # Added 2026-08-10 — audit previously had ZERO documented path for "high risk
+        # OBSERVATIONS/findings" independent of a corrective action (confirmed absent
+        # everywhere: every prior 'risk level' example here goes through
+        # audit_corrective_action.risk_level_id, which only exists once a CA is raised).
+        # Risk Level is a form answer, auto-derived from Impact/Compliance/etc. on the
+        # SAME submission as the Findings/Remarks text — read it from ai_audit_answers,
+        # NEVER aca.risk_level_id, which is the CA's own separate, later workflow value
+        # and would silently exclude every observation with no CA raised. See
+        # AUDIT_BUSINESS_RULES' RISK LEVEL note. Mirrors inspection's identical fix
+        # (sql/examples/seed_data.py, 'show high risk observations').
+        'nl':     'show high risk observations findings that are high risk list observations with high risk level',
+        'sql':    """\
+-- Self-join on findings.submission_id = risk.submission_id — NOT audit_report_id, which
+-- would pair this Risk Level answer with an unrelated Findings/Remarks entry from a
+-- DIFFERENT observation in the same report. Target output is the finding TEXT itself;
+-- Risk Level is only a filter, not a result column.
+SELECT findings.answer_text AS observation_text, arep.audit_id, arep.submitted_on
+FROM ai_audit_answers risk
+JOIN ai_questions risk_aq ON risk.element_id = risk_aq.element_id
+JOIN ai_audit_answers findings ON findings.submission_id = risk.submission_id
+JOIN ai_questions findings_aq ON findings.element_id = findings_aq.element_id
+JOIN audit_report arep ON risk.audit_report_id = arep.id
+WHERE risk_aq.label = 'Risk Level' AND risk.answer_text ILIKE '%High%'
+  AND findings_aq.label = 'Findings / Remarks'
+  AND arep.active = true
+ORDER BY arep.submitted_on DESC LIMIT 100;
+""",
+        'domain': 'ai_audit_answers', 'intent': 'filter', 'limit': 100,
+    },
+    {
+        # Added 2026-08-10 — confirmed live the same day as the Risk Level fix above:
+        # "risk mappings for these observations" fell back to
+        # aca.risk_level_id/impact_id/compliance_id (the CORRECTIVE ACTION's own, separate,
+        # later classification) instead of the observations' own form answers, silently
+        # excluding any observation with no CA raised. Risk Level, Impact, AND Compliance
+        # are ALL form answers in the SAME submission_id group as Findings/Remarks — see
+        # AUDIT_BUSINESS_RULES' RISK LEVEL / IMPACT / COMPLIANCE note.
+        # Conditional-aggregation pivot (GROUP BY submission_id, MAX(CASE WHEN label=...))
+        # instead of a multi-way self-join — pulling 3+ labels from one entry this way
+        # guarantees every value comes from the SAME submission_id with a single scan, no
+        # self-join-grain risk at all (preferred over self-joining ai_audit_answers to
+        # itself once for each label).
+        'nl':     'risk impact and compliance mappings for these observations classification for these findings',
+        'sql':    """\
+SELECT arep.audit_id,
+       MAX(CASE WHEN aq.label = 'Findings / Remarks' THEN aaa.answer_text END) AS observation_text,
+       MAX(CASE WHEN aq.label = 'Risk Level' THEN aaa.answer_text END) AS risk_level,
+       MAX(CASE WHEN aq.label = 'Impact' THEN aaa.answer_text END) AS impact,
+       MAX(CASE WHEN aq.label = 'Compliance' THEN aaa.answer_text END) AS compliance
+FROM ai_audit_answers aaa
+JOIN ai_questions aq ON aaa.element_id = aq.element_id
+JOIN audit_report arep ON aaa.audit_report_id = arep.id
+WHERE aq.label IN ('Findings / Remarks', 'Risk Level', 'Impact', 'Compliance')
+  AND arep.active = true
+GROUP BY aaa.submission_id, arep.audit_id
+ORDER BY arep.audit_id;
+""",
+        'domain': 'ai_audit_answers', 'intent': 'filter', 'limit': None,
     },
     {
         'nl':     'what is the cause, correction, and corrective action for this',
@@ -1289,6 +1457,37 @@ LIMIT 100;
         'domain': 'ai_audit_answers', 'intent': 'join', 'limit': 100,
     },
     {
+        # FORWARD direction (plural) — the counterpart to the two REVERSE (CA -> observation)
+        # examples above. Added 2026-08-10: this direction had NO seeded example anywhere
+        # (confirmed via full-repo search) despite the reverse direction being seeded twice —
+        # mirrors inspection's forward seed (sql/examples/seed_data.py, "show mitigative
+        # actions linked to a specific observation"), swapped ica->aca/ai_answers->
+        # ai_audit_answers, plus the mandatory aq.label filter audit needs (no single
+        # 'Observation' label exists here — see the OTHER examples in this cluster).
+        'nl':     'show corrective actions raised against a specific observation CAs for this observation corrective actions for this finding what CAs came from this observation',
+        'sql':    """-- OBSERVATION -> CA PATH (forward, plural): aaa.submission_id = aca.observation_id::varchar
+-- Cast UUID side to varchar — NOT aaa.submission_id::uuid (submission_id is varchar, observation_id is UUID)
+-- This is the DIRECT link — NOT aca.audit_id = arep.id (that returns ALL CAs in the report)
+-- aq.label = 'Findings / Remarks' anchors to the free-text finding for THIS observation
+-- (audit has no single 'Observation' label, unlike inspection — confirmed live)
+SELECT aca.corrective_action_id,
+       aca.cause,
+       aca.corrective_action,
+       aca.correction,
+       aca.responsible,
+       aca.status
+FROM audit_corrective_action aca
+JOIN ai_audit_answers aaa ON aaa.submission_id = aca.observation_id::varchar
+JOIN ai_questions aq ON aaa.element_id = aq.element_id
+WHERE aca.observation_id IS NOT NULL
+  AND aca.active = true
+  AND aq.label = 'Findings / Remarks'
+  AND aaa.answer_text ILIKE '%observation_text%'
+ORDER BY aca.corrective_action_id;
+""",
+        'domain': 'ai_audit_answers', 'intent': 'filter', 'limit': None,
+    },
+    {
         'nl':     'which observation triggered the most corrective actions observation with most CAs',
         'sql':    """-- CAST direction: aaa.submission_id = aca.observation_id::varchar
 -- submission_id is varchar, observation_id is UUID — cast UUID to varchar, NOT varchar to uuid
@@ -1311,6 +1510,9 @@ ORDER BY ca_count DESC LIMIT 10;
         'nl':     'reconstruct the form for this audit show all answers for this audit report full filled out form',
         'sql':    """-- PATH 2: whole-report reconstruction — aaa.audit_report_id = arep.id
 -- Group by submission_id: each distinct value is one repeatable entry (e.g. one observation)
+-- Tiebreak on aaa.id (real uuid PK, confirmed live 2026-08-10) — all answers of one
+-- submission are written in a single batch and commonly share the same aaa.created_on,
+-- so submission_id+created_on alone doesn't reliably order rows within one entry.
 SELECT aq.label,
        aaa.answer_text,
        aaa.answer_numeric,
@@ -1319,9 +1521,55 @@ FROM ai_audit_answers aaa
 JOIN ai_questions aq ON aaa.element_id = aq.element_id
 JOIN audit_report arep ON aaa.audit_report_id = arep.id
 WHERE arep.audit_id = '<AUDIT_DISPLAY_ID>'
-ORDER BY aaa.submission_id, aaa.created_on
+ORDER BY aaa.submission_id, aaa.created_on, aaa.id
 LIMIT 200;
 """,
         'domain': 'ai_audit_answers', 'intent': 'join', 'limit': 200,
+    },
+    {
+        'nl':     'list all audits plans schedules conducted and completed combined show every audit regardless of status all of the above',
+        'sql':    """\
+-- 'all' audits = plan UNION schedule (not yet conducted) UNION conducted UNION completed.
+-- audit_plan, audit_schedule, and audit_report are THREE SEPARATE tables. The
+-- NOT EXISTS guard on the AUDIT_SCHEDULE branch is REQUIRED: audit_schedule.
+-- schedule_status can itself reach ONGOING/COMPLETED once the underlying audit
+-- has actually happened — without the guard, an audit whose schedule already has
+-- a submitted/closed audit_report would be counted TWICE (once as AUDIT_SCHEDULE,
+-- again as CONDUCTED_AUDIT/COMPLETED_AUDIT).
+SELECT 'AUDIT_PLAN' AS entity_type, ap.id AS id, ap.title AS name,
+       ap.status AS status, ap.created_on AS ref_date
+FROM audit_plan ap
+WHERE ap.active = true AND ap.status != 'DRAFT'
+
+UNION ALL
+
+SELECT 'AUDIT_SCHEDULE' AS entity_type, asch.id AS id, asch.schedule_id AS name,
+       asch.schedule_status AS status, asch.created_on AS ref_date
+FROM audit_schedule asch
+WHERE asch.active = true
+  AND asch.schedule_status != 'DRAFT'
+  AND NOT EXISTS (
+      SELECT 1 FROM audit_report arep2
+      WHERE arep2.schedule_id = asch.id AND arep2.active = true
+  )
+
+UNION ALL
+
+SELECT 'CONDUCTED_AUDIT' AS entity_type, arep.id AS id, arep.audit_id AS name,
+       arep.status AS status, arep.submitted_on AS ref_date
+FROM audit_report arep
+WHERE arep.active = true AND arep.status = 'SUBMITTED'
+
+UNION ALL
+
+SELECT 'COMPLETED_AUDIT' AS entity_type, arep.id AS id, arep.audit_id AS name,
+       arep.status AS status, arep.submitted_on AS ref_date
+FROM audit_report arep
+WHERE arep.active = true AND arep.status IN ('CLOSED','CLOSED_WITH_EXCEPTION')
+
+ORDER BY ref_date DESC
+LIMIT 100;
+""",
+        'domain': 'audit_report', 'intent': 'listing', 'limit': 100,
     },
 ]

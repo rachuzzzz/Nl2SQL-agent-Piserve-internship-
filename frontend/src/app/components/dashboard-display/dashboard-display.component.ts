@@ -1,11 +1,12 @@
 import {
-  Component, Input, OnChanges, AfterViewInit, OnDestroy,
+  Component, Input, Output, EventEmitter, OnChanges, AfterViewInit, OnDestroy,
   SimpleChanges, ChangeDetectionStrategy, ChangeDetectorRef
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { ChartDisplayComponent } from '../chart-display/chart-display.component';
 import { ResultTableComponent } from '../result-table/result-table.component';
-import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model';
+import { DashboardCard, ChartConfig, ResultData, SelectedRow } from '../../models/chat.model';
+import { resolveSubject } from '../../utils/subject';
 
 @Component({
   selector: 'app-dashboard-display',
@@ -19,7 +20,13 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
       <div class="kpi-row">
         <div class="kpi-card"
              *ngFor="let card of cards; let i = index"
-             [class.kpi-in]="entered[i]">
+             [class.kpi-in]="entered[i]"
+             [class.kpi-card--clickable]="!!card.filter_value"
+             [class.kpi-card--critical]="card.severity === 'critical'"
+             [class.kpi-card--warning]="card.severity === 'warning'"
+             [class.kpi-card--ok]="card.severity === 'ok'"
+             [attr.title]="card.filter_value ? 'Click to see these rows' : null"
+             (click)="onCardClick(card)">
           <div class="kpi-icon" [ngClass]="'kpi-icon--' + card.icon">
             <svg *ngIf="card.icon === 'star'" viewBox="0 0 20 20" fill="currentColor">
               <path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z"/>
@@ -34,6 +41,10 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
             <!-- hash: count distinct -->
             <svg *ngIf="card.icon === 'hash'" viewBox="0 0 20 20" fill="currentColor">
               <path fill-rule="evenodd" d="M9.243 3.03a1 1 0 01.727 1.213L9.53 6h2.94l.56-2.243a1 1 0 111.94.486L14.53 6H17a1 1 0 110 2h-2.97l-.6 2.4H16a1 1 0 110 2h-3.07l-.56 2.243a1 1 0 11-1.94-.486L10.97 12H8.03l-.56 2.243a1 1 0 11-1.94-.486L6.47 12H4a1 1 0 110-2h2.97l.6-2.4H5a1 1 0 010-2h3.07l.56-2.243a1 1 0 011.213-.727zM9.03 8l-.6 2.4h2.94l.6-2.4H9.03z" clip-rule="evenodd"/>
+            </svg>
+            <!-- status: dot-in-ring, colored by severity -->
+            <svg *ngIf="card.icon === 'status'" viewBox="0 0 20 20" fill="currentColor">
+              <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.5 2.5a1 1 0 001.414-1.414L11 9.586V6z" clip-rule="evenodd"/>
             </svg>
           </div>
           <div class="kpi-body">
@@ -55,8 +66,11 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
               [class.kpi-badge--avg]="card.kind === 'avg'"
               [class.kpi-badge--sum]="card.kind === 'sum'"
               [class.kpi-badge--range]="card.kind === 'range'"
-              [class.kpi-badge--distinct]="card.kind === 'distinct'">
-              {{ card.kind === 'avg' ? 'Average' : card.kind === 'sum' ? 'Total' : card.kind === 'range' ? 'Min – Max' : 'Distinct' }}
+              [class.kpi-badge--distinct]="card.kind === 'distinct'"
+              [class.kpi-badge--critical]="card.severity === 'critical'"
+              [class.kpi-badge--warning]="card.severity === 'warning'"
+              [class.kpi-badge--ok]="card.severity === 'ok'">
+              {{ card.kind === 'avg' ? 'Average' : card.kind === 'sum' ? 'Total' : card.kind === 'range' ? 'Min – Max' : card.kind === 'status' ? (card.severity ?? 'Status') : 'Distinct' }}
             </span>
           </div>
         </div>
@@ -87,7 +101,9 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
             [mode]="'control'"
             [noOverlay]="true"
             [resizeTrigger]="chartResizeTrigger"
-            (fullscreenChange)="onChartFullscreen($event)">
+            [sourceQuestion]="sourceQuestion"
+            (fullscreenChange)="onChartFullscreen($event)"
+            (drilldown)="onChartDrilldown($event)">
           </app-chart-display>
         </div>
 
@@ -108,7 +124,10 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
           <app-result-table
             [data]="resultData"
             [sessionId]="sessionId"
-            [messageId]="messageId">
+            [messageId]="messageId"
+            [selectable]="selectable"
+            [resetSelection]="resetSelection"
+            (selectionChange)="selectionChange.emit($event)">
           </app-result-table>
         </div>
 
@@ -156,6 +175,48 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
     .kpi-card.kpi-in { opacity: 1; transform: translateY(0) scale(1); }
     .kpi-card:hover  { box-shadow: var(--shadow); }
     .kpi-card:hover::before { opacity: 1; }
+
+    /* Clickable status cards — drill into the underlying rows for that status */
+    .kpi-card--clickable { cursor: pointer; }
+    .kpi-card--clickable:hover { transform: translateY(-1px); }
+    .kpi-card--clickable:active { transform: translateY(0) scale(0.98); }
+
+    /* Severity accents — critical/warning/ok replace the default blue
+       gradient top-border with a semantic color, so a status breakdown
+       ("Overdue: 5", "Open: 3", "Closed: 12") reads at a glance instead of
+       needing the label text to carry all the meaning. */
+    .kpi-card--critical::before { background: linear-gradient(90deg, #dc2626, #ef4444); opacity: 1; }
+    .kpi-card--warning::before  { background: linear-gradient(90deg, #d97706, #f59e0b); opacity: 1; }
+    .kpi-card--ok::before       { background: linear-gradient(90deg, #059669, #10b981); opacity: 1; }
+
+    .kpi-icon--status.kpi-icon--status { background: rgba(107,114,128,0.12); color: var(--gray-500); }
+    .kpi-card--critical .kpi-icon--status {
+      background: linear-gradient(135deg, rgba(220,38,38,0.16), rgba(239,68,68,0.10));
+      color: #dc2626;
+    }
+    .kpi-card--warning .kpi-icon--status {
+      background: linear-gradient(135deg, rgba(217,119,6,0.16), rgba(245,158,11,0.10));
+      color: #d97706;
+    }
+    .kpi-card--ok .kpi-icon--status {
+      background: linear-gradient(135deg, rgba(5,150,105,0.16), rgba(16,185,129,0.10));
+      color: #059669;
+    }
+
+    .kpi-badge--critical { background: rgba(220,38,38,0.1);  color: #dc2626; border: 1px solid rgba(220,38,38,0.2); }
+    .kpi-badge--warning  { background: rgba(217,119,6,0.1);  color: #d97706; border: 1px solid rgba(217,119,6,0.2); }
+    .kpi-badge--ok       { background: rgba(5,150,105,0.1);  color: #059669; border: 1px solid rgba(5,150,105,0.2); }
+
+    /* A critical card gets a slow, subtle pulse on its icon once settled —
+       purposeful liveliness (draws the eye to what actually needs
+       attention) rather than decorative motion everywhere. */
+    .kpi-card--critical.kpi-in .kpi-icon--status {
+      animation: kpi-pulse 2.2s ease-in-out infinite;
+    }
+    @keyframes kpi-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.35); }
+      50%      { box-shadow: 0 0 0 6px rgba(220,38,38,0); }
+    }
 
     .kpi-icon {
       width: 38px; height: 38px;
@@ -277,6 +338,7 @@ import { DashboardCard, ChartConfig, ResultData } from '../../models/chat.model'
     /* Respect reduced motion */
     @media (prefers-reduced-motion: reduce) {
       .kpi-card { transition: none; opacity: 1; transform: none !important; }
+      .kpi-card--critical.kpi-in .kpi-icon--status { animation: none; }
     }
   `],
 })
@@ -286,6 +348,19 @@ export class DashboardDisplayComponent implements OnChanges, AfterViewInit, OnDe
   @Input() chartConfig!: ChartConfig;
   @Input() sessionId:    string = '';
   @Input() messageId:    string = '';
+  // Row-selection passthrough — this component wraps its own <app-result-table>
+  // (the "panel-table" below), which was missed when checkbox selection was
+  // first wired up: any query that triggers the KPI-dashboard view instead of
+  // the plain table never got these bindings, so its table had no checkboxes
+  // at all regardless of ResultData.row_selectable.
+  @Input() selectable = false;
+  @Input() resetSelection = 0;
+  @Output() selectionChange = new EventEmitter<SelectedRow[]>();
+  // Card click-to-drill — the question that produced this dashboard, used
+  // to infer the subject noun ("corrective actions", "audit schedules", ...)
+  // the same way result-table.component.ts's onRowClick/resolveSubject does.
+  @Input() sourceQuestion?: string;
+  @Output() drilldown = new EventEmitter<string>();
 
   displayValues: number[] = [];
   entered:       boolean[] = [];
@@ -294,6 +369,19 @@ export class DashboardDisplayComponent implements OnChanges, AfterViewInit, OnDe
 
   private timers: any[] = [];
   private destroyed = false;
+
+  /** Click a status KPI card ("Overdue: 5") to drill into just those rows. */
+  onCardClick(card: DashboardCard): void {
+    if (!card.filter_value) return;
+    const subject = resolveSubject(this.sourceQuestion, 'items');
+    this.drilldown.emit(`show me the ${subject} that are ${card.label.toLowerCase()}`);
+  }
+
+  /** Bubble a chart-segment click (see chart-display.component.ts) up as
+   * the same kind of drilldown request a card click produces. */
+  onChartDrilldown(text: string): void {
+    this.drilldown.emit(text);
+  }
 
   constructor(private cdr: ChangeDetectorRef) {}
 

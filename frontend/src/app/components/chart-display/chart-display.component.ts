@@ -7,6 +7,7 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
 import { ChartConfig, ChartAlt, ColumnMeta } from '../../models/chat.model';
+import { resolveSubject } from '../../utils/subject';
 import * as echarts from 'echarts';
 
 @Component({
@@ -292,7 +293,10 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
   @Input()  mode: 'quick' | 'control' = 'quick';  // 'control' shows switcher + axis panel
   @Input()  noOverlay: boolean = false;  // when true, fullscreen emits event only; parent handles layout
   @Input()  resizeTrigger: number = 0;  // increment from parent to force chart.resize()
+  @Input()  sourceQuestion?: string;    // the question that produced `cfg` — used to infer
+                                         // drilldown intent (see resolveSubject() in utils/subject.ts)
   @Output() fullscreenChange = new EventEmitter<boolean>();
+  @Output() drilldown = new EventEmitter<string>();  // emits message text to send, on segment click
   @ViewChild('chartDiv') chartDivRef!: ElementRef<HTMLDivElement>;
 
   private http   = inject(HttpClient);
@@ -578,6 +582,13 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
     }
     [0,1].forEach(i => this.chart!.dispatchAction({ type:'dataZoom', dataZoomIndex:i, start:0, end:100 }));
   }
+  /** Clicked a bar/pie/etc segment labeled `category` — drill into just
+   * that category's rows, mirroring result-table.component.ts's onRowClick. */
+  private onSegmentClick(category: string): void {
+    const subject = resolveSubject(this.sourceQuestion);
+    this.drilldown.emit(`show me the list of ${subject} where ${this.cfg?.x_label || 'category'} is ${category}`);
+  }
+
   private _applyCalendarCellSize() {
     if (!this.chart) return;
     const size = Math.max(10, Math.round(20 * this.calZoom));
@@ -669,6 +680,17 @@ export class ChartDisplayComponent implements OnInit, OnChanges, OnDestroy, Afte
         return;
       }
       this.chart.on('dataZoom', () => this.zone.run(() => this.hasZoomed = true));
+      // Click a bar/pie/etc segment to drill into just that category —
+      // params.name is the clicked category's axis/legend label for every
+      // chart type this advisor produces (bar, pie, doughnut, line, ...).
+      // Aggregate-only shapes (waterfall's synthetic Income/Cost/Profit
+      // bars, gauge, heatmap cells with composite keys) still emit
+      // something clickable here; harmless since it just becomes a
+      // slightly odd follow-up question rather than a broken interaction.
+      this.chart.on('click', (params: any) => {
+        if (!params?.name) return;
+        this.zone.run(() => this.onSegmentClick(String(params.name)));
+      });
       if (this.activeType === 'calendar_heatmap') {
         el.addEventListener('wheel', (e: WheelEvent) => {
           e.preventDefault();

@@ -1,0 +1,334 @@
+{
+  "timestamp": "20260814_115514",
+  "base_url": "http://10.77.20.13:11434",
+  "rows": [
+    {
+      "case": "cold",
+      "domain": "inspection",
+      "role": "reasoning",
+      "prompt_eval_count": 14284,
+      "prompt_eval_duration_ms": 2918.4,
+      "eval_duration_ms": 65.1,
+      "load_duration_ms": 113.1,
+      "wall_ms": 3153.3
+    },
+    {
+      "case": "warm_repeat",
+      "domain": "inspection",
+      "role": "reasoning",
+      "prompt_eval_count": 14260,
+      "prompt_eval_duration_ms": 332.5,
+      "eval_duration_ms": 66.7,
+      "load_duration_ms": 99.5,
+      "wall_ms": 532.7
+    },
+    {
+      "case": "warm_repeat",
+      "domain": "inspection",
+      "role": "reasoning",
+      "prompt_eval_count": 14260,
+      "prompt_eval_duration_ms": 342.1,
+      "eval_duration_ms": 65.6,
+      "load_duration_ms": 100.5,
+      "wall_ms": 542.9
+    },
+    {
+      "case": "warm_repeat",
+      "domain": "inspection",
+      "role": "reasoning",
+      "prompt_eval_count": 14260,
+      "prompt_eval_duration_ms": 332.0,
+      "eval_duration_ms": 65.8,
+      "load_duration_ms": 99.2,
+      "wall_ms": 534.2
+    },
+    {
+      "case": "warm_prefix_varied_tail",
+      "domain": "inspection",
+      "role": "reasoning",
+      "prompt_eval_count": 14262,
+      "prompt_eval_duration_ms": 331.8,
+      "eval_duration_ms": 66.5,
+      "load_duration_ms": 98.5,
+      "wall_ms": 529.9
+    },
+    {
+      "case": "warm_prefix_varied_tail",
+      "domain": "inspection",
+      "role": "reasoning",
+      "prompt_eval_count": 14264,
+      "prompt_eval_duration_ms": 338.4,
+      "eval_duration_ms": 66.1,
+      "load_duration_ms": 97.9,
+      "wall_ms": 537.0
+    },
+    {
+      "case": "cold",
+      "domain": "inspection",
+      "role": "sql",
+      "prompt_eval_count": 6193,
+      "prompt_eval_duration_ms": 804.4,
+      "eval_duration_ms": 45.1,
+      "load_duration_ms": 63.1,
+      "wall_ms": 941.5
+    },
+    {
+      "case": "warm_repeat",
+      "domain": "inspection",
+      "role": "sql",
+      "prompt_eval_count": 6171,
+      "prompt_eval_duration_ms": 15.0,
+      "eval_duration_ms": 45.1,
+      "load_duration_ms": 52.1,
+      "wall_ms": 140.5
+    },
+    {
+      "case": "warm_repeat",
+      "domain": "inspection",
+      "role": "sql",
+      "prompt_eval_count": 6171,
+      "prompt_eval_duration_ms": 6.4,
+      "eval_duration_ms": 44.1,
+      "load_duration_ms": 52.8,
+      "wall_ms": 130.3
+    },
+    {
+      "case": "warm_repeat",
+      "domain": "inspection",
+      "role": "sql",
+      "prompt_eval_count": 6171,
+      "prompt_eval_duration_ms": 6.4,
+      "eval_duration_ms": 44.1,
+      "load_duration_ms": 52.3,
+      "wall_ms": 130.4
+    },
+    {
+      "case": "warm_prefix_varied_tail",
+      "domain": "inspection",
+      "role": "sql",
+      "prompt_eval_count": 6173,
+      "prompt_eval_duration_ms": 12.0,
+      "eval_duration_ms": 44.9,
+      "load_duration_ms": 52.0,
+      "wall_ms": 136.2
+    },
+    {
+      "case": "warm_prefix_varied_tail",
+      "domain": "inspection",
+      "role": "sql",
+      "prompt_eval_count": 6175,
+      "prompt_eval_duration_ms": 12.1,
+      "eval_duration_ms": 45.0,
+      "load_duration_ms": 49.5,
+      "wall_ms": 133.3
+    },
+    {
+      "case": "cold",
+      "domain": "audit",
+      "role": "reasoning",
+      "prompt_eval_count": 13706,
+      "prompt_eval_duration_ms": 2797.3,
+      "eval_duration_ms": 65.0,
+      "load_duration_ms": 107.5,
+      "wall_ms": 3001.9
+    },
+    {
+      "case": "warm_repeat",
+      "domain": "audit",
+      "role": "reasoning",
+      "prompt_eval_count": 13681,
+      "prompt_eval_duration_ms": 213.1,
+      "eval_duration_ms": 65.4,
+      "load_duration_ms": 100.3,
+      "wall_ms": 413.1
+    },
+    {
+      "case": "warm_repeat",
+      "domain": "audit",
+      "role": "reasoning",
+      "prompt_eval_count": 13681,
+      "prompt_eval_duration_ms": 218.4,
+      "eval_duration_ms": 65.8,
+      "load_duration_ms": 103.1,
+      "wall_ms": 416.8
+    },
+    {
+      "case": "warm_repeat",
+      "domain": "audit",
+      "role": "reasoning",
+      "prompt_eval_count": 13681,
+      "prompt_eval_duration_ms": 208.7,
+      "eval_duration_ms": 66.6,
+      "load_duration_ms": 100.6,
+      "wall_ms": 407.0
+    },
+    {
+      "case": "warm_prefix_varied_tail",
+      "domain": "audit",
+      "role": "reasoning",
+      "prompt_eval_count": 13684,
+      "prompt_eval_duration_ms": 209.4,
+      "eval_duration_ms": 66.1,
+      "load_duration_ms": 97.0,
+      "wall_ms": 404.0
+    },
+    {
+      "case": "warm_prefix_varied_tail",
+      "domain": "audit",
+      "role": "reasoning",
+      "prompt_eval_count": 13682,
+      "prompt_eval_duration_ms": 215.4,
+      "eval_duration_ms": 65.7,
+      "load_duration_ms": 101.1,
+      "wall_ms": 410.9
+    },
+    {
+      "case": "cold",
+      "domain": "audit",
+      "role": "sql",
+      "prompt_eval_count": 5703,
+      "prompt_eval_duration_ms": 716.3,
+      "eval_duration_ms": 45.0,
+      "load_duration_ms": 56.3,
+      "wall_ms": 844.6
+    },
+    {
+      "case": "warm_repeat",
+      "domain": "audit",
+      "role": "sql",
+      "prompt_eval_count": 5680,
+      "prompt_eval_duration_ms": 31.7,
+      "eval_duration_ms": 44.8,
+      "load_duration_ms": 53.0,
+      "wall_ms": 157.0
+    },
+    {
+      "case": "warm_repeat",
+      "domain": "audit",
+      "role": "sql",
+      "prompt_eval_count": 5680,
+      "prompt_eval_duration_ms": 6.4,
+      "eval_duration_ms": 43.9,
+      "load_duration_ms": 56.9,
+      "wall_ms": 132.3
+    },
+    {
+      "case": "warm_repeat",
+      "domain": "audit",
+      "role": "sql",
+      "prompt_eval_count": 5680,
+      "prompt_eval_duration_ms": 6.4,
+      "eval_duration_ms": 43.9,
+      "load_duration_ms": 55.4,
+      "wall_ms": 133.2
+    },
+    {
+      "case": "warm_prefix_varied_tail",
+      "domain": "audit",
+      "role": "sql",
+      "prompt_eval_count": 5683,
+      "prompt_eval_duration_ms": 11.8,
+      "eval_duration_ms": 44.7,
+      "load_duration_ms": 49.9,
+      "wall_ms": 132.2
+    },
+    {
+      "case": "warm_prefix_varied_tail",
+      "domain": "audit",
+      "role": "sql",
+      "prompt_eval_count": 5681,
+      "prompt_eval_duration_ms": 11.3,
+      "eval_duration_ms": 45.2,
+      "load_duration_ms": 55.4,
+      "wall_ms": 137.9
+    },
+    {
+      "case": "cross_domain_thrash",
+      "domain": "inspection",
+      "role": "reasoning",
+      "cycle": 0,
+      "prompt_eval_count": 14260,
+      "prompt_eval_duration_ms": 2904.9,
+      "eval_duration_ms": 65.3,
+      "load_duration_ms": 99.3,
+      "wall_ms": 3103.8
+    },
+    {
+      "case": "cross_domain_thrash",
+      "domain": "audit",
+      "role": "reasoning",
+      "cycle": 0,
+      "prompt_eval_count": 13681,
+      "prompt_eval_duration_ms": 2788.8,
+      "eval_duration_ms": 65.5,
+      "load_duration_ms": 105.7,
+      "wall_ms": 2990.8
+    },
+    {
+      "case": "cross_domain_thrash",
+      "domain": "inspection",
+      "role": "reasoning",
+      "cycle": 1,
+      "prompt_eval_count": 14260,
+      "prompt_eval_duration_ms": 2913.5,
+      "eval_duration_ms": 65.3,
+      "load_duration_ms": 102.2,
+      "wall_ms": 3113.0
+    },
+    {
+      "case": "cross_domain_thrash",
+      "domain": "audit",
+      "role": "reasoning",
+      "cycle": 1,
+      "prompt_eval_count": 13681,
+      "prompt_eval_duration_ms": 2798.6,
+      "eval_duration_ms": 64.8,
+      "load_duration_ms": 101.7,
+      "wall_ms": 2995.9
+    },
+    {
+      "case": "cross_domain_thrash",
+      "domain": "inspection",
+      "role": "sql",
+      "cycle": 0,
+      "prompt_eval_count": 6171,
+      "prompt_eval_duration_ms": 789.1,
+      "eval_duration_ms": 45.1,
+      "load_duration_ms": 52.0,
+      "wall_ms": 914.8
+    },
+    {
+      "case": "cross_domain_thrash",
+      "domain": "audit",
+      "role": "sql",
+      "cycle": 0,
+      "prompt_eval_count": 5680,
+      "prompt_eval_duration_ms": 717.2,
+      "eval_duration_ms": 45.0,
+      "load_duration_ms": 68.3,
+      "wall_ms": 855.9
+    },
+    {
+      "case": "cross_domain_thrash",
+      "domain": "inspection",
+      "role": "sql",
+      "cycle": 1,
+      "prompt_eval_count": 6171,
+      "prompt_eval_duration_ms": 789.8,
+      "eval_duration_ms": 45.4,
+      "load_duration_ms": 52.7,
+      "wall_ms": 915.4
+    },
+    {
+      "case": "cross_domain_thrash",
+      "domain": "audit",
+      "role": "sql",
+      "cycle": 1,
+      "prompt_eval_count": 5680,
+      "prompt_eval_duration_ms": 717.2,
+      "eval_duration_ms": 45.1,
+      "load_duration_ms": 50.7,
+      "wall_ms": 840.1
+    }
+  ]
+}

@@ -448,6 +448,28 @@ app-dashboard-display {
 
 .msg.msg-wide { max-width: 100%; }
 
+/* Brief flash when jumping here from elsewhere (e.g. the Dashboard gallery) —
+   see ChatService.jumpToMessage() / ChatWindowComponent.ngAfterViewChecked(). */
+.msg-highlight .bubble,
+.msg-highlight app-dashboard-display,
+.msg-highlight app-result-table,
+.msg-highlight app-chart-display {
+  animation: msgHighlightFlash 1.6s ease-out;
+  border-radius: 20px;
+}
+@keyframes msgHighlightFlash {
+  0%   { box-shadow: 0 0 0 3px var(--accent-soft-border, rgba(27,67,255,0.35)); }
+  100% { box-shadow: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .msg-highlight .bubble,
+  .msg-highlight app-dashboard-display,
+  .msg-highlight app-result-table,
+  .msg-highlight app-chart-display {
+    animation: none;
+  }
+}
+
 .msg-meta { display: flex; align-items: center; gap: 6px; padding: 0 2px; }
 .msg-time  { font-size: 10.5px; color: var(--text-3); }
 .msg-pill {
@@ -456,6 +478,11 @@ app-dashboard-display {
   border-radius: 999px; font-size: 10px; font-weight: 500; font-family: var(--font-mono);
 }
 .msg-pill-warn { background: var(--red-bg); color: var(--red); border-color: color-mix(in srgb, var(--err) 30%, transparent); }
+.msg-pill-domain { background: var(--gray-100); color: var(--gray-600); border-color: var(--gray-200); }
+.msg-recap {
+  font-size: 12px; font-style: italic; color: var(--gray-500);
+  margin: 0 0 4px 2px;
+}
 
 /* Typing */
 .typing-bub {

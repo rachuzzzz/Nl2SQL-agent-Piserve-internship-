@@ -25,6 +25,25 @@ def _ilike_escape(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Content-size capping — for tool-result text appended into the reasoning
+# loop's `messages` history (see synthesis.py's _context_msg generic
+# fallback and loop.py's rows_preview construction). These sites can
+# otherwise be genuinely unbounded (a wide get_schema dump, a wide result
+# row) and are the actual bytes behind the num_ctx-overflow failure mode —
+# capping here shrinks the oversized content itself without ever dropping
+# a whole tool-call round-trip (see the proactive structural trim in
+# loop.py for that, a separate and complementary mechanism).
+# ---------------------------------------------------------------------------
+
+def _cap_text(s: str, max_chars: int = 4000) -> str:
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + f"\n…(truncated, {len(s) - max_chars} more chars omitted)"
+
+
+
+
+# ---------------------------------------------------------------------------
 # Debug logger — enable with DEBUG_LLM=1 in environment or .env
 # Writes to debug_llm_YYYYMMDD_HHMMSS.log in the working directory
 # ---------------------------------------------------------------------------

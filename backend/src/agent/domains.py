@@ -32,6 +32,16 @@ class DomainConfig:
     # RBAC scope-injection (sql/validation/scope.py's enforce_scope primary table)
     scope_primary_table: str
     scope_primary_alias: str
+    # SeedExampleIndex domain-tag overrides (retrieval/examples.py) — None
+    # keeps that class's built-in inspection-tuned keyword map, which is
+    # correct for the inspection domain but actively wrong for any other
+    # domain's index (see SeedExampleIndex.__init__'s docstring for the
+    # confirmed-live bug this avoids: inspection vocabulary overlapping
+    # with ordinary audit phrasing silently penalized valid audit seed
+    # examples). Audit passes {} / ([], '') below — neutral, no domain-tag
+    # boost/penalty — until audit has its own tuned keyword map.
+    seed_query_domain_tags: dict | None = None
+    seed_query_domain_fallback: tuple | None = None
 
 
 def _build_registry() -> dict:
@@ -86,6 +96,8 @@ def _build_registry() -> dict:
             build_core_context_additions_fn=build_core_context_additions_audit,
             scope_primary_table="audit_schedule",
             scope_primary_alias="asch",
+            seed_query_domain_tags={},
+            seed_query_domain_fallback=([], ''),
         ),
     }
 

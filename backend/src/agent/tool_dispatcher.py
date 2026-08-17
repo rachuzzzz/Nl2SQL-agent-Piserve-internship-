@@ -21,6 +21,7 @@ except ImportError:
     _HAS_JSON_REPAIR = False
 
 from src.agent.tools import ToolRegistry
+from src.agent.tool_defs import declared_names as _declared_names
 
 
 # ---------------------------------------------------------------------------
@@ -36,18 +37,51 @@ _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 # Finds the first { and everything after — used to strip leading prose
 _FIRST_BRACE_RE = re.compile(r"\{", re.DOTALL)
 
-# Known tool names — used for regex fallback extraction
-_KNOWN_TOOLS = {
-    "list_forms", "semantic_search", "search_questions",
-    "get_answers", "get_answer_stats",
-    "generate_sql", "execute_sql", "get_schema",
-    "final_answer", "redirect_domain",
-}
-_TOOL_NAMES_PATTERN = "|".join(re.escape(t) for t in sorted(_KNOWN_TOOLS, key=len, reverse=True))
-_TOOL_RE = re.compile(
-    rf'"tool"\s*:\s*"({_TOOL_NAMES_PATTERN})"',
-    re.IGNORECASE,
-)
+# Known tool names — used for regex fallback extraction. Derived from
+# ToolRegistry.KNOWN_TOOLS + agent/tool_defs' declared tools instead of a
+# third independently-maintained list, so a new declared tool is
+# automatically recoverable here without an extra edit.
+#
+# Computed LAZILY (module __getattr__ below, PEP 562) rather than at
+# import time — a declared tool's implementation can live under
+# agent/orchestrator/*, and agent/orchestrator/__init__.py eagerly imports
+# loop.py, which imports THIS module; resolving tool_defs' registry at
+# tool_dispatcher's own import time re-enters tool_defs mid-build (a real
+# cycle, confirmed live 2026-08-05 while wiring resolve_ordinal_reference).
+# Deferring until first actual use (parse_tool_call, well after all
+# top-level imports have finished) breaks the cycle.
+_known_tools_cache: set[str] | None = None
+_tool_re_cache: "re.Pattern | None" = None
+
+
+def _compute_known_tools() -> set[str]:
+    return ToolRegistry.KNOWN_TOOLS | _declared_names() | {"final_answer", "redirect_domain"}
+
+
+def _get_known_tools() -> set[str]:
+    global _known_tools_cache
+    if _known_tools_cache is None:
+        _known_tools_cache = _compute_known_tools()
+    return _known_tools_cache
+
+
+def _get_tool_re() -> "re.Pattern":
+    global _tool_re_cache
+    if _tool_re_cache is None:
+        _pattern = "|".join(re.escape(t) for t in sorted(_get_known_tools(), key=len, reverse=True))
+        _tool_re_cache = re.compile(rf'"tool"\s*:\s*"({_pattern})"', re.IGNORECASE)
+    return _tool_re_cache
+
+
+def __getattr__(name: str):
+    # PEP 562 module-level lazy attribute — lets `from src.agent.tool_dispatcher
+    # import _KNOWN_TOOLS` keep working unchanged for existing callers/tests
+    # while the underlying set is computed lazily, not at import time.
+    if name == "_KNOWN_TOOLS":
+        return _get_known_tools()
+    if name == "_TOOL_RE":
+        return _get_tool_re()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # SQL clause keywords that appear as fragment keys when Qwen emits Python-style
@@ -80,25 +114,39 @@ _SQL_FRAGMENT_PREFIXES = (
 
 def _reconstruct_fragmented_schema_hint(args: dict) -> dict:
     """
-    Detect and repair fragmented schema_hint caused by Python-style string
-    concatenation in Qwen's JSON output.
+    Detect and repair fragmented schema_hint/draft_sql caused by
+    Python-style string concatenation in Qwen's JSON output.
 
     When Qwen writes:
         "schema_hint": "SELECT x\n" + "FROM t\n" + "WHERE ..."
     the parser receives THREE separate keys instead of one full string.
 
     We detect keys that look like SQL clause continuations (starting with
-    FROM, WHERE, GROUP BY, etc.) and append them to schema_hint in order.
+    FROM, WHERE, GROUP BY, etc.) and append them to whichever of
+    draft_sql/schema_hint is present, preferring draft_sql.
 
-    Returns a cleaned args dict with the full schema_hint and fragment keys removed.
+    draft_sql is the generation-quality plan's Item 3 field for
+    planner-authored SQL (schema_hint is now reserved for freeform notes,
+    see generation.py's _build_additional_context). Confirmed by direct
+    read: this function used to bail out unconditionally whenever
+    "schema_hint" was absent (`if "schema_hint" not in args: return args`)
+    — once a planner emits draft_sql instead of cramming SQL into
+    schema_hint, that left this exact corruption class with zero repair,
+    silently. Checking draft_sql first (falling back to schema_hint for
+    any caller not yet updated to the new shape) closes that gap without
+    changing behavior for legacy callers.
+
+    Returns a cleaned args dict with the full draft_sql/schema_hint and
+    fragment keys removed.
     """
-    if "schema_hint" not in args:
+    target_key = "draft_sql" if "draft_sql" in args else ("schema_hint" if "schema_hint" in args else None)
+    if target_key is None:
         return args
 
     # Collect keys in insertion order — Python dicts preserve insertion order
     fragment_keys = [
         k for k in args
-        if k != "schema_hint"
+        if k != target_key
         and isinstance(k, str)
         and any(k.upper().startswith(prefix.upper()) for prefix in _SQL_FRAGMENT_PREFIXES)
     ]
@@ -106,8 +154,8 @@ def _reconstruct_fragmented_schema_hint(args: dict) -> dict:
     if not fragment_keys:
         return args  # no corruption detected
 
-    # Reconstruct: start with existing (partial) schema_hint, append each fragment
-    parts = [str(args["schema_hint"])]
+    # Reconstruct: start with existing (partial) draft_sql/schema_hint, append each fragment
+    parts = [str(args[target_key])]
     for key in fragment_keys:
         # The fragment value is the clause that follows this key
         # e.g. key="FROM inspection_report ir", value="WHERE ir.status != 'DRAFT'"
@@ -118,7 +166,7 @@ def _reconstruct_fragmented_schema_hint(args: dict) -> dict:
             parts.append("\n" + str(val))
 
     cleaned = dict(args)  # shallow copy preserving other args
-    cleaned["schema_hint"] = "".join(parts)
+    cleaned[target_key] = "".join(parts)
     for key in fragment_keys:
         cleaned.pop(key, None)
 
@@ -281,7 +329,7 @@ def parse_tool_call(raw_output: str) -> dict[str, Any]:
 
     # ── Step 4: regex fallback — if we can at least find the tool name, build
     #           a minimal valid dict so the orchestrator can continue ──────────
-    tool_match = _TOOL_RE.search(raw_output)
+    tool_match = _get_tool_re().search(raw_output)
     if tool_match:
         tool_name = tool_match.group(1)
 
@@ -361,7 +409,8 @@ def _validate_tool_call(parsed: Any, raw_output: str) -> dict[str, Any]:
 # dispatch
 # ---------------------------------------------------------------------------
 
-def dispatch(tool_call: dict[str, Any], registry: ToolRegistry) -> dict[str, Any]:
+def dispatch(tool_call: dict[str, Any], registry: ToolRegistry,
+             override_args: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     Route a validated tool-call dict to the ToolRegistry.
 
@@ -375,9 +424,18 @@ def dispatch(tool_call: dict[str, Any], registry: ToolRegistry) -> dict[str, Any
         (which intercepts and returns before dispatch() is called, exactly
         like final_answer), kept here for consistency/defensiveness so a
         future direct caller of dispatch() doesn't hit an unhandled tool name.
+
+    override_args: when given, used INSTEAD of tool_call["args"] for the
+    actual registry.call() — lets loop.py merge in per-call, non-JSON-safe
+    context (e.g. a live ConversationSession object for a declared tool's
+    context_provider) without mutating tool_call["args"] itself, since that
+    dict is stored verbatim on AgentStep and assumed JSON-safe/loggable
+    elsewhere. Defaults to tool_call["args"], preserving existing behavior
+    for every caller that doesn't pass it.
     """
     tool_name = tool_call.get("tool", "")
     args = tool_call.get("args", {})
+    dispatch_args = override_args if override_args is not None else args
 
     # final_answer is handled by the orchestrator, not the registry
     if tool_name == "final_answer":
@@ -395,7 +453,7 @@ def dispatch(tool_call: dict[str, Any], registry: ToolRegistry) -> dict[str, Any
         }
 
     try:
-        result = registry.call(tool_name, args)
+        result = registry.call(tool_name, dispatch_args)
     except Exception as exc:
         result = {
             "success": False,

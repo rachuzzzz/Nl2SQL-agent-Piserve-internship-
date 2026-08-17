@@ -225,7 +225,7 @@ class DomainRouter:
         _dbg(self._debug_logger, "ROUTER TIER-3 PROMPT", f"{_ROUTER_SYSTEM_PROMPT}\n\nUSER: {question}")
         try:
             response = self.reasoning_llm.chat(messages)
-            raw = response.message.content.strip()
+            raw = (response.message.content or "").strip()
         except Exception as exc:
             _log_router.warning("[ROUTER] Tier-3 LLM call failed: %s", exc)
             _dbg(self._debug_logger, "ROUTER TIER-3 EXCEPTION", str(exc))

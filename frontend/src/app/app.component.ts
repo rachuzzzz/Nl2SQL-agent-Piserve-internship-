@@ -240,7 +240,7 @@ const USERNAME_KEY = 'octaai_username';
             <app-debug-panel></app-debug-panel>
           </ng-container>
           <app-dashboard-view *ngSwitchCase="'dashboard'" (switchToChat)="activeTab='chat'"></app-dashboard-view>
-          <app-saved-view     *ngSwitchCase="'saved'"     (switchToChat)="activeTab='chat'"></app-saved-view>
+          <app-saved-view     *ngSwitchCase="'saved'"></app-saved-view>
           <app-schema-view    *ngSwitchCase="'schema'"></app-schema-view>
         </ng-container>
       </div>

@@ -568,14 +568,26 @@ def completed_required_regex(semantics: dict = SEMANTICS) -> str:
 
 def conducted_required_regex(semantics: dict = SEMANTICS) -> str:
     """Regex matching the correct 'conducted' filter form: status IN (...) for
-    2+ statuses, or status = 'X' for exactly one (e.g. AUDIT_REPORT_SEMANTICS's
-    single-status 'conducted' bucket) — a naturally-written single-status
-    filter uses '=', not 'IN (single_value)', so without this branch the
-    regex would never match real single-status SQL. Mirrors
-    completed_required_regex()'s existing len==1 branch above."""
+    2+ statuses, or status = 'X' OR status IN ('X') for exactly one (e.g.
+    AUDIT_REPORT_SEMANTICS's single-status 'conducted' bucket). Mirrors
+    completed_required_regex()'s existing len==1 branch above.
+
+    Confirmed live 2026-08-07 (debug_llm_20260807_153128): conducted_in_list()
+    (used to build the glossary's own corrective "Use: ..." message) has no
+    len==1 special case and always renders the IN-form — "status IN
+    ('SUBMITTED')" — but this function's len==1 branch used to accept ONLY
+    the '=' form. The glossary's own corrective message could never satisfy
+    its own required_pattern. Harmless while glossary hits were SOFT_WARN
+    only; would have been an unfixable retry loop the moment one was
+    escalated to HARD_FAIL. Accepting both forms here (rather than adding a
+    len==1 case to conducted_in_list(), which is also used verbatim in
+    prompt prose where the IN-form reads correctly) is the safe fix.
+    NOTE: completed_required_regex() has NO equivalent mismatch — its sibling
+    completed_filter() already has a matching len==1 '=' branch — do not
+    "fix" it too."""
     sts = conducted_statuses(semantics)
     if len(sts) == 1:
-        return rf"status\s*=\s*'{sts[0]}'"
+        return rf"status\s*(?:=\s*'{sts[0]}'|IN\s*\(\s*'{sts[0]}'\s*\))"
     in_list = "|".join(f"'{s}'" for s in sts)
     return rf"status\s*IN\s*\([^)]*(?:{in_list})[^)]*\)"
 

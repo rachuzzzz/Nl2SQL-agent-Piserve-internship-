@@ -5,7 +5,8 @@ import {
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ChatService } from '../../services/chat.service';
-import { ResultData } from '../../models/chat.model';
+import { ResultData, SelectedRow } from '../../models/chat.model';
+import { resolveSubject } from '../../utils/subject';
 
 @Component({
   selector: 'app-result-table',
@@ -20,19 +21,30 @@ import { ResultData } from '../../models/chat.model';
         <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zm.75 4.75a.75.75 0 00-1.5 0v3.5H5.5a.75.75 0 000 1.5h3.25V5.75z"/></svg>
         {{ display.disambiguation ? 'Click a row to select' : 'Click a row to drill down' }}
       </div>
+      <div class="drilldown-hint" *ngIf="showCheckboxes">
+        <svg viewBox="0 0 16 16" fill="currentColor"><path d="M13.485 1.929a1 1 0 00-1.414 0L6.15 7.85 3.929 5.629a1 1 0 10-1.414 1.414l3 3a1 1 0 001.414 0l6.556-6.556a1 1 0 000-1.414z"/></svg>
+        Check rows to ask a follow-up about just those
+      </div>
 
       <div class="table-scroll">
         <table>
           <thead>
             <tr>
+              <th *ngIf="showCheckboxes" class="col-check"></th>
               <th *ngFor="let col of display.columns">{{ formatHeader(col) }}</th>
             </tr>
           </thead>
           <tbody>
-            <tr *ngFor="let row of display.rows; let even = even"
+            <tr *ngFor="let row of display.rows; let i = index; let even = even"
                 [class.row-even]="even"
                 [class.row-drilldown]="isDrilldown"
+                [class.row-selected]="showCheckboxes && selectedPositions.has(i + 1)"
                 (click)="isDrilldown ? onRowClick(row) : null">
+              <td *ngIf="showCheckboxes" class="col-check" (click)="$event.stopPropagation()">
+                <input type="checkbox"
+                  [checked]="selectedPositions.has(i + 1)"
+                  (change)="onRowCheck(row, i, $event)">
+              </td>
               <td *ngFor="let col of display.columns" [title]="formatCell(row[col])">{{ formatCell(row[col]) }}</td>
             </tr>
           </tbody>
@@ -132,6 +144,11 @@ import { ResultData } from '../../models/chat.model';
     .row-even { background: var(--surface-2); }
     tbody tr:hover { background: var(--surface-2); }
 
+    /* Row selection */
+    .col-check { width: 34px; padding: 8px 10px 8px 14px; }
+    .col-check input[type="checkbox"] { cursor: pointer; width: 14px; height: 14px; }
+    .row-selected { background: var(--blue-50) !important; }
+
     /* Drilldown rows */
     .row-drilldown { cursor: pointer; transition: all 0.12s; }
     .row-drilldown:hover {
@@ -195,13 +212,20 @@ export class ResultTableComponent implements OnChanges {
   @Input()  messageId!:      string;
   @Input()  sourceQuestion?: string;  // the question that produced `data` — used to infer
                                        // drilldown intent (see resolveSubject())
+  @Input()  selectable = false;       // server said this turn's rows are resolvable
+                                       // (ResultData.row_selectable) AND the caller has
+                                       // restricted this to the latest AI message.
+  @Input()  resetSelection = 0;       // bump to clear checkboxes from outside (e.g. the
+                                       // chip bar's "clear" action) — watched via ngOnChanges.
   @Output() drilldown = new EventEmitter<string>();  // emits message text to send
+  @Output() selectionChange = new EventEmitter<SelectedRow[]>();
 
   display!:    ResultData;
   currentPage = 0;
   pageSize    = 50;
   loading     = false;
   error: string | null = null;
+  selectedPositions = new Set<number>();
 
   constructor(private svc: ChatService, private cdr: ChangeDetectorRef) {}
 
@@ -212,6 +236,40 @@ export class ResultTableComponent implements OnChanges {
       this.pageSize    = this.data.page_size ?? 50;
       this.error       = null;
     }
+    if (changes['resetSelection'] && !changes['resetSelection'].firstChange) {
+      this.selectedPositions.clear();
+    }
+  }
+
+  // Checkboxes only make sense on an ungrouped, unpaginated, non-drilldown
+  // table — selection resolves server-side against ConversationTurn.row_titles
+  // (page 1 only, see ResultData.row_selectable's docstring), so hide them
+  // once the user has paged or changed page size within THIS table.
+  get showCheckboxes(): boolean {
+    return this.selectable && !this.isDrilldown && this.currentPage === 0;
+  }
+
+  onRowCheck(row: Record<string, any>, rowIndex: number, event: Event): void {
+    const position = this.currentPage * this.pageSize + rowIndex + 1;
+    const checked = (event.target as HTMLInputElement).checked;
+    if (checked) {
+      this.selectedPositions.add(position);
+    } else {
+      this.selectedPositions.delete(position);
+    }
+    this.emitSelection();
+  }
+
+  private emitSelection(): void {
+    const labelCol = this.display?.columns?.[0];
+    const selected: SelectedRow[] = Array.from(this.selectedPositions)
+      .sort((a, b) => a - b)
+      .map(position => {
+        const row = this.display.rows[position - 1 - this.currentPage * this.pageSize];
+        const label = labelCol ? this.formatCell(row?.[labelCol]) : `row ${position}`;
+        return { position, label };
+      });
+    this.selectionChange.emit(selected);
   }
 
   /**
@@ -266,31 +324,6 @@ export class ResultTableComponent implements OnChanges {
     return typeof second === 'number' || !isNaN(Number(second));
   }
 
-  // Subject phrases to look for in the question that produced this table,
-  // ordered by specificity. The FIRST one found in `sourceQuestion` wins.
-  // Falls back to 'inspections' when nothing matches (the original behaviour) —
-  // most drilldown tables (by inspector, by facility, ...) really are inspection
-  // counts, but "corrective actions at X" / "schedules for X" etc. must not be
-  // silently rewritten to an inspections query on click.
-  private static readonly SUBJECT_PATTERNS: Array<[RegExp, string]> = [
-    [/corrective\s*actions?/i,          'corrective actions'],
-    [/mitigative\s*actions?/i,          'mitigative actions'],
-    [/inspection\s*cycles?|\bcycles?\b/i, 'inspection cycles'],
-    [/inspection\s*schedules?|\bschedules?\b/i, 'inspection schedules'],
-    [/form\s*answers?|question\s*answers?/i, 'form answers'],
-    [/findings?/i,                      'findings'],
-    [/observations?/i,                  'observations'],
-  ];
-
-  /** Infer what the user actually asked about from `sourceQuestion`. */
-  private resolveSubject(): string {
-    const q = this.sourceQuestion ?? '';
-    for (const [re, label] of ResultTableComponent.SUBJECT_PATTERNS) {
-      if (re.test(q)) return label;
-    }
-    return 'inspections';
-  }
-
   /**
    * When a drilldown row is clicked, emit a message requesting the DETAIL LIST
    * for that entity — not a recount. Preferred path: the backend already told
@@ -324,7 +357,7 @@ export class ResultTableComponent implements OnChanges {
 
     // Fallback — build a generic detail request based on the column name
     // so Llama understands to return rows, not an aggregate
-    const subject = this.resolveSubject();
+    const subject = resolveSubject(this.sourceQuestion);
     const colName  = labelCol.toLowerCase();
     if (colName.includes('inspector') || colName.includes('name')) {
       this.drilldown.emit(`show me the list of ${subject} by ${value}`);
@@ -389,6 +422,11 @@ export class ResultTableComponent implements OnChanges {
     if (page < 0 || page >= this.totalPages || this.loading) return;
     this.loading = true;
     this.error   = null;
+    // /api/page bypasses the session entirely (see ResultData.row_selectable's
+    // docstring) — no row_titles backing exists to resolve a selection made
+    // on a different page against, so clear it rather than carry it forward.
+    this.selectedPositions.clear();
+    this.emitSelection();
     this.svc.fetchPage(this.sessionId, page, this.pageSize).subscribe({
       next: res => {
         this.display     = { ...res };
@@ -408,6 +446,8 @@ export class ResultTableComponent implements OnChanges {
   changePageSize(): void {
     this.loading = true;
     this.error   = null;
+    this.selectedPositions.clear();
+    this.emitSelection();
     this.svc.fetchPage(this.sessionId, 0, this.pageSize).subscribe({
       next: res => {
         this.display     = { ...res };

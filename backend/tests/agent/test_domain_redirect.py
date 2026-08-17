@@ -75,6 +75,13 @@ def test_redirect_domain_produces_clarification_tagged_turn():
     # on the NEXT ambiguous follow-up doesn't stick right back to the domain
     # that just admitted uncertainty.
     assert session.turns[-1].domain == ""
+    # clarification_origin_question must stay unset even though this
+    # answer itself contains a "?" — loop.py:707-714 documents this as
+    # deliberate: that field drives session.py's PENDING CLARIFICATION
+    # hint, whose premise is "the next message answers THIS SAME
+    # orchestrator's own question" — wrong premise for a domain redirect,
+    # which may hand off to a DIFFERENT domain's orchestrator next turn.
+    assert session.turns[-1].clarification_origin_question == ""
 
 
 def test_redirect_domain_answer_is_not_mangled_by_final_answer_repair():

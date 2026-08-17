@@ -388,6 +388,116 @@ BLOCK_RULES: list[dict] = [
     },
 
     {
+        "id":          "block_ma_id_for_observation_wrong_path",
+        "type":        BLOCK,
+        "code":        "MA_ID_OBSERVATION_WRONG_PATH",
+        "description": (
+            "Sibling of block_ma_for_observation_wrong_path — that one guards the fresh "
+            "ILIKE-text-search direction; this one guards the ALREADY-RESOLVED-id "
+            "direction (ica.id = <uuid>, e.g. from resolve_selected_rows/resolve_ordinal_"
+            "reference). When fetching the observation/form-answers for one SPECIFIC "
+            "mitigative action, must use observation_id -> submission_id path, not the "
+            "whole-inspection join. Audit's mirror confirmed this exact failure mode live "
+            "2026-08-10: a uuid-guard retry re-inserting a dropped id filter silently "
+            "swapped the join to the whole-report path instead, returning unrelated form "
+            "answers for a single-MA question with no error raised — this guard catches "
+            "that shape before it reaches inspection too."
+        ),
+        # Fires when: ai_answers present + a specific resolved MA id filter (= or IN)
+        # + the wrong path (anywhere via ica.inspection_id) but observation_id path absent.
+        "sql_pattern": (
+            r"(?=.*\bai_answers\b)"                           # ai_answers present
+            r"(?=.*\bica\.id\s*(?:=|in\s*\())"                # a specific resolved MA id filter
+            r"(?=.*\bica\.inspection_id\b)"                   # wrong path: anywhere via ica.inspection_id
+            r"(?!.*\bica\.observation_id\b)"                  # correct path absent
+        ),
+        "message": (
+            "WRONG PATH: this question already resolved a SPECIFIC mitigative action "
+            "(ica.id = <uuid>) and joins ai_answers — that means it's asking about THAT "
+            "MA's linked observation, not the whole inspection's form. Join via "
+            "aa.submission_id = ica.observation_id::varchar (cast the UUID side to "
+            "varchar) — NOT via ica.inspection_id (directly to aa.inspection_report_id, "
+            "or via an intermediate inspection_report join), which returns every answer "
+            "in the whole inspection regardless of which observation raised this MA."
+        ),
+        "hard_fail": True,
+    },
+
+    {
+        "id":          "block_ai_answers_self_join_wrong_grain",
+        "type":        BLOCK,
+        "code":        "AI_ANSWERS_SELF_JOIN_WRONG_GRAIN",
+        "description": (
+            "Combining two different question labels from the SAME repeatable form entry "
+            "(e.g. a Risk Level answer paired with its sibling Observation text) requires "
+            "self-joining ai_answers to itself matched on submission_id — the value that "
+            "identifies 'these answers belong to the same entry'. Confirmed live 2026-08-10: "
+            "two existing seed examples ('show high risk observations', 'which month had "
+            "the most high risk observations') both self-joined via inspection_report_id "
+            "instead — matching ANY answer from the SAME REPORT, not the same entry, so on "
+            "a report with multiple observations a High-risk Risk Level answer from entry #1 "
+            "could pair with unrelated Observation text from entry #2. This mistake shape "
+            "had never been modeled correctly anywhere in this codebase before this fix — "
+            "no prior guard existed for it."
+        ),
+        # Fires when: ai_answers appears in both FROM and a separate JOIN (two aliases,
+        # i.e. a self-join) but no submission_id = submission_id equality exists anywhere.
+        "sql_pattern": (
+            r"(?=.*\bfrom\s+ai_answers\b)"
+            r"(?=.*\bjoin\s+ai_answers\b)"
+            r"(?!.*\.submission_id\s*=\s*\w+\.submission_id\b)"
+        ),
+        "message": (
+            "WRONG GRAIN: this query self-joins ai_answers to itself but not on "
+            "submission_id — that pairs answers from ANY entry in the same report, not "
+            "necessarily the SAME repeatable entry. If combining two question labels "
+            "(e.g. Risk Level + Observation) from one entry, add "
+            "<alias2>.submission_id = <alias1>.submission_id to the join condition. If "
+            "you only need to filter/count by one label (not pull a second label's text "
+            "too), you don't need a self-join at all — a single ai_answers scan with "
+            "COUNT(DISTINCT submission_id) or a CASE expression is simpler and correct."
+        ),
+        "hard_fail": True,
+    },
+
+    {
+        "id":          "block_ai_answers_constant_join_wrong_path",
+        "type":        BLOCK,
+        "code":        "AI_ANSWERS_CONSTANT_JOIN_WRONG_PATH",
+        "description": (
+            "Audit's mirror confirmed this live 2026-08-10 (qid=328ca155) — a different "
+            "failure mode of the same uuid-guard-retry class as "
+            "block_ma_id_for_observation_wrong_path: when the retry needed to reinsert a "
+            "dropped aa.submission_id filter, it hardcoded the uuid as a bare constant on "
+            "the JOIN's ON clause (JOIN ai_answers aa ON aa.submission_id = '<uuid>') "
+            "instead of using it as ica.observation_id::varchar — eliminating the actual "
+            "join predicate between inspection_corrective_action and ai_answers entirely "
+            "(an unintentional cross join). Added here pre-emptively so inspection "
+            "doesn't have to hit the same incident separately."
+        ),
+        # Fires when: inspection_corrective_action present + ai_answers joined via a
+        # bare UUID-literal constant (not a column reference) + ica.observation_id absent.
+        "sql_pattern": (
+            r"(?=.*\binspection_corrective_action\b)"
+            r"(?=.*\bjoin\s+ai_answers(?:\s+as)?\s+(\w+)\s+on\s+\1\.submission_id\s*"
+            r"=\s*'[0-9a-fA-F-]{36}')"
+            r"(?!.*\bica\.observation_id\b)"
+        ),
+        "message": (
+            "WRONG PATH: ai_answers is joined via a bare UUID CONSTANT "
+            "(<alias>.submission_id = '<uuid>') instead of a real join predicate — this "
+            "eliminates the link to inspection_corrective_action entirely, producing an "
+            "unintentional cross join (every mitigative action in the table, not just "
+            "the ones tied to the resolved observation). Use the constant as the value "
+            "ica.observation_id must equal instead: JOIN ai_answers aa ON "
+            "aa.submission_id = ica.observation_id::varchar WHERE ica.observation_id = "
+            "'<uuid>' (or wherever the resolved id belongs) — never as the ai_answers "
+            "side's own join condition."
+        ),
+        "hard_fail": True,
+    },
+
+    {
         "id":          "block_degenerate_label_groupby",
         "type":        BLOCK,
         "code":        "DEGENERATE_LABEL_GROUPBY",

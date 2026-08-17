@@ -7,8 +7,61 @@ from __future__ import annotations
 
 from src.charts.advisor.classify import (
     _classify, _coerce, _PCT_RE, _SCORE_RE, _INCOME_RE, _COST_RE, _PROFIT_RE, _CAPEX_RE,
+    _WORKFLOW_RE, _status_severity,
 )
 from src.charts.advisor.common import _lbl
+
+
+_SEVERITY_RANK = {"critical": 0, "warning": 1, "ok": 2, None: 3}
+
+
+def _status_breakdown_cards(columns: list, rows: list, t: dict) -> list:
+    """
+    One card PER STATUS VALUE (e.g. "Overdue: 5", "Open: 3", "Closed: 12"),
+    most-urgent-first, instead of the generic "Total X" sum card — for the
+    common "corrective actions overdue vs open vs closed" / "schedules by
+    status" shape, where a single grand-total sum flattens away exactly the
+    information (which status is the concerning one) the question was
+    actually asking for.
+
+    Only fires when the categorical axis is a workflow/status-NAMED column
+    (_WORKFLOW_RE) with a small (2-6) number of distinct values that line up
+    with a GROUP BY-style result — i.e. this genuinely looks like a status
+    breakdown, not an incidental status column on a long detail listing.
+    Returns [] (falls through to the existing generic card logic) otherwise.
+    """
+    status_col = next((c for c in t["category"] if _WORKFLOW_RE.search(c)), None)
+    if not status_col or not t["numeric"]:
+        return []
+
+    value_col = t["numeric"][0]
+    per_status: dict[str, float] = {}
+    for r in rows:
+        raw = r.get(status_col)
+        if raw is None:
+            continue
+        v = _coerce(r.get(value_col))
+        if v is None:
+            continue
+        key = str(raw)
+        per_status[key] = per_status.get(key, 0) + v
+
+    if not (2 <= len(per_status) <= 6):
+        return []
+
+    cards = [
+        {
+            "label":        _lbl(label),
+            "value":        int(value) if value == int(value) else round(value, 2),
+            "kind":         "status",
+            "icon":         "status",
+            "severity":     _status_severity(label),
+            "filter_value": label,
+        }
+        for label, value in per_status.items()
+    ]
+    cards.sort(key=lambda c: _SEVERITY_RANK.get(c["severity"], 3))
+    return cards
 
 
 
@@ -37,6 +90,11 @@ def build_kpi_cards(columns: list, rows: list, max_cards: int = 4) -> list:
     Returns at most max_cards cards, prioritised: financial > score/pct > count.
     """
     t = _classify(columns, rows)
+
+    status_cards = _status_breakdown_cards(columns, rows, t)
+    if status_cards:
+        return status_cards[:max_cards]
+
     cards = []
     range_added = False  # only one range card
 

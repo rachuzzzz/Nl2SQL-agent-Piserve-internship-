@@ -4,7 +4,9 @@ fixes — parse_tool_call()/_validate_tool_call() shouldn't lose part of a
 model's answer to json_repair's truncated-JSON heuristics.
 """
 
-from src.agent.tool_dispatcher import _validate_tool_call
+from src.agent.tool_dispatcher import _validate_tool_call, _KNOWN_TOOLS
+from src.agent.tools import ToolRegistry
+from src.agent.tool_defs import declared_names
 
 
 def test_fragmented_final_answer_is_reassembled():
@@ -67,3 +69,17 @@ def test_non_final_answer_tool_keeps_multiple_args():
     result = _validate_tool_call(parsed, raw_output="<raw>")
 
     assert result["args"] == {"question": "list plans", "schema_hint": "SELECT ..."}
+
+
+def test_known_tools_stays_in_sync_with_registry_and_declared_tools():
+    """Regression guard for the "5 places to touch" drift risk the
+    agent/tool_defs framework exists to prevent: _KNOWN_TOOLS (used for
+    parse_tool_call's regex-fallback recovery) must always be derivable
+    from ToolRegistry.KNOWN_TOOLS + agent/tool_defs' declared tools —
+    never a fourth, silently-diverging hand-maintained list."""
+    expected = ToolRegistry.KNOWN_TOOLS | declared_names() | {"final_answer", "redirect_domain"}
+    assert _KNOWN_TOOLS == expected
+    # Concretely confirms declared tools (not just the original 8) are
+    # actually reachable via this set, not merely that the set equation
+    # happens to hold.
+    assert "resolve_ordinal_reference" in _KNOWN_TOOLS

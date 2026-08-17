@@ -19,6 +19,7 @@ from src.security.auth import require_auth
 from src.sql.result_shape import is_disambiguation_result, is_entity_disambiguation_result, extract_search_term
 from src.security.rbac import DATA_VISIBILITY_PERMS, build_scope_filter
 from src.agent.orchestrator.models import ConversationTurn
+from src.api.intent_recap import start_intent_recap, resolve_intent_recap
 from src.api.deps import (
     get_orch, get_orch_inspection, get_orch_audit, get_router,
     get_or_create_session, _sessions,
@@ -143,6 +144,7 @@ async def chat(
                 return ChatResponse(
                     answer="Here's the chart.",
                     sql=None, reasoning=None,
+                    domain=sess_data["session"].last_domain or None,
                     prompt_tokens=0, completion_tokens=0, total_tokens=0,
                     time_ms=1, llm_calls=0, sql_errors=0, steps=[],
                     session_id=req.session_id,
@@ -171,6 +173,7 @@ async def chat(
                 return ChatResponse(
                     answer="Here's the chart.",
                     sql=None, reasoning=None,
+                    domain=sess_data["session"].last_domain or None,
                     prompt_tokens=0, completion_tokens=0, total_tokens=0,
                     time_ms=1, llm_calls=0, sql_errors=0, steps=[],
                     session_id=req.session_id,
@@ -228,6 +231,7 @@ async def chat(
             return ChatResponse(
                 answer=route.clarifying_question,
                 sql=None, reasoning=None,
+                domain=None,  # ambiguous — no orchestrator ran, nothing accurate to label
                 prompt_tokens=0, completion_tokens=0, total_tokens=0,
                 time_ms=0, llm_calls=0, sql_errors=0, steps=[],
                 session_id=req.session_id,
@@ -236,13 +240,67 @@ async def chat(
         orch = orch_audit if route.domain == "AUDIT" else orch_inspection
         _effective_message = _prev.question if _is_pending_domain_pick else req.message
 
+        # A message that's STILL just a bare domain word after the carryover
+        # swap above means there was no real question to resume (the prior
+        # turn was a bare greeting, or this is a session's very first
+        # message) — sending "audit" to the reasoning model as if it were a
+        # real question left the outcome to model judgment, and confirmed
+        # live that judgment isn't consistent: the SAME bare "audit" input
+        # produced two different real outcomes across two sessions — once a
+        # fast clarifying question (~5s, 1 LLM call), once an unrequested
+        # default "recent audit reports" query (~16.5s, 3 LLM calls, a
+        # validation retry). Short-circuit deterministically instead: just
+        # acknowledge the domain and ask what they'd like to know, with no
+        # LLM call at all — cheap, fast, and never wrong.
+        if _BARE_DOMAIN_PICK_RE.match(_effective_message.strip()):
+            _domain_label = "audits" if orch.domain == "audit" else "facility inspections"
+            _ack = f"Got it — {_domain_label}. What would you like to know?"
+            _sess_obj.add_turn(ConversationTurn(
+                question=req.message, answer=_ack,
+                tool_used="domain_ack", domain=orch.domain,
+            ))
+            return ChatResponse(
+                answer=_ack,
+                sql=None, reasoning=None,
+                domain=orch.domain,
+                intent_recap=None,
+                prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                time_ms=0, llm_calls=0, sql_errors=0, steps=[],
+                session_id=req.session_id,
+                result_data=None,
+            )
+
+        # Fresh every request — set BEFORE orch.query() so build_context_block()
+        # (called inside the reasoning loop) can prime the LLM to call
+        # resolve_selected_rows. Defaults to [] when the client selected
+        # nothing this turn; never explicitly cleared elsewhere since this
+        # always overwrites whatever the previous request left behind.
+        sess_data["session"].pending_selected_positions = req.selected_positions or []
+
+        # Fired now, resolved after orch.query() returns (below) — runs
+        # concurrently with the SQL-gen/execution loop so its latency
+        # overlaps instead of adding on top. See api/intent_recap.py.
+        _recap_future = start_intent_recap(
+            orch.reasoning_llm, _effective_message, sess_data["session"],
+        )
+
+        # Only trust the router's decision as authoritative for THIS message
+        # when it resolved via Tier 1 (an unambiguous domain keyword actually
+        # present in the classified text) AND that's the same text being sent
+        # to the orchestrator — the domain-pick carryover path above swaps in
+        # the ORIGIN question, whose wording the router never actually saw
+        # (that's precisely why it needed clarification in the first place).
+        _router_locked_domain = route.tier == 1 and not _is_pending_domain_pick
+
         t0 = time.time()
         result = await asyncio.to_thread(
             orch.query, _effective_message, session=sess_data["session"],
             visibility_scope=visibility_scope, query_id=qid,
+            router_locked_domain=_router_locked_domain,
         )
         elapsed_ms = int((time.time() - t0) * 1000)
         sess_data["message_count"] += 1
+        intent_recap = resolve_intent_recap(_recap_future, _effective_message, sess_data["session"])
 
         sql       = None
         reasoning = None
@@ -541,6 +599,7 @@ async def chat(
         _result_cols, _result_rows = strip_uuid_columns(_result_cols, _result_rows)
         display_answer = redact_security_internals(display_answer)
         reasoning = redact_security_internals(reasoning)
+        intent_recap = redact_security_internals(intent_recap)
 
         log_query.info(
             "[QUERY] END   qid=%s sub=%s elapsed=%dms llm_calls=%d "
@@ -554,10 +613,20 @@ async def chat(
             result.success,
         )
 
+        # Ground-truth flag, not a frontend heuristic — true only when this
+        # turn's rows actually made it into row_titles (see synthesis.py's
+        # turn-finish capture), which is exactly what resolve_selected_rows
+        # needs to resolve a checkbox selection against. get_answer_stats
+        # tables (never captured) correctly come back False.
+        _last_turn = sess_data["session"].last_turn
+        _row_selectable = bool(_last_turn and _last_turn.row_titles)
+
         return ChatResponse(
             answer=display_answer,
             sql=sql,
             reasoning=reasoning,
+            domain=orch.domain,
+            intent_recap=intent_recap,
             prompt_tokens=result.stats.total_prompt_tokens,
             completion_tokens=result.stats.total_completion_tokens,
             total_tokens=result.stats.total_prompt_tokens + result.stats.total_completion_tokens,
@@ -576,6 +645,7 @@ async def chat(
                 has_more=_has_more,
                 sql=sql,
                 disambiguation=_disambiguation_meta,
+                row_selectable=_row_selectable,
             ) if _result_rows else None,
             chart_config=_chart_config,
             dashboard=_dashboard,
@@ -653,6 +723,11 @@ async def get_page(req: PageRequest, token_data: dict = Depends(require_auth), o
             "page_size":      req.page_size,
             "has_more":       has_more,
             "disambiguation": _page_disambiguation,
+            # Always False here — this path re-executes the cached SQL
+            # directly against the DB and never touches session.turns, so
+            # there's no row_titles/row_ids capture to resolve a checkbox
+            # selection against (see ResultData.row_selectable's docstring).
+            "row_selectable": False,
         }
 
     except HTTPException:

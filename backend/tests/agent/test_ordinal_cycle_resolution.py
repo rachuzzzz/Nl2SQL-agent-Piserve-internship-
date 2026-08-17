@@ -26,6 +26,7 @@ deterministically, with zero LLM guessing required.
 
 from src.agent.orchestrator.session import ConversationSession
 from src.agent.orchestrator.models import ConversationTurn
+from src.agent.orchestrator.ordinal import resolve_ordinal_reference
 
 # Mirrors the real 6-cycle listing shape from the live-caught failure.
 _CYCLE_TITLES = [
@@ -63,18 +64,19 @@ def _session_after_cycle_listing() -> ConversationSession:
 
 
 def test_fourth_one_resolves_to_the_specific_cycle_uuid():
+    # Original question ("show all auditors who submitted portfolios for
+    # the 4th one in the list") names no entity noun — a bare ordinal, same
+    # as the LLM would send with entity_type_hint omitted.
     session = _session_after_cycle_listing()
-    ctx = session.build_context_block(
-        current_question="show all auditors who submitted portfolios for the 4th one in the list",
-        current_domain="audit",
-    )
-    assert "ORDINAL RESOLVED" in ctx
-    assert f"id '{_CYCLE_4_ID}'" in ctx
-    assert "WHERE <alias>.id" in ctx
-    # None of the other 5 cycle UUIDs should appear
+    r = resolve_ordinal_reference(session, "audit", position=4, entity_type_hint=None)
+    result = r["result"]
+    assert result["resolved"] is True
+    assert result["target_id"] == _CYCLE_4_ID
+    assert result["target_column"] == "id"
+    # None of the other 5 cycle UUIDs should be the resolved target.
     for other_id in _ROW_IDS:
         if other_id != _CYCLE_4_ID:
-            assert other_id not in ctx
+            assert result["target_id"] != other_id
 
 
 def test_does_not_fall_back_to_offset_based_guidance():

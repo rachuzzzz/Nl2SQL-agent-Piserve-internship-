@@ -23,6 +23,7 @@ item beyond position 10 must still resolve correctly.
 
 from src.agent.orchestrator.session import ConversationSession
 from src.agent.orchestrator.models import ConversationTurn
+from src.agent.orchestrator.ordinal import resolve_ordinal_reference
 
 # 20 items — matches synthesis.py's actual capture cap (last_rows[:20],
 # tied to max_display_rows), not an arbitrary large number.
@@ -65,15 +66,14 @@ def test_render_previews_only_ten_with_a_more_marker():
 
 
 def test_ordinal_beyond_the_render_cap_still_resolves():
-    """The render preview stops at 10, but "the 15th one" must still resolve
-    — the ordinal mechanism reads the full stored list, not the preview."""
+    """The render preview stops at 10, but position=15 must still resolve
+    — resolve_ordinal_reference reads the full stored list on the
+    ConversationTurn directly, never the render preview."""
     session = _session_with_20_row_listing()
-    ctx = session.build_context_block(
-        current_question="show observations for the 15th one",
-        current_domain="audit",
-    )
-    assert "ORDINAL RESOLVED" in ctx
-    assert f"id '{_IDS[14]}'" in ctx
+    r = resolve_ordinal_reference(session, "audit", position=15, entity_type_hint=None)
+    result = r["result"]
+    assert result["resolved"] is True
+    assert result["target_id"] == _IDS[14]
 
 
 def test_long_free_text_title_is_truncated_in_the_render():

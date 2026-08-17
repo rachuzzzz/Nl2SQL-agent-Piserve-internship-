@@ -24,6 +24,7 @@ was purely the missing noun registration in disambiguation.py.
 
 from src.agent.orchestrator.session import ConversationSession
 from src.agent.orchestrator.models import ConversationTurn
+from src.agent.orchestrator.ordinal import resolve_ordinal_reference
 
 _CYCLE_TITLES = [
     "2026-06-03 to 2026-06-04 (COMPLETED)",
@@ -85,26 +86,22 @@ def _session_with_cycle_then_inspection_listing() -> ConversationSession:
 
 def test_third_cycle_resolves_against_the_cycles_list_not_the_intervening_inspections_list():
     session = _session_with_cycle_then_inspection_listing()
-    ctx = session.build_context_block(
-        current_question="what is the status of the 3rd cycle",
-        current_domain="inspection",
-    )
-    assert "ORDINAL RESOLVED" in ctx
-    assert f"id '{_CYCLE_3_ID}'" in ctx
-    # None of the inspection row ids should appear — confirms it did NOT
-    # fall back to the untyped "most recent list" (the inspections listing).
+    r = resolve_ordinal_reference(session, "inspection", position=3, entity_type_hint="cycle")
+    result = r["result"]
+    assert result["resolved"] is True
+    assert result["target_id"] == _CYCLE_3_ID
+    # Must NOT have fallen back to the untyped "most recent list" (the
+    # inspections listing) — none of the inspection row ids should match.
     for other_id in _INSPECTION_ROW_IDS:
-        assert other_id not in ctx
+        assert result["target_id"] != other_id
 
 
 def test_bare_ordinal_with_no_noun_still_falls_back_to_most_recent_list_unchanged():
     """Regression guard: this fix must not touch the untyped bare-ordinal
-    path other tests already cover — "the 3rd one" (no noun) should still
+    path other tests already cover — "the 3rd one" (no hint) should still
     resolve against the most recently listed turn regardless of type."""
     session = _session_with_cycle_then_inspection_listing()
-    ctx = session.build_context_block(
-        current_question="show details for the 3rd one",
-        current_domain="inspection",
-    )
-    assert "ORDINAL RESOLVED" in ctx
-    assert f"id '{_INSPECTION_ROW_IDS[2]}'" in ctx
+    r = resolve_ordinal_reference(session, "inspection", position=3, entity_type_hint=None)
+    result = r["result"]
+    assert result["resolved"] is True
+    assert result["target_id"] == _INSPECTION_ROW_IDS[2]

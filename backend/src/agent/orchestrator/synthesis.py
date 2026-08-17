@@ -18,8 +18,10 @@ from src.sql.result_shape import is_disambiguation_result
 from src.api.response_formatting import strip_row_identity_columns
 
 from src.agent.orchestrator.models import AgentStep, QueryStats, ConversationTurn, AgentResult
-from src.agent.orchestrator.debug import _ilike_escape, _has_uuid_leak, _dbg, _detect_truncation
+from src.agent.orchestrator.debug import _ilike_escape, _has_uuid_leak, _dbg, _detect_truncation, _cap_text
 from src.llm.base import extract_token_counts
+from src.agent.tool_defs import get_declared
+from src.agent.orchestrator.disambiguation_reply import _find_exact_candidate
 
 
 # Maps each ACTIVE CONTEXT scope type to the SQL keyword(s) that indicate
@@ -249,18 +251,21 @@ class SynthesisMixin:
         _ROW_NAME_COL_TYPES = {
             "facility_name": "facility", "auditor_name": "person", "inspector_name": "person",
         }
-        # Capped at 20, matching max_display_rows' default — the same number
-        # of rows the deterministic answer formatter (_synthesize_body) actually
-        # shows the user. Was capped at 5 until 2026-07-31: live-confirmed
-        # "list all audits" displayed 17 rows to the user, but "show
-        # observations for the 10th one" had nothing to resolve against since
-        # row_titles/row_ids only ever captured the first 5 — combined with
-        # session.py's old 1st-5th-only ordinal word list, "the 10th one" had
-        # no chance of resolving either way. Rows beyond what's actually
-        # displayed have no visible position for an ordinal to refer to, so
-        # this cap should always track max_display_rows, not exceed it.
+        # Capped at 100, matching the LIMIT 100 the LLM's own SQL-gen prompt
+        # standardizes on (agent/tools.py) — NOT max_display_rows (still 20,
+        # the separate cap on the deterministic TEXT answer's bullet list).
+        # Was capped at 5 until 2026-07-31: live-confirmed "list all audits"
+        # displayed 17 rows to the user, but "show observations for the 10th
+        # one" had nothing to resolve against since row_titles/row_ids only
+        # ever captured the first 5. Then capped at 20 (tied to
+        # max_display_rows) until row-selection checkboxes needed every row
+        # actually rendered in the result TABLE (up to 100) to be resolvable,
+        # not just the ones echoed in the text answer — the 10-row preview
+        # truncation in build_context_block() (session.py) is what actually
+        # guards prompt-size bloat, so raising this capture cap alone doesn't
+        # reintroduce that.
         if len(last_rows) > 1:
-            for row in last_rows[:20]:
+            for row in last_rows[:100]:
                 if not isinstance(row, dict):
                     continue
                 _matched = False
@@ -293,8 +298,28 @@ class SynthesisMixin:
                 # title-suffix match below, or the parent's title wins by
                 # accident whenever it isn't literally named "title" (see
                 # test_row_ids_paired_with_row_titles_multi_row_list).
-                for col in ("audit_id", "schedule_id", "inspection_id",
-                            "corrective_action_id"):
+                #
+                # Iterates the ROW'S OWN key order (== the SQL SELECT list
+                # order — dict(zip(columns, row)) in sql/execution.py and
+                # agent/tools.py preserves it), NOT a fixed tuple order.
+                # Confirmed live 2026-08-06: "list all corrective actions"
+                # selected aca.corrective_action_id FIRST but also included
+                # arep.audit_id (joined in purely for facility/auditor
+                # context) — a fixed ("audit_id", "schedule_id", ...,
+                # "corrective_action_id") scan order always picked audit_id
+                # over corrective_action_id whenever both were present,
+                # regardless of which one the query (and the user's
+                # question) was actually about. That silently coarsened a
+                # 3-row checkbox selection of specific corrective actions
+                # into 3 whole audit_report ids, and a follow-up filtering
+                # on those ids pulled in 13 corrective actions instead of
+                # the 3 actually selected. The column the LLM chose to
+                # SELECT first is the reliable signal of the row's true
+                # subject; an arbitrary fixed sub-priority among these four
+                # columns has no such signal behind it.
+                for col in row:
+                    if col not in _ROW_ID_COL_TYPES:
+                        continue
                     v = row.get(col)
                     if v and str(v).strip():
                         row_titles.append(str(v))
@@ -469,18 +494,55 @@ class SynthesisMixin:
             _prev_turn = session.turns[-1]
             # This turn ran no new SQL that names a single entity (e.g. it's
             # just "Adnoc Schools- Ghayathi" answering "which one did you
-            # mean?"). If it's an exact pick from the PREVIOUS turn's entity
-            # disambiguation list, resolve the scope directly instead of
-            # falling through to "no active subject". Facility keeps the
-            # dedicated "facility" type (tested wording); project/client/
-            # organisation use the generic "entity" type, carrying their
-            # table/alias so build_context_block can build a correct filter.
-            if _prev_turn.entity_disambiguation_candidates:
-                _ed_q = re.sub(r"[?.!,;:]+$", "", question.strip()).strip().lower()
-                _ed_matches = [
-                    c for c in _prev_turn.entity_disambiguation_candidates
-                    if c.get("name", "").strip().lower() == _ed_q
-                ]
+            # mean?"). Two ways to resolve that pick into a scope:
+            #
+            # PRIMARY: this turn's own steps already carry a resolved
+            # resolve_disambiguation_reply call (agent/orchestrator/
+            # disambiguation_reply.py) — that's strictly better ground truth
+            # than re-deriving a match from `question` text a second time,
+            # since it works for BOTH people and entity kinds (people-picks
+            # never got this inheritance treatment before this existed —
+            # only entities did) and doesn't depend on the follow-up
+            # sentence's exact shape. "person" maps to the existing
+            # "inspector" active_subject_type — the closest pre-existing
+            # vocabulary entry for "a specific resolved user id" (the ACTIVE
+            # CONTEXT rendering for it only ever builds a plain `u.id = ...`
+            # filter, so it isn't literally inspector-specific).
+            _disambig_step = next(
+                (s for s in steps if s.tool == "resolve_disambiguation_reply"
+                 and s.result.get("success")
+                 and s.result.get("result", {}).get("resolved")),
+                None,
+            )
+            if _disambig_step:
+                _dr = _disambig_step.result["result"]
+                if _dr["kind"] == "person":
+                    active_subject_type = "inspector"
+                elif _dr["target_table"] == "facility":
+                    active_subject_type = "facility"
+                else:
+                    active_subject_type = "entity"
+                    active_subject_table = _dr["target_table"]
+                    active_subject_alias = _dr["target_alias"]
+                active_subject_value = _dr["display_name"]
+                active_subject_label = _dr["display_name"]
+                active_subject_id = _dr["target_id"]
+                active_subject_domain = self.domain
+            # FALLBACK: the tool wasn't invoked this turn (e.g. a
+            # max-iteration forced-finish bypassed normal tool dispatch) —
+            # re-derive from text, but through the SAME exact-match rule the
+            # tool itself uses (disambiguation_reply._find_exact_candidate),
+            # not an independent, silently-diverging implementation as
+            # before (this used to be whole-question EXACT match here vs.
+            # SUBSTRING containment in session.py's now-retired prompt-
+            # injection block — a real, confirmed divergence: a full-
+            # sentence drilldown reply resolved fine for SQL-generation
+            # purposes but never got recorded here for continuity).
+            elif _prev_turn.entity_disambiguation_candidates:
+                _ed_q = re.sub(r"[?.!,;:]+$", "", question.strip()).strip()
+                _ed_matches = _find_exact_candidate(
+                    _prev_turn.entity_disambiguation_candidates, "name", _ed_q
+                )
                 if len(_ed_matches) == 1:
                     if _prev_turn.entity_disambiguation_table == "facility":
                         active_subject_type = "facility"
@@ -697,28 +759,21 @@ class SynthesisMixin:
 
 
     def _synthesize(self, question, tool_name, tool_result, max_display_rows=20, sql="", session=None):
-        """Thin wrapper around _synthesize_body(): prepends
-        session.pending_resolved_disclosure (set by
-        ConversationSession.build_context_block() when this turn's question
-        resolved an ordinal/back-reference — see session.py) to whatever
-        _synthesize_body() returns.
+        """Thin wrapper around _synthesize_body(). `session` is kept for
+        call-site compatibility (every caller already threads it through).
 
-        This has to live here, wrapping the return value, rather than as a
-        prompt instruction to the LLM, because most answers below are built
-        by plain Python string formatting ("Found N result(s): ...", "The
-        query returned no results.") — never composed by the LLM at all.
-        Confirmed live 2026-07-31: telling the LLM via the system prompt to
-        "state what you resolved" had zero effect on these answers, even
-        though the LLM's OWN internal thought correctly named the resolved
-        row — that reasoning never reaches this deterministic formatter, so
-        it can't appear in what the user sees unless injected here instead.
+        Used to also prepend session.pending_resolved_disclosure (set by
+        ConversationSession.build_context_block() when this turn's question
+        resolved an ordinal/back-reference — see session.py) directly into
+        the answer text. That's now surfaced instead as chat.py's
+        `intent_recap` response field (see api/intent_recap.py's
+        resolve_intent_recap, which reads pending_resolved_disclosure with
+        priority over the generic paraphrase) — a dedicated field with its
+        own visual treatment, rather than inline text a disambiguation/
+        ordinal-resolution turn would otherwise show twice.
         """
-        answer = self._synthesize_body(question, tool_name, tool_result,
-                                        max_display_rows=max_display_rows, sql=sql)
-        disclosure = getattr(session, "pending_resolved_disclosure", "") if session else ""
-        if disclosure:
-            return f"{disclosure}\n\n{answer}"
-        return answer
+        return self._synthesize_body(question, tool_name, tool_result,
+                                      max_display_rows=max_display_rows, sql=sql)
 
     def _synthesize_body(self, question, tool_name, tool_result, max_display_rows=20, sql=""):
         data = tool_result.get("result", {})
@@ -1064,7 +1119,7 @@ class SynthesisMixin:
             f"Answer the question using ONLY the data provided. "
             f"Do not estimate or invent. If data is empty, say so.\n"
             f"{extra}\n\nQuestion: {question}\n\n"
-            f"Data ({tool_name}):\n{json.dumps(data, default=str, indent=2)}\n\n"
+            f"Data ({tool_name}):\n{json.dumps(data, default=str, separators=(',', ':'))}\n\n"
             f"Give a concise, accurate answer. No JSON."
         )
         try:
@@ -1078,6 +1133,14 @@ class SynthesisMixin:
     # ------------------------------------------------------------------ #
 
     def _context_msg(self, tool_name, tool_result, question=""):
+        # Tools declared via agent/tool_defs carry their own result
+        # formatting (ToolDef.format_result) instead of a bespoke branch
+        # here — checked first so a declared tool never falls through to
+        # the generic json.dumps fallback at the bottom of this method.
+        _declared = get_declared(tool_name)
+        if _declared is not None and _declared.format_result is not None:
+            return _declared.format_result(tool_result, question)
+
         if not tool_result.get("success"):
             error = tool_result.get("error", "unknown")
 
@@ -1107,9 +1170,15 @@ class SynthesisMixin:
                 return f"generate_sql failed: {error}{hint}"
 
             if tool_name == "get_answers":
+                # Points at generate_sql (with draft_sql), not execute_sql —
+                # this is the only place in the system that ever instructed
+                # the direct execute_sql path (confirmed by direct read,
+                # 2026-08-07 generation-quality plan Item 4a). generate_sql
+                # runs this same SQL through the validator, AST repairs, and
+                # identity injection instead of executing it unguarded.
                 return (
                     f"get_answers failed: {error}\n"
-                    f"FALLBACK: Use execute_sql with:\n"
+                    f"FALLBACK: call generate_sql with draft_sql:\n"
                     f"SELECT aq.label, aa.answer_text, aa.answer_numeric, aa.inspection_id\n"
                     f"FROM ai_answers aa LEFT JOIN ai_questions aq ON aa.element_id = aq.element_id\n"
                     f"WHERE aa.module_name ILIKE '%MODULE%' LIMIT 50;"
@@ -1157,7 +1226,10 @@ class SynthesisMixin:
                 )
             return "search_questions found no matches. Try a broader keyword or use semantic_search."
 
-        return json.dumps(tool_result, default=str)
+        # Capped — an uncapped tool (e.g. get_schema's column dump) landing
+        # here repeatedly across iterations was a real contributor to the
+        # num_ctx-overflow failure mode (see loop.py's proactive trim).
+        return _cap_text(json.dumps(tool_result, default=str))
 
 
     def _schema_hint_for_error(self, error_msg):
@@ -1197,6 +1269,7 @@ class SynthesisMixin:
             _prompt_tok, _completion_tok = extract_token_counts(raw)
             stats.total_prompt_tokens += _prompt_tok
             stats.total_completion_tokens += _completion_tok
+            self._prefix_cache.record(raw)
 
         _log_llm.debug("[LLM ] iter=%d latency=%dms prompt_tok=%d completion_tok=%d out_len=%d",
                        iteration, latency_ms, _prompt_tok, _completion_tok, len(content))

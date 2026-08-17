@@ -306,6 +306,77 @@ INJECT_RULES: list[dict] = [
     },
 
     {
+        "id":             "inject_capex_opex_full_breakdown",
+        "type":           INJECT,
+        "priority":       91,
+        # Confirmed live 2026-08-07 (qid=e63f03af): inject_financial_routing's prose hint
+        # plus a near-identical worked example were both already in the prompt, but
+        # qwen2.5-coder still reverted to a direct po_details/pr_details LEFT JOIN in a
+        # GROUP BY on all 3 attempts, tripping block_po_pr_double_direct_join every time
+        # and exhausting the retry budget with no answer. A literal "USE THIS EXACT SQL"
+        # template — the same pattern already proven for inject_top_capex_converters —
+        # is the fix, not more prose.
+        "description":    "CAPEX+OPEX 'generated AND converted' breakdown (not a top-N ranking) — inject exact per-MA CTE SQL, bypass embedding.",
+        "required_tables": ["po_details", "pr_details"],
+        "forbidden_patterns": [
+            r"LEFT\s+JOIN\s+po_details.{0,300}LEFT\s+JOIN\s+pr_details.{0,600}GROUP\s+BY",
+        ],
+        # Deliberately requires BOTH "generat*" and "convert*" near capex/opex — the bare
+        # single-concept case (just "capex generated" or "top capex converters") already has
+        # its own worked example / higher-priority rule; this rule targets specifically the
+        # combined "generated vs converted" shape that was confirmed to break.
+        "question_pattern": (
+            r"\bcapex\b.{0,60}\bgenerat\w*\b.{0,80}\bconvert\w*\b"
+            r"|\bcapex\b.{0,60}\bconvert\w*\b.{0,80}\bgenerat\w*\b"
+            r"|\bopex\b.{0,60}\bgenerat\w*\b.{0,80}\bconvert\w*\b"
+            r"|\bopex\b.{0,60}\bconvert\w*\b.{0,80}\bgenerat\w*\b"
+        ),
+        "hint": (
+            "\nUSE THIS EXACT SQL FOR A CAPEX/OPEX 'GENERATED vs CONVERTED' BREAKDOWN "
+            "(do not deviate — this is NOT a top-N ranking question):\n"
+            "capex_generated = SUM(ica.capex); opex_generated = SUM(ica.opex) — ica-level estimates.\n"
+            "capex_converted = SUM(po.po_amount) via po_details; opex_converted = SUM(pr.pr_amount) via pr_details.\n"
+            "WITH po_agg AS (\n"
+            "    SELECT mitigative_action_uuid AS ica_id, SUM(po_amount) AS total_po\n"
+            "    FROM po_details WHERE active = true GROUP BY 1\n"
+            "),\n"
+            "pr_agg AS (\n"
+            "    SELECT mitigative_action_uuid AS ica_id, SUM(pr_amount) AS total_pr\n"
+            "    FROM pr_details WHERE active = true GROUP BY 1\n"
+            ")\n"
+            "SELECT\n"
+            "    ica.corrective_action_id,\n"
+            "    ica.cause,\n"
+            "    ica.corrective_action,\n"
+            "    ica.status,\n"
+            "    fac.name                            AS facility_name,\n"
+            "    COALESCE(ica.capex, 0)              AS capex_generated,\n"
+            "    COALESCE(po.total_po, 0)            AS capex_converted,\n"
+            "    COALESCE(ica.opex, 0)               AS opex_generated,\n"
+            "    COALESCE(pr.total_pr, 0)            AS opex_converted\n"
+            "FROM inspection_corrective_action ica\n"
+            "JOIN inspection_report ir ON ica.inspection_id = ir.id\n"
+            "JOIN facility fac ON ir.facility_id = fac.id\n"
+            "LEFT JOIN po_agg po ON po.ica_id = ica.id\n"
+            "LEFT JOIN pr_agg pr ON pr.ica_id = ica.id\n"
+            "WHERE ir.active = true AND ica.active = true AND fac.active = true\n"
+            "ORDER BY ica.corrective_action_id;\n"
+            "NEVER LEFT JOIN po_details and pr_details directly into a GROUP BY/SUM query — "
+            "pre-aggregate each in its own CTE first (as above), or a MA with >1 PO/PR row "
+            "fans out and corrupts every SUM().\n"
+            "NEVER invent a 'project'/'proj' table or ica.project_id — it does not exist in "
+            "this schema; only facility is joined (via inspection_report).\n"
+            "If the user asks only for a single grand total (no per-MA rows), use this instead:\n"
+            "SELECT COALESCE(SUM(ica.capex),0) AS capex_generated, COALESCE(SUM(po.total_po),0) AS capex_converted,\n"
+            "       COALESCE(SUM(ica.opex),0) AS opex_generated, COALESCE(SUM(pr.total_pr),0) AS opex_converted\n"
+            "FROM inspection_corrective_action ica\n"
+            "LEFT JOIN po_agg po ON po.ica_id = ica.id\n"
+            "LEFT JOIN pr_agg pr ON pr.ica_id = ica.id\n"
+            "WHERE ica.active = true;\n"
+        ),
+    },
+
+    {
         "id":             "inject_financial_routing",
         "required_tables": [],
         "forbidden_patterns": [r"SUM\\(ica\\.opex\\)", r"capex_status\\s*=\\s*'ACCEPTED'"],
