@@ -151,6 +151,18 @@ def build_worked_examples(
             continue
     if not matched:
         return ""
+    # Evidence for a future retrieval-aware "bucketed" prefix cache
+    # (PrefixCache MVP's Option B — not built yet): which EXAMPLES_TIER2
+    # titles fired for this question, so offline log analysis can measure
+    # how often different questions match the same block set before anyone
+    # builds caching logic around it. Logs the pre-budget match set (not
+    # _select_within_budget's post-cap survivors) — good enough signal for
+    # "which topics this question touched" without threading titles through
+    # _select_within_budget's return contract.
+    _log_prompts.debug(
+        "[PROMPTS] worked-example titles matched: %r -> %s",
+        question[:120], [title for title, _ in matched],
+    )
     kept = _select_within_budget(matched, question, score_fn, budget_chars)
     return (
         "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -237,6 +249,12 @@ def build_conditional_blocks(
             continue
     if not matched:
         return ""
+    # See build_worked_examples' matching comment above — same Option-B
+    # evidence-gathering rationale, applied to CONDITIONAL_BLOCKS instead.
+    _log_prompts.debug(
+        "[PROMPTS] conditional-block titles matched: %r -> %s",
+        question[:120], [title for title, _ in matched],
+    )
     kept = _select_within_budget(matched, question, score_fn, budget_chars)
     return (
         "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"

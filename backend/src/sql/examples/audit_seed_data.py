@@ -748,6 +748,43 @@ LIMIT 100;
         'domain': 'audit_corrective_action', 'intent': 'filter', 'limit': 100,
     },
     {
+        # Added to fix a live recurring failure, not a hypothetical one:
+        # "show all high risk corrective actions that are overdue" retrieved
+        # the 'list open overdue corrective actions with risk level and
+        # facility' example above as its #1 nearest neighbor — that example's
+        # own NL text mentions "risk level", so it out-competes the
+        # single-status 'list all corrective actions that are overdue'
+        # example (which never mentions risk level) on cosine similarity for
+        # any question that also says "high risk". The SQL-gen model then
+        # copied that #1 example's status IN ('OPEN', 'OVERDUE') filter
+        # almost verbatim — even dropping the rl.name filter its own
+        # schema_hint had already supplied — tripping the
+        # AUDIT_OVERDUE_INCLUDES_OPEN guard identically on all 3 retries and
+        # refusing every time (confirmed live 2026-08-14, two separate
+        # sessions, qid=b0a083b4 and qid=50c6d3f3). retrieve()'s skip_top_n
+        # retry-diversification can't recover from this: rank #1 is NEVER
+        # dropped on retry by design (see that method's INVARIANT docstring),
+        # so once a genuinely-wrong example lands at #1, no amount of
+        # retrying escapes it — the fix has to be giving retrieval a
+        # closer-matching CORRECT #1 candidate for this phrasing instead.
+        'nl':     'high risk corrective actions that are overdue',
+        'sql':    """\
+SELECT aca.corrective_action_id, aca.cause, aca.status, rl.name AS risk_level_name,
+       fac.name AS facility_name, aca.target_close_out_date
+FROM audit_corrective_action aca
+JOIN audit_report arep ON aca.audit_id = arep.id
+JOIN audit_schedule asch ON arep.schedule_id = asch.id
+LEFT JOIN risk_level rl ON aca.risk_level_id = rl.id
+LEFT JOIN facility fac ON asch.facility_id = fac.id
+WHERE aca.status = 'OVERDUE' AND rl.name ILIKE '%High%' AND aca.active = true
+  AND arep.active = true AND asch.active = true
+  AND aca.adequacy_status = 'APPROVE'
+ORDER BY aca.target_close_out_date ASC NULLS LAST
+LIMIT 100;
+""",
+        'domain': 'audit_corrective_action', 'intent': 'filter', 'limit': 100,
+    },
+    {
         'nl':     'corrective actions that are at risk behind schedule progress stage',
         'sql':    """\
 -- 'at risk' = progress_stage = 'AT_RISK' ONLY — do NOT OR in NULL/NOT_STARTED.

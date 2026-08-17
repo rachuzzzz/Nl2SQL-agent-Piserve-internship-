@@ -37,6 +37,12 @@ class Settings:
     ollama_chat_model: str
     embedding_model: str
 
+    # How long Ollama keeps a model (and its cached KV slots) resident after
+    # the last request — see llm/ollama.py's build_ollama_client keep_alive
+    # docstring. Server default is 5m, too short to survive normal gaps
+    # between user questions without losing prefix-cache benefit.
+    ollama_keep_alive: str
+
     # Anthropic (Claude) — optional alternative LLM provider, see llm/anthropic.py
     anthropic_api_key: str
     anthropic_model: str
@@ -90,6 +96,7 @@ def get_settings() -> Settings:
         ollama_url=g("OLLAMA_URL", "http://localhost:11434"),
         ollama_sql_model=g("OLLAMA_SQL_MODEL", "sqlcoder:7b"),
         ollama_chat_model=g("OLLAMA_CHAT_MODEL", "qwen2.5:14b-instruct-q4_K_M"),
+        ollama_keep_alive=g("OLLAMA_KEEP_ALIVE", "30m"),
         embedding_model=g("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
         anthropic_api_key=g("ANTHROPIC_API_KEY", "").strip(),
         # Same model for both the reasoning and sql roles (llm/factory.py's

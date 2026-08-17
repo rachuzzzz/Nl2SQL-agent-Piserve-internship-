@@ -2,8 +2,11 @@
 SeedExampleIndex — retrieval-reranking index for NL->SQL seed examples.
 """
 
+import logging
 import numpy as np
 from typing import Optional
+
+_log = logging.getLogger("inspectai.sql")
 
 
 class SeedExampleIndex:
@@ -365,6 +368,20 @@ class SeedExampleIndex:
             # old deduped[skip_top_n:] slice for ranks 2+, just never
             # sacrifices the top-ranked example to do it.
             deduped = [deduped[0]] + deduped[1 + skip_top_n:]
+
+        # Evidence for a future retrieval-aware "bucketed" prefix cache
+        # (PrefixCache MVP's Option B — not built yet): logs which example
+        # set this question retrieved, so offline log analysis can measure
+        # how often different questions land on the same retrieved set
+        # before anyone builds caching logic around it. _example_key is the
+        # same stable per-example id already used to report PRIMARY example
+        # attribution (see that classmethod's docstring) — reused, not
+        # reinvented, so both features attribute to the same identity.
+        if deduped:
+            _log.debug(
+                "[RETRIEVAL] question=%r example_keys=%s",
+                query, sorted(self._example_key(ex) for ex in deduped),
+            )
         return deduped
 
     @classmethod

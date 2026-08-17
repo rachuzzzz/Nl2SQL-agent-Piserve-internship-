@@ -1,5 +1,5 @@
 ### Task
-Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
+Generate a SQL query answering the question given at the end of this prompt.
 
 ### Instructions
 - Generate a PostgreSQL SELECT query ONLY. No INSERT/UPDATE/DELETE/DROP.

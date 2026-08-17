@@ -1,71 +1,13 @@
-import { Component, Output, EventEmitter } from '@angular/core';
+import { Component, EventEmitter, OnDestroy, Output } from '@angular/core';
 import { CommonModule } from '@angular/common';
+import { Subscription } from 'rxjs';
+import { ChatService } from '../../services/chat.service';
+import { Conversation, Message } from '../../models/chat.model';
 
-interface Kpi { label: string; value: string; delta: string; up: boolean; iconPath: string; }
-interface RecentItem { title: string; tag: string; }
-interface BarRect { x: number; y: number; bw: number; bh: number; }
-interface ScorePt { cx: number; cy: number; label: string; }
-
-const W = 340, H = 140;
-
-function computeLinePts(data: number[]): ScorePt[] {
-  const min = Math.min(...data), max = Math.max(...data);
-  const range = max - min || 1;
-  const step = W / (data.length - 1);
-  const pad = H * 0.12;
-  return data.map((v, i) => ({
-    cx: +(i * step).toFixed(1),
-    cy: +(pad + (1 - (v - min) / range) * (H - 2 * pad)).toFixed(1),
-    label: v.toFixed(1),
-  }));
+interface DashboardEntry {
+  conversation: Conversation;
+  message:      Message;
 }
-
-function ptsToPolyline(pts: ScorePt[]): string {
-  return pts.map(p => `${p.cx},${p.cy}`).join(' ');
-}
-
-function ptsToArea(pts: ScorePt[]): string {
-  const line = pts.map(p => `${p.cx},${p.cy}`).join(' L');
-  const last = pts[pts.length - 1];
-  return `M${line} L${last.cx},${H} L0,${H} Z`;
-}
-
-function computeBars(data: number[]): BarRect[] {
-  const max = Math.max(...data) || 1;
-  const count = data.length;
-  const gap = W / count;
-  const bw = gap * 0.56;
-  const pad = H * 0.06;
-  return data.map((v, i) => {
-    const bh = (v / max) * (H - pad);
-    return { x: +(i * gap + (gap - bw) / 2).toFixed(1), y: +(H - bh).toFixed(1), bw: +bw.toFixed(1), bh: +bh.toFixed(1) };
-  });
-}
-
-const SCORE_DATA   = [91.64, 81.75, 87.31, 81.35, 85.55];
-const SCORE_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May'];
-const CAPA_DATA    = [38, 29, 22, 18, 14, 12, 9];
-const CAPA_LABELS  = ['Houston', 'Rotterdam', 'Singapore', 'Antwerp', 'Jubail', 'Tex.City', 'Pernis'];
-
-const ICON_ROWS     = 'M3 12h18M3 6h18M3 18h18';
-const ICON_WARN     = 'M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4M12 17h.01';
-const ICON_PERMIT   = 'M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8';
-const ICON_INCIDENT = 'M13 2L3 14h9l-1 8 10-12h-9l1-8z';
-
-const KPIS: Kpi[] = [
-  { label: 'INSPECTIONS THIS MONTH', value: '1,284', delta: '+8.2%', up: true,  iconPath: ICON_ROWS },
-  { label: 'OPEN MITIGATIVE ACTIONS', value: '168',   delta: '−12',   up: true,  iconPath: ICON_WARN },
-  { label: 'PERMITS EXPIRING ≤30d',   value: '23',    delta: '+5',    up: false, iconPath: ICON_PERMIT },
-  { label: 'LOST-TIME INCIDENTS YTD', value: '2',     delta: '0',     up: true,  iconPath: ICON_INCIDENT },
-];
-
-const RECENT: RecentItem[] = [
-  { title: 'What is the average inspection score across months?', tag: 'Inspections' },
-  { title: 'Show open mitigative actions by site',                tag: 'MA' },
-  { title: 'How many permits expire in the next 30 days?',        tag: 'Permits' },
-  { title: 'Trend of safety incidents by severity this year',     tag: 'Safety' },
-  { title: 'Top 5 inspectors by audits completed',               tag: 'Audits' },
-];
 
 @Component({
   selector: 'app-dashboard-view',
@@ -75,127 +17,48 @@ const RECENT: RecentItem[] = [
     <div class="d-scroll">
       <div class="d-inner">
 
-        <!-- Page head -->
         <div class="page-head">
           <div>
-            <h1 class="page-title">Operations overview</h1>
-            <p class="page-sub">Live EHS posture across all sites · updated 2 min ago</p>
+            <h1 class="page-title">Dashboards</h1>
+            <p class="page-sub">Rich answers from this session &middot; click one to jump back to it in chat</p>
           </div>
-          <button class="pill-btn" (click)="switchToChat.emit()">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"
-                 stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/>
-              <path d="M19 3v4M21 5h-4"/>
-            </svg>
-            Ask OctaAI
-          </button>
         </div>
 
-        <!-- KPI grid -->
-        <div class="kpi-grid">
-          <div *ngFor="let k of kpis" class="kpi-card">
-            <div class="kpi-top">
-              <span class="kpi-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                     width="17" height="17" stroke-linecap="round" stroke-linejoin="round">
-                  <path [attr.d]="k.iconPath"/>
-                </svg>
+        <div class="gallery-grid" *ngIf="entries.length">
+          <button class="g-card" *ngFor="let e of entries" (click)="open(e)">
+            <div class="g-card-top">
+              <span class="msg-pill msg-pill-domain" *ngIf="e.message.domain">
+                {{ e.message.domain === 'audit' ? '📋 Audit' : '🏢 Inspection' }}
               </span>
-              <span class="kpi-label">{{ k.label }}</span>
+              <span class="g-time">{{ e.message.timestamp | date:'MMM d, h:mm a' }}</span>
             </div>
-            <div class="kpi-value">{{ k.value }}</div>
-            <div class="kpi-delta">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-                   width="12" height="12" stroke-linecap="round" stroke-linejoin="round"
-                   [style.color]="k.up ? 'var(--ok)' : 'var(--err)'">
-                <polyline *ngIf="k.up"  points="18 15 12 9 6 15"/>
-                <polyline *ngIf="!k.up" points="6 9 12 15 18 9"/>
-              </svg>
-              <span [style.color]="k.up ? 'var(--ok)' : 'var(--err)'" style="font-weight:700">{{ k.delta }}</span>
-              <span class="kpi-cmp">vs last month</span>
+            <h3 class="g-question">{{ e.message.sourceQuestion || e.conversation.title }}</h3>
+            <div class="g-cards" *ngIf="e.message.dashboard?.cards?.length">
+              <div class="g-mini" *ngFor="let c of e.message.dashboard!.cards.slice(0, 3)"
+                   [class.g-mini--critical]="c.severity === 'critical'"
+                   [class.g-mini--warning]="c.severity === 'warning'"
+                   [class.g-mini--ok]="c.severity === 'ok'">
+                <span class="g-mini-label">{{ c.label }}</span>
+                <span class="g-mini-value">
+                  {{ c.value | number:'1.0-2' }}{{ c.value2 != null ? ' – ' + (c.value2 | number:'1.0-2') : '' }}
+                </span>
+              </div>
             </div>
-          </div>
-        </div>
-
-        <!-- Chart cards -->
-        <div class="chart-grid">
-          <!-- Line: inspection score trend -->
-          <div class="chart-card">
-            <div class="chart-card-head">
-              <h3 class="chart-title">Inspection score trend</h3>
-              <button class="open-btn" (click)="switchToChat.emit()">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"
-                     stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                Open
-              </button>
-            </div>
-            <svg [attr.viewBox]="'0 0 ' + W + ' ' + (H + 28)" class="chart-svg">
-              <!-- Area fill -->
-              <path [attr.d]="scoreAreaPath" fill="rgba(27,67,255,0.08)" stroke="none"/>
-              <!-- Line -->
-              <polyline [attr.points]="scorePolyline"
-                        fill="none" stroke="var(--accent)" stroke-width="2.2"
-                        stroke-linecap="round" stroke-linejoin="round"/>
-              <!-- Dots -->
-              <circle *ngFor="let p of scorePts"
-                      [attr.cx]="p.cx" [attr.cy]="p.cy" r="3.5"
-                      fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>
-              <!-- X labels -->
-              <text *ngFor="let p of scorePts; let i = index"
-                    [attr.x]="p.cx" [attr.y]="H + 22" text-anchor="middle"
-                    fill="var(--text-3)" font-size="10" font-family="var(--font-mono)">
-                {{ scoreLabels[i] }}
-              </text>
-            </svg>
-          </div>
-
-          <!-- Bar: open mitigative actions by site -->
-          <div class="chart-card">
-            <div class="chart-card-head">
-              <h3 class="chart-title">Open mitigative actions by site</h3>
-              <button class="open-btn" (click)="switchToChat.emit()">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"
-                     stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                Open
-              </button>
-            </div>
-            <svg [attr.viewBox]="'0 0 ' + W + ' ' + (H + 28)" class="chart-svg">
-              <rect *ngFor="let b of capaBars; let i = index"
-                    [attr.x]="b.x" [attr.y]="b.y"
-                    [attr.width]="b.bw" [attr.height]="b.bh"
-                    rx="3" fill="var(--accent)" opacity="0.82"/>
-              <!-- X labels -->
-              <text *ngFor="let b of capaBars; let i = index"
-                    [attr.x]="b.x + b.bw / 2" [attr.y]="H + 22" text-anchor="middle"
-                    fill="var(--text-3)" font-size="9" font-family="var(--font-mono)">
-                {{ capaLabels[i] }}
-              </text>
-            </svg>
-          </div>
-        </div>
-
-        <!-- Recent queries -->
-        <div class="recent-card">
-          <div class="recent-head">
-            <h3 class="chart-title">Recent queries</h3>
-          </div>
-          <button *ngFor="let r of recent; let i = index"
-                  class="recent-row"
-                  [class.not-first]="i > 0"
-                  (click)="switchToChat.emit()">
-            <span class="recent-icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"
-                   stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
-              </svg>
-            </span>
-            <span class="recent-title">{{ r.title }}</span>
-            <span class="recent-tag">{{ r.tag }}</span>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="13" height="13"
-                 stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-3);flex-shrink:0">
-              <polyline points="9 18 15 12 9 6"/>
-            </svg>
           </button>
+        </div>
+
+        <div class="empty" *ngIf="!entries.length">
+          <div class="empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="28" height="28"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="7" height="9" rx="1.5"/>
+              <rect x="14" y="3" width="7" height="5" rx="1.5"/>
+              <rect x="14" y="12" width="7" height="9" rx="1.5"/>
+              <rect x="3" y="16" width="7" height="5" rx="1.5"/>
+            </svg>
+          </div>
+          <p class="empty-text">No dashboard-shaped answers yet this session</p>
+          <p class="empty-sub">Ask a question with a rich result &mdash; a breakdown, trend, or status summary &mdash; and it'll show up here. Scoped to this session only, same as your chat history: it clears on refresh.</p>
         </div>
 
       </div>
@@ -209,130 +72,99 @@ const RECENT: RecentItem[] = [
     .d-scroll { flex: 1; overflow-y: auto; }
     .d-inner  { max-width: 1100px; margin: 0 auto; padding: 30px 32px 60px; }
 
-    .page-head {
-      display: flex; align-items: flex-end; justify-content: space-between;
-      gap: 12px; margin-bottom: 24px; flex-wrap: wrap;
-    }
+    .page-head { margin-bottom: 24px; }
     .page-title {
       margin: 0 0 5px; font-size: 28px; font-weight: 800; letter-spacing: -0.02em;
       color: var(--text);
     }
     .page-sub { margin: 0; font-size: 14px; color: var(--text-2); }
 
-    .pill-btn {
-      display: flex; align-items: center; gap: 6px;
-      padding: 9px 16px; border-radius: 999px;
-      background: var(--accent); border: none; color: #fff;
-      font-size: 13px; font-weight: 600; cursor: pointer;
-      font-family: var(--font); white-space: nowrap;
-      transition: opacity 0.15s, transform 0.15s;
+    /* Gallery */
+    .gallery-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 14px;
     }
-    .pill-btn:hover { opacity: 0.88; transform: translateY(-1px); }
-
-    /* KPI */
-    .kpi-grid {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 14px; margin-bottom: 20px;
-    }
-    .kpi-card {
+    .g-card {
+      display: flex; flex-direction: column; gap: 10px; text-align: left;
       background: var(--surface); border: 1px solid var(--border);
-      border-radius: 22px; padding: 18px 20px;
-      box-shadow: var(--shadow-sm); transition: box-shadow 0.22s, transform 0.22s, border-color 0.22s;
+      border-radius: 22px; padding: 16px 18px; cursor: pointer;
+      font-family: var(--font); box-shadow: var(--shadow-sm);
+      transition: box-shadow 0.22s, transform 0.22s, border-color 0.22s;
     }
-    .kpi-card:hover { box-shadow: var(--shadow-md), 0 0 0 1px rgba(27,67,255,0.08); transform: translateY(-3px); border-color: var(--blue-100); }
-    .kpi-top {
-      display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+    .g-card:hover {
+      box-shadow: var(--shadow-md), 0 0 0 1px rgba(27,67,255,0.08);
+      transform: translateY(-3px); border-color: var(--blue-100);
     }
-    .kpi-icon {
-      width: 34px; height: 34px; border-radius: 12px;
-      background: var(--accent-soft); display: grid; place-items: center;
-      flex-shrink: 0; color: var(--accent);
+    .g-card-top {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
     }
-    .kpi-label {
-      font-size: 9.5px; font-weight: 700; letter-spacing: 0.07em;
-      color: var(--text-3); text-transform: uppercase; line-height: 1.3;
-      font-family: var(--font-mono);
+    .g-time { font-size: 10.5px; color: var(--text-3); white-space: nowrap; }
+    .g-question {
+      margin: 0; font-size: 14px; font-weight: 700; color: var(--text);
+      line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical; overflow: hidden;
     }
-    .kpi-value {
-      font-size: 30px; font-weight: 700; letter-spacing: -0.02em;
-      color: var(--text); font-family: var(--font-mono);
-    }
-    .kpi-delta {
-      display: flex; align-items: center; gap: 4px; margin-top: 8px;
-      font-size: 12px;
-    }
-    .kpi-cmp { color: var(--text-3); }
 
-    /* Charts */
-    .chart-grid {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-      gap: 14px; margin-bottom: 20px;
+    .g-cards { display: flex; flex-direction: column; gap: 6px; margin-top: 2px; }
+    .g-mini {
+      display: flex; align-items: baseline; justify-content: space-between;
+      gap: 10px; padding: 7px 10px; background: var(--surface-2);
+      border-radius: 10px; border: 1px solid var(--border);
     }
-    .chart-card {
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 22px; padding: 18px 20px; box-shadow: var(--shadow-sm);
-      transition: box-shadow 0.22s, transform 0.22s;
+    .g-mini-label {
+      font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+      color: var(--text-3); text-transform: uppercase;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
     }
-    .chart-card:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
-    .chart-card-head {
-      display: flex; align-items: center; margin-bottom: 14px;
+    .g-mini-value {
+      font-size: 13px; font-weight: 700; color: var(--text);
+      font-family: var(--font-mono); white-space: nowrap; flex-shrink: 0;
     }
-    .chart-title {
-      margin: 0; font-size: 15px; font-weight: 700; color: var(--text);
+    .g-mini--critical .g-mini-value { color: #dc2626; }
+    .g-mini--warning  .g-mini-value { color: #d97706; }
+    .g-mini--ok       .g-mini-value { color: #059669; }
+
+    /* Empty state */
+    .empty {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 64px 24px; gap: 12px; color: var(--text-3);
     }
-    .open-btn {
-      margin-left: auto; display: flex; align-items: center; gap: 5px;
-      padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 600;
+    .empty-icon {
+      width: 56px; height: 56px; border-radius: 16px;
       background: var(--blue-50); border: 1px solid var(--blue-100);
-      color: var(--accent); cursor: pointer; font-family: var(--font);
-      transition: background 0.14s;
+      display: flex; align-items: center; justify-content: center; color: var(--accent);
     }
-    .open-btn:hover { background: var(--blue-100); }
-    .chart-svg { width: 100%; overflow: visible; display: block; }
-
-    /* Recent queries */
-    .recent-card {
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 22px; overflow: hidden; box-shadow: var(--shadow-sm);
-    }
-    .recent-head {
-      padding: 15px 20px; border-bottom: 1px solid var(--border);
-    }
-    .recent-row {
-      width: 100%; display: flex; align-items: center; gap: 12px;
-      padding: 13px 20px; background: transparent; border: none;
-      text-align: left; cursor: pointer; transition: background 0.12s;
-    }
-    .recent-row.not-first { border-top: 1px solid var(--border); }
-    .recent-row:hover { background: var(--surface-2); }
-    .recent-icon {
-      width: 32px; height: 32px; border-radius: 50%;
-      background: var(--accent-soft); display: grid; place-items: center;
-      flex-shrink: 0; color: var(--accent);
-    }
-    .recent-title {
-      flex: 1; min-width: 0; font-size: 13.5px; font-weight: 600;
-      color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    }
-    .recent-tag {
-      font-size: 11px; font-weight: 600; color: var(--text-2);
-      background: var(--surface-3); padding: 3px 9px; border-radius: 999px;
-      white-space: nowrap;
-    }
+    .empty-text { font-size: 16px; font-weight: 600; color: var(--text); margin: 0; }
+    .empty-sub  { font-size: 13px; color: var(--text-3); margin: 0; text-align: center; max-width: 380px; line-height: 1.6; }
   `],
 })
-export class DashboardViewComponent {
+export class DashboardViewComponent implements OnDestroy {
   @Output() switchToChat = new EventEmitter<void>();
 
-  readonly kpis        = KPIS;
-  readonly recent      = RECENT;
-  readonly scoreLabels = SCORE_LABELS;
-  readonly capaLabels  = CAPA_LABELS;
-  readonly W = W;
-  readonly H = H;
+  entries: DashboardEntry[] = [];
+  private sub: Subscription;
 
-  readonly scorePts     = computeLinePts(SCORE_DATA);
-  readonly scorePolyline = ptsToPolyline(this.scorePts);
-  readonly scoreAreaPath = ptsToArea(this.scorePts);
-  readonly capaBars      = computeBars(CAPA_DATA);
+  constructor(private chatSvc: ChatService) {
+    this.sub = chatSvc.conversations$.subscribe(convs => {
+      const flat: DashboardEntry[] = [];
+      for (const conversation of convs) {
+        for (const message of conversation.messages) {
+          if (message.role === 'ai' && message.dashboard?.show) {
+            flat.push({ conversation, message });
+          }
+        }
+      }
+      flat.sort((a, b) => b.message.timestamp.getTime() - a.message.timestamp.getTime());
+      this.entries = flat;
+    });
+  }
+
+  ngOnDestroy(): void {
+    this.sub.unsubscribe();
+  }
+
+  open(e: DashboardEntry): void {
+    this.chatSvc.jumpToMessage(e.conversation.id, e.message.id);
+    this.switchToChat.emit();
+  }
 }

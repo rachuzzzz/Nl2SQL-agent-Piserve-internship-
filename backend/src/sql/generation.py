@@ -14,6 +14,7 @@ from sqlalchemy.engine import Engine
 
 from src.sql.validation import SQLValidator, ValidationResult
 from src.llm.base import extract_token_counts
+from src.llm.prefix_cache import PrefixCacheManager
 
 
 _schema_cache: Optional[str] = None
@@ -316,6 +317,7 @@ def generate_sql(
     _build_core_context_fn=None,
     _join_graph_module=None,
     _rules_engine=None,
+    _domain: str = "inspection",
 ) -> dict[str, Any]:
     try:
         # Planner->SQL structured contract (generation-quality plan Item 3):
@@ -465,12 +467,15 @@ def generate_sql(
         # must be the sum, not just the last call's count.
         _prompt_tok_total = 0
         _completion_tok_total = 0
+        _prefix_cache = PrefixCacheManager(sql_llm, domain=_domain, role="sql")
 
         response = sql_llm.complete(prompt)
         raw_sql = str(response).strip()
-        _pt, _ct = extract_token_counts(getattr(response, "raw", {}) or {})
+        _raw_response = getattr(response, "raw", {}) or {}
+        _pt, _ct = extract_token_counts(_raw_response)
         _prompt_tok_total += _pt
         _completion_tok_total += _ct
+        _prefix_cache.record(_raw_response)
 
         # Log raw SQL-gen model output
         if _debug_logger:
@@ -534,6 +539,7 @@ def generate_sql(
                     _pt, _ct = extract_token_counts(getattr(response_og, "raw", {}) or {})
                     _prompt_tok_total += _pt
                     _completion_tok_total += _ct
+                    _prefix_cache.record(getattr(response_og, "raw", {}) or {})
                     if _debug_logger:
                         _debug_logger.debug(
                             f"\n{'='*70}\n>>> SQL-GEN RAW OUTPUT ({_sql_model_name}) (offset-guard retry)"
@@ -622,6 +628,7 @@ def generate_sql(
                     _pt, _ct = extract_token_counts(getattr(response2, "raw", {}) or {})
                     _prompt_tok_total += _pt
                     _completion_tok_total += _ct
+                    _prefix_cache.record(getattr(response2, "raw", {}) or {})
 
                     # Re-check: did the retry actually fix what triggered it?
                     # Without this, a small model ignoring the forced instruction
@@ -742,6 +749,7 @@ def generate_sql(
                 _pt, _ct = extract_token_counts(getattr(response3, "raw", {}) or {})
                 _prompt_tok_total += _pt
                 _completion_tok_total += _ct
+                _prefix_cache.record(getattr(response3, "raw", {}) or {})
                 if _debug_logger:
                     _debug_logger.debug(
                         f"\n{'='*70}\n>>> SQL-GEN RAW OUTPUT ({_sql_model_name}) (uuid-guard retry)\n{'='*70}\n{raw_sql}\n"

@@ -40,6 +40,7 @@ def get_reasoning_llm(model: str, base_url: str):
     same question from sampling alone, making it hard to attribute a change
     in the numbers to an actual prompt/rule fix versus noise.
     """
+    from src.config.settings import get_settings
     return build_ollama_client(
         model=model,
         base_url=base_url,
@@ -47,6 +48,7 @@ def get_reasoning_llm(model: str, base_url: str):
         request_timeout=120.0,
         thinking=False,
         json_mode=True,
+        keep_alive=get_settings().ollama_keep_alive,
         additional_kwargs={
             "num_predict": 1024,
             "num_ctx": 20000,
@@ -59,11 +61,13 @@ def get_sql_llm(model: str, base_url: str):
     SQL-generation LLM. temperature=0 for determinism; stop tokens prevent
     the model from appending explanation text after the query ends.
     """
+    from src.config.settings import get_settings
     return build_ollama_client(
         model=model,
         base_url=base_url,
         temperature=0.0,
         request_timeout=120.0,
+        keep_alive=get_settings().ollama_keep_alive,
         additional_kwargs={
             "num_predict": 1024,
             "num_ctx": 16384,

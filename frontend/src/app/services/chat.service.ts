@@ -14,6 +14,13 @@ export class ChatService {
   activeConversation$ = new BehaviorSubject<Conversation | null>(null);
   lastDebug$          = new BehaviorSubject<ChatResponse | null>(null);
   loading$            = new BehaviorSubject<boolean>(false);
+  // Message id the chat window should scroll to and highlight next — a
+  // BehaviorSubject (not a plain Subject) because *ngSwitchCase destroys and
+  // recreates ChatWindowComponent on every tab switch, so a freshly
+  // constructed instance must still see a jump that was requested just
+  // before it was created (see jumpToMessage() below and its consumer in
+  // ChatWindowComponent, which resets this back to null once handled).
+  scrollToMessage$    = new BehaviorSubject<string | null>(null);
 
   constructor(private http: HttpClient) {
     this.newConversation();
@@ -124,6 +131,14 @@ export class ChatService {
       page,
       page_size:  pageSize,
     });
+  }
+
+  // Switches to the conversation containing messageId, then signals
+  // ChatWindowComponent to scroll to and highlight it. Used by the
+  // Dashboard gallery to jump back to the originating chat message.
+  jumpToMessage(conversationId: string, messageId: string): void {
+    this.selectConversation(conversationId);
+    this.scrollToMessage$.next(messageId);
   }
 
   updateMessageResultData(messageId: string, data: ResultData): void {

@@ -1269,6 +1269,7 @@ class SynthesisMixin:
             _prompt_tok, _completion_tok = extract_token_counts(raw)
             stats.total_prompt_tokens += _prompt_tok
             stats.total_completion_tokens += _completion_tok
+            self._prefix_cache.record(raw)
 
         _log_llm.debug("[LLM ] iter=%d latency=%dms prompt_tok=%d completion_tok=%d out_len=%d",
                        iteration, latency_ms, _prompt_tok, _completion_tok, len(content))

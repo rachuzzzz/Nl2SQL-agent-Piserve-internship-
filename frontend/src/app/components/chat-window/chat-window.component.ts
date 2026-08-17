@@ -75,6 +75,7 @@ import { SlashCommandService, ColumnSelection } from '../../services/slash-comma
         </div>
 
         <div *ngFor="let msg of messages; trackBy: trackMsg"
+             [attr.id]="'msg-' + msg.id"
              class="msg"
              [class.msg-user]="msg.role === 'user'"
              [class.msg-wide]="(msg.role === 'ai' && !!msg.dashboard?.show) || expandedChartMsgs.has(msg.id)">
@@ -571,6 +572,11 @@ export class ChatWindowComponent implements AfterViewChecked {
   private lastMsgCount     = 0;
   private lastLoadingState = false;
   private authSub          = Subscription.EMPTY;
+  // Set by the scrollToMessage$ subscription below when something (e.g. the
+  // Dashboard gallery) requested a jump to a specific past message; consumed
+  // and cleared once ngAfterViewChecked can find that message's element in
+  // the (by-then-rendered) DOM. See ChatService.jumpToMessage().
+  private pendingScrollMsgId: string | null = null;
 
   // Row selection — checkboxes are only ever shown on the LATEST AI
   // message's table (sidesteps resolving against a stale/evicted turn —
@@ -648,8 +654,14 @@ export class ChatWindowComponent implements AfterViewChecked {
       }
       this.cdr.markForCheck();
     });
+    // BehaviorSubject, not a plain Subject — replays the last requested jump
+    // to a freshly (re)constructed instance, since *ngSwitchCase destroys
+    // this component when the user leaves the Chat tab (see app.component.ts).
+    svc.scrollToMessage$.subscribe(id => {
+      if (id) this.pendingScrollMsgId = id;
+    });
   }
-  
+
   ngOnDestroy() {
     this.authSub.unsubscribe();
     if (this.loadingInterval) clearInterval(this.loadingInterval);
@@ -659,6 +671,23 @@ export class ChatWindowComponent implements AfterViewChecked {
   ngAfterViewChecked(): void {
     const el = this.msgsEl?.nativeElement;
     if (!el) return;
+
+    if (this.pendingScrollMsgId) {
+      const target = el.querySelector('#msg-' + this.pendingScrollMsgId) as HTMLElement | null;
+      if (target) {
+        this.pendingScrollMsgId = null;
+        this.svc.scrollToMessage$.next(null); // consumed — don't re-trigger on a later remount
+        requestAnimationFrame(() => {
+          target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          target.classList.add('msg-highlight');
+          setTimeout(() => target.classList.remove('msg-highlight'), 1600);
+        });
+      }
+      // Skip bottom-autoscroll this cycle either way — either we just jumped
+      // elsewhere, or the target isn't rendered yet and we'll retry next tick.
+      return;
+    }
+
     const changed = this.messages.length !== this.lastMsgCount
                  || this.loading          !== this.lastLoadingState;
     if (changed) {

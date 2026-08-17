@@ -730,6 +730,7 @@ class ToolRegistry:
                     _build_core_context_fn=self._build_core_context_fn,
                     _join_graph_module=self._join_graph_module,
                     _rules_engine=self._rules_engine,
+                    _domain=self._domain,
                 )
 
             if name == "execute_sql":

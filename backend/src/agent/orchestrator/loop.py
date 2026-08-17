@@ -20,6 +20,7 @@ from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from src.llm.factory import get_llm_client
+from src.llm.prefix_cache import PrefixCacheManager
 from src.retrieval import SemanticQuestionIndex, SeedExampleIndex, text_similarity
 from src.sql.validation import SQLValidator
 from src.agent.domains import get_domain_config
@@ -187,6 +188,13 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             .replace("{inspection_schema_sql}", "")
             .replace("{audit_schema_sql}", "")
         )
+        # Everything before {schema_hint} is the true byte-identical prefix
+        # across every SQL-gen call in this domain — {schema_hint},
+        # {dynamic_examples}, and {question} (in that order in the template)
+        # are all per-request variable content, so Ollama's prefix match
+        # stops at the first one regardless of what's warmed. Priming past
+        # that point would prime bytes real traffic never repeats.
+        self._sql_static_prefix = self._sql_prompt.split("{schema_hint}")[0]
 
         if embed_model is not None:
             self.embed_model = embed_model
@@ -240,6 +248,23 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         print(f"  Configuring SQL LLM ({sql_llm_provider}): {sql_model}...")
         self.sql_llm = _build("sql", sql_llm_provider, sql_model)
         print(f"  ✓ SQL LLM ({sql_model})")
+
+        # Warm this domain's static system-prompt prefix into Ollama's own
+        # slot cache before real user traffic hits it — see llm/prefix_cache.py.
+        # Best-effort (never blocks startup on a network hiccup); harmless
+        # extra call for non-Ollama reasoning providers, which have no slot
+        # cache to warm but answer the call fine regardless.
+        self._prefix_cache = PrefixCacheManager(self.reasoning_llm, domain=self.domain, role="reasoning")
+        self._prefix_cache.warmup(self._system_prompt)
+
+        # Same warmup for the SQL role's static skeleton — without this the
+        # first SQL-gen call of every session still pays near-cold prefill
+        # (confirmed live: 954ms vs ~390ms on warm calls in the same
+        # session, see debug_llm_20260814_115608.log) because generate_sql()
+        # builds its own PrefixCacheManager per-call with no warmup of its
+        # own (sql/generation.py).
+        self._sql_prefix_cache = PrefixCacheManager(self.sql_llm, domain=self.domain, role="sql")
+        self._sql_prefix_cache.warmup(self._sql_static_prefix)
 
         self._debug = _make_debug_logger()
 
