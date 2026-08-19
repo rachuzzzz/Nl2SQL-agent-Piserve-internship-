@@ -54,6 +54,7 @@ TEST_SET = [
         "id": "PLAN-01", "category": "Plan",
         "question": "list all audit plans",
         "expected_contains": ["plan"],
+        "forbidden_contains": ["draft"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Baseline listing",
     },
@@ -112,6 +113,7 @@ TEST_SET = [
         "id": "SCHED-01", "category": "Schedule",
         "question": "list all audit schedules",
         "expected_contains": ["schedule"],
+        "forbidden_contains": ["draft"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Baseline listing",
     },
@@ -170,6 +172,13 @@ TEST_SET = [
         "expected_contains": ["auditee"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "auditee_id → users, ranked",
+    },
+    {
+        "id": "SCHED-10", "category": "Schedule",
+        "question": "which audit schedules are still in draft",
+        "expected_contains": ["draft"],
+        "expected_nonempty": False,
+        "expected_llm_calls": 1, "notes": "schedule_status = 'DRAFT' — explicit-ask carve-out, mirrors PLAN-02",
     },
 
     # ── Statuses ─────────────────────────────────────────────────────────────
@@ -772,6 +781,12 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
             kh = sum(1 for kw in keywords if kw.lower() in al)
             kp = round(kh / kt * 100) if kt else None
 
+            # ── forbidden-keyword scoring — e.g. "draft" must never appear in
+            # a general listing's answer (PLAN-01/SCHED-01 regression guard
+            # for the DRAFT-exclusion filter-dropping bug, 2026-08-18) ──────
+            forbidden = test.get("forbidden_contains", [])
+            forbidden_hit = next((kw for kw in forbidden if kw.lower() in al), None)
+
             # ── sql / parse error counting ───────────────────────────────────
             se = sum(1 for s in result.steps
                      if s.tool == "execute_sql" and not s.result.get("success"))
@@ -798,7 +813,7 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
             except Exception as _te:
                 tm = {"covered": False, "truth_match": None, "detail": f"err: {_te}"}
 
-            forced_fail = bool(test.get("expected_nonempty") and empty)
+            forced_fail = bool(test.get("expected_nonempty") and empty) or bool(forbidden_hit)
             real_pass   = result.success and not forced_fail
 
             row = dict(
@@ -808,6 +823,13 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
                 model_pair=model_pair_label,
                 wall_s=round(wall, 2),
                 llm_calls=result.stats.total_llm_calls,
+                reasoning_ms=result.stats.total_llm_latency_ms,
+                sql_gen_ms=result.stats.total_sql_gen_ms,
+                sql_exec_ms=result.stats.total_sql_exec_ms,
+                reasoning_prefill_ms=result.stats.reasoning_prefill_ms,
+                reasoning_decode_ms=result.stats.reasoning_decode_ms,
+                sql_gen_prefill_ms=result.stats.sql_gen_prefill_ms,
+                sql_gen_decode_ms=result.stats.sql_gen_decode_ms,
                 prompt_tokens=result.stats.total_prompt_tokens,
                 completion_tokens=result.stats.total_completion_tokens,
                 sql_errors=se,
@@ -816,6 +838,7 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
                 keyword_pct=kp,
                 empty_result=empty,
                 forced_fail=forced_fail,
+                forbidden_hit=forbidden_hit,
                 real_pass=real_pass,
                 truth_covered=tm["covered"],
                 truth_match=tm["truth_match"],
@@ -830,7 +853,9 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
             perf = ("🟢" if result.stats.total_llm_calls <= 1
                     else "🟡" if result.stats.total_llm_calls <= 3 else "🔴")
             kw_str = f"{kh}/{kt}" if kt else "n/a"
-            status = "✅" if real_pass else ("❌ EMPTY" if forced_fail else "❌")
+            status = ("✅" if real_pass else
+                      f"❌ FORBIDDEN({forbidden_hit})" if forbidden_hit else
+                      "❌ EMPTY" if forced_fail else "❌")
             print(f"         {perf} {wall:.1f}s | {result.stats.total_llm_calls} calls | "
                   f"kw {kw_str} | SQL {'OK' if se == 0 else str(se) + ' err'} | {status}")
             print(f"         -> {result.answer[:100]}\n")
@@ -840,7 +865,11 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
             print(f"         CRASH {wall:.1f}s: {e}\n")
             results.append(dict(
                 id=qid, category=cat, question=q, model_pair=model_pair_label,
-                wall_s=round(wall, 2), llm_calls=-1, prompt_tokens=0,
+                wall_s=round(wall, 2), llm_calls=-1,
+                reasoning_ms=0, sql_gen_ms=0, sql_exec_ms=0,
+                reasoning_prefill_ms=0, reasoning_decode_ms=0,
+                sql_gen_prefill_ms=0, sql_gen_decode_ms=0,
+                prompt_tokens=0,
                 completion_tokens=0, sql_errors=-1, parse_errors=-1,
                 keyword_hits="0/0", keyword_pct=0,
                 empty_result=False, forced_fail=True, real_pass=False,
@@ -857,6 +886,27 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
     avg_t      = sum(r["wall_s"] for r in results) / total if total else 0
     tot_se     = sum(r["sql_errors"]   for r in results if r["sql_errors"]   >= 0)
     tot_pe     = sum(r["parse_errors"] for r in results if r["parse_errors"] >= 0)
+
+    # ── latency breakdown — Phase 3.1 profiling ────────────────────────────
+    # wall_s vs. (reasoning_ms + sql_gen_ms + sql_exec_ms) — the gap is real
+    # unaccounted overhead (turn-classifier regex/fuzzy-vocab work, scope
+    # filter building, JSON parsing, tool dispatch, network round-trips
+    # themselves, etc.), NOT a bug — see QueryStats.total_sql_gen_ms.
+    _ok = [r for r in results if r["llm_calls"] >= 0]
+    _tot_wall_ms   = sum(r["wall_s"] * 1000 for r in _ok)
+    _tot_reason_ms = sum(r["reasoning_ms"] for r in _ok)
+    _tot_sqlgen_ms = sum(r["sql_gen_ms"]   for r in _ok)
+    _tot_sqlexec_ms= sum(r["sql_exec_ms"]  for r in _ok)
+    _tot_other_ms  = max(0, _tot_wall_ms - _tot_reason_ms - _tot_sqlgen_ms - _tot_sqlexec_ms)
+    _pct = lambda part: round(100 * part / _tot_wall_ms) if _tot_wall_ms else 0
+
+    # ── prefill vs decode split — Phase 3.2 profiling (llama.cpp only,
+    # zero on other providers — see QueryStats.reasoning_prefill_ms) ──────
+    _tot_reason_pf = sum(r["reasoning_prefill_ms"] for r in _ok)
+    _tot_reason_dc = sum(r["reasoning_decode_ms"]  for r in _ok)
+    _tot_sqlgen_pf = sum(r["sql_gen_prefill_ms"]   for r in _ok)
+    _tot_sqlgen_dc = sum(r["sql_gen_decode_ms"]    for r in _ok)
+    _sub_pct = lambda part, whole: round(100 * part / whole) if whole else 0
 
     kp_vals = [r["keyword_pct"] for r in results
                if r["keyword_pct"] is not None and r["keyword_pct"] >= 0]
@@ -900,8 +950,25 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
     print(f"  Avg time:     {avg_t:.1f}s")
     print(f"  Avg kw hit:   {avg_kp}%  (over {len(kp_vals)} keyword-tested questions)")
     print(f"  SQL errors:   {tot_se}  |  Parse errors: {tot_pe}")
+    print(f"\n  LATENCY BREAKDOWN (of {_tot_wall_ms/1000:.1f}s total wall time, {len(_ok)} queries)")
+    print(f"    reasoning LLM (chat/classify/synthesize): {_tot_reason_ms/1000:>7.1f}s  ({_pct(_tot_reason_ms):>3d}%)")
+    print(f"    SQL-gen (retrieval+prompt+coder LLM+val): {_tot_sqlgen_ms/1000:>7.1f}s  ({_pct(_tot_sqlgen_ms):>3d}%)")
+    print(f"    SQL execution (Postgres):                 {_tot_sqlexec_ms/1000:>7.1f}s  ({_pct(_tot_sqlexec_ms):>3d}%)")
+    print(f"    other/unaccounted overhead:                {_tot_other_ms/1000:>7.1f}s  ({_pct(_tot_other_ms):>3d}%)")
+    if _tot_reason_pf + _tot_reason_dc + _tot_sqlgen_pf + _tot_sqlgen_dc:
+        print(f"\n  PREFILL vs DECODE SPLIT (llama.cpp `timings` field)")
+        print(f"    reasoning: prefill {_tot_reason_pf/1000:>6.1f}s ({_sub_pct(_tot_reason_pf, _tot_reason_ms):>3d}%)"
+              f"  |  decode {_tot_reason_dc/1000:>6.1f}s ({_sub_pct(_tot_reason_dc, _tot_reason_ms):>3d}%)")
+        print(f"    sql-gen  : prefill {_tot_sqlgen_pf/1000:>6.1f}s ({_sub_pct(_tot_sqlgen_pf, _tot_sqlgen_ms):>3d}%)"
+              f"  |  decode {_tot_sqlgen_dc/1000:>6.1f}s ({_sub_pct(_tot_sqlgen_dc, _tot_sqlgen_ms):>3d}%)")
 
-    ff_rows = [r for r in results if r["forced_fail"]]
+    fb_rows = [r for r in results if r.get("forbidden_hit")]
+    if fb_rows:
+        print(f"\n  FORBIDDEN-KEYWORD HITS (leaked content that should be filtered out):")
+        for r in fb_rows:
+            print(f"    {r['id']:<8} {r['question'][:50]:<52} hit={r['forbidden_hit']!r}")
+
+    ff_rows = [r for r in results if r["forced_fail"] and not r.get("forbidden_hit")]
     if ff_rows:
         print(f"\n  FORCED FAILS (empty result where data expected):")
         for r in ff_rows:
@@ -923,6 +990,12 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
             sql_errors_total=tot_se,
             parse_errors_total=tot_pe,
             forced_fails=forced_fails,
+            latency_breakdown_ms=dict(
+                total_wall=round(_tot_wall_ms), reasoning=_tot_reason_ms,
+                sql_gen=_tot_sqlgen_ms, sql_exec=_tot_sqlexec_ms, other=_tot_other_ms,
+                reasoning_prefill=_tot_reason_pf, reasoning_decode=_tot_reason_dc,
+                sql_gen_prefill=_tot_sqlgen_pf, sql_gen_decode=_tot_sqlgen_dc,
+            ),
             results=results,
         ), f, indent=2)
     print(f"\n  Results saved -> {fname}\n")

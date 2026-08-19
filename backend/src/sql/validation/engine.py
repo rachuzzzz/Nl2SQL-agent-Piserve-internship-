@@ -425,6 +425,11 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
         "audit_block_conformity_spelling",
         "audit_warn_ca_draft_literal", "audit_warn_role_name_auditor_filter",
         "audit_block_review_completed_not_approved", "audit_block_portfolio_ap_alias",
+        # Group Y — audit_schedule.schedule_status and audit_plan.status DRAFT
+        # exclusion had zero enforcement (confirmed 2026-08-18) — same trap Group C's
+        # audit_block_ca_draft_not_excluded guards for adequacy_status, now applied
+        # to these two sibling columns.
+        "audit_block_schedule_draft_not_excluded", "audit_block_plan_draft_not_excluded",
         # Group D — inspection domain's own review-table approval trap (shared
         # table, same status='COMPLETED' != approved issue as Group C's audit
         # rule above — see block_rules.py's inspection_block_review_completed_not_approved).

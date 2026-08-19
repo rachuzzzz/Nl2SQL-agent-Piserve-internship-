@@ -56,6 +56,12 @@ _DYNAMIC_TOOLS_BLOCK = "".join(
     t.doc for t in _declared_tools() if "inspection" in t.domains
 )
 
+# NOTE: system_prompt.txt's "OBSERVATION -> MITIGATIVE ACTION" section
+# (~line 300-330, PATH 1/2/3 worked examples) is an independently
+# hand-written restatement of the same rule spliced in via
+# knowledge/schema_introspector.py's _business_rules_core (~line 81-94) —
+# currently in sync but with no shared source or consistency-checker
+# coverage between the two. If you edit one, check the other.
 SYSTEM_PROMPT = (
     _read_template("system_prompt.txt")
     .replace("<<<STATUS_BLOCK>>>", _STATUS_BLOCK)

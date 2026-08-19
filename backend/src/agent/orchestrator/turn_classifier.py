@@ -92,7 +92,9 @@ except ImportError:
     _HAS_JSON_REPAIR = False
 
 from src.agent.orchestrator.debug import _dbg
-from src.llm.base import extract_token_counts
+from src.llm.base import extract_token_counts, extract_llamacpp_timings, TokenUsage
+from src.llm.prefix_cache import PrefixCacheManager
+from src.llm.anthropic import build_cached_system_message
 
 _log_turn = logging.getLogger("inspectai.turn_classifier")
 
@@ -252,7 +254,7 @@ def _parse_turn_json(raw: str) -> Optional[dict]:
 
 
 class TurnClassifier:
-    def __init__(self, reasoning_llm=None, debug_logger=None):
+    def __init__(self, reasoning_llm=None, debug_logger=None, domain: str = ""):
         # reasoning_llm: the SAME warm client AgentOrchestrator uses for
         # planning (see agent/orchestrator/loop.py's self.reasoning_llm) and
         # DomainRouter reuses for its own Tier-3 — passed in explicitly, not
@@ -261,6 +263,22 @@ class TurnClassifier:
         # classifier then falls back to NEW_QUERY/NONE instead of raising.
         self.reasoning_llm = reasoning_llm
         self._debug_logger = debug_logger
+        # role="turn_classifier", not "reasoning" — this call sends a
+        # completely different, much shorter system prompt
+        # (_CLASSIFIER_SYSTEM_PROMPT) than the main loop's own reasoning-role
+        # calls (self._system_prompt in loop.py, the one actually warmed via
+        # AgentOrchestrator's own PrefixCacheManager). A distinct role label
+        # here means [PREFIX-CACHE] log lines can show whether THIS call is
+        # cold/warm separately from the main loop's — previously invisible,
+        # since this class never called .record() at all. Reuses the SAME
+        # llm_client the main loop warms (self.reasoning_llm), so a cold
+        # prefill here is itself evidence worth having: it's what you'd
+        # expect if this call's differently-shaped prompt is evicting the
+        # main loop's own warmed prefix from Ollama's slot cache every turn
+        # (see the TurnClassifier section of the token/caching audit) —
+        # record() alone doesn't warm anything or fix that, it only makes
+        # the pattern visible in logs so it can be measured before acting on it.
+        self._prefix_cache = PrefixCacheManager(reasoning_llm, domain=domain, role="turn_classifier")
 
     def _render_state(self, session) -> str:
         lines = ["CONVERSATION STATE:"]
@@ -326,8 +344,12 @@ class TurnClassifier:
         from llama_index.core.llms import ChatMessage, MessageRole
         state_block = self._render_state(session)
         user_content = f"{state_block}\n\nCURRENT MESSAGE: {question}"
+        # _CLASSIFIER_SYSTEM_PROMPT is fully static (a module constant, no
+        # per-turn content) — no separate dynamic tail to keep out of the
+        # cached region, unlike loop.py's system message. Still a no-op on
+        # every non-Anthropic client (see build_cached_system_message).
         messages = [
-            ChatMessage(role=MessageRole.SYSTEM, content=_CLASSIFIER_SYSTEM_PROMPT),
+            build_cached_system_message(self.reasoning_llm, _CLASSIFIER_SYSTEM_PROMPT, ""),
             ChatMessage(role=MessageRole.USER, content=user_content),
         ]
         _dbg(self._debug_logger, "TURN CLASSIFIER PROMPT", f"{_CLASSIFIER_SYSTEM_PROMPT}\n\n{user_content}")
@@ -341,15 +363,20 @@ class TurnClassifier:
             return TurnAction(action="NEW_QUERY", reference="NONE", confidence=0.0)
         _latency_ms = int((time.time() - _t0) * 1000)
 
-        _prompt_tok = 0
-        _completion_tok = 0
+        _usage = TokenUsage()
         if stats is not None:
             stats.total_llm_calls += 1
             stats.total_llm_latency_ms += _latency_ms
             _raw_usage = getattr(response, "raw", {}) or {}
-            _prompt_tok, _completion_tok = extract_token_counts(_raw_usage)
-            stats.total_prompt_tokens += _prompt_tok
-            stats.total_completion_tokens += _completion_tok
+            _usage = extract_token_counts(_raw_usage)
+            stats.total_prompt_tokens += _usage.prompt_tokens
+            stats.total_completion_tokens += _usage.completion_tokens
+            stats.total_cache_read_tokens += _usage.cache_read_tokens
+            stats.total_cache_creation_tokens += _usage.cache_creation_tokens
+            self._prefix_cache.record(_raw_usage)
+            _t = extract_llamacpp_timings(_raw_usage)
+            stats.reasoning_prefill_ms += int(_t.prompt_ms)
+            stats.reasoning_decode_ms += int(_t.predicted_ms)
 
         _dbg(self._debug_logger, "TURN CLASSIFIER RAW OUTPUT", raw or "(empty)")
 
@@ -382,8 +409,10 @@ class TurnClassifier:
 
         _log_turn.info(
             "[TURN CLASSIFIER] action=%s reference=%s confidence=%.2f "
-            "latency=%dms prompt_tok=%d completion_tok=%d question=%r",
-            action, reference, confidence, _latency_ms, _prompt_tok, _completion_tok,
+            "latency=%dms prompt_tok=%d completion_tok=%d cache_read=%d cache_write=%d question=%r",
+            action, reference, confidence, _latency_ms,
+            _usage.prompt_tokens, _usage.completion_tokens,
+            _usage.cache_read_tokens, _usage.cache_creation_tokens,
             question[:120],
         )
         return TurnAction(

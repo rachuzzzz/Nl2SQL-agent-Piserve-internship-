@@ -21,6 +21,7 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from src.llm.factory import get_llm_client
 from src.llm.prefix_cache import PrefixCacheManager
+from src.llm.anthropic import build_cached_system_message
 from src.retrieval import SemanticQuestionIndex, SeedExampleIndex, text_similarity
 from src.sql.validation import SQLValidator
 from src.agent.domains import get_domain_config
@@ -127,7 +128,8 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                  domain: str = "inspection",
                  db_engine=None, embed_model=None, reasoning_llm=None,
                  reasoning_llm_provider: str = "ollama", sql_llm_provider: str = "ollama",
-                 anthropic_api_key: str = "", vllm_url: str = ""):
+                 anthropic_api_key: str = "", vllm_url: str = "",
+                 llamacpp_reasoning_url: str = "", llamacpp_sql_url: str = ""):
         print(f"Initialising AgentOrchestrator (domain={domain})...")
         self.domain = domain
         self._domain_cfg = get_domain_config(domain)
@@ -188,13 +190,30 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             .replace("{inspection_schema_sql}", "")
             .replace("{audit_schema_sql}", "")
         )
-        # Everything before {schema_hint} is the true byte-identical prefix
-        # across every SQL-gen call in this domain — {schema_hint},
-        # {dynamic_examples}, and {question} (in that order in the template)
-        # are all per-request variable content, so Ollama's prefix match
-        # stops at the first one regardless of what's warmed. Priming past
-        # that point would prime bytes real traffic never repeats.
-        self._sql_static_prefix = self._sql_prompt.split("{schema_hint}")[0]
+        # The template puts {dynamic_examples} before {schema_hint} (see
+        # sql/examples/templates/sql_generation_prompt.txt — deliberately
+        # reordered so the guaranteed-static content comes first; it used to
+        # be {schema_hint} first, which meant even the STATIC CORE_CONTEXT
+        # block landed at a different byte offset on every call, since it's
+        # substituted into {dynamic_examples} and {schema_hint} is fully
+        # variable per question — see sql/generation.py's dynamic_examples =
+        # core_context + build_core_context_additions(question) + retrieved).
+        # {question} still comes last, after {schema_hint}.
+        #
+        # core_context (CORE_CONTEXT / CORE_CONTEXT_AUDIT, per domain — see
+        # domains.py) is itself fully static, built once at import, but it's
+        # SUBSTITUTED content, not template text — splitting the raw template
+        # string on {dynamic_examples} only gets the literal skeleton text
+        # before that placeholder, not what actually replaces it. Appending
+        # core_context here is what makes the warmed prefix match the real
+        # bytes every call sends: skeleton + core_context is byte-identical
+        # across every question in this domain (retrieved examples and any
+        # per-question conditional block are appended after core_context
+        # inside {dynamic_examples}'s own substituted value, so they don't
+        # participate in this guaranteed-stable prefix).
+        self._sql_static_prefix = (
+            self._sql_prompt.split("{dynamic_examples}")[0] + self._domain_cfg.core_context
+        )
 
         if embed_model is not None:
             self.embed_model = embed_model
@@ -232,9 +251,15 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # .complete(prompt) per the LLMClient protocol (llm/base.py), so
         # neither knows or cares which provider built it.
         _base_urls = {"ollama": ollama_url, "vllm": vllm_url}
+        # llamacpp gets a per-role base_url instead of one shared URL: unlike
+        # Ollama (one server, many models) or this app's vLLM usage,
+        # reasoning and sql are two separate llama-server processes/ports
+        # (one model per process — see llm/factory.py's
+        # get_reasoning_llm_llamacpp docstring).
+        _llamacpp_role_urls = {"reasoning": llamacpp_reasoning_url, "sql": llamacpp_sql_url}
 
         def _build(role: str, provider: str, model: str):
-            base_url = _base_urls.get(provider, "")
+            base_url = _llamacpp_role_urls[role] if provider == "llamacpp" else _base_urls.get(provider, "")
             return get_llm_client(provider, role, model, base_url=base_url, api_key=anthropic_api_key)
 
         if reasoning_llm is not None:
@@ -273,7 +298,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # changed — see turn_classifier.py's module docstring for the regex
         # bank this replaces. Reuses self.reasoning_llm, same as DomainRouter
         # does for its own Tier-3 (one extra short completion, no model swap).
-        self._turn_classifier = TurnClassifier(self.reasoning_llm, self._debug)
+        self._turn_classifier = TurnClassifier(self.reasoning_llm, self._debug, domain=self.domain)
 
         # Domain-scoped pieces threaded through to generate_sql() (see
         # sql/generation.py) via ToolRegistry — the rules engine is also
@@ -448,8 +473,20 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 len(system_content),
             )
 
+        # system_content always starts with self._system_prompt (see its
+        # construction above: `self._system_prompt + build_dynamic_prompt_
+        # additions(...)`, then `+=` for CURRENT USER / SECURITY CONSTRAINT /
+        # session history) — self._system_prompt is the one piece that's
+        # byte-identical across EVERY call for this domain's whole lifetime,
+        # so it's the right Anthropic cache breakpoint; everything after it
+        # is per-question/per-turn and must stay outside the cached region.
+        # build_cached_system_message no-ops to today's exact single flat
+        # message on every non-Anthropic client (Ollama/vLLM) — see its
+        # docstring in llm/anthropic.py.
         messages = [
-            ChatMessage(role=MessageRole.SYSTEM, content=system_content),
+            build_cached_system_message(
+                self.reasoning_llm, self._system_prompt, system_content[len(self._system_prompt):],
+            ),
             ChatMessage(role=MessageRole.USER, content=question),
         ]
         steps = []
@@ -937,6 +974,18 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 # (see SeedExampleIndex.retrieve's skip_top_match).
                 args["_retry_attempt"] = _sql_retry_signal
 
+                # Tells generate_sql this call, if it also fails validation
+                # or execution, will be the 3rd failure that trips
+                # _refuse_or_clarify_after_failures() below (gen_sql_failures
+                # >= 3) — so its own internal guard retries (offset/table/
+                # uuid, see generation.py) can skip firing: whatever they'd
+                # produce still gets judged by the same terminal cap on the
+                # next pass, so the extra LLM call(s) they'd otherwise make
+                # can't change the outcome, only add latency/tokens. Not set
+                # (defaults False) on attempts 1-2, where a guard fixing the
+                # SQL genuinely can still save the query.
+                args["_last_attempt"] = gen_sql_failures >= 2
+
                 # Preserve explicit LIMIT from user question.
                 # Negative lookahead after the digit excludes time-window
                 # phrasing ("the last 30 DAYS") — confirmed live-testable:
@@ -1306,10 +1355,28 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 _loop_locals = {"session": session, "domain": self.domain}
                 dispatch_args = {**args, **_declared_tool.context_provider(_loop_locals)}
 
+            # Separate timer from `t0` (set at the top of this iteration,
+            # before the reasoning LLM call above) — AgentStep.duration_ms
+            # below deliberately keeps its existing, long-standing meaning
+            # of "whole iteration span since t0" (reasoning-LLM-call time +
+            # dispatch time combined; other consumers of .duration_ms rely
+            # on that), so it can't also be used as a clean dispatch-only
+            # measurement for QueryStats.total_sql_gen_ms. Confirmed live
+            # during Phase 3.1 profiling: reusing s.duration_ms here made
+            # sql_gen_ms include the preceding reasoning-LLM latency too,
+            # inflating the reported breakdown well past 100% of wall time.
+            _dispatch_t0 = time.time()
             result = dispatch(tc, self.registry, override_args=dispatch_args)
+            _dispatch_ms = int((time.time()-_dispatch_t0)*1000)
             s = AgentStep(iteration, thought, tool, args, result,
                           int((time.time()-t0)*1000))
             steps.append(s); _emit(s)
+
+            # See QueryStats.total_sql_gen_ms's docstring — the only place
+            # this whole-call duration (retrieval + prompt build + sql_llm
+            # completion + validation/guard retries) is captured.
+            if tool == "generate_sql":
+                stats.total_sql_gen_ms += _dispatch_ms
 
             # generate_sql's LLM calls (initial + up to 3 guard retries, see
             # sql/generation.py) were never folded into stats before — only
@@ -1324,6 +1391,13 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 if _sql_tok:
                     stats.total_prompt_tokens += _sql_tok.get("prompt_tokens", 0)
                     stats.total_completion_tokens += _sql_tok.get("completion_tokens", 0)
+                    stats.total_cache_read_tokens += _sql_tok.get("cache_read_tokens", 0)
+                    stats.total_cache_creation_tokens += _sql_tok.get("cache_creation_tokens", 0)
+                # See QueryStats.sql_gen_prefill_ms/sql_gen_decode_ms docstring.
+                _sql_timing = (result.get("result") or {}).get("_llm_timings")
+                if _sql_timing:
+                    stats.sql_gen_prefill_ms += int(_sql_timing.get("prefill_ms", 0))
+                    stats.sql_gen_decode_ms += int(_sql_timing.get("decode_ms", 0))
 
             # Path A: generate_sql → auto-execute
             if tool == "generate_sql" and result.get("success"):
@@ -1588,18 +1662,22 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # configured for — independent per role, so e.g. reasoning="vllm" +
         # sql="ollama" picks vllm_reasoning_model for chat_model and
         # ollama_sql_model for sql_model at the same time.
-        def _model_for(provider: str, ollama_model: str, vllm_model: str) -> str:
+        def _model_for(provider: str, ollama_model: str, vllm_model: str, llamacpp_model: str) -> str:
             if provider == "anthropic":
                 return settings.anthropic_model
             if provider == "vllm":
                 return vllm_model
+            if provider == "llamacpp":
+                return llamacpp_model
             return ollama_model
 
         chat_model = _model_for(
-            settings.reasoning_llm_provider, settings.ollama_chat_model, settings.vllm_reasoning_model
+            settings.reasoning_llm_provider, settings.ollama_chat_model,
+            settings.vllm_reasoning_model, settings.llamacpp_reasoning_model,
         )
         sql_model = _model_for(
-            settings.sql_llm_provider, settings.ollama_sql_model, settings.vllm_sql_model
+            settings.sql_llm_provider, settings.ollama_sql_model,
+            settings.vllm_sql_model, settings.llamacpp_sql_model,
         )
         return cls(
             db_connection_string=(
@@ -1619,5 +1697,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             sql_llm_provider=settings.sql_llm_provider,
             anthropic_api_key=settings.anthropic_api_key,
             vllm_url=settings.vllm_url,
+            llamacpp_reasoning_url=settings.llamacpp_reasoning_url,
+            llamacpp_sql_url=settings.llamacpp_sql_url,
         )
 

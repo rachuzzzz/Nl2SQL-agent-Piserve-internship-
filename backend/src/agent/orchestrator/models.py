@@ -26,9 +26,36 @@ class QueryStats:
     total_llm_calls: int = 0
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
+    # Anthropic-only (0 on Ollama/vLLM, which have no prompt-caching concept)
+    # — see llm/base.py's TokenUsage. Tracked separately from
+    # total_prompt_tokens (which already includes them, per Anthropic's own
+    # usage accounting) so cache effectiveness is visible without having to
+    # infer it from a before/after prompt_tokens delta.
+    total_cache_read_tokens: int = 0
+    total_cache_creation_tokens: int = 0
     total_llm_latency_ms: int = 0
+    # Wall time spent inside generate_sql() calls — retrieval (seed/semantic
+    # index lookups), schema-block/prompt assembly, the sql_llm completion
+    # itself, and post-gen validation/guard retries, all bundled together
+    # (see sql/generation.py). Previously untracked: only reasoning-role
+    # latency (total_llm_latency_ms, via _call_llm) and raw Postgres exec
+    # time (total_sql_exec_ms, via execute_sql steps) were summed, so this
+    # entire phase silently fell into the wall_ms - (the other two) gap —
+    # see loop.py's `if tool == "generate_sql": stats.total_sql_gen_ms += ...`
+    # for where it's populated. Phase 3.1 latency-profiling gap fix.
+    total_sql_gen_ms: int = 0
     total_sql_exec_ms: int = 0
     total_wall_ms: int = 0
+    # llama.cpp-only prefill/decode split (see llm/base.py's LlamaCppTimings)
+    # — 0 on any other provider. Split by role, not just summed, because
+    # reasoning and SQL-gen use different models/servers and a prefill-bound
+    # reasoning stage calls for a different fix (trim the prompt) than a
+    # decode-bound one (fewer output tokens, or a faster model) — see
+    # Phase 3.2 profiling.
+    reasoning_prefill_ms: int = 0
+    reasoning_decode_ms: int = 0
+    sql_gen_prefill_ms: int = 0
+    sql_gen_decode_ms: int = 0
 
 
 

@@ -725,6 +725,7 @@ class ToolRegistry:
                     _db_schema=self._db_schema,
                     _active_cycle_uuid=str(args.get("_active_cycle_uuid", "")),
                     _retry_attempt=_retry_attempt,
+                    _last_attempt=bool(args.get("_last_attempt", False)),
                     relevant_tables=_tables,
                     _core_context=self._core_context,
                     _build_core_context_fn=self._build_core_context_fn,

@@ -78,6 +78,12 @@ BUSINESS_RULES = [
     "Use ILIKE for text matching, never LIKE.",
     "corrective_action_id is a human-readable ID like '2026/01/ST064/INS001_MA001', not a UUID.",
     "inspection_corrective_action.inspection_id is the PRIMARY FK to inspection_report.id.",
+    # NOTE: agent/prompts/templates/system_prompt.txt (~line 300-330, the
+    # "OBSERVATION -> MITIGATIVE ACTION" worked-example section) is an
+    # independently hand-written restatement of this same PATH 1/2/3 rule
+    # (different example values/phrasing, not generated from this source) —
+    # currently in sync but with no shared source or consistency-checker
+    # coverage between them. If you edit the rule here, check that file too.
     "OBSERVATION → MITIGATIVE ACTION — two distinct paths, NEVER confuse them: "
     "PATH 1 — MAs for a SPECIFIC observation: JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar "
     "(cast the UUID side to varchar — NEVER aa.submission_id::uuid = ica.observation_id, NEVER ::text). "
@@ -201,6 +207,8 @@ HOW TABLES CONNECT (inspection_report is the hub):
     inspection_communication_group_organisations.organisation_id or organisation_countries.organisation_id
     instead (see COMMUNICATION GROUPS below). In current data both of those paths also only ever
     point at a single organisation, so "break down by organisation" queries won't be meaningful yet.
+    This is a data snapshot, not a DB-enforced constraint — if it ever needs re-checking, run
+    SELECT COUNT(*) FROM facility WHERE organization_id IS NOT NULL again.
   facility.region_id       → region.id
   region.country_id        → country.id        ← region belongs to a country
   inspection_report.inspector_user_id   → users.id
@@ -773,7 +781,11 @@ AUDIT_BUSINESS_RULES = [
     "warning of any kind. 'pending submission' = status IN ('DRAFT', 'PENDING') instead — DRAFT/"
     "PENDING are valid schema values with 0 populated rows in the current dataset, not invalid ones.",
     "'COMPLETED' ON review IS NOT 'APPROVED' — confirmed live: of 261 COMPLETED reviews, 73 (28%) "
-    "have action = 'RETURN_FOR_MODIFICATION' (rejected/sent back), not 'APPROVE'. review.status "
+    "have action = 'RETURN_FOR_MODIFICATION' (rejected/sent back), not 'APPROVE'. This 28% figure is "
+    "a data snapshot, not a fixed rule — re-verify via SELECT action, COUNT(*) FROM review WHERE "
+    "status='COMPLETED' GROUP BY action if it ever needs re-checking; the underlying RULE (status "
+    "COMPLETED != approved, always check action too) holds regardless of the exact percentage. "
+    "review.status "
     "only tracks whether the review STEP is finished, not its outcome. 'who approved X' / 'was X "
     "approved' / 'approved corrective actions|plans|schedules' MUST filter "
     "WHERE status = 'COMPLETED' AND action = 'APPROVE' — filtering status = 'COMPLETED' alone "
@@ -799,7 +811,8 @@ AUDIT_BUSINESS_RULES = [
     "Confirmed live: reusing 'ap' for auditor_portfolio caused a hallucinated po.portfolio_id lookup.",
     "review_level IS NOT A RELIABLE SOURCE for 'how many levels of approval does X have' — it is a "
     "small, incomplete, stale-looking config table (4 rows total: AUDIT_CORRECTIVE_ACTION=1, "
-    "INSPECTION_PORTFOLIO=1, PORTFOLIO=1, SCHEDULE=2) that has NO row at all for AUDIT_PLAN or "
+    "INSPECTION_PORTFOLIO=1, PORTFOLIO=1, SCHEDULE=2 — a data snapshot, re-verify via "
+    "SELECT * FROM review_level if it ever needs re-checking) that has NO row at all for AUDIT_PLAN or "
     "INSPECTION_REPORT, and even where it does have a row it disagrees with real data — "
     "AUDIT_CORRECTIVE_ACTION actually reaches level 2 for BOTH review_type='ADEQUACY' and "
     "'IMPLEMENTATION' (confirmed live), not the single level review_level claims. NEVER join or "

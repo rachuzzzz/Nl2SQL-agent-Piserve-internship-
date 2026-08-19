@@ -55,6 +55,17 @@ class Settings:
     vllm_sql_model: str
     vllm_api_key: str
 
+    # llama.cpp — optional alternative LLM provider, see llm/factory.py's
+    # get_reasoning_llm_llamacpp/get_sql_llm_llamacpp. Unlike vLLM/Ollama,
+    # reasoning and sql are two separate llama-server processes/ports (one
+    # model per process is a llama-server constraint), hence two URLs
+    # instead of one shared vllm_url/ollama_url.
+    llamacpp_reasoning_url: str
+    llamacpp_reasoning_model: str
+    llamacpp_sql_url: str
+    llamacpp_sql_model: str
+    llamacpp_api_key: str
+
     # Which provider AgentOrchestrator.from_env() builds reasoning_llm/sql_llm
     # from, independently per role — each is "ollama" (default), "anthropic",
     # or "vllm". Replaces the old single llm_provider switch that flipped both
@@ -108,6 +119,11 @@ def get_settings() -> Settings:
         vllm_reasoning_model=g("VLLM_REASONING_MODEL", ""),
         vllm_sql_model=g("VLLM_SQL_MODEL", ""),
         vllm_api_key=g("VLLM_API_KEY", "dummy").strip(),
+        llamacpp_reasoning_url=g("LLAMACPP_REASONING_URL", "http://localhost:10000/v1"),
+        llamacpp_reasoning_model=g("LLAMACPP_REASONING_MODEL", ""),
+        llamacpp_sql_url=g("LLAMACPP_SQL_URL", "http://localhost:10001/v1"),
+        llamacpp_sql_model=g("LLAMACPP_SQL_MODEL", ""),
+        llamacpp_api_key=g("LLAMACPP_API_KEY", "dummy").strip(),
         reasoning_llm_provider=g("REASONING_LLM_PROVIDER", "ollama").strip().lower(),
         sql_llm_provider=g("SQL_LLM_PROVIDER", "ollama").strip().lower(),
         # NOTE: no .lower() here — matches the original orchestrator.py check

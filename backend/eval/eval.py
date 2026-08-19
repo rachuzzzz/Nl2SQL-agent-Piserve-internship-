@@ -908,6 +908,13 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
                 model_pair=model_pair_label,
                 wall_s=round(wall, 2),
                 llm_calls=result.stats.total_llm_calls,
+                reasoning_ms=result.stats.total_llm_latency_ms,
+                sql_gen_ms=result.stats.total_sql_gen_ms,
+                sql_exec_ms=result.stats.total_sql_exec_ms,
+                reasoning_prefill_ms=result.stats.reasoning_prefill_ms,
+                reasoning_decode_ms=result.stats.reasoning_decode_ms,
+                sql_gen_prefill_ms=result.stats.sql_gen_prefill_ms,
+                sql_gen_decode_ms=result.stats.sql_gen_decode_ms,
                 prompt_tokens=result.stats.total_prompt_tokens,
                 completion_tokens=result.stats.total_completion_tokens,
                 sql_errors=se,
@@ -947,7 +954,11 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
             print(f"         CRASH {wall:.1f}s: {e}\n")
             results.append(dict(
                 id=qid, category=cat, question=q, model_pair=model_pair_label,
-                wall_s=round(wall, 2), llm_calls=-1, prompt_tokens=0,
+                wall_s=round(wall, 2), llm_calls=-1,
+                reasoning_ms=0, sql_gen_ms=0, sql_exec_ms=0,
+                reasoning_prefill_ms=0, reasoning_decode_ms=0,
+                sql_gen_prefill_ms=0, sql_gen_decode_ms=0,
+                prompt_tokens=0,
                 completion_tokens=0, sql_errors=-1, parse_errors=-1,
                 keyword_hits="0/0", keyword_pct=0,
                 empty_result=False, forced_fail=True, real_pass=False,
@@ -964,6 +975,23 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
     avg_t      = sum(r["wall_s"] for r in results) / total if total else 0
     tot_se     = sum(r["sql_errors"]   for r in results if r["sql_errors"]   >= 0)
     tot_pe     = sum(r["parse_errors"] for r in results if r["parse_errors"] >= 0)
+
+    # ── latency breakdown — Phase 3.1/3.2 profiling, mirrored from
+    # eval_audit.py — see QueryStats.total_sql_gen_ms/reasoning_prefill_ms
+    # docstrings for what these fields mean and why sql_gen is tracked
+    # separately from raw Postgres exec time. ──────────────────────────────
+    _ok = [r for r in results if r["llm_calls"] >= 0]
+    _tot_wall_ms   = sum(r["wall_s"] * 1000 for r in _ok)
+    _tot_reason_ms = sum(r["reasoning_ms"] for r in _ok)
+    _tot_sqlgen_ms = sum(r["sql_gen_ms"]   for r in _ok)
+    _tot_sqlexec_ms= sum(r["sql_exec_ms"]  for r in _ok)
+    _tot_other_ms  = max(0, _tot_wall_ms - _tot_reason_ms - _tot_sqlgen_ms - _tot_sqlexec_ms)
+    _pct = lambda part: round(100 * part / _tot_wall_ms) if _tot_wall_ms else 0
+    _tot_reason_pf = sum(r["reasoning_prefill_ms"] for r in _ok)
+    _tot_reason_dc = sum(r["reasoning_decode_ms"]  for r in _ok)
+    _tot_sqlgen_pf = sum(r["sql_gen_prefill_ms"]   for r in _ok)
+    _tot_sqlgen_dc = sum(r["sql_gen_decode_ms"]    for r in _ok)
+    _sub_pct = lambda part, whole: round(100 * part / whole) if whole else 0
 
     # keyword avg only over questions that have keywords defined
     kp_vals = [r["keyword_pct"] for r in results
@@ -1008,6 +1036,17 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
     print(f"  Avg time:     {avg_t:.1f}s")
     print(f"  Avg kw hit:   {avg_kp}%  (over {len(kp_vals)} keyword-tested questions)")
     print(f"  SQL errors:   {tot_se}  |  Parse errors: {tot_pe}")
+    print(f"\n  LATENCY BREAKDOWN (of {_tot_wall_ms/1000:.1f}s total wall time, {len(_ok)} queries)")
+    print(f"    reasoning LLM (chat/classify/synthesize): {_tot_reason_ms/1000:>7.1f}s  ({_pct(_tot_reason_ms):>3d}%)")
+    print(f"    SQL-gen (retrieval+prompt+coder LLM+val): {_tot_sqlgen_ms/1000:>7.1f}s  ({_pct(_tot_sqlgen_ms):>3d}%)")
+    print(f"    SQL execution (Postgres):                 {_tot_sqlexec_ms/1000:>7.1f}s  ({_pct(_tot_sqlexec_ms):>3d}%)")
+    print(f"    other/unaccounted overhead:                {_tot_other_ms/1000:>7.1f}s  ({_pct(_tot_other_ms):>3d}%)")
+    if _tot_reason_pf + _tot_reason_dc + _tot_sqlgen_pf + _tot_sqlgen_dc:
+        print(f"\n  PREFILL vs DECODE SPLIT (llama.cpp `timings` field)")
+        print(f"    reasoning: prefill {_tot_reason_pf/1000:>6.1f}s ({_sub_pct(_tot_reason_pf, _tot_reason_ms):>3d}%)"
+              f"  |  decode {_tot_reason_dc/1000:>6.1f}s ({_sub_pct(_tot_reason_dc, _tot_reason_ms):>3d}%)")
+        print(f"    sql-gen  : prefill {_tot_sqlgen_pf/1000:>6.1f}s ({_sub_pct(_tot_sqlgen_pf, _tot_sqlgen_ms):>3d}%)"
+              f"  |  decode {_tot_sqlgen_dc/1000:>6.1f}s ({_sub_pct(_tot_sqlgen_dc, _tot_sqlgen_ms):>3d}%)")
 
     # ── ground-truth summary ─────────────────────────────────────────────────
     truth_rows = [r for r in results if r.get("truth_covered")]
@@ -1048,6 +1087,12 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
             forced_fails=forced_fails,
             truth_covered=len(truth_rows),
             truth_pass=truth_pass,
+            latency_breakdown_ms=dict(
+                total_wall=round(_tot_wall_ms), reasoning=_tot_reason_ms,
+                sql_gen=_tot_sqlgen_ms, sql_exec=_tot_sqlexec_ms, other=_tot_other_ms,
+                reasoning_prefill=_tot_reason_pf, reasoning_decode=_tot_reason_dc,
+                sql_gen_prefill=_tot_sqlgen_pf, sql_gen_decode=_tot_sqlgen_dc,
+            ),
             results=results,
         ), f, indent=2)
     print(f"\n  Results saved -> {fname}\n")

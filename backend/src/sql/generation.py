@@ -13,7 +13,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.engine import Engine
 
 from src.sql.validation import SQLValidator, ValidationResult
-from src.llm.base import extract_token_counts
+from src.llm.base import extract_token_counts, extract_llamacpp_timings, TokenUsage
 from src.llm.prefix_cache import PrefixCacheManager
 
 
@@ -312,6 +312,16 @@ def generate_sql(
     _db_schema=None,
     _active_cycle_uuid: str = "",
     _retry_attempt: int = 0,
+    # True when the caller (loop.py) knows this call, if it also fails
+    # validation/execution, will trip the outer 3-attempt cap and end the
+    # turn in a refusal/clarification — see loop.py's _last_attempt comment.
+    # When True, the offset/table/uuid guard retries below skip firing:
+    # whatever they'd produce is still judged by that same terminal cap on
+    # the next pass, so the extra sql_llm.complete() call(s) they'd make
+    # can only add latency/tokens, never change the outcome. Guards on
+    # attempts 1-2 (the default, False) are unaffected — a guard fixing the
+    # SQL there can still save the query, so they still fire.
+    _last_attempt: bool = False,
     relevant_tables: list | None = None,
     _core_context: str | None = None,
     _build_core_context_fn=None,
@@ -458,24 +468,38 @@ def generate_sql(
         if _debug_logger:
             _debug_logger.debug(
                 f"\n{'='*70}\n>>> SQL-GEN PROMPT ({_sql_model_name}) (question={question!r})\n"
-                f"{'='*70}\n{prompt[-3000:]}\n"  # last 3000 chars — schema_hint is at end
+                f"{'='*70}\n{prompt[-3000:]}\n"  # last 3000 chars — schema_hint now sits right before the question (dynamic_examples moved earlier, see loop.py's _sql_static_prefix comment)
             )
 
         # Accumulated across every sql_llm.complete() call this invocation
         # makes (initial + up to 3 guard retries below) — each is a real,
         # separately-billed API call, so the total returned to the caller
-        # must be the sum, not just the last call's count.
+        # must be the sum, not just the last call's count. Cache fields are
+        # Anthropic-only (0 on Ollama/vLLM) — see llm/base.py's TokenUsage.
         _prompt_tok_total = 0
         _completion_tok_total = 0
+        _cache_read_tok_total = 0
+        _cache_creation_tok_total = 0
+        # llama.cpp-only prefill/decode split, summed across every
+        # sql_llm.complete() call this invocation makes — same
+        # accumulate-across-retries rationale as the token counters above.
+        # See llm/base.py's LlamaCppTimings and Phase 3.2 profiling.
+        _prefill_ms_total = 0.0
+        _decode_ms_total = 0.0
         _prefix_cache = PrefixCacheManager(sql_llm, domain=_domain, role="sql")
 
         response = sql_llm.complete(prompt)
         raw_sql = str(response).strip()
         _raw_response = getattr(response, "raw", {}) or {}
-        _pt, _ct = extract_token_counts(_raw_response)
-        _prompt_tok_total += _pt
-        _completion_tok_total += _ct
+        _usage = extract_token_counts(_raw_response)
+        _prompt_tok_total += _usage.prompt_tokens
+        _completion_tok_total += _usage.completion_tokens
+        _cache_read_tok_total += _usage.cache_read_tokens
+        _cache_creation_tok_total += _usage.cache_creation_tokens
         _prefix_cache.record(_raw_response)
+        _timing = extract_llamacpp_timings(_raw_response)
+        _prefill_ms_total += _timing.prompt_ms
+        _decode_ms_total += _timing.predicted_ms
 
         # Log raw SQL-gen model output
         if _debug_logger:
@@ -515,7 +539,13 @@ def generate_sql(
         # the row-selector that pinned it to one specific row. ────────────
         try:
             if re.search(r'\bOFFSET\s+\d+', _guard_scan_text or "", re.IGNORECASE):
-                if not re.search(r'\bOFFSET\s+\d+', raw_sql, re.IGNORECASE):
+                if not re.search(r'\bOFFSET\s+\d+', raw_sql, re.IGNORECASE) and _last_attempt:
+                    if _debug_logger:
+                        _debug_logger.debug(
+                            "  [offset-guard] skipped — last permitted attempt, "
+                            "a retry here can't change the outcome"
+                        )
+                elif not re.search(r'\bOFFSET\s+\d+', raw_sql, re.IGNORECASE):
                     _mandatory = (
                         "### MANDATORY (do not deviate)\n"
                         "Your schema_hint above resolves \"the Nth one\" via a LIMIT 1 OFFSET "
@@ -536,10 +566,15 @@ def generate_sql(
                         )
                     response_og = sql_llm.complete(forced_prompt)
                     raw_sql = str(response_og).strip()
-                    _pt, _ct = extract_token_counts(getattr(response_og, "raw", {}) or {})
-                    _prompt_tok_total += _pt
-                    _completion_tok_total += _ct
+                    _usage = extract_token_counts(getattr(response_og, "raw", {}) or {})
+                    _prompt_tok_total += _usage.prompt_tokens
+                    _completion_tok_total += _usage.completion_tokens
+                    _cache_read_tok_total += _usage.cache_read_tokens
+                    _cache_creation_tok_total += _usage.cache_creation_tokens
                     _prefix_cache.record(getattr(response_og, "raw", {}) or {})
+                    _timing = extract_llamacpp_timings(getattr(response_og, "raw", {}) or {})
+                    _prefill_ms_total += _timing.prompt_ms
+                    _decode_ms_total += _timing.predicted_ms
                     if _debug_logger:
                         _debug_logger.debug(
                             f"\n{'='*70}\n>>> SQL-GEN RAW OUTPUT ({_sql_model_name}) (offset-guard retry)"
@@ -592,7 +627,13 @@ def generate_sql(
                     except re.error:
                         pass
 
-                if missing_req or violated_forbidden:
+                if (missing_req or violated_forbidden) and _last_attempt:
+                    if _debug_logger:
+                        _debug_logger.debug(
+                            "  [table-guard] skipped — last permitted attempt, "
+                            "a retry here can't change the outcome"
+                        )
+                elif missing_req or violated_forbidden:
                     guard_msg_parts = []
                     if missing_req:
                         guard_msg_parts.append(f"MUST USE TABLES: {', '.join(missing_req)}")
@@ -625,10 +666,15 @@ def generate_sql(
                         )
                     response2 = sql_llm.complete(forced_prompt)
                     raw_sql = str(response2).strip()
-                    _pt, _ct = extract_token_counts(getattr(response2, "raw", {}) or {})
-                    _prompt_tok_total += _pt
-                    _completion_tok_total += _ct
+                    _usage = extract_token_counts(getattr(response2, "raw", {}) or {})
+                    _prompt_tok_total += _usage.prompt_tokens
+                    _completion_tok_total += _usage.completion_tokens
+                    _cache_read_tok_total += _usage.cache_read_tokens
+                    _cache_creation_tok_total += _usage.cache_creation_tokens
                     _prefix_cache.record(getattr(response2, "raw", {}) or {})
+                    _timing = extract_llamacpp_timings(getattr(response2, "raw", {}) or {})
+                    _prefill_ms_total += _timing.prompt_ms
+                    _decode_ms_total += _timing.predicted_ms
 
                     # Re-check: did the retry actually fix what triggered it?
                     # Without this, a small model ignoring the forced instruction
@@ -692,7 +738,13 @@ def generate_sql(
                 (col, uid, src) for col, uid, src in _hint_uuid_filters
                 if uid.lower() not in raw_sql.lower()
             ]
-            if _missing_uuid:
+            if _missing_uuid and _last_attempt:
+                if _debug_logger:
+                    _debug_logger.debug(
+                        "  [uuid-guard] skipped — last permitted attempt, "
+                        "a retry here can't change the outcome"
+                    )
+            elif _missing_uuid:
                 # Multiple FK columns can resolve to the SAME uuid (e.g. "assigned
                 # to X" meaning X could be the inspector OR the inspectee) — those
                 # must be OR'd, not AND'd, or the filter demands a row where X is
@@ -746,10 +798,15 @@ def generate_sql(
                     _debug_logger.debug(f"  [uuid-guard] firing retry — missing={_missing_uuid}")
                 response3 = sql_llm.complete(forced_prompt)
                 raw_sql = str(response3).strip()
-                _pt, _ct = extract_token_counts(getattr(response3, "raw", {}) or {})
-                _prompt_tok_total += _pt
-                _completion_tok_total += _ct
+                _usage = extract_token_counts(getattr(response3, "raw", {}) or {})
+                _prompt_tok_total += _usage.prompt_tokens
+                _completion_tok_total += _usage.completion_tokens
+                _cache_read_tok_total += _usage.cache_read_tokens
+                _cache_creation_tok_total += _usage.cache_creation_tokens
                 _prefix_cache.record(getattr(response3, "raw", {}) or {})
+                _timing = extract_llamacpp_timings(getattr(response3, "raw", {}) or {})
+                _prefill_ms_total += _timing.prompt_ms
+                _decode_ms_total += _timing.predicted_ms
                 if _debug_logger:
                     _debug_logger.debug(
                         f"\n{'='*70}\n>>> SQL-GEN RAW OUTPUT ({_sql_model_name}) (uuid-guard retry)\n{'='*70}\n{raw_sql}\n"
@@ -971,6 +1028,15 @@ def generate_sql(
                 "_token_usage": {
                     "prompt_tokens": _prompt_tok_total,
                     "completion_tokens": _completion_tok_total,
+                    "cache_read_tokens": _cache_read_tok_total,
+                    "cache_creation_tokens": _cache_creation_tok_total,
+                },
+                # llama.cpp-only prefill/decode split — see llm/base.py's
+                # LlamaCppTimings and Phase 3.2 profiling. 0/0 on any other
+                # provider (extract_llamacpp_timings' zero-valued default).
+                "_llm_timings": {
+                    "prefill_ms": _prefill_ms_total,
+                    "decode_ms": _decode_ms_total,
                 },
                 # Internal-only, human-debugging attribution data (Item 3 of
                 # the generation-quality plan) — answers "did the planner or
@@ -1000,6 +1066,8 @@ def generate_sql(
                 "_token_usage": {
                     "prompt_tokens": _prompt_tok_total if "_prompt_tok_total" in locals() else 0,
                     "completion_tokens": _completion_tok_total if "_completion_tok_total" in locals() else 0,
+                    "cache_read_tokens": _cache_read_tok_total if "_cache_read_tok_total" in locals() else 0,
+                    "cache_creation_tokens": _cache_creation_tok_total if "_cache_creation_tok_total" in locals() else 0,
                 },
             },
             "error": str(exc),

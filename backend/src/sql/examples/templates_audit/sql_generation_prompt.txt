@@ -122,6 +122,18 @@ Generate a SQL query answering the question given at the end of this prompt.
   an existence check — that wrongly treats "raised but not yet approved" as "never raised",
   silently inflating the "no corrective actions" count with audits that DO have one raised.
 
+### DEFAULT SCOPE FOR AUDIT SCHEDULE / AUDIT PLAN LISTINGS:
+  A general "list/show audit schedules" question (no explicit status ask) must
+  exclude DRAFT rows by default — add AND asch.schedule_status != 'DRAFT'.
+  Valid schedule_status values: DRAFT, PENDING_REVIEW, APPROVED, ONGOING,
+  COMPLETED, RETURN_MODIFICATION. ONLY omit this filter when the question
+  explicitly asks about draft/pending/unapproved schedules or schedule status.
+
+  Same rule for audit_plan: a general "list/show audit plans" question must
+  add AND ap.status != 'DRAFT'. Valid audit_plan.status values: APPROVED,
+  DRAFT, RETURNED_FOR_MODIFICATION, SUBMITTED. ONLY omit when the question
+  explicitly asks about draft/pending plans or plan status.
+
 ### OBSERVATION → CORRECTIVE ACTION LINK:
   audit_corrective_action.observation_id (UUID) → ai_audit_answers.submission_id (varchar)
   JOIN: aaa.submission_id = aca.observation_id::varchar  ← cast UUID to varchar, NOT the other way
@@ -170,14 +182,14 @@ Generate a SQL query answering the question given at the end of this prompt.
     -- commonly share the same created_on (confirmed live 2026-08-10) — without id,
     -- ordering within one repeatable entry is not deterministic.
 
-### Additional context
-{schema_hint}
-
 ### Examples
 The first example below is marked PRIMARY: it is the closest retrieved
 match to this question and is the pattern to follow. The rest are
 secondary references.
 {dynamic_examples}
+
+### Additional context
+{schema_hint}
 
 ### Answer
 REMINDER: a query that LISTS/DISPLAYS audit_corrective_action rows must add
@@ -187,5 +199,10 @@ this applies regardless of how many other tables/columns the query joins.
 This does NOT apply to an EXISTENCE check ("no corrective actions", "has a CA
 been raised") — there, a 'CA_DRAFT' row still counts as raised/exists; check
 aca.id IS NULL, never adequacy_status or corrective_action_id.
+REMINDER: a query LISTING audit_schedule rows must add
+AND asch.schedule_status != 'DRAFT' UNLESS the question explicitly asks about
+draft/pending schedules or schedule status. A query LISTING audit_plan rows
+must add AND ap.status != 'DRAFT' UNLESS the question explicitly asks about
+draft/pending plans or plan status.
 Given the database schema, here is the SQL query that answers [QUESTION]{question}[/QUESTION]
 [SQL]

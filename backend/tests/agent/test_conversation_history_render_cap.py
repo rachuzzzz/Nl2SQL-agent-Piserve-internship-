@@ -115,6 +115,38 @@ def test_history_block_is_meaningfully_smaller_than_uncapped():
     assert len(ctx_8) < len(ctx_3) * 3
 
 
+def test_domain_empty_recent_turn_is_compacted_not_verbatim():
+    """A greeting/domain-ack turn resolves no domain data — it must render
+    via the compact one-line form even when it's within the 3-most-recent
+    window, not the full-detail form real data-bearing turns get. Regression
+    guard for the MTP-vs-base investigation: two live sessions whose only
+    difference was "Hello" vs "hello" in this exact kind of turn produced
+    different downstream SQL three turns later, purely from this verbatim
+    rendering — the model itself was proven deterministic per exact input."""
+    session = ConversationSession()
+    session.add_turn(ConversationTurn(
+        question="hello",
+        answer="Are you looking for information about facility inspections or audits?",
+        tool_used="domain_clarification",
+    ))
+    session.add_turn(ConversationTurn(
+        question="audit",
+        answer="Got it — audits. What would you like to know?",
+        tool_used="domain_ack", domain="audit",
+    ))
+    ctx = session.build_context_block(
+        current_question="show all audit schedules", current_domain="audit",
+    )
+    # Compact form: "Turn N: User: 'q' -> a"
+    assert "Turn 1: User: 'hello'" in ctx
+    assert "Turn 2: User: 'audit'" in ctx
+    # Full-detail form markers must NOT appear for these two turns.
+    assert "Turn 1:\n" not in ctx
+    assert "Turn 2:\n" not in ctx
+    assert "Answer: Are you looking for" not in ctx
+    assert "Answer: Got it" not in ctx
+
+
 def test_go_back_to_older_turn_still_resolves_via_structured_data():
     """The active_subject on turn 2 (an "older", now-compacted turn once 8
     turns exist) must still be found by the "go back to" resolver — it

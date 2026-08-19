@@ -32,7 +32,9 @@ Generate a SQL query answering the question given at the end of this prompt.
   inspection_report.entity_id       → entity.id        (DIRECT FK)
   # inspection_report has NO country_id — country is ONLY reachable via facility.country_id below
   NOTE: inspection_report has NO organisation_id or region_id — join via facility
-  facility.organization_id          → organisation.id  ⚠ CONFIRMED DEAD (all 175 rows NULL) —
+  facility.organization_id          → organisation.id  ⚠ CONFIRMED DEAD (all 175 rows NULL, verified
+                                        2026-07-08 — re-check via SELECT COUNT(*) FROM facility WHERE
+                                        organization_id IS NOT NULL if this ever needs re-verifying) —
                                         reach organisation via inspection_communication_group_organisations
                                         or organisation_countries instead
   facility.region_id                → region.id
@@ -246,14 +248,14 @@ Generate a SQL query answering the question given at the end of this prompt.
                (ir.submitted_on and aa.submitted_on differ — use aa.submitted_on for most-recently-answered)
 
 
-### Additional context
-{schema_hint}
-
 ### Examples
 The first example below is marked PRIMARY: it is the closest retrieved
 match to this question and is the pattern to follow. The rest are
 secondary references.
 {dynamic_examples}
+
+### Additional context
+{schema_hint}
 
 ### Answer
 Given the database schema, here is the SQL query that answers [QUESTION]{question}[/QUESTION]

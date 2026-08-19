@@ -603,13 +603,15 @@ async def chat(
 
         log_query.info(
             "[QUERY] END   qid=%s sub=%s elapsed=%dms llm_calls=%d "
-            "sql_errors=%d rows=%d tokens=%d/%d success=%s",
+            "sql_errors=%d rows=%d tokens=%d/%d cache_read=%d cache_write=%d success=%s",
             qid, sub, elapsed_ms,
             result.stats.total_llm_calls,
             sql_errors,
             _row_count,
             result.stats.total_prompt_tokens,
             result.stats.total_completion_tokens,
+            result.stats.total_cache_read_tokens,
+            result.stats.total_cache_creation_tokens,
             result.success,
         )
 
@@ -630,6 +632,8 @@ async def chat(
             prompt_tokens=result.stats.total_prompt_tokens,
             completion_tokens=result.stats.total_completion_tokens,
             total_tokens=result.stats.total_prompt_tokens + result.stats.total_completion_tokens,
+            cache_read_tokens=result.stats.total_cache_read_tokens,
+            cache_creation_tokens=result.stats.total_cache_creation_tokens,
             time_ms=elapsed_ms,
             llm_calls=result.stats.total_llm_calls,
             sql_errors=sql_errors,

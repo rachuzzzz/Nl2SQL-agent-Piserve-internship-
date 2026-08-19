@@ -360,6 +360,65 @@ AUDIT_BLOCK_RULES: list[dict] = [
         "hard_fail": True,
     },
     {
+        "id":          "audit_block_schedule_draft_not_excluded",
+        "type":        BLOCK,
+        "code":        "AUDIT_SCHEDULE_DRAFT_NOT_EXCLUDED",
+        "description": (
+            "General audit_schedule listings must exclude DRAFT rows by "
+            "default (schedule_status != 'DRAFT') unless the question "
+            "explicitly asks about draft/pending schedules or schedule "
+            "status. Sibling gap to audit_block_ca_draft_not_excluded — "
+            "this column had zero enforcement anywhere until now (confirmed "
+            "2026-08-18: the filter only ever appeared inside the reasoning "
+            "model's own worked example, so the coder model's unqualified "
+            "'may add or remove predicates' freedom silently dropped it)."
+        ),
+        "question_pattern": (
+            r"(?i)(?=.*\b(?:audit\s+)?schedules?\b)"
+            r"(?!.*\b(pending|draft|unapprov\w*|approv\w*|review|status)\b)"
+        ),
+        "sql_pattern": (
+            r"(?=.*\bFROM\s+audit_schedule\b)"
+            r"(?!.*\bschedule_status\s*(?:!=|<>|=|IN\s*\(|NOT\s+IN|"
+            r"IS(?:\s+NOT)?\s+NULL|IS\s+DISTINCT\s+FROM))"
+        ),
+        "message": (
+            "BLOCKED: general audit_schedule listing queries must exclude "
+            "DRAFT rows by default — add AND asch.schedule_status != "
+            "'DRAFT'. Only omit this when the question explicitly asks "
+            "about draft/pending schedules or schedule status."
+        ),
+        "hard_fail": True,
+    },
+    {
+        "id":          "audit_block_plan_draft_not_excluded",
+        "type":        BLOCK,
+        "code":        "AUDIT_PLAN_DRAFT_NOT_EXCLUDED",
+        "description": (
+            "General audit_plan listings must exclude DRAFT rows by "
+            "default (status != 'DRAFT') unless the question explicitly "
+            "asks about draft/pending plans or plan status. Same gap/fix "
+            "as audit_block_schedule_draft_not_excluded, applied to "
+            "audit_plan's sibling status column."
+        ),
+        "question_pattern": (
+            r"(?i)(?=.*\b(?:audit\s+)?plans?\b)"
+            r"(?!.*\b(pending|draft|unapprov\w*|approv\w*|review|status)\b)"
+        ),
+        "sql_pattern": (
+            r"(?=.*\bFROM\s+audit_plan\b)"
+            r"(?!.*\b(?:ap\.)?status\s*(?:!=|<>|=|IN\s*\(|NOT\s+IN|"
+            r"IS(?:\s+NOT)?\s+NULL|IS\s+DISTINCT\s+FROM))"
+        ),
+        "message": (
+            "BLOCKED: general audit_plan listing queries must exclude "
+            "DRAFT rows by default — add AND ap.status != 'DRAFT'. Only "
+            "omit this when the question explicitly asks about draft/"
+            "pending plans or plan status."
+        ),
+        "hard_fail": True,
+    },
+    {
         "id":          "audit_block_ca_existence_check_adequacy_filtered",
         "type":        BLOCK,
         "code":        "AUDIT_CA_EXISTENCE_CHECK_ADEQUACY_FILTERED",
@@ -429,7 +488,9 @@ AUDIT_BLOCK_RULES: list[dict] = [
             "review.status = 'COMPLETED' does NOT mean approved — a completed review can "
             "have action = 'RETURN_FOR_MODIFICATION' (rejected/sent back) instead of "
             "'APPROVE'. Confirmed live: 73 of 261 completed reviews (28%) are rejections, "
-            "not approvals. 'who/which approved' questions must filter "
+            "not approvals — a data snapshot, re-verify via SELECT action, COUNT(*) FROM "
+            "review WHERE status='COMPLETED' GROUP BY action if it ever needs re-checking. "
+            "'who/which approved' questions must filter "
             "status = 'COMPLETED' AND action = 'APPROVE', not status alone — same shape of "
             "trap as audit_block_ca_draft_not_excluded's adequacy_status filter."
         ),

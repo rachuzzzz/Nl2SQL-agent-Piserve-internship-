@@ -22,7 +22,7 @@ FROM audit_schedule asch
 LEFT JOIN facility fac ON asch.facility_id = fac.id
 LEFT JOIN users u_aud ON asch.auditor_id = u_aud.id
 LEFT JOIN users u_ee ON asch.auditee_id = u_ee.id
-WHERE asch.active = true
+WHERE asch.active = true AND asch.schedule_status != 'DRAFT'
 ORDER BY asch.follow_up_date DESC NULLS LAST
 LIMIT 100;
 """,
@@ -345,7 +345,7 @@ FROM audit_plan ap
 JOIN audit_cycle acyc ON ap.cycle_id = acyc.id
 LEFT JOIN audit_category acat ON ap.category_id = acat.id
 LEFT JOIN users u ON ap.user_id = u.id
-WHERE ap.active = true
+WHERE ap.active = true AND ap.status != 'DRAFT'
 ORDER BY acyc.start_date DESC
 LIMIT 100;
 """,
