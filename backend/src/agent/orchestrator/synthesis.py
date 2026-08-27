@@ -70,7 +70,7 @@ class SynthesisMixin:
     # ------------------------------------------------------------------ #
 
     def _finish(self, question, answer, steps, iteration, emit_fn=None,
-                stats=None, session=None, query_start=None):
+                stats=None, session=None, query_start=None, qid: str = "", sub: str = ""):
         s = AgentStep(iteration, "[auto] synthesized", "final_answer",
                       {"answer": answer}, {"answer": answer}, 0)
         steps.append(s)
@@ -739,8 +739,9 @@ class SynthesisMixin:
             ))
 
         _final_stats = stats or QueryStats()
-        _log_query.debug("[QUERY] _finish sub=? iter=%d wall=%dms llm=%dms sql=%dms "
+        _log_query.debug("[QUERY] _finish qid=%s sub=%s iter=%d wall=%dms llm=%dms sql=%dms "
                          "llm_calls=%d prompt_tok=%d completion_tok=%d",
+                         qid, sub,
                          iteration,
                          _final_stats.total_wall_ms,
                          _final_stats.total_llm_latency_ms,

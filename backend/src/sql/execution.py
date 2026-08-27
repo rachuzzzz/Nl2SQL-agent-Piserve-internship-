@@ -3,6 +3,7 @@ SQL execution against the live database. Extracted from agent/tools.py,
 alongside sql/generation.py.
 """
 
+import logging
 import re
 from typing import Any
 
@@ -10,6 +11,8 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.engine import Engine
 
 from src.sql.validation import SQLValidator
+
+logger = logging.getLogger("inspectai.sql")
 
 
 def _strip_limit_offset(sql: str) -> str:
@@ -24,7 +27,8 @@ def _strip_limit_offset(sql: str) -> str:
 
 
 def execute_sql(db_engine: Engine, validator: SQLValidator, sql: str, question: str = "",
-                 offset: int = 0, limit: int = 50, force: bool = False) -> dict[str, Any]:
+                 offset: int = 0, limit: int = 50, force: bool = False,
+                 qid: str = "") -> dict[str, Any]:
     try:
         # validate() returns ValidationResult.
         # Only hard fails block execution — soft warns are advisory and ignored here.
@@ -32,7 +36,7 @@ def execute_sql(db_engine: Engine, validator: SQLValidator, sql: str, question: 
         # OVERDUE_DATE_ARITHMETIC, CYCLE_UUID_NO_JOIN) still apply here — this is
         # also the re-validation gate used by the "forced execution after 3
         # failures" fallback in the orchestrator, which must not silently bypass them.
-        vresult = validator.validate(sql, question)
+        vresult = validator.validate(sql, question, qid=qid)
         if not vresult.passed:
             # force=True is the orchestrator's "forced execution after 3
             # validation failures" safety valve (loop.py) — but calling
@@ -89,6 +93,8 @@ def execute_sql(db_engine: Engine, validator: SQLValidator, sql: str, question: 
                         total_count = count_row[0]
                         truncated = total_count > (offset + limit)
             except Exception:
+                logger.debug("qid=%s COUNT(*) subquery failed, falling back to truncated=True",
+                             qid, exc_info=True)
                 truncated = True
                 total_count = -1
 
@@ -102,4 +108,5 @@ def execute_sql(db_engine: Engine, validator: SQLValidator, sql: str, question: 
             "error": None,
         }
     except Exception as exc:
+        logger.debug("qid=%s SQL execution raised %s", qid, type(exc).__name__, exc_info=True)
         return {"success": False, "result": None, "error": str(exc)}

@@ -219,7 +219,7 @@ async def chat(
         # to see the actual domain word, e.g. "Audit") — only the message
         # actually sent to the orchestrator gets swapped for the origin
         # question, once resolved.
-        route = router_.classify(req.message, session=_sess_obj)
+        route = router_.classify(req.message, session=_sess_obj, qid=qid)
         log_query.info("[ROUTER] qid=%s tier=%d domain=%s confidence=%.2f%s",
                         qid, route.tier, route.domain, route.confidence,
                         " (origin-question carryover)" if _is_pending_domain_pick and route.domain != "AMBIGUOUS" else "")
@@ -405,7 +405,7 @@ async def chat(
                     # Inline the same scope predicate the tool applied at query time.
                     # Uses build_scope_filter (server-trusted SQL, int(sub) cast).
                     # Added to clauses before SQL string is built to preserve :params.
-                    _ga_scope = build_scope_filter(visibility_scope) if visibility_scope else 'BLOCK'
+                    _ga_scope = build_scope_filter(visibility_scope, qid=qid) if visibility_scope else 'BLOCK'
                     if _ga_scope and _ga_scope != 'BLOCK':
                         _ga_clauses.append(_ga_scope)
                     _ga_where = " AND ".join(_ga_clauses)
@@ -603,7 +603,8 @@ async def chat(
 
         log_query.info(
             "[QUERY] END   qid=%s sub=%s elapsed=%dms llm_calls=%d "
-            "sql_errors=%d rows=%d tokens=%d/%d cache_read=%d cache_write=%d success=%s",
+            "sql_errors=%d rows=%d tokens=%d/%d cache_read=%d cache_write=%d success=%s "
+            "| reasoning=%dms(prefill=%dms decode=%dms) sql_gen=%dms(prefill=%dms decode=%dms) sql_exec=%dms",
             qid, sub, elapsed_ms,
             result.stats.total_llm_calls,
             sql_errors,
@@ -613,6 +614,13 @@ async def chat(
             result.stats.total_cache_read_tokens,
             result.stats.total_cache_creation_tokens,
             result.success,
+            result.stats.total_llm_latency_ms,
+            result.stats.reasoning_prefill_ms,
+            result.stats.reasoning_decode_ms,
+            result.stats.total_sql_gen_ms,
+            result.stats.sql_gen_prefill_ms,
+            result.stats.sql_gen_decode_ms,
+            result.stats.total_sql_exec_ms,
         )
 
         # Ground-truth flag, not a frontend heuristic — true only when this

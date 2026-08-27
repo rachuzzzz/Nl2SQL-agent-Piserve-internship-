@@ -164,7 +164,7 @@ async def get_my_permissions(
                 {"sub": int(sub)},
             ).fetchone()
     except Exception:
-        logging.exception("UUID lookup failed for sub=%s", sub)
+        log_auth.exception("UUID lookup failed for sub=%s", sub)
         raise HTTPException(status_code=502, detail="User UUID lookup failed")
 
     if not row:

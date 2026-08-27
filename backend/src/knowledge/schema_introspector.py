@@ -21,10 +21,14 @@ and the domain-router plan's §1b for the review/review_level approval-workflow
 findings this was built from.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.engine import Engine
+from src.knowledge.question_patterns import (
+    USER_ROLES_TOPIC, APPROVAL_WORKFLOW_TOPIC, COMMUNICATION_GROUPS_TOPIC,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +70,39 @@ _USERS_ID_NOTE = (
     "id_fk is the integer Drupal UID (e.g. 11410) — id is the UUID PK. "
     "Filtering by a raw numeric user ID → WHERE id_fk = <int>, NEVER WHERE id = <int>."
 )
+
+
+def _split_relationship_sections(text: str) -> list[tuple[str, str]]:
+    """
+    Phase 3.12: split a TABLE_RELATIONSHIPS-shaped constant into
+    (title, body) sections on its ALL-CAPS, column-0 heading lines (e.g.
+    "WHERE CONCEPTS LIVE:", "HOW TABLES CONNECT (...):") — every other line
+    in these constants is indented. Read-only text analysis for
+    DatabaseSchema.profile_fixed_overhead_relevance's relevance-by-section
+    measurement; never used to build a prompt, so approximate section
+    boundaries (a multi-line heading collapses to one space-joined title)
+    are fine — confirmed live: covers every line of TABLE_RELATIONSHIPS
+    with none dropped or duplicated.
+    """
+    sections: list[tuple[str, str]] = []
+    title_lines: list[str] = []
+    body_lines: list[str] = []
+    mode = "title"
+    for line in text.split("\n"):
+        is_heading = bool(line) and not line[0].isspace()
+        if is_heading:
+            if mode == "body":
+                sections.append((" ".join(title_lines).strip(), "\n".join(body_lines)))
+                title_lines, body_lines = [], []
+                mode = "title"
+            title_lines.append(line)
+        else:
+            body_lines.append(line)
+            mode = "body"
+    if title_lines or body_lines:
+        sections.append((" ".join(title_lines).strip(), "\n".join(body_lines)))
+    return sections
+
 
 BUSINESS_RULES = [
     # NOTE: the observation↔MA cast direction below must match
@@ -1056,6 +1093,20 @@ _tr_rest, _TR_APPROVAL_WORKFLOW = _extract_tr_section(
 TABLE_RELATIONSHIPS_CORE = _tr_rest
 del _tr_rest
 
+# Phase 3.15: for_schema_hint()'s SQL-gen "targeted" branch — the complement
+# of TABLE_RELATIONSHIPS_CORE above. 3.14's causal ablation (full 105-
+# question suite, all 6 CORE sections removed at once) showed zero
+# correctness regression; these 3 sections were kept unconditional instead
+# of also being cut because a keyword-coverage check found the eval suite
+# had zero/weak coverage of their topics at ablation time (communication
+# groups, approval-workflow's COMPLETED-vs-approved trap, user-role
+# EXISTS-not-JOIN fan-out) — since fixed by eval.py's FLT-08/JOI-13..15/
+# PPL-04/PPL-05, but not re-ablated individually, so left in rather than
+# assumed safe. Reuses the same extracted chunks as TABLE_RELATIONSHIPS_CORE
+# so the two constants are guaranteed to partition TABLE_RELATIONSHIPS with
+# no section duplicated or dropped.
+TABLE_RELATIONSHIPS_SQL_GEN = _TR_COMMUNICATION_GROUPS + _TR_USER_ROLES + _TR_APPROVAL_WORKFLOW
+
 INSPECTION_RULE_TOPIC_TEXT = {
     "user_roles": (
         "\n".join(f"  - {r}" for r in _INSPECTION_RULES_TOPICAL["user_roles"])
@@ -1360,6 +1411,25 @@ class DatabaseSchema:
     _business_rules_core: list = field(
         default_factory=lambda: list(BUSINESS_RULES_CORE), repr=False)
     _table_relationships_core: str = field(default=TABLE_RELATIONSHIPS_CORE, repr=False)
+    # for_schema_hint() only (Phase 3.15) — see TABLE_RELATIONSHIPS_SQL_GEN
+    # above for why this differs from both _table_relationships (full,
+    # still used by for_system_prompt) and _table_relationships_core (used
+    # only by the reasoning-prompt splice). Phase 3.16: this is now also the
+    # "no question supplied" / "domain doesn't support gating" fallback for
+    # _table_relationships_topic_gated() below, not for_schema_hint()'s
+    # only source of this content.
+    _table_relationships_sql_gen: str = field(default=TABLE_RELATIONSHIPS_SQL_GEN, repr=False)
+    # Phase 3.16: for_schema_hint()'s per-question topic gating of the same
+    # 3 sections TABLE_RELATIONSHIPS_SQL_GEN unconditionally concatenates —
+    # reuses the identical extracted chunks (_TR_USER_ROLES etc.) so a
+    # gated call renders byte-identical section text to the unconditional
+    # one, just fewer of them. Empty + _supports_tr_topic_gating=False for
+    # audit (see the audit factory override) since AUDIT_TABLE_RELATIONSHIPS
+    # was never split into per-topic chunks.
+    _tr_user_roles: str = field(default=_TR_USER_ROLES, repr=False)
+    _tr_approval_workflow: str = field(default=_TR_APPROVAL_WORKFLOW, repr=False)
+    _tr_communication_groups: str = field(default=_TR_COMMUNICATION_GROUPS, repr=False)
+    _supports_tr_topic_gating: bool = field(default=True, repr=False)
     _section_title: str = field(default="INSPECTION WORKFLOW TABLES", repr=False)
     _has_ai_section: bool = field(default=True, repr=False)
     _ai_join_pattern: str = field(
@@ -1411,6 +1481,59 @@ class DatabaseSchema:
             lines.append(f"AI FLAT TABLES join pattern:\n  {self._ai_join_pattern}")
         return "\n".join(lines)
 
+    # Same set for_sql_prompt_slim's FK-joins section filters to — pulled out
+    # to a module-level constant so _slim_schema_parts and for_sql_prompt_slim
+    # share one definition instead of two copies that could drift.
+    _CRITICAL_FKS = frozenset({
+        "risk_level_id", "impact_id", "facility_id", "inspection_type_id",
+        "inspector_user_id", "frequency_definition_id", "portfolio_details_id",
+    })
+
+    def _slim_schema_parts(self) -> dict:
+        """
+        Structural breakdown behind for_sql_prompt_slim() — one rendered
+        line per table/FK, keyed by name, in the same order
+        for_sql_prompt_slim() emits them. Extracted as its own method so
+        Phase 3.10's schema-block composition profiling
+        (profile_slim_schema_tokens below) can tokenize each line
+        individually without re-deriving this rendering logic a second
+        time with room to drift from the real one — same pattern
+        generation.py's _planner_contract_parts used for Phase 3.9.
+        for_sql_prompt_slim() itself is unchanged output (still the
+        identical joined string) and now just assembles these parts under
+        their section headers.
+
+        Returns {"key_columns": {table: line}, "lookup_tables": {table:
+        line}, "fk_joins": {fk_col: line}} — rendered line strings, not the
+        section header/label text for_sql_prompt_slim() wraps them in.
+        """
+        key_columns = {}
+        for tname, cols in self._useful_columns.items():
+            ev = self.enum_values.get(f"{tname}.status")
+            status_note = f" | status: {', '.join(repr(v) for v in ev)}" if ev else ""
+            key_columns[tname] = f"  {tname}: {', '.join(cols)}{status_note}"
+
+        lookup_tables = {}
+        for tname, info in self._lookup_config.items():
+            ev = self.enum_values.get(tname)
+            if ev and isinstance(ev[0], str):
+                vals = ", ".join(repr(v) for v in ev[:12])
+                lookup_tables[tname] = f"  {tname}.name → [{vals}]"
+            elif ev and isinstance(ev[0], dict):
+                names = ", ".join(repr(d["name"]) for d in ev[:8])
+                lookup_tables[tname] = f"  {tname}.name → [{names}]"
+            elif tname == "users":
+                lookup_tables[tname] = f"  users: {_USERS_ID_NOTE}"
+            else:
+                lookup_tables[tname] = f"  {tname}.name (UUID FK)"
+
+        fk_joins = {}
+        for fk_col, (table, alias, sel) in self._fk_resolution.items():
+            if fk_col in self._CRITICAL_FKS:
+                fk_joins[fk_col] = f"  {fk_col} → JOIN {table} {alias} ON ...{fk_col}={alias}.id → {sel}"
+
+        return {"key_columns": key_columns, "lookup_tables": lookup_tables, "fk_joins": fk_joins}
+
     def for_sql_prompt_slim(self) -> str:
         """
         Compact schema block for deepseek — target ~600 tokens.
@@ -1418,53 +1541,283 @@ class DatabaseSchema:
         Does NOT dump the full introspected column list for every table —
         that inflates context 3x and degrades 7B model generation quality.
         """
+        parts = self._slim_schema_parts()
         lines = ["### Schema — key columns (get_schema for full DDL):"]
-
-        for tname, cols in self._useful_columns.items():
-            ev = self.enum_values.get(f"{tname}.status")
-            status_note = f" | status: {', '.join(repr(v) for v in ev)}" if ev else ""
-            lines.append(f"  {tname}: {', '.join(cols)}{status_note}")
-
+        lines.extend(parts["key_columns"].values())
         lines.append("")
         lines.append("Lookup tables (JOIN by UUID FK, never compare UUID to string):")
-        for tname, info in self._lookup_config.items():
-            ev = self.enum_values.get(tname)
-            if ev and isinstance(ev[0], str):
-                vals = ", ".join(repr(v) for v in ev[:12])
-                lines.append(f"  {tname}.name → [{vals}]")
-            elif ev and isinstance(ev[0], dict):
-                names = ", ".join(repr(d["name"]) for d in ev[:8])
-                lines.append(f"  {tname}.name → [{names}]")
-            elif tname == "users":
-                lines.append(f"  users: {_USERS_ID_NOTE}")
-            else:
-                lines.append(f"  {tname}.name (UUID FK)")
-
-        CRITICAL_FKS = {
-            "risk_level_id", "impact_id", "facility_id", "inspection_type_id",
-            "inspector_user_id", "frequency_definition_id", "portfolio_details_id",
-        }
+        lines.extend(parts["lookup_tables"].values())
         lines.append("")
         lines.append("FK joins:")
-        for fk_col, (table, alias, sel) in self._fk_resolution.items():
-            if fk_col in CRITICAL_FKS:
-                lines.append(f"  {fk_col} → JOIN {table} {alias} ON ...{fk_col}={alias}.id → {sel}")
-
+        lines.extend(parts["fk_joins"].values())
         return "\n".join(lines)
 
-    def for_schema_hint(self, table_names: list) -> str:
+    def profile_slim_schema_tokens(self, base_url: str) -> dict:
+        """
+        Phase 3.10: real /tokenize count for each line of the slim SQL-gen
+        schema block, computed ONCE — not per question. Unlike schema_hint
+        as a whole (3.9), for_sql_prompt_slim()'s content doesn't depend on
+        the question at all: the same _useful_columns/_lookup_config/
+        _fk_resolution lines render on every single call (only live enum
+        values feed in, and those are fixed at DatabaseSchema construction,
+        not re-fetched per question). So a one-time per-line breakdown is
+        exact, not an approximation, for the whole eval run — versus
+        ~29 x 103 repeated /tokenize calls for the same unchanging text.
+
+        Callers (eval.py/eval_audit.py, gated behind --profile-tokens) diff
+        this against each query's _diagnostics["generated_tables"] to see
+        which included tables the generated SQL actually referenced.
+        """
+        from src.llm.tokenize import count_tokens_llamacpp
+        parts = self._slim_schema_parts()
+        key_columns_tok = {k: count_tokens_llamacpp(v, base_url) for k, v in parts["key_columns"].items()}
+        lookup_tables_tok = {k: count_tokens_llamacpp(v, base_url) for k, v in parts["lookup_tables"].items()}
+        fk_joins_tok = {k: count_tokens_llamacpp(v, base_url) for k, v in parts["fk_joins"].items()}
+        return {
+            "key_columns": key_columns_tok,
+            "lookup_tables": lookup_tables_tok,
+            "fk_joins": fk_joins_tok,
+            "key_columns_total": sum(key_columns_tok.values()),
+            "lookup_tables_total": sum(lookup_tables_tok.values()),
+            "fk_joins_total": sum(fk_joins_tok.values()),
+            "static_block_total": sum(key_columns_tok.values()) + sum(lookup_tables_tok.values()) + sum(fk_joins_tok.values()),
+        }
+
+    def profile_targeted_schema_tables(self, base_url: str) -> dict:
+        """
+        Phase 3.11: real /tokenize breakdown of for_schema_hint()'s per-
+        table rendering (_fmt_table), computed ONCE for every table this
+        domain knows about (self.tables | self.ai_tables |
+        self.lookup_tables) — same invariant-content rationale as
+        profile_slim_schema_tokens (3.10): _fmt_table(ts)'s output for a
+        given table doesn't depend on which OTHER tables the reasoning
+        model also named that call, so a per-table cost computed once here
+        lets eval.py reconstruct any specific "targeted"-variant call's
+        exact schema-block total via dict lookup on its named tables —
+        zero additional /tokenize calls in the hot path, however many
+        tables a call names.
+
+        Also tokenizes _fmt_lookup() and self._table_relationships ONCE —
+        both are appended by for_schema_hint() UNCONDITIONALLY, regardless
+        of which/how-many tables were selected, so they're fixed overhead
+        on every targeted call. This method exists specifically to answer
+        3.11's hypothesis B: is the targeted branch's ~4x cost (vs the slim
+        block) driven by per-table rendering richness, or by this fixed
+        baseline alone?
+        """
+        from src.llm.tokenize import count_tokens_llamacpp
+        all_tables = {**self.tables, **self.ai_tables, **self.lookup_tables}
+        per_table = {}
+        for tname, ts in all_tables.items():
+            fmt_parts = self._fmt_table_parts(ts)
+            plain_text = "\n".join(l for c, l in fmt_parts if c == "plain")
+            fk_text = "\n".join(l for c, l in fmt_parts if c == "fk")
+            enum_text = "\n".join(l for c, l in fmt_parts if c == "enum")
+            useful_line = (f"Useful output columns: {', '.join(self._useful_columns[tname])}"
+                           if tname in self._useful_columns else "")
+            table_full = self._fmt_table(ts)
+            columns_tok = count_tokens_llamacpp(plain_text, base_url)
+            fk_tok = count_tokens_llamacpp(fk_text, base_url)
+            enum_tok = count_tokens_llamacpp(enum_text, base_url)
+            useful_tok = count_tokens_llamacpp(useful_line, base_url)
+            table_total_tok = count_tokens_llamacpp(table_full, base_url)
+            per_table[tname] = {
+                "columns_tokens": columns_tok,
+                "fk_tokens": fk_tok,
+                "enum_tokens": enum_tok,
+                "useful_output_tokens": useful_tok,
+                # "### {name}\nColumns:" header + reconciliation slack —
+                # same by-subtraction treatment as 3.9/3.10's boilerplate.
+                "header_tokens": max(0, table_total_tok - columns_tok - fk_tok - enum_tok - useful_tok),
+                "table_total_tokens": table_total_tok,
+            }
+        return {
+            "per_table": per_table,
+            "lookup_section_tokens": count_tokens_llamacpp(self._fmt_lookup(), base_url),
+            # Phase 3.15: for_schema_hint() appends _table_relationships_sql_gen
+            # (COMMUNICATION GROUPS/USER ROLES/APPROVAL WORKFLOW only), not the
+            # full _table_relationships — tokenize what's actually rendered.
+            # STALE as of Phase 3.16: for_schema_hint() now further topic-gates
+            # this per-question (0-3 of the 3 sections, not always all 3), so
+            # this fixed "computed once" value is only correct again for calls
+            # where the question matches all 3 topic patterns. --profile-tokens
+            # reconciliation (eval.py) was not reworked for per-call gating —
+            # use plain (non-profiled) eval runs for Phase 3.16+ correctness
+            # validation, not --profile-tokens's token-composition breakdown.
+            "table_relationships_tokens": count_tokens_llamacpp(self._table_relationships_sql_gen, base_url),
+        }
+
+    def profile_fixed_overhead_relevance(self, base_url: str) -> dict:
+        """
+        Phase 3.12: structural breakdown of the two FIXED blocks 3.11
+        identified as ~78% of every "targeted" for_schema_hint() call's
+        cost — _fmt_lookup() (~979 tok) and self._table_relationships
+        (~1922 tok), both appended in full regardless of which/how-many
+        tables were named. Computed ONCE (same invariant-content rationale
+        as profile_slim_schema_tokens/profile_targeted_schema_tables) —
+        returns each sub-part's real token count AND its raw rendered text,
+        so eval.py can check per-call relevance (does this sub-part mention
+        any of THIS call's named/generated tables?) via a simple text
+        search, with zero additional /tokenize calls in the hot path.
+
+        lookup_tables/status_enums/join_patterns entries carry a "table"
+        field (the one table each line is about) for a direct relevance
+        check; relationship_sections entries don't (a prose section can
+        mention several tables) — eval.py substring-searches "text" for
+        those instead.
+        """
+        from src.llm.tokenize import count_tokens_llamacpp
+        parts = self._fmt_lookup_parts()
+
+        lookup_tables_tok = {
+            tname: {"text": line, "tokens": count_tokens_llamacpp(line, base_url), "table": tname}
+            for tname, line in parts["lookup_tables"].items()
+        }
+        status_enums_tok = {
+            key: {"text": line, "tokens": count_tokens_llamacpp(line, base_url), "table": key.split(".")[0]}
+            for key, line in parts["status_enums"].items()
+        }
+        join_patterns_tok = {
+            fk_col: {
+                "text": line, "tokens": count_tokens_llamacpp(line, base_url),
+                "table": self._fk_resolution[fk_col][0],
+            }
+            for fk_col, line in parts["join_patterns"].items()
+        }
+
+        relationship_sections_tok = {}
+        for title, body in _split_relationship_sections(self._table_relationships):
+            full = f"{title}\n{body}"
+            relationship_sections_tok[title] = {
+                "text": full, "tokens": count_tokens_llamacpp(full, base_url),
+            }
+
+        return {
+            "lookup_tables": lookup_tables_tok,
+            "status_enums": status_enums_tok,
+            "join_patterns": join_patterns_tok,
+            "relationship_sections": relationship_sections_tok,
+        }
+
+    def _table_relationships_topic_gated(self, question: str | None) -> str:
+        """
+        Phase 3.16: per-question gate on TABLE_RELATIONSHIPS_SQL_GEN's 3
+        sections, reusing the EXACT same question_pattern regexes
+        agent/prompts/builder.py's CONDITIONAL_BLOCKS already uses to gate
+        the identical content (user_roles/approval_workflow/communication_
+        groups topical rules) into the reasoning-LLM's prompt — single
+        source of truth in knowledge/question_patterns.py, so the SQL-gen
+        and reasoning prompts agree on which niche topics a question
+        touches instead of one being unconditional and the other gated.
+
+        Falls back to the full, unconditional _table_relationships_sql_gen
+        when no question is supplied (preserves exact prior behavior for
+        callers that don't have one — e.g. agent/tools.py's get_schema()
+        on-demand single-table lookup) or when the domain doesn't support
+        gating (audit — AUDIT_TABLE_RELATIONSHIPS was never split into
+        per-topic chunks, see the audit factory's _supports_tr_topic_gating
+        override).
+
+        Zero-match questions get "" — no size penalty, same as
+        build_conditional_blocks() on the reasoning side. This is a real
+        behavior change from 3.15's unconditional-3 baseline, not
+        instrumentation — validate with the standard full-eval-suite
+        real_pass/sql_ok/truth_pass gate before trusting it, same as every
+        other behavior-changing phase in this project.
+        """
+        if not question or not self._supports_tr_topic_gating:
+            return self._table_relationships_sql_gen
+        matched = []
+        if re.search(USER_ROLES_TOPIC, question):
+            matched.append(self._tr_user_roles)
+        if re.search(APPROVAL_WORKFLOW_TOPIC, question):
+            matched.append(self._tr_approval_workflow)
+        if re.search(COMMUNICATION_GROUPS_TOPIC, question):
+            matched.append(self._tr_communication_groups)
+        return "\n".join(matched)
+
+    def for_schema_hint(self, table_names: list, question: str | None = None) -> str:
+        """
+        Phase 3.13: _fmt_lookup() is scoped to the named tables' own FK
+        neighborhood — confirmed by 3.12's relevance profiling (real 103-
+        question suite, real /tokenize + generated-SQL-table diff): of
+        _fmt_lookup()'s ~979 tok, the cleanly per-table-attributable lines
+        (lookup tables / status enums / FK join-patterns) were irrelevant
+        to the actual generated SQL 87% of the time on average, and 12 of
+        them (149 tok, constant every call) were relevant on ZERO of 52
+        real targeted-branch calls. Additionally: for any table that IS
+        named, its own FK columns already get full join-resolution info
+        rendered inline by _fmt_table (see _fmt_table_parts's "fk" branch,
+        which checks the SAME self._fk_resolution _fmt_lookup's "JOIN
+        patterns:" section draws from) — so the unscoped join-patterns
+        list was largely re-stating information already present elsewhere
+        in the prompt for named tables, on top of listing irrelevant FKs
+        for tables that weren't named at all.
+
+        Phase 3.15: renders self._table_relationships_sql_gen (COMMUNICATION
+        GROUPS / USER ROLES / APPROVAL WORKFLOW only) instead of the full
+        self._table_relationships — 3.14's causal ablation (full 105-
+        question suite, all 6 other sections removed at once: WHERE
+        CONCEPTS LIVE, HOW TABLES CONNECT, TABLE COLUMNS, CRITICAL ai_*
+        JOIN PATTERN, MULTI-HOP EXAMPLES, RULE: TYPE names) showed zero
+        correctness regression — real_pass/sql_ok held, and the specific
+        entity/country/organisation-hierarchy questions those sections
+        document (FLT-08, JOI-13, JOI-15) still resolved correctly. See
+        TABLE_RELATIONSHIPS_SQL_GEN for why the 3 kept sections weren't
+        also cut.
+
+        Phase 3.16: those 3 kept sections are now further gated per-question
+        via _table_relationships_topic_gated(question) — see that method's
+        docstring. `question` is optional (defaults to None, preserving the
+        3.15 unconditional-3 behavior) since not every caller has the
+        natural-language question available (agent/tools.py's get_schema()
+        on-demand lookup does not).
+        """
         parts = []
         for tname in table_names:
             ts = self.tables.get(tname) or self.ai_tables.get(tname) or self.lookup_tables.get(tname)
             if ts:
                 parts.append(self._fmt_table(ts))
-        parts.append(self._fmt_lookup())
-        parts.append(self._table_relationships)
+        parts.append(self._fmt_lookup(scope=self.targeted_lookup_scope(table_names)))
+        parts.append(self._table_relationships_topic_gated(question))
         return "\n".join(parts)
 
-    def _fmt_table(self, ts: TableSchema) -> str:
-        lines = [f"### {ts.name}"]
-        col_parts = []
+    def targeted_lookup_scope(self, table_names: list) -> dict:
+        """
+        The _fmt_lookup() scope for_schema_hint() uses for these
+        table_names — extracted as its own method so eval.py's Phase 3.13
+        validation (comparing each targeted call's real vs. reconstructed
+        cost using Phase 3.12's per-item costs) can compute the identical
+        scope without re-deriving the FK-neighbor logic a second time.
+        """
+        relevant_lookup_tables: set = set()
+        relevant_fk_cols: set = set()
+        for tname in table_names:
+            ts = self.tables.get(tname) or self.ai_tables.get(tname) or self.lookup_tables.get(tname)
+            if ts:
+                for fk in ts.foreign_keys:
+                    relevant_fk_cols.add(fk["column"])
+                    relevant_lookup_tables.add(fk["referred_table"])
+        return {
+            "lookup_tables": relevant_lookup_tables,
+            "status_enums": set(table_names),
+            "join_patterns": relevant_fk_cols,
+        }
+
+    def _fmt_table_parts(self, ts: TableSchema) -> list[tuple[str, str]]:
+        """
+        Ordered (category, rendered_line) pairs behind _fmt_table's per-
+        column rendering — category is one of "plain"/"fk"/"enum", in the
+        same order and with the identical line text _fmt_table's inline
+        loop produced. Extracted as its own method so Phase 3.11's
+        targeted-branch (for_schema_hint) composition profiling
+        (profile_targeted_schema_tables below) can tokenize each category
+        separately without duplicating this column-rendering logic in a
+        second place — same pattern _slim_schema_parts (3.10) and
+        _planner_contract_parts (3.9) used. _fmt_table itself is unchanged
+        output and now just extracts the line text from these pairs.
+        """
+        parts: list[tuple[str, str]] = []
         for col in ts.columns:
             col_name = col["name"]
 
@@ -1487,10 +1840,10 @@ class DatabaseSchema:
             if full_key in self._enum_columns:
                 vals = self._enum_columns[full_key]
                 if vals:
-                    col_parts.append(
-                        f"  {col_name} ({ctype} — ENUM: {', '.join(repr(v) for v in vals)})")
+                    parts.append(("enum",
+                        f"  {col_name} ({ctype} — ENUM: {', '.join(repr(v) for v in vals)})"))
                 else:
-                    col_parts.append(f"  {col_name} ({ctype} — plain string)")
+                    parts.append(("enum", f"  {col_name} ({ctype} — plain string)"))
                 continue
 
             fk = next((f for f in ts.foreign_keys if f["column"] == col_name), None)
@@ -1500,17 +1853,20 @@ class DatabaseSchema:
                 jtype = "LEFT JOIN" if is_opt else "JOIN"
                 if col_name in self._fk_resolution:
                     _, alias, sel = self._fk_resolution[col_name]
-                    col_parts.append(
+                    parts.append(("fk",
                         f"  {col_name} (uuid FK → {ref}. "
-                        f"{jtype} {ref} {alias} ON ...{col_name} = {alias}.id → {sel})")
+                        f"{jtype} {ref} {alias} ON ...{col_name} = {alias}.id → {sel})"))
                 else:
                     note = " — may be NULL, use LEFT JOIN" if is_opt else ""
-                    col_parts.append(f"  {col_name} (uuid FK → {ref}{note})")
+                    parts.append(("fk", f"  {col_name} (uuid FK → {ref}{note})"))
             else:
-                col_parts.append(f"  {col_name} ({ctype})")
+                parts.append(("plain", f"  {col_name} ({ctype})"))
 
-        lines.append("Columns:")
-        lines.extend(col_parts)
+        return parts
+
+    def _fmt_table(self, ts: TableSchema) -> str:
+        lines = [f"### {ts.name}", "Columns:"]
+        lines.extend(line for _, line in self._fmt_table_parts(ts))
         if ts.name in self._useful_columns:
             lines.append(f"Useful output columns: {', '.join(self._useful_columns[ts.name])}")
         return "\n".join(lines)
@@ -1525,42 +1881,83 @@ class DatabaseSchema:
         lines.append(f"Standard JOIN:\n  {self._ai_join_pattern}")
         return "\n".join(lines)
 
-    def _fmt_lookup(self) -> str:
+    def _fmt_lookup_parts(self) -> dict:
+        """
+        Structural breakdown behind _fmt_lookup() — one rendered line (or
+        two-line block, for "users") per lookup table / status-enum key /
+        FK join pattern, keyed by name, in the same order _fmt_lookup()'s
+        three inline loops produce. Extracted for Phase 3.12's fixed-
+        overhead relevance profiling (see profile_fixed_overhead_relevance)
+        — _fmt_lookup() itself is unchanged output and now just assembles
+        these parts under its header/section labels.
+
+        Returns {"lookup_tables": {table: line}, "status_enums":
+        {status_key: line}, "join_patterns": {fk_col: line}}.
+        """
+        lookup_tables = {}
+        for tname, info in self._lookup_config.items():
+            ts = self.lookup_tables.get(tname)
+            if not ts:
+                continue
+            expr = info["name_expr"] or info["name_col"]
+            ev = self.enum_values.get(tname)
+            if ev and isinstance(ev[0], str):
+                vals = ", ".join(repr(v) for v in ev[:20])  # cap at 20
+                line = f"  {tname}: {expr}  [values: {vals}]"
+            elif ev and isinstance(ev[0], dict):
+                # frequency_definition — show names only in the lookup section
+                names = ", ".join(repr(d["name"]) for d in ev[:10])
+                line = f"  {tname}: {expr}  [definitions: {names}]"
+            else:
+                line = f"  {tname}: {expr}"
+            if tname == "users":
+                line += f"\n    ⚠ {_USERS_ID_NOTE}"
+            lookup_tables[tname] = line
+
+        status_enums = {}
+        for col_key in self._status_enum_keys:
+            vals = self.enum_values.get(col_key)
+            if vals:
+                status_enums[col_key] = f"  {col_key}: {', '.join(repr(v) for v in vals)}"
+
+        join_patterns = {}
+        for fk_col, (table, alias, sel) in self._fk_resolution.items():
+            join_patterns[fk_col] = f"  {fk_col} → JOIN {table} {alias} ON ...{fk_col} = {alias}.id → {sel}"
+
+        return {"lookup_tables": lookup_tables, "status_enums": status_enums, "join_patterns": join_patterns}
+
+    def _fmt_lookup(self, scope: dict | None = None) -> str:
+        """
+        scope=None (the default — used by for_reasoning_prompt/
+        for_system_prompt, both unaffected by Phase 3.13) renders every
+        lookup table / status enum / FK join-pattern, unchanged from
+        before. scope={"lookup_tables": {...}, "status_enums": {...},
+        "join_patterns": {...}} (for_schema_hint's Phase 3.13 use) keeps
+        only entries whose table (lookup_tables/status_enums, matched by
+        table name) or FK column (join_patterns) is in the corresponding
+        set — status_enums matches on the table name before the "."
+        (e.g. "inspection_report" for the "inspection_report.status" key).
+        """
+        parts = self._fmt_lookup_parts()
+        lookup_items = parts["lookup_tables"]
+        status_items = parts["status_enums"]
+        join_items = parts["join_patterns"]
+        if scope is not None:
+            lookup_items = {k: v for k, v in lookup_items.items() if k in scope.get("lookup_tables", ())}
+            status_items = {k: v for k, v in status_items.items()
+                            if k.split(".")[0] in scope.get("status_enums", ())}
+            join_items = {k: v for k, v in join_items.items() if k in scope.get("join_patterns", ())}
         lines = [
             "", "### UUID RESOLUTION:",
             "NEVER show raw UUIDs. Always JOIN to lookup tables.",
             "'responsible', 'pending_with', 'status' are string enums — NOT FKs.",
             "", "Lookup tables:",
         ]
-        for tname, info in self._lookup_config.items():
-            ts = self.lookup_tables.get(tname)
-            if not ts:
-                continue
-            expr = info["name_expr"] or info["name_col"]
-            # Append live enum values if available
-            ev = self.enum_values.get(tname)
-            if ev and isinstance(ev[0], str):
-                vals = ", ".join(repr(v) for v in ev[:20])  # cap at 20
-                lines.append(f"  {tname}: {expr}  [values: {vals}]")
-            elif ev and isinstance(ev[0], dict):
-                # frequency_definition — show names only in the lookup section
-                names = ", ".join(repr(d["name"]) for d in ev[:10])
-                lines.append(f"  {tname}: {expr}  [definitions: {names}]")
-            else:
-                lines.append(f"  {tname}: {expr}")
-            if tname == "users":
-                lines.append(f"    ⚠ {_USERS_ID_NOTE}")
-
-        # Show live status enum values for key tables
-        for col_key in self._status_enum_keys:
-            vals = self.enum_values.get(col_key)
-            if vals:
-                lines.append(f"  {col_key}: {', '.join(repr(v) for v in vals)}")
-
+        lines.extend(lookup_items.values())
+        lines.extend(status_items.values())
         lines.append("")
         lines.append("JOIN patterns:")
-        for fk_col, (table, alias, sel) in self._fk_resolution.items():
-            lines.append(f"  {fk_col} → JOIN {table} {alias} ON ...{fk_col} = {alias}.id → {sel}")
+        lines.extend(join_items.values())
         return "\n".join(lines)
 
     def _build_system_block(self) -> str:
@@ -1764,6 +2161,17 @@ def introspect_audit_schema(db_engine: Engine) -> DatabaseSchema:
             _table_relationships=AUDIT_TABLE_RELATIONSHIPS,
             _business_rules_core=list(AUDIT_BUSINESS_RULES_CORE),
             _table_relationships_core=AUDIT_TABLE_RELATIONSHIPS_CORE,
+            # Audit's for_schema_hint() keeps the full block — unlike
+            # inspection's, AUDIT_TABLE_RELATIONSHIPS was never split (see
+            # the "left fully core" note above) and wasn't part of 3.14's
+            # ablation, so there's no evidence any of it is safe to drop.
+            _table_relationships_sql_gen=AUDIT_TABLE_RELATIONSHIPS,
+            # Phase 3.16: audit has no per-topic TR chunks to gate on (see
+            # above) — disable gating so _table_relationships_topic_gated()
+            # always falls back to the unconditional full block regardless
+            # of question, same as before 3.16 existed.
+            _tr_user_roles="", _tr_approval_workflow="", _tr_communication_groups="",
+            _supports_tr_topic_gating=False,
             _section_title="AUDIT WORKFLOW TABLES",
             _has_ai_section=True,
             _ai_join_pattern=(

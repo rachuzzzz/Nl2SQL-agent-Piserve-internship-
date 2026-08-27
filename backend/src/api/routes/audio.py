@@ -17,6 +17,8 @@ from src.api.schemas import TTSRequest
 
 router = APIRouter()
 
+log = logging.getLogger("inspectai.audio")
+
 # ── TTS — lazy-loaded on first /api/tts call ──────────────────────────────────
 _tts_model = None
 
@@ -28,9 +30,9 @@ def _get_tts():
     global _tts_model
     if _tts_model is None:
         from kokoro_onnx import Kokoro
-        logging.info("Loading Kokoro TTS …")
+        log.info("Loading Kokoro TTS …")
         _tts_model = Kokoro(_TTS_MODEL, _TTS_VOICES)
-        logging.info("Kokoro TTS ready.")
+        log.info("Kokoro TTS ready.")
     return _tts_model
 
 _MD_STRIP = re.compile(
@@ -64,14 +66,14 @@ def _get_asr():
         import torch
         from transformers import pipeline as hf_pipeline
         device = 0 if torch.cuda.is_available() else -1
-        logging.info("Loading openai/whisper-tiny on %s …", "GPU" if device == 0 else "CPU")
+        log.info("Loading openai/whisper-tiny on %s …", "GPU" if device == 0 else "CPU")
         _asr_pipeline = hf_pipeline(
             "automatic-speech-recognition",
             model="openai/whisper-tiny",
             device=device,
             generate_kwargs={"language": "en", "task": "transcribe"},
         )
-        logging.info("ASR model ready.")
+        log.info("ASR model ready.")
     return _asr_pipeline
 
 
@@ -121,7 +123,7 @@ async def transcribe(audio: UploadFile = File(...), _: None = Depends(require_au
     except HTTPException:
         raise
     except Exception as exc:
-        logging.exception("Transcription error")
+        log.exception("Transcription error")
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         for p in (in_path, out_path):
@@ -162,5 +164,5 @@ async def tts(req: TTSRequest, _: None = Depends(require_auth)):
         return Response(content=buf.read(), media_type="audio/wav")
 
     except Exception as exc:
-        logging.exception("TTS error")
+        log.exception("TTS error")
         raise HTTPException(status_code=500, detail=str(exc))

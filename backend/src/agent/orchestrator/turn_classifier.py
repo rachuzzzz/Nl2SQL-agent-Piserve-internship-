@@ -321,7 +321,7 @@ class TurnClassifier:
 
         return "\n".join(lines)
 
-    def classify(self, question: str, session=None, stats=None) -> TurnAction:
+    def classify(self, question: str, session=None, stats=None, qid: str = "") -> TurnAction:
         # stats: the SAME QueryStats instance AgentOrchestrator.query() passes
         # to its own _call_llm (see synthesis.py) — without this, this call's
         # tokens/latency/count were silently invisible to stats.total_llm_calls/
@@ -358,7 +358,7 @@ class TurnClassifier:
             response = self.reasoning_llm.chat(messages)
             raw = response.message.content.strip()
         except Exception as exc:
-            _log_turn.warning("[TURN CLASSIFIER] LLM call failed: %s", exc)
+            _log_turn.warning("qid=%s [TURN CLASSIFIER] LLM call failed: %s", qid, exc)
             _dbg(self._debug_logger, "TURN CLASSIFIER EXCEPTION", str(exc))
             return TurnAction(action="NEW_QUERY", reference="NONE", confidence=0.0)
         _latency_ms = int((time.time() - _t0) * 1000)
@@ -382,7 +382,7 @@ class TurnClassifier:
 
         parsed = _parse_turn_json(raw)
         if not parsed:
-            _log_turn.warning("[TURN CLASSIFIER] could not parse LLM output: %r", raw[:200])
+            _log_turn.warning("qid=%s [TURN CLASSIFIER] could not parse LLM output: %r", qid, raw[:200])
             return TurnAction(action="NEW_QUERY", reference="NONE", confidence=0.0)
 
         action = str(parsed.get("action", "NEW_QUERY")).upper()
@@ -408,9 +408,9 @@ class TurnClassifier:
             confidence = 0.5
 
         _log_turn.info(
-            "[TURN CLASSIFIER] action=%s reference=%s confidence=%.2f "
+            "qid=%s [TURN CLASSIFIER] action=%s reference=%s confidence=%.2f "
             "latency=%dms prompt_tok=%d completion_tok=%d cache_read=%d cache_write=%d question=%r",
-            action, reference, confidence, _latency_ms,
+            qid, action, reference, confidence, _latency_ms,
             _usage.prompt_tokens, _usage.completion_tokens,
             _usage.cache_read_tokens, _usage.cache_creation_tokens,
             question[:120],

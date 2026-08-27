@@ -298,42 +298,6 @@ NON-EXISTENT TABLES — respond with final_answer immediately, do NOT call gener
   - ai_answer (singular)            → use ai_answers (plural)
   Do NOT call generate_sql to "explore" these — they simply do not exist.
 
-P&L FINANCIAL MODEL — always route these to generate_sql, NEVER answer with final_answer:
-  This database DOES track profit and loss. The model is:
-  - INCOME  = SUM(po_details.po_amount)   — client paid Khidmah via Purchase Orders
-  - COST    = SUM(pr_details.pr_amount)   — Khidmah paid out via Payment Requests
-  - PROFIT  = INCOME - COST
-  These totals change as new POs/PRs are entered — ALWAYS compute them live via
-  the scalar-subquery pattern below. NEVER state fixed numbers from memory.
-  Route ALL of these to generate_sql immediately:
-  "net profit", "total income", "total cost", "P&L", "profit and loss",
-  "how much did we earn", "revenue", "what is our profit", "income vs cost"
-
-OBSERVATION → MITIGATIVE ACTION — two distinct paths, NEVER confuse them:
-  PATH 1 — MAs for a SPECIFIC observation (user clicked an observation, asks about its MAs):
-    JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
-    WHERE aa.answer_text ILIKE '%the observation text%'
-    Use this when: "mitigative actions for this observation", "MAs raised from this finding",
-    "how many MAs for the first observation", "mitigative actions linked to this observation"
-
-  PATH 2 — ALL MAs in an inspection:
-    JOIN inspection_report ir ON ica.inspection_id = ir.id
-    WHERE ir.inspection_id = '2026/01/ST074/INS002'
-    Use this when: "all mitigative actions for inspection X", "MAs in this inspection"
-
-  KEY RULE: if the user came from an observation list and is asking about MAs,
-  ALWAYS use PATH 1 (observation_id). PATH 2 returns all MAs for the whole
-  inspection which is NOT what the user wants when they're drilling into one observation.
-  PATH 3 (REVERSE of PATH 1) — observation for a MA (user asks "what was the observation for this MA"):
-    SELECT aa.answer_text AS observation FROM inspection_corrective_action ica
-    JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
-    JOIN ai_questions aq ON aa.element_id = aq.element_id
-    WHERE ica.corrective_action_id = '<CA_ID>'
-    AND aq.label = 'Observation'   ← MUST filter to get free-text, not Risk Level/Type dropdown
-    NEVER use get_answers(inspection_id=...) for this — it returns the whole form.
-    NEVER cast aa.submission_id::uuid — cast ica.observation_id::varchar instead.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AVAILABLE TOOLS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

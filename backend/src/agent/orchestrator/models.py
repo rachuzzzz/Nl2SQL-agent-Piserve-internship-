@@ -56,6 +56,52 @@ class QueryStats:
     reasoning_decode_ms: int = 0
     sql_gen_prefill_ms: int = 0
     sql_gen_decode_ms: int = 0
+    # Phase 3.21: conversation-history cost (session.build_context_block) —
+    # the reasoning prompt's largest previously-uninstrumented growth vector
+    # (a real logged case hit 83,456 total system_content chars by turn 18).
+    # chars/turn_count are free and always populated for multi-turn queries;
+    # tokens requires a live /tokenize call, so it's 0 unless the
+    # orchestrator was constructed with profile=True (see loop.py's
+    # query() — same zero-cost-when-off contract as every other
+    # _profile-gated field here).
+    history_block_chars: int = 0
+    history_block_tokens: int = 0
+    history_block_turn_count: int = 0
+
+    # Phase 3.8 profiling: prompt-composition breakdown, summed across every
+    # "generate_sql" tool dispatch whose result carried a non-None
+    # _prompt_composition (see sql/generation.py's _profile param — 0 on
+    # every field unless the caller opted in, same zero-valued-not-None
+    # convention as the prefill/decode fields above). One tool dispatch =
+    # one fresh prompt build (a validator-triggered retry re-dispatches
+    # "generate_sql" with a new _retry_attempt, rebuilding schema_hint/
+    # retrieved from scratch) — distinct from the offset/uuid/table GUARD
+    # retries generate_sql() may run internally within a single dispatch,
+    # which reuse the same prompt and so don't get a second measurement
+    # (see generation.py's "First call only" comment). sql_gen_profiled_calls
+    # is the divisor for turning these sums into per-call averages — NOT the
+    # same as total_llm_calls, which also counts the reasoning role.
+    sql_gen_question_tokens: int = 0
+    sql_gen_schema_hint_tokens: int = 0
+    sql_gen_core_context_tokens: int = 0
+    sql_gen_retrieved_example_tokens: int = 0
+    sql_gen_total_prompt_tokens: int = 0
+    sql_gen_profiled_calls: int = 0
+
+    # Phase 3.9 profiling: schema_hint's own sub-contributors, summed
+    # alongside sql_gen_schema_hint_tokens above whenever a profiled call's
+    # result carries a schema_hint_breakdown (see generation.py's
+    # _planner_contract_parts and the _prompt_composition["schema_hint_breakdown"]
+    # comment) — reuses sql_gen_profiled_calls as the divisor, same calls.
+    # sum(these 6) + boilerplate == sql_gen_schema_hint_tokens; boilerplate
+    # (the "#### ..." headers _build_additional_context adds) is derived by
+    # subtraction in eval reporting, not tracked as its own field here.
+    sql_gen_auto_schema_tokens: int = 0
+    sql_gen_mandatory_hint_tokens: int = 0
+    sql_gen_planner_notes_tokens: int = 0
+    sql_gen_join_path_tokens: int = 0
+    sql_gen_business_rules_tokens: int = 0
+    sql_gen_draft_sql_tokens: int = 0
 
 
 

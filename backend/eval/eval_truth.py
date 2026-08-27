@@ -392,10 +392,14 @@ GROUND_TRUTH: dict[str, dict] = {
         "mode": "scalar",
         "sql": "SELECT COUNT(*) FROM ai_questions",
     },
-    "PORT-01": {  # inspectors with portfolios
+    "PORT-01": {  # inspectors with portfolios — the inspector FK on
+                  # inspector_portfolio is `user_id` (uuid); there is no
+                  # `inspector_id` column on this table (that lives on
+                  # inspection_schedule). Confirmed via live information_schema
+                  # 2026-08-27.
         "mode": "scalar",
         "sql": """
-            SELECT COUNT(DISTINCT ip.inspector_id)
+            SELECT COUNT(DISTINCT ip.user_id)
             FROM inspector_portfolio ip
             WHERE ip.active = true
         """,
@@ -530,7 +534,10 @@ def extract_agent_rows(result) -> list:
     rows = []
     for s in getattr(result, "steps", []):
         if s.tool == "execute_sql" and s.result.get("success"):
-            rows = s.result.get("rows") or []
+            # execute_sql returns the standard tool envelope
+            # {"success", "result": {"rows", "columns", ...}, "error"} — the
+            # rows live one level down under "result", not at the top level.
+            rows = (s.result.get("result") or {}).get("rows") or []
     return rows
 
 

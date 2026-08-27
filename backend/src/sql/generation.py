@@ -83,6 +83,54 @@ def _looks_like_sql(text: str) -> bool:
     return bool(_SQL_START_RE.match(text or ""))
 
 
+def _planner_contract_parts(
+    schema_hint: str, draft_sql: str, join_path: str, business_rules,
+) -> dict[str, str]:
+    """
+    Atom-level building block behind _resolve_planner_contract (see its
+    docstring for the draft_sql/schema_hint compat rule this implements) —
+    extracted as its own function so Phase 3.8/3.9's schema_hint composition
+    profiling (see generate_sql's _profile param) can tokenize each atom
+    individually without re-deriving this resolution logic a second time
+    with room to drift from the real one. _resolve_planner_contract itself
+    is unchanged (still a 2-tuple return — see
+    tests/sql/test_planner_contract_compat.py) and now just joins these
+    parts.
+
+    Returns {"notes", "join_path_line", "business_rules_line",
+    "resolved_draft"} — join_path_line/business_rules_line are the exact
+    (possibly empty) strings _resolve_planner_contract would append, not
+    just the raw join_path/business_rules inputs, so tokenizing them
+    directly matches what actually lands in the prompt.
+    """
+    if draft_sql:
+        resolved_draft = draft_sql
+        notes = schema_hint
+    elif _looks_like_sql(schema_hint):
+        resolved_draft = schema_hint
+        notes = ""
+    else:
+        resolved_draft = ""
+        notes = schema_hint
+
+    join_path_line = f"Suggested join path: {join_path}" if join_path else ""
+    business_rules_line = ""
+    if business_rules:
+        _rules_text = (business_rules if isinstance(business_rules, str)
+                        else "; ".join(str(r) for r in business_rules))
+        business_rules_line = (
+            "Planner-noted business rules (verify against the schema "
+            f"reference and Required section above): {_rules_text}"
+        )
+
+    return {
+        "notes": notes,
+        "join_path_line": join_path_line,
+        "business_rules_line": business_rules_line,
+        "resolved_draft": resolved_draft,
+    }
+
+
 def _resolve_planner_contract(
     schema_hint: str, draft_sql: str, join_path: str, business_rules,
 ) -> tuple[str, str]:
@@ -106,32 +154,12 @@ def _resolve_planner_contract(
     text alone, used for _extract_table_names_from_sql and (by the caller)
     guard-scan fidelity checks.
     """
-    if draft_sql:
-        resolved_draft = draft_sql
-        notes = schema_hint
-    elif _looks_like_sql(schema_hint):
-        resolved_draft = schema_hint
-        notes = ""
-    else:
-        resolved_draft = ""
-        notes = schema_hint
-
-    lines = []
-    if notes:
-        lines.append(notes)
-    if join_path:
-        lines.append(f"Suggested join path: {join_path}")
-    if business_rules:
-        _rules_text = (business_rules if isinstance(business_rules, str)
-                        else "; ".join(str(r) for r in business_rules))
-        lines.append(
-            "Planner-noted business rules (verify against the schema "
-            f"reference and Required section above): {_rules_text}"
-        )
-    if resolved_draft:
-        lines.append(resolved_draft)
-
-    return "\n".join(lines), resolved_draft
+    parts = _planner_contract_parts(schema_hint, draft_sql, join_path, business_rules)
+    lines = [v for v in (
+        parts["notes"], parts["join_path_line"], parts["business_rules_line"],
+        parts["resolved_draft"],
+    ) if v]
+    return "\n".join(lines), parts["resolved_draft"]
 
 
 def _build_additional_context(auto_schema: str, llm_hint: str, mandatory_hint: str) -> str:
@@ -175,7 +203,7 @@ def _build_additional_context(auto_schema: str, llm_hint: str, mandatory_hint: s
 
 def _select_schema_block(
     db_schema, relevant_tables: list | None, db_engine=None, join_graph_module=None,
-    fallback_tables: list | None = None,
+    fallback_tables: list | None = None, question: str | None = None,
 ) -> str:
     """
     Prefer a targeted, full-column-detail block for the tables the reasoning
@@ -193,6 +221,11 @@ def _select_schema_block(
     inspection, sql/audit_join_graph.py for audit — see agent/domains.py's
     DOMAIN_REGISTRY). None defaults to inspection's, preserving behavior for
     every existing caller.
+
+    question: passed through to DatabaseSchema.for_schema_hint() (Phase
+    3.16) so its table_relationships topic-gating has the natural-language
+    question to match against — None preserves the pre-3.16 unconditional
+    behavior (e.g. for callers with no question in scope).
 
     fallback_tables: confirmed live (2026-07-30, 2026-08-04) that
     relevant_tables is essentially NEVER populated in practice — checked 58
@@ -214,7 +247,7 @@ def _select_schema_block(
         if isinstance(relevant_tables, list) and relevant_tables:
             clean = [t for t in relevant_tables if isinstance(t, str) and t.strip()]
             if clean:
-                block = db_schema.for_schema_hint(clean)
+                block = db_schema.for_schema_hint(clean, question=question)
                 if len(clean) >= 2:
                     block += _join_path_hints(clean, join_graph_module)
                 return block
@@ -328,6 +361,15 @@ def generate_sql(
     _join_graph_module=None,
     _rules_engine=None,
     _domain: str = "inspection",
+    # Phase 3.8 profiling: off by default (zero extra cost on the hot path).
+    # When True, tokenizes the dynamic prompt components (question,
+    # schema_hint, core_context, retrieved examples) individually via
+    # llama.cpp's /tokenize endpoint and returns the breakdown as
+    # result["_prompt_composition"] — see llm/tokenize.py's module docstring
+    # for why 3.7's finding (static size != prefill cost) makes a real
+    # per-component breakdown necessary instead of another char-count guess.
+    _profile: bool = False,
+    _qid: str = "",
 ) -> dict[str, Any]:
     try:
         # Planner->SQL structured contract (generation-quality plan Item 3):
@@ -338,6 +380,18 @@ def generate_sql(
         # scans, the debug prompt log — automatically covers the new
         # fields with no further plumbing) and the resolved SQL draft
         # alone, for table extraction and fidelity checks.
+        #
+        # Phase 3.9: capture the pre-join atoms (notes/join_path_line/
+        # business_rules_line/resolved_draft) for schema_hint composition
+        # profiling BEFORE the reassignment below overwrites the original
+        # `schema_hint` param with the combined llm_hint string —
+        # _planner_contract_parts is the same pure logic
+        # _resolve_planner_contract uses internally, called a second time
+        # (cheap: no network, just string formatting) only when profiling.
+        _llm_hint_parts = (
+            _planner_contract_parts(schema_hint, draft_sql, join_path, business_rules)
+            if _profile else None
+        )
         schema_hint, _draft_sql_only = _resolve_planner_contract(
             schema_hint, draft_sql, join_path, business_rules,
         )
@@ -367,6 +421,7 @@ def generate_sql(
         auto_schema = _select_schema_block(
             _db_schema, relevant_tables, db_engine, _join_graph_module,
             fallback_tables=_extract_table_names_from_sql(_llama_schema_hint),
+            question=question,
         )
 
         # Three registers, three authorities — rendered as separately
@@ -432,9 +487,16 @@ def generate_sql(
                 # One real trace burned 8 retries because the same seed
                 # example (missing a JOIN its WHERE clause still referenced)
                 # reappeared in the prompt every time. Capped at 3 so at
-                # least one example always survives at top_k=4.
+                # least one example always survives at top_k=4 — this margin
+                # only matters once retries start (skip_top_n > 0); on the
+                # first attempt (_retry_attempt=0, skip_top_n=0) there's
+                # nothing to preserve headroom for yet, so top_k can shrink
+                # to 3 there without touching the retry anti-contamination
+                # guarantee (Phase 3.20 token audit — validated against the
+                # full 105-question eval suite before landing this).
+                _top_k = 4 if _retry_attempt > 0 else 3
                 retrieved, _primary_example_key = _seed_index.retrieve_with_primary_key(
-                    question, top_k=4, skip_top_n=min(_retry_attempt, 3)
+                    question, top_k=_top_k, skip_top_n=min(_retry_attempt, 3)
                 )
             except Exception:
                 retrieved = ""
@@ -446,6 +508,82 @@ def generate_sql(
         if _active_cycle_uuid and retrieved:
             retrieved = retrieved.replace("<CYCLE_UUID>", _active_cycle_uuid)
         dynamic_examples = _core_ctx + ("\n" + retrieved if retrieved else "")
+
+        # Phase 3.8 prompt-composition breakdown — the four dynamic pieces
+        # that get substituted into the template, tokenized individually so
+        # we can rank them by real prefill cost rather than assume the
+        # largest-looking block is the expensive one (see 3.7: static size
+        # didn't predict prefill cost once llama.cpp's prefix cache was
+        # accounted for). total_prompt_tokens is filled in below from the
+        # first sql_llm.complete() call's OWN reported usage — not a second
+        # tokenize() of the assembled prompt — so components-vs-total stays
+        # an apples-to-apples reconciliation against the real value the
+        # model itself billed, including chat-template/special-token
+        # overhead a raw tokenize() of the bare strings wouldn't see.
+        _prompt_composition = None
+        if _profile:
+            try:
+                from src.llm.tokenize import count_tokens_llamacpp
+                _tok_base_url = getattr(sql_llm, "api_base", "") or getattr(sql_llm, "base_url", "")
+                # Same non-empty-after-clean check _select_schema_block uses
+                # to pick its branch (generation.py:213-215) — computed once
+                # here and reused for both schema_block_variant and
+                # targeted_tables below.
+                _clean_relevant_tables = (
+                    [t for t in relevant_tables if isinstance(t, str) and t.strip()]
+                    if isinstance(relevant_tables, list) and relevant_tables else []
+                )
+                _prompt_composition = {
+                    "question_tokens": count_tokens_llamacpp(question, _tok_base_url),
+                    "schema_hint_tokens": count_tokens_llamacpp(additional_context, _tok_base_url),
+                    "core_context_tokens": count_tokens_llamacpp(_core_ctx, _tok_base_url),
+                    "retrieved_example_tokens": count_tokens_llamacpp(retrieved, _tok_base_url),
+                    "total_prompt_tokens": 0,  # filled in after the first completion call below
+                    # Phase 3.9 — schema_hint's own sub-contributors, real
+                    # /tokenize counts on the exact strings that render into
+                    # additional_context (see _build_additional_context/
+                    # _planner_contract_parts). auto_schema uses
+                    # _auto_schema_for_context (the post-suppression value
+                    # actually rendered), not raw auto_schema. The gap
+                    # between schema_hint_tokens above and the sum of these
+                    # six is the "#### ..." headers/labels
+                    # _build_additional_context adds — a fixed-cost
+                    # scaffolding bucket, not a 7th atom to tokenize
+                    # separately (measured by subtraction in eval reporting,
+                    # same treatment 3.8 gave the top-level template/other).
+                    "schema_hint_breakdown": {
+                        "auto_schema_tokens": count_tokens_llamacpp(_auto_schema_for_context, _tok_base_url),
+                        "mandatory_hint_tokens": count_tokens_llamacpp(_mandatory_hint, _tok_base_url),
+                        "planner_notes_tokens": count_tokens_llamacpp(_llm_hint_parts["notes"], _tok_base_url),
+                        "join_path_tokens": count_tokens_llamacpp(_llm_hint_parts["join_path_line"], _tok_base_url),
+                        "business_rules_tokens": count_tokens_llamacpp(_llm_hint_parts["business_rules_line"], _tok_base_url),
+                        "draft_sql_tokens": count_tokens_llamacpp(_llm_hint_parts["resolved_draft"], _tok_base_url),
+                        # Phase 3.10 — which _select_schema_block() branch
+                        # produced auto_schema: "slim" (for_sql_prompt_slim,
+                        # the same ~29-line static block on every call — see
+                        # DatabaseSchema.profile_slim_schema_tokens) or
+                        # "targeted" (for_schema_hint(clean), a per-question
+                        # full-column dump for whichever tables the
+                        # reasoning model named via relevant_tables/tables —
+                        # MUCH larger, and NOT the static content Part A
+                        # measures). Same truthy/non-empty-after-clean check
+                        # _select_schema_block itself uses, replicated here
+                        # rather than threading a return value through it
+                        # (its plain-string return is depended on by ~15
+                        # existing tests — see 3.10 plan's signature-safety
+                        # note for _resolve_planner_contract, same rationale
+                        # applies here).
+                        "schema_block_variant": "targeted" if _clean_relevant_tables else "slim",
+                        # Phase 3.11 — the exact table list for_schema_hint()
+                        # rendered (empty when variant is "slim"), so
+                        # eval.py can reconstruct this call's targeted-branch
+                        # cost via DatabaseSchema.profile_targeted_schema_tables'
+                        # per-table lookup without any extra /tokenize calls.
+                        "targeted_tables": _clean_relevant_tables,
+                    },
+                }
+            except Exception:
+                _prompt_composition = None
 
         prompt = sql_prompt_template.replace(
             "{question}", question
@@ -492,6 +630,12 @@ def generate_sql(
         raw_sql = str(response).strip()
         _raw_response = getattr(response, "raw", {}) or {}
         _usage = extract_token_counts(_raw_response)
+        # First call only — a retry re-prompts with a different string
+        # (dropped examples, guard corrections), so its total wouldn't
+        # reconcile against the component counts measured above, which are
+        # all from this original `prompt`.
+        if _prompt_composition is not None:
+            _prompt_composition["total_prompt_tokens"] = _usage.prompt_tokens
         _prompt_tok_total += _usage.prompt_tokens
         _completion_tok_total += _usage.completion_tokens
         _cache_read_tok_total += _usage.cache_read_tokens
@@ -557,8 +701,8 @@ def generate_sql(
                     )
                     forced_prompt = _build_guard_retry_prompt(question, additional_context, raw_sql, _mandatory)
                     import logging as _logging
-                    _logging.getLogger("inspectai").warning(
-                        "[offset-guard] retry fired — schema_hint has OFFSET, raw_sql doesn't"
+                    _logging.getLogger("inspectai.sql").warning(
+                        "qid=%s [offset-guard] retry fired — schema_hint has OFFSET, raw_sql doesn't", _qid
                     )
                     if _debug_logger:
                         _debug_logger.debug(
@@ -582,8 +726,8 @@ def generate_sql(
                         )
 
                     if not re.search(r'\bOFFSET\s+\d+', raw_sql, re.IGNORECASE):
-                        _logging.getLogger("inspectai").warning(
-                            "[offset-guard] retry did NOT fix it — still no OFFSET"
+                        _logging.getLogger("inspectai.sql").warning(
+                            "qid=%s [offset-guard] retry did NOT fix it — still no OFFSET", _qid
                         )
                         if _debug_logger:
                             _debug_logger.debug(
@@ -657,8 +801,8 @@ def generate_sql(
                     forced_prompt = _build_guard_retry_prompt(forced_question, additional_context, raw_sql, _mandatory)
                     # Always log table-guard fires — doubles deepseek latency, important to track
                     import logging as _logging
-                    _logging.getLogger("inspectai").warning(
-                        f"[table-guard] retry fired — missing={missing_req} forbidden={violated_forbidden}"
+                    _logging.getLogger("inspectai.sql").warning(
+                        f"qid={_qid} [table-guard] retry fired — missing={missing_req} forbidden={violated_forbidden}"
                     )
                     if _debug_logger:
                         _debug_logger.debug(
@@ -686,8 +830,8 @@ def generate_sql(
                         if re.search(fpat, raw_sql, re.IGNORECASE)
                     ]
                     if _still_missing or _still_violated:
-                        _logging.getLogger("inspectai").warning(
-                            f"[table-guard] retry did NOT fix it — still missing="
+                        _logging.getLogger("inspectai.sql").warning(
+                            f"qid={_qid} [table-guard] retry did NOT fix it — still missing="
                             f"{_still_missing} still_violated={_still_violated}"
                         )
                         if _debug_logger:
@@ -791,8 +935,8 @@ def generate_sql(
                 )
                 forced_prompt = _build_guard_retry_prompt(question, additional_context, raw_sql, _mandatory)
                 import logging as _logging
-                _logging.getLogger("inspectai").warning(
-                    f"[uuid-guard] retry fired — missing={_missing_uuid}"
+                _logging.getLogger("inspectai.sql").warning(
+                    f"qid={_qid} [uuid-guard] retry fired — missing={_missing_uuid}"
                 )
                 if _debug_logger:
                     _debug_logger.debug(f"  [uuid-guard] firing retry — missing={_missing_uuid}")
@@ -822,8 +966,8 @@ def generate_sql(
                     if uid.lower() not in raw_sql.lower()
                 ]
                 if _still_missing_uuid:
-                    _logging.getLogger("inspectai").warning(
-                        f"[uuid-guard] retry did NOT fix it — still missing={_still_missing_uuid}"
+                    _logging.getLogger("inspectai.sql").warning(
+                        f"qid={_qid} [uuid-guard] retry did NOT fix it — still missing={_still_missing_uuid}"
                     )
                     if _debug_logger:
                         _debug_logger.debug(
@@ -890,7 +1034,7 @@ def generate_sql(
             _debug_logger.debug(f"  [intent-autocorrect] {'; '.join(_name_filter_mutations)}")
 
         # validate() returns ValidationResult — hard fails block, soft warns are advisory only.
-        vresult = validator.validate(sql, question)
+        vresult = validator.validate(sql, question, qid=_qid)
 
         # validate_semantic() returns SOFT_WARN issues by default.
         # These are logged for observability but NEVER injected into the retry prompt.
@@ -1055,6 +1199,9 @@ def generate_sql(
                     "draft_sql_supplied": bool(draft_sql),
                     "join_path": join_path,
                 },
+                # None unless _profile=True — see this function's _profile
+                # param docstring and llm/tokenize.py.
+                "_prompt_composition": _prompt_composition,
             },
             "error": None,
         }
@@ -1069,6 +1216,7 @@ def generate_sql(
                     "cache_read_tokens": _cache_read_tok_total if "_cache_read_tok_total" in locals() else 0,
                     "cache_creation_tokens": _cache_creation_tok_total if "_cache_creation_tok_total" in locals() else 0,
                 },
+                "_prompt_composition": _prompt_composition if "_prompt_composition" in locals() else None,
             },
             "error": str(exc),
         }
