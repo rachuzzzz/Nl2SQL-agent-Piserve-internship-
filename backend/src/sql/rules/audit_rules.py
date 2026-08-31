@@ -377,10 +377,18 @@ AUDIT_BLOCK_RULES: list[dict] = [
             r"(?i)(?=.*\b(?:audit\s+)?schedules?\b)"
             r"(?!.*\b(pending|draft|unapprov\w*|approv\w*|review|status)\b)"
         ),
+        # (?!.*GROUP BY) added 2026-08-28 (Phase 4.6.2): this rule targets
+        # LISTINGS an analyst eyeballs — a per-group rollup or a
+        # "who/which has the most" ranking (GROUP BY ... [ORDER BY ... LIMIT])
+        # is not that shape. Confirmed live: "audit schedules per country" and
+        # "who proposed the most audit plans" (sibling plan rule) hard-failed
+        # every retry and the agent gave up. Plain listings have no GROUP BY
+        # and are still caught.
         "sql_pattern": (
             r"(?=.*\bFROM\s+audit_schedule\b)"
             r"(?!.*\bschedule_status\s*(?:!=|<>|=|IN\s*\(|NOT\s+IN|"
             r"IS(?:\s+NOT)?\s+NULL|IS\s+DISTINCT\s+FROM))"
+            r"(?!.*\bGROUP\s+BY\b)"
         ),
         "message": (
             "BLOCKED: general audit_schedule listing queries must exclude "
@@ -405,10 +413,14 @@ AUDIT_BLOCK_RULES: list[dict] = [
             r"(?i)(?=.*\b(?:audit\s+)?plans?\b)"
             r"(?!.*\b(pending|draft|unapprov\w*|approv\w*|review|status)\b)"
         ),
+        # (?!.*GROUP BY) added 2026-08-28 (Phase 4.6.2) — see the sibling
+        # audit_block_schedule_draft_not_excluded note. A ranking / per-group
+        # rollup is not the analyst-eyeballs listing this rule guards.
         "sql_pattern": (
             r"(?=.*\bFROM\s+audit_plan\b)"
             r"(?!.*\b(?:ap\.)?status\s*(?:!=|<>|=|IN\s*\(|NOT\s+IN|"
             r"IS(?:\s+NOT)?\s+NULL|IS\s+DISTINCT\s+FROM))"
+            r"(?!.*\bGROUP\s+BY\b)"
         ),
         "message": (
             "BLOCKED: general audit_plan listing queries must exclude "
@@ -515,9 +527,17 @@ AUDIT_BLOCK_RULES: list[dict] = [
         # a correct query that already correctly included both outcomes, then the
         # retry dropped RETURN_FOR_MODIFICATION entirely and silently returned 0 rows
         # for a question whose one true match was a RETURN_FOR_MODIFICATION row.
+        # percent\w*/proportion/fraction/ratio/rate excluded 2026-08-28
+        # (Phase 4.6.2) — a "what percentage of completed reviews were
+        # approvals" question legitimately needs BOTH the approve and the
+        # non-approve counts (the denominator), so forcing action='APPROVE'
+        # as the only filter breaks it. Confirmed live: eval_audit APPR-EXT-03
+        # hard-failed every retry and the agent gave up. Same class as the
+        # need\w*/requir\w* exclusion already here for process questions.
         "question_pattern": (
             r"(?i)^(?=.*\bapprov\w*\b)"
-            r"(?!.*\b(reject\w*|return\w*|declin\w*|pending|need\w*|requir\w*)\b)"
+            r"(?!.*\b(reject\w*|return\w*|declin\w*|pending|need\w*|requir\w*"
+            r"|percent\w*|proportion|fraction|ratio|rate)\b)"
         ),
         "sql_pattern": (
             r"(?=.*\b(?:FROM|JOIN)\s+review\b)"

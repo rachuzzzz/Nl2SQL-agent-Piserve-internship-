@@ -113,6 +113,15 @@ Generate a SQL query answering the question given at the end of this prompt.
   corrective actions, or specifically about adequacy review/approval status — in that case
   showing 'CA_DRAFT' rows is correct and expected.
 
+  NAMED APPROVAL TRACK OVERRIDES THIS DEFAULT: when the question names one track —
+  "implementation status/approval approved" or "adequacy status/approval approved" —
+  filter ONLY that track's column and do NOT also add the other:
+    "implementation status approved"  ->  AND aca.implementation_status = 'APPROVE'
+    "adequacy status approved"        ->  AND aca.adequacy_status = 'APPROVE'
+  (implementation_status and adequacy_status are two independent auditor tracks with the
+  same 4 enum values; the adequacy default above is only for a GENERIC "approved corrective
+  actions" ask that names neither.)
+
   DOES NOT APPLY TO EXISTENCE CHECKS — CRITICAL DISTINCTION, confirmed live as a real bug:
   A 'CA_DRAFT' row is a REAL corrective action that WAS raised, just not yet adequacy-approved.
   For "audits/reports with NO corrective actions", "has a CA been raised against X", or any
@@ -194,11 +203,14 @@ secondary references.
 ### Answer
 REMINDER: a query that LISTS/DISPLAYS audit_corrective_action rows must add
 AND aca.adequacy_status = 'APPROVE' UNLESS the question explicitly asks for
-pending/draft/unapproved corrective actions or adequacy review status —
-this applies regardless of how many other tables/columns the query joins.
-This does NOT apply to an EXISTENCE check ("no corrective actions", "has a CA
-been raised") — there, a 'CA_DRAFT' row still counts as raised/exists; check
-aca.id IS NULL, never adequacy_status or corrective_action_id.
+pending/draft/unapproved corrective actions or adequacy review status, OR
+names one approval track — "implementation status/approval approved" ->
+filter aca.implementation_status = 'APPROVE' ONLY; "adequacy status/approval
+approved" -> filter aca.adequacy_status = 'APPROVE' ONLY (never both when one
+is named) — this applies regardless of how many other tables/columns the
+query joins. This does NOT apply to an EXISTENCE check ("no corrective
+actions", "has a CA been raised") — there, a 'CA_DRAFT' row still counts as
+raised/exists; check aca.id IS NULL, never adequacy_status or corrective_action_id.
 REMINDER: a query LISTING audit_schedule rows must add
 AND asch.schedule_status != 'DRAFT' UNLESS the question explicitly asks about
 draft/pending schedules or schedule status. A query LISTING audit_plan rows

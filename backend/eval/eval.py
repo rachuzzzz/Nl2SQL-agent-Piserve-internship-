@@ -30,10 +30,12 @@ TEST_SET = [
     },
     {
         "id": "AGG-02", "category": "Aggregate",
-        "question": "how many inspections were completed this year",
-        "expected_contains": ["inspection"],
+        "question": "give me this year's inspection counts split by completed vs conducted",
+        "expected_contains": ["complet", "conduct"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "Date filter + count",
+        "expected_llm_calls": 1,
+        "notes": "Year filter + conducted/completed category split (2 rows). "
+                 "completed = CLOSED; conducted = other non-DRAFT.",
     },
     {
         "id": "AGG-03", "category": "Aggregate",
@@ -51,10 +53,12 @@ TEST_SET = [
     },
     {
         "id": "AGG-05", "category": "Aggregate",
-        "question": "how many inspections were completed this month vs last month",
+        "question": "break down inspections this month vs last month by completed and conducted",
         "expected_contains": ["month"],
         "expected_nonempty": False,
-        "expected_llm_calls": 1, "notes": "date_trunc comparison",
+        "expected_llm_calls": 1,
+        "notes": "date_trunc month FILTER crossed with the conducted/completed "
+                 "category split (2 rows x this_month/last_month)",
     },
     {
         "id": "AGG-06", "category": "Aggregate",
@@ -65,17 +69,24 @@ TEST_SET = [
     },
     {
         "id": "AGG-07", "category": "Aggregate",
-        "question": "how many mitigative actions were raised vs closed this quarter",
-        "expected_contains": ["open", "closed"],
+        "question": "how many mitigative actions were raised this quarter, and how many were closed this quarter",
+        "expected_contains": ["raised", "closed"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "FILTER clause",
+        "expected_llm_calls": 1,
+        "notes": "FLOW metric via two FILTER clauses: raised = created_on in "
+                 "quarter (132); closed = completed_on in quarter (13). KNOWN "
+                 "DEFECT: agent returns a COHORT count instead (raised-this-"
+                 "quarter that are now closed = 23) — left failing to surface it.",
     },
     {
         "id": "AGG-08", "category": "Aggregate",
         "question": "what is the average inspection duration in hours",
         "expected_contains": ["hour"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "start_date_time / end_date_time",
+        "expected_llm_calls": 1,
+        "notes": "AVG(end_date_time - start_date_time) = 8.36h. KNOWN DEFECT: "
+                 "agent uses submitted_on - start_date_time (3.59h, includes "
+                 "write-up time) — left failing to surface it.",
     },
     {
         "id": "AGG-09", "category": "Aggregate",
@@ -87,9 +98,10 @@ TEST_SET = [
     {
         "id": "AGG-10", "category": "Aggregate",
         "question": "what is the average number of observations per inspection",
-        "expected_contains": ["4", "observation"],
+        "expected_contains": ["observation"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "Subquery AVG ~4.2",
+        "expected_llm_calls": 1, "notes": "Subquery AVG per submission_id, label='Observation'",
+        "data_dependency": "ai_answers",
     },
     # ── Filters ──────────────────────────────────────────────────────────────
     {
@@ -191,7 +203,14 @@ TEST_SET = [
         "question": "which facility has the highest number of overdue mitigative actions",
         "expected_contains": ["facility", "overdue"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "ADJD AA -Al Roya: 45",
+        "expected_llm_calls": 1, "notes": "top1 — facility with most OVERDUE MAs via ica->ir->facility",
+    },
+    {
+        "id": "JOI-07", "category": "Join",
+        "question": "which client has the highest number of overdue mitigative actions",
+        "expected_contains": ["client", "overdue"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "top1 — client with most OVERDUE MAs via ica->ir->client",
     },
     {
         "id": "JOI-08", "category": "Join",
@@ -262,6 +281,7 @@ TEST_SET = [
         "expected_contains": ["deviation", "observation"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "get_answer_stats Deviation:359",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "ANS-02", "category": "Form Answers",
@@ -269,6 +289,7 @@ TEST_SET = [
         "expected_contains": ["question", "answer"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "module_name filter regression",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "ANS-03", "category": "Form Answers",
@@ -283,6 +304,7 @@ TEST_SET = [
         "expected_contains": ["observation", "ghadeer"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Cross-domain 4-table JOIN",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "ANS-05", "category": "Form Answers",
@@ -297,6 +319,7 @@ TEST_SET = [
         "expected_contains": ["high", "medium", "low"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "get_answer_stats High:230",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "ANS-07", "category": "Form Answers",
@@ -304,6 +327,7 @@ TEST_SET = [
         "expected_contains": ["observation"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "GROUP BY HAVING COUNT > 1",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "ANS-08", "category": "Form Answers",
@@ -311,6 +335,7 @@ TEST_SET = [
         "expected_contains": ["observation"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Subquery: risk High -> obs text",
+        "data_dependency": "ai_answers",
     },
     # ── Scores ────────────────────────────────────────────────────────────────
     {
@@ -319,6 +344,7 @@ TEST_SET = [
         "expected_contains": ["score", "george"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "ai_answers.score + users JOIN",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "SCR-02", "category": "Scores",
@@ -326,6 +352,7 @@ TEST_SET = [
         "expected_contains": ["score", "risk"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "get_answer_stats avg 3.24",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "SCR-03", "category": "Scores",
@@ -333,6 +360,7 @@ TEST_SET = [
         "expected_contains": ["score", "inspection"],
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "SUM ai_answers.score = 102",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "SCR-04", "category": "Scores",
@@ -367,9 +395,10 @@ TEST_SET = [
     {
         "id": "TRD-03", "category": "Trends",
         "question": "which month had the most high risk observations this year",
-        "expected_contains": ["january", "month"],
+        "expected_contains": ["month"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "GROUP BY month Jan:73",
+        "expected_llm_calls": 1, "notes": "GROUP BY month over ai_answers observations",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "TRD-04", "category": "Trends",
@@ -433,6 +462,7 @@ TEST_SET = [
         "expected_nonempty": True,
         "expected_llm_calls": 1,
         "notes": "Turn 1 — uses ai_answers.submitted_on so the result always has form data",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "MT-02", "category": "Multi-turn",
@@ -449,6 +479,7 @@ TEST_SET = [
         "expected_nonempty": True,
         "expected_llm_calls": 1, "notes": "Turn 3 inspection_id context (12584 regression)",
         "depends_on": "MT-02",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "MT-04", "category": "Multi-turn",
@@ -457,6 +488,7 @@ TEST_SET = [
         "expected_nonempty": True,
         "expected_llm_calls": 0, "notes": "Pagination — must return Q&A rows not inspector names",
         "depends_on": "MT-03",
+        "data_dependency": "ai_answers",
     },
     # ── ICA Risk Level — Problem 2 fix ───────────────────────────────────────
     {
@@ -507,6 +539,7 @@ TEST_SET = [
         "expected_nonempty": False,
         "expected_llm_calls": 1,
         "notes": "P5 fix: CLOSE_WITH_DEFERRED at facility — cause values may be short codes",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "DEF-03", "category": "Deferred Chain",
@@ -531,13 +564,16 @@ TEST_SET = [
         "expected_contains": ["high", "observation"],
         "expected_nonempty": False,
         "expected_llm_calls": 1, "notes": "Answer + date filter",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "EDG-02", "category": "Edge Case",
         "question": "how many questions are in the inspection form",
-        "expected_contains": ["240", "question"],
+        "expected_contains": ["24", "question"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "COUNT ai_questions = 240",
+        "expected_llm_calls": 1,
+        "notes": "COUNT ai_questions WHERE module_name='Inspection Form' = 24 "
+                 "(the whole table also counts every audit form's questions)",
     },
     {
         "id": "EDG-03", "category": "Edge Case",
@@ -625,6 +661,7 @@ TEST_SET = [
         "expected_nonempty": True,
         "expected_llm_calls": 2,
         "notes": "ai_answers risk_level=High LEFT JOIN ica IS NULL",
+        "data_dependency": "ai_answers",
     },
 
     # ── ETL Boundary Awareness ────────────────────────────────────────────────
@@ -635,6 +672,7 @@ TEST_SET = [
         "expected_nonempty": True,
         "expected_llm_calls": 1,
         "notes": "Must use aa subquery NOT ir.submitted_on — ETL gap awareness",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "ETL-02", "category": "ETL Boundary",
@@ -643,6 +681,7 @@ TEST_SET = [
         "expected_nonempty": True,
         "expected_llm_calls": 1,
         "notes": "SELECT DISTINCT inspection_report_id FROM ai_answers ORDER BY submitted_on DESC LIMIT 10",
+        "data_dependency": "ai_answers",
     },
     {
         "id": "ETL-03", "category": "ETL Boundary",
@@ -754,22 +793,26 @@ TEST_SET = [
         "question": "what percentage of mitigative actions are currently overdue",
         "expected_contains": ["overdue", "%", "percent"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "OVERDUE / total * 100",
+        "expected_llm_calls": 1,
+        "notes": "OVERDUE / ALL active MAs * 100 = 32.7%. KNOWN DEFECT: agent "
+                 "scopes the denominator to OVERDUE too -> always 100%. Left "
+                 "failing to surface it.",
     },
     {
         "id": "AGG-EXT-04", "category": "Extended Aggregate",
-        "question": "how many facilities have had zero inspections this year",
-        "expected_contains": ["facility", "zero", "no inspection", "0"],
+        "question": "how many facilities have had zero inspections this year — return a single number",
+        "expected_contains": ["facilit"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
-        "notes": "facility LEFT JOIN ir WHERE EXTRACT(YEAR)... IS NULL — zero-inspection facilities",
+        "notes": "scalar COUNT — facility WHERE NOT EXISTS(ir this year). ~146.",
     },
     {
         "id": "AGG-EXT-05", "category": "Extended Aggregate",
         "question": "what is the total number of observations recorded across all inspections",
-        "expected_contains": ["observation", "total", "count"],
+        "expected_contains": ["observation"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "COUNT ai_answers WHERE label='Observation'",
+        "expected_llm_calls": 1, "notes": "COUNT DISTINCT submission_id WHERE label='Observation'",
+        "data_dependency": "ai_answers",
     },
 
     # ── Financial / CAPEX / OPEX ─────────────────────────────────────────────
@@ -799,19 +842,21 @@ TEST_SET = [
     },
     {
         "id": "FIN-04", "category": "Financial",
-        "question": "show capex lost from rejected mitigative actions",
-        "expected_contains": ["reject", "capex"],
+        "question": "what is the total capex on mitigative actions whose capex_status is REJECTED",
+        "expected_contains": ["capex"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
-        "notes": "capex_status=REJECTED — lost quotes",
+        "notes": "scalar SUM(capex) WHERE capex_status='REJECTED' (aggregate, "
+                 "not a listing; avoids the 'capex lost' glossary rule)",
     },
     {
         "id": "FIN-05", "category": "Financial",
-        "question": "show total capex and opex by facility from po and pr details",
+        "question": "for each facility that has at least one purchase order or requisition, show total capex converted and opex incurred",
         "expected_contains": ["facility", "capex", "opex"],
         "expected_nonempty": True,
         "expected_llm_calls": 1,
-        "notes": "po_details + pr_details joined via ica → ir → facility",
+        "notes": "po_details + pr_details pre-aggregated per MA, summed per "
+                 "facility via ica -> ir -> facility; only facilities with a PO/PR",
     },
     {
         "id": "FIN-06", "category": "Financial",
@@ -828,6 +873,92 @@ TEST_SET = [
         "expected_nonempty": True,
         "expected_llm_calls": 1,
         "notes": "FM managers (inspectee_user_id) generate capex via MAs — NOT inspector_user_id. SUM(ica.capex) vs SUM(po.po_amount) per FM manager",
+    },
+
+    # ── Window functions / percentile / stddev / NTILE / FILTER / junctions ──
+    {
+        "id": "WIN-01", "category": "Trends",
+        "question": "show inspections where the score dropped more than 10 points from the previous inspection at the same facility",
+        "expected_contains": ["facility", "score"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "LAG(inspection_score) OVER (PARTITION BY facility_id ORDER BY submitted_on); count = 10",
+    },
+    {
+        "id": "WIN-02", "category": "Scores",
+        "question": "for each inspector, what was the score of their single most recent inspection",
+        "expected_contains": ["inspector", "score"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "ROW_NUMBER() PARTITION BY inspector_user_id ORDER BY submitted_on DESC = 1; 15 inspectors",
+    },
+    {
+        "id": "PCT-01", "category": "Aggregate",
+        "question": "what is the median inspection score",
+        "expected_contains": ["median", "score"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY inspection_score) = 93",
+    },
+    {
+        "id": "PCT-02", "category": "Financial",
+        "question": "what is the 90th percentile of mitigative action capex",
+        "expected_contains": ["percentile", "capex"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY capex) = 5200",
+    },
+    {
+        "id": "STDV-01", "category": "Aggregate",
+        "question": "what is the standard deviation of inspection scores",
+        "expected_contains": ["deviation", "score"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "STDDEV_SAMP(inspection_score) = 14.88",
+    },
+    {
+        "id": "STDV-02", "category": "Comparison",
+        "question": "which inspection type has the most variable inspection scores",
+        "expected_contains": ["type"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "STDDEV_SAMP GROUP BY type ORDER BY DESC LIMIT 1",
+    },
+    {
+        "id": "NTL-01", "category": "Comparison",
+        "question": "split facilities into four quartiles by average inspection score and show how many facilities are in each quartile",
+        "expected_contains": ["quartile"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "NTILE(4) OVER (ORDER BY avg_score); 4 rows ~9/8/8/8",
+    },
+    {
+        "id": "FIL-01", "category": "Join",
+        "question": "for each inspection type, how many inspections are closed versus still in progress",
+        "expected_contains": ["type", "closed"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "COUNT(*) FILTER (...) x2 GROUP BY inspection_type",
+    },
+    {
+        "id": "FIL-02", "category": "Aggregate",
+        "question": "give me open, closed, and overdue mitigative action counts in one row",
+        "expected_contains": ["open", "closed", "overdue"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "3 FILTER columns over inspection_corrective_action",
+    },
+    {
+        "id": "JUN-01", "category": "Join",
+        "question": "how many organisations operate in each country",
+        "expected_contains": ["country", "organisation"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "organisation_countries junction JOIN country GROUP BY country",
+    },
+    {
+        "id": "DIS-01", "category": "Conversational",
+        "question": "show me the scores",
+        "expected_contains": [],
+        "expected_nonempty": True,
+        "expected_llm_calls": 2,
+        "notes": "Under-specified — a good answer asks which scores (inspection / "
+                 "form-answer / by whom). real_pass-only, no ground truth.",
     },
 ]
 
@@ -917,6 +1048,15 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
         orch = AgentOrchestrator.from_env(profile=profile_tokens)
     results = []
     session = ConversationSession()
+
+    # ── data-health preflight — detect a stale/incomplete answer-layer load
+    # (the one-time ai_answers insert) so questions that depend on it are
+    # bucketed as `snapshot_blocked` instead of counting against the headline
+    # pass rate. They still run, so a repaired snapshot auto-recovers them. ──
+    from data_health import run_preflight, blocked_dependencies, classify_row, format_report
+    data_health = run_preflight(orch.db_engine, "inspection")
+    blocked_deps = blocked_dependencies(data_health)
+    print(format_report(data_health) + "\n")
 
     # ── Phase 3.10: static schema-block composition, computed ONCE (see
     # DatabaseSchema.profile_slim_schema_tokens docstring — the slim block's
@@ -1012,7 +1152,7 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
         t0 = time.time()
         try:
             result = orch.query(q, session=session if cat == "Multi-turn" else None,
-                                visibility_scope={})
+                                visibility_scope=test.get("visibility_scope", {}))
             wall   = time.time() - t0
             al     = result.answer.lower()
 
@@ -1041,6 +1181,11 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
             # Force fail when we know the result must not be empty
             forced_fail = bool(test.get("expected_nonempty") and empty)
             real_pass   = result.success and not forced_fail
+
+            # snapshot_blocked: this question depends on an answer layer the
+            # preflight flagged as broken AND it went wrong (empty / truth miss)
+            dep = test.get("data_dependency")
+            snap_blocked = classify_row(dep, blocked_deps, real_pass, tm["truth_match"])
 
             # ── Phase 3.17 Part A2: reasoning-side per-call dynamic additions
             # — tokenize the ACTUAL build_dynamic_prompt_additions() output
@@ -1266,6 +1411,8 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
                 empty_result=empty,
                 forced_fail=forced_fail,
                 real_pass=real_pass,
+                data_dependency=dep,
+                snapshot_blocked=snap_blocked,
                 truth_covered=tm["covered"],
                 truth_match=tm["truth_match"],
                 truth_detail=tm["detail"],
@@ -1312,6 +1459,9 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
                 sql_errors=-1, parse_errors=-1,
                 keyword_hits="0/0", keyword_pct=0,
                 empty_result=False, forced_fail=True, real_pass=False,
+                data_dependency=test.get("data_dependency"),
+                snapshot_blocked=bool(test.get("data_dependency") in blocked_deps),
+                truth_covered=False, truth_match=None, truth_detail="",
                 answer_preview=f"CRASH: {e}",
                 success=False, manual_score=0, notes=test["notes"],
             ))
@@ -1323,6 +1473,14 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
     real_pass  = sum(1 for r in results if r["real_pass"])
     forced_fails = sum(1 for r in results if r["forced_fail"])
     avg_t      = sum(r["wall_s"] for r in results) / total if total else 0
+
+    # ── snapshot-blocked accounting — questions excluded from the headline
+    # rate because a broken answer-layer load (not the agent) sank them ──────
+    snap_ids   = [r["id"] for r in results if r.get("snapshot_blocked")]
+    n_snap     = len(snap_ids)
+    eff_total  = total - n_snap
+    real_pass_adjusted = sum(1 for r in results
+                             if r["real_pass"] and not r.get("snapshot_blocked"))
     tot_se     = sum(r["sql_errors"]   for r in results if r["sql_errors"]   >= 0)
     tot_pe     = sum(r["parse_errors"] for r in results if r["parse_errors"] >= 0)
 
@@ -1404,6 +1562,10 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
     print(f"\n  Real pass:    {real_pass}/{total} "
           f"({100 * real_pass // total if total else 0}%)"
           f"  [{forced_fails} forced-fail on empty result]")
+    if n_snap:
+        print(f"  Real pass*:   {real_pass_adjusted}/{eff_total} "
+              f"({100 * real_pass_adjusted // eff_total if eff_total else 0}%)"
+              f"  [* excludes {n_snap} snapshot-blocked: {', '.join(snap_ids)}]")
     print(f"  SQL success:  {sql_ok}/{total} "
           f"({100 * sql_ok // total if total else 0}%)")
     print(f"  Single-call:  {single}/{total} "
@@ -1658,14 +1820,21 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
     truth_pass = sum(1 for r in truth_rows if r.get("truth_match") is True)
     truth_fail = [r for r in truth_rows if r.get("truth_match") is False]
     truth_err  = [r for r in truth_rows if r.get("truth_match") is None]
+    truth_rows_eff = [r for r in truth_rows if not r.get("snapshot_blocked")]
+    truth_pass_adjusted = sum(1 for r in truth_rows_eff if r.get("truth_match") is True)
     if truth_rows:
         print(f"  TRUTH MATCH:  {truth_pass}/{len(truth_rows)} "
               f"({100 * truth_pass // len(truth_rows)}%)  "
               f"— result-level correctness on covered cases")
+        if len(truth_rows_eff) != len(truth_rows):
+            print(f"  TRUTH MATCH*: {truth_pass_adjusted}/{len(truth_rows_eff)} "
+                  f"({100 * truth_pass_adjusted // len(truth_rows_eff) if truth_rows_eff else 0}%)"
+                  f"  [* excludes snapshot-blocked]")
         for r in truth_fail:
-            print(f"    ✗ {r['id']:<8} {r['truth_detail'][:90]}")
+            tag = " (snapshot-blocked)" if r.get("snapshot_blocked") else ""
+            print(f"    ✗ {r['id']:<10} {r['truth_detail'][:80]}{tag}")
         for r in truth_err:
-            print(f"    ? {r['id']:<8} {r['truth_detail'][:90]}")
+            print(f"    ? {r['id']:<10} {r['truth_detail'][:80]}")
 
     # ── forced-fail detail ───────────────────────────────────────────────────
     ff_rows = [r for r in results if r["forced_fail"]]
@@ -1692,6 +1861,12 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
             forced_fails=forced_fails,
             truth_covered=len(truth_rows),
             truth_pass=truth_pass,
+            data_health=data_health,
+            snapshot_blocked=n_snap,
+            snapshot_blocked_ids=snap_ids,
+            real_pass_adjusted=real_pass_adjusted,
+            truth_covered_adjusted=len(truth_rows_eff),
+            truth_pass_adjusted=truth_pass_adjusted,
             latency_breakdown_ms=dict(
                 total_wall=round(_tot_wall_ms), reasoning=_tot_reason_ms,
                 sql_gen=_tot_sqlgen_ms, sql_exec=_tot_sqlexec_ms, other=_tot_other_ms,

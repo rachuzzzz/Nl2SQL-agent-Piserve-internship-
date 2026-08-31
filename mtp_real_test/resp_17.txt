@@ -1,8 +1,0 @@
-{
-  "thought": "User explicitly requested 'audit schedules' — qualified table name, not bare 'audits' — generate SQL for audit_schedule with active filter and DRAFT exclusion.",
-  "tool": "generate_sql",
-  "args": {
-    "question": "all audit schedules with details",
-    "schema_hint": "SELECT asch.schedule_id, asch.schedule_status, asch.audit_plan_id, asch.auditor_id, asch.auditee_id, asch.facility_id, asch.project_id, asch.audit_universe_id, asch.audit_sub_category_id, asch.duration, asch.follow_up_date, asch.created_on, fac.name AS facility_name, proj.name AS project_name, u_aud.first_name || ' ' || u_aud.last_name AS auditor_name, u_ee.first_name || ' ' || u_ee.last_name AS auditee_name FROM audit_schedule asch LEFT JOIN facility fac ON asch.facility_id = fac.id LEFT JOIN project proj ON asch.project_id = proj.id LEFT JOIN users u_aud ON asch.auditor_id = u_aud.id LEFT JOIN users u_ee ON asch.auditee_id = u_ee.id WHERE asch.active = true AND asch.schedule_status != 'DRAFT' ORDER BY asch.created_on DESC;"
-  }
-}

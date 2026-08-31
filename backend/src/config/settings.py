@@ -30,6 +30,31 @@ class Settings:
     db_port: str
     db_name: str
     db_schema: str
+    # SQLAlchemy connection-pool resilience (Phase 5 hardening). pool_pre_ping
+    # is always on in create_engine; these tune size / staleness. pool_recycle
+    # in seconds — recycle a connection older than this before handing it out,
+    # so an idle-timed-out or server-restarted connection never reaches a query.
+    db_pool_size: int
+    db_max_overflow: int
+    db_pool_recycle: int
+
+    # ── API service hardening (Phase 5) — consumed in api/routes/chat.py and
+    # api/deps.py. All have safe defaults; override via env for load tuning.
+    # request_timeout_s: hard deadline on one /api/chat turn (the whole
+    #   reasoning+SQL pipeline). On expiry the request returns 504 and the
+    #   event loop is freed (the worker thread finishes in the background —
+    #   Python can't force-kill it — but the semaphore below bounds how many
+    #   can pile up).
+    # max_concurrent_pipelines: how many /api/chat turns may run the LLM
+    #   pipeline at once (the llama-servers have finite slots; unbounded
+    #   fan-out just makes every request slow). Excess requests wait up to
+    #   sem_acquire_timeout_s then get 503.
+    # session_ttl_s / session_max: eviction for the in-memory _sessions store.
+    request_timeout_s: float
+    max_concurrent_pipelines: int
+    sem_acquire_timeout_s: float
+    session_ttl_s: float
+    session_max: int
 
     # Ollama / models
     ollama_url: str
@@ -104,6 +129,14 @@ def get_settings() -> Settings:
         db_port=g("DB_PORT", "5432"),
         db_name=g("DB_NAME", "postgres"),
         db_schema=g("DB_SCHEMA", "public"),
+        db_pool_size=int(g("DB_POOL_SIZE", "10")),
+        db_max_overflow=int(g("DB_MAX_OVERFLOW", "5")),
+        db_pool_recycle=int(g("DB_POOL_RECYCLE", "1800")),
+        request_timeout_s=float(g("REQUEST_TIMEOUT_S", "300")),
+        max_concurrent_pipelines=int(g("MAX_CONCURRENT_PIPELINES", "4")),
+        sem_acquire_timeout_s=float(g("SEM_ACQUIRE_TIMEOUT_S", "5")),
+        session_ttl_s=float(g("SESSION_TTL_S", "86400")),
+        session_max=int(g("SESSION_MAX", "5000")),
         ollama_url=g("OLLAMA_URL", "http://localhost:11434"),
         ollama_sql_model=g("OLLAMA_SQL_MODEL", "sqlcoder:7b"),
         ollama_chat_model=g("OLLAMA_CHAT_MODEL", "qwen2.5:14b-instruct-q4_K_M"),

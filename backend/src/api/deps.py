@@ -13,6 +13,7 @@ pattern, read fresh on every request via dependency injection.
 """
 
 import os
+import time
 
 from fastapi import HTTPException, Request
 
@@ -70,13 +71,45 @@ def get_router(request: Request):
 # Shared mutable state read and written by routes/chat.py (chat, get_page,
 # clear_session, get_last_sql, get_last_columns) and routes/charts.py
 # (get_chart).
+#
+# Phase 5 hardening: in-memory dict that previously grew without bound (one
+# ConversationSession + last rows/cols/sql per "session_id:sub", forever).
+# Now every touch stamps _last_seen and prunes: drop entries idle longer than
+# SESSION_TTL_S, and if still over SESSION_MAX, LRU-evict the oldest. Still
+# process-local and lost on restart — acceptable for a chat store, and the
+# only thing lost is conversational context, not data.
 
 _sessions: dict = {}
+_session_seen: dict[str, float] = {}
+
+
+def _prune_sessions() -> None:
+    from src.config.settings import get_settings
+    s = get_settings()
+    now = time.time()
+    stale = [k for k, t in _session_seen.items() if now - t > s.session_ttl_s]
+    for k in stale:
+        _sessions.pop(k, None)
+        _session_seen.pop(k, None)
+    over = len(_sessions) - s.session_max
+    if over > 0:
+        # oldest-first LRU eviction
+        for k, _ in sorted(_session_seen.items(), key=lambda kv: kv[1])[:over]:
+            _sessions.pop(k, None)
+            _session_seen.pop(k, None)
+
+
+def forget_session(session_id: str) -> None:
+    """Drop a session from both the store and the LRU index (used by
+    DELETE /api/sessions/{id})."""
+    _sessions.pop(session_id, None)
+    _session_seen.pop(session_id, None)
 
 
 def get_or_create_session(session_id: str) -> dict:
     from src.agent.orchestrator import ConversationSession
-    if session_id not in _sessions:
+    is_new = session_id not in _sessions
+    if is_new:
         _sessions[session_id] = {
             "session": ConversationSession(),
             "message_count": 0,
@@ -86,6 +119,12 @@ def get_or_create_session(session_id: str) -> dict:
             "last_sql_params": {},   # bound params when last_sql uses :placeholder style
             "last_total": None,
         }
+    _session_seen[session_id] = time.time()
+    if is_new:
+        # prune AFTER inserting (with the fresh timestamp above) so the count
+        # settles to exactly SESSION_MAX and the just-created entry is never
+        # the one evicted.
+        _prune_sessions()
     return _sessions[session_id]
 
 

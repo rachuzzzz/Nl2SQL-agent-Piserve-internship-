@@ -126,10 +126,12 @@ TEST_SET = [
     },
     {
         "id": "SCHED-03", "category": "Schedule",
-        "question": "show audit schedules awaiting auditee acceptance",
+        "question": "show audit schedules whose status is pending review",
         "expected_contains": ["schedule"],
         "expected_nonempty": False,
-        "expected_llm_calls": 1, "notes": "schedule_status = 'PENDING_REVIEW'",
+        "expected_llm_calls": 1,
+        "notes": "schedule_status = 'PENDING_REVIEW' (the schedule's own status, "
+                 "NOT a pending row in the review table)",
     },
     {
         "id": "SCHED-04", "category": "Schedule",
@@ -313,10 +315,13 @@ TEST_SET = [
     # ── Admin-level ──────────────────────────────────────────────────────────
     {
         "id": "ADMIN-01", "category": "Admin",
-        "question": "how many total audits have been conducted across all universes",
+        "question": "how many audits are conducted — submitted but not yet closed out — across all universes",
         "expected_contains": ["audit"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "org-wide count",
+        "expected_llm_calls": 1,
+        "notes": "conducted = audit_report.status = 'SUBMITTED' per "
+                 "AUDIT_REPORT_SEMANTICS (CLOSED/CLOSED_WITH_EXCEPTION are "
+                 "'completed', not 'conducted')",
     },
     {
         "id": "ADMIN-02", "category": "Admin",
@@ -334,10 +339,12 @@ TEST_SET = [
     },
     {
         "id": "ADMIN-04", "category": "Admin",
-        "question": "which facility has been audited the most",
+        "question": "which facility has the most audit reports",
         "expected_contains": ["facility"],
         "expected_nonempty": True,
-        "expected_llm_calls": 1, "notes": "two-hop via audit_schedule, ranked",
+        "expected_llm_calls": 1,
+        "notes": "COUNT(audit_report) per facility, two-hop via schedule_id -> "
+                 "audit_schedule -> facility (not a count of schedules)",
     },
     {
         "id": "ADMIN-05", "category": "Admin",
@@ -660,6 +667,125 @@ TEST_SET = [
                  "('CLOSED','CLOSE_WITH_DEFERRED') — directly exercises the confirmed-live fact that "
                  "closing is a SEPARATE MANUAL auditor action, never automatic once both tracks clear.",
     },
+
+    # ── Window / percentile / stddev / NTILE / FILTER / junction / obs-recon ──
+    {
+        "id": "WIN-01", "category": "Workflow",
+        "question": "show audits where the audit score dropped from the previous audit at the same facility",
+        "expected_contains": ["facilit", "score"],
+        "expected_nonempty": False,
+        "expected_llm_calls": 1,
+        "notes": "LAG(audit_score) PARTITION BY facility (via audit_report -> audit_schedule) ORDER BY submitted_on",
+    },
+    {
+        "id": "PCT-01", "category": "Admin",
+        "question": "what is the median audit score across all reports",
+        "expected_contains": ["median", "score"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY audit_score) = 89",
+    },
+    {
+        "id": "STDV-01", "category": "Admin",
+        "question": "what is the standard deviation of audit scores",
+        "expected_contains": ["deviation", "score"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "STDDEV_SAMP(audit_score) = 19.95",
+    },
+    {
+        "id": "NTL-01", "category": "Admin",
+        "question": "split facilities into four quartiles by number of audits and show the count per quartile",
+        "expected_contains": ["quartile"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "NTILE(4) over per-facility audit count; 4 rows",
+    },
+    {
+        "id": "FIL-01", "category": "Schedule",
+        "question": "for each schedule status, how many schedules are unplanned versus planned",
+        "expected_contains": ["status", "unplanned"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "COUNT(*) FILTER (is_unplanned) x2 GROUP BY schedule_status",
+    },
+    {
+        "id": "FIL-02", "category": "Status",
+        "question": "break down audit corrective actions by status: open, overdue, closed, deferred",
+        "expected_contains": ["open", "overdue", "closed"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "COUNT GROUP BY status (open/overdue/closed/deferred)",
+    },
+    {
+        "id": "JUN-01", "category": "Portfolio",
+        "question": "how many auditor portfolios cover each audit category",
+        "expected_contains": ["categor"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "portfolio_detail_audit_category -> auditor_portfolio_detail -> audit_category. "
+                 "NEVER the dead audit_category_portfolio junction.",
+    },
+    {
+        "id": "JUN-03", "category": "Forms",
+        "question": "how many active audit form templates are mapped to at least one facility",
+        "expected_contains": ["form"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "COUNT(DISTINCT audit_forms.id) via audit_form_facilities WHERE af.active",
+    },
+    {
+        "id": "APPR-EXT-01", "category": "Approval",
+        "question": "how many audit corrective actions have adequacy status APPROVE",
+        "expected_contains": ["adequacy"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "adequacy_status = 'APPROVE' (exact enum, never 'APPROVED') = 18",
+    },
+    {
+        "id": "APPR-EXT-02", "category": "Approval",
+        "question": "which corrective action reviews were marked completed but were actually returned for modification",
+        "expected_contains": ["return"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "review status='COMPLETED' AND action='RETURN_FOR_MODIFICATION' — status alone != approved",
+    },
+    {
+        "id": "APPR-EXT-03", "category": "Approval",
+        "question": "what percentage of completed audit plan reviews were approvals",
+        "expected_contains": ["%"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "100 * FILTER(action='APPROVE') / FILTER(status='COMPLETED') for entity_type='AUDIT_PLAN' ~84%",
+    },
+    {
+        "id": "OBS-01", "category": "Workflow",
+        "question": "what is the highest number of corrective actions raised against a single audit observation",
+        "expected_contains": ["corrective"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1, "notes": "MAX over COUNT(*) GROUP BY observation_id = 6",
+        "data_dependency": "ai_audit_answers",
+    },
+    {
+        "id": "OBS-02", "category": "Workflow",
+        "question": "how many audit corrective actions are linked to a form observation",
+        "expected_contains": ["corrective"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "aca.observation_id::varchar = ai_audit_answers.submission_id (the cast join) = 7",
+        "data_dependency": "ai_audit_answers",
+    },
+    {
+        "id": "UNP-02", "category": "Workflow",
+        "question": "for unplanned audits, what is the average audit score",
+        "expected_contains": ["score"],
+        "expected_nonempty": True,
+        "expected_llm_calls": 1,
+        "notes": "AVG(audit_score) via audit_report -> audit_schedule WHERE is_unplanned = true ~92.3",
+    },
+    {
+        "id": "DIS-01", "category": "Approval",
+        "question": "who approved it",
+        "expected_contains": [],
+        "expected_nonempty": True,
+        "expected_llm_calls": 2,
+        "notes": "No prior turn — a good answer asks which entity (plan / schedule / "
+                 "corrective action). real_pass-only, no ground truth.",
+    },
 ]
 
 # ── Multi-turn sequences ─────────────────────────────────────────────────────
@@ -778,6 +904,13 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
     results = []
     session = ConversationSession()
 
+    # ── data-health preflight (see eval.py's block) — flags a stale/incomplete
+    # ai_audit_answers load so dependent questions bucket as snapshot_blocked. ─
+    from data_health import run_preflight, blocked_dependencies, classify_row, format_report
+    data_health = run_preflight(orch.db_engine, "audit")
+    blocked_deps = blocked_dependencies(data_health)
+    print(format_report(data_health) + "\n")
+
     # ── Phase 3.10: static schema-block composition, computed ONCE — see
     # eval.py's identical block for the full rationale (DatabaseSchema.
     # profile_slim_schema_tokens' content is question-independent).
@@ -816,7 +949,7 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
         t0 = time.time()
         try:
             result = orch.query(q, session=session if cat == "Multi-turn" else None,
-                                visibility_scope={})
+                                visibility_scope=test.get("visibility_scope", {}))
             wall   = time.time() - t0
             al     = result.answer.lower()
 
@@ -860,6 +993,9 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
 
             forced_fail = bool(test.get("expected_nonempty") and empty) or bool(forbidden_hit)
             real_pass   = result.success and not forced_fail
+
+            dep = test.get("data_dependency")
+            snap_blocked = classify_row(dep, blocked_deps, real_pass, tm["truth_match"])
 
             # ── Phase 3.10: schema-block utilization — see eval.py's
             # identical block for the full rationale, including why
@@ -1013,6 +1149,8 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
                 forced_fail=forced_fail,
                 forbidden_hit=forbidden_hit,
                 real_pass=real_pass,
+                data_dependency=dep,
+                snapshot_blocked=snap_blocked,
                 truth_covered=tm["covered"],
                 truth_match=tm["truth_match"],
                 truth_detail=tm["detail"],
@@ -1054,6 +1192,9 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
                 sql_errors=-1, parse_errors=-1,
                 keyword_hits="0/0", keyword_pct=0,
                 empty_result=False, forced_fail=True, real_pass=False,
+                data_dependency=test.get("data_dependency"),
+                snapshot_blocked=bool(test.get("data_dependency") in blocked_deps),
+                truth_covered=False, truth_match=None, truth_detail="",
                 answer_preview=f"CRASH: {e}",
                 success=False, manual_score=0, notes=test["notes"],
             ))
@@ -1065,6 +1206,19 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
     real_pass  = sum(1 for r in results if r["real_pass"])
     forced_fails = sum(1 for r in results if r["forced_fail"])
     avg_t      = sum(r["wall_s"] for r in results) / total if total else 0
+
+    # ── snapshot-blocked + ground-truth accounting ─────────────────────────
+    snap_ids   = [r["id"] for r in results if r.get("snapshot_blocked")]
+    n_snap     = len(snap_ids)
+    eff_total  = total - n_snap
+    real_pass_adjusted = sum(1 for r in results
+                             if r["real_pass"] and not r.get("snapshot_blocked"))
+    truth_rows = [r for r in results if r.get("truth_covered")]
+    truth_pass = sum(1 for r in truth_rows if r.get("truth_match") is True)
+    truth_fail = [r for r in truth_rows if r.get("truth_match") is False]
+    truth_err  = [r for r in truth_rows if r.get("truth_match") is None]
+    truth_rows_eff = [r for r in truth_rows if not r.get("snapshot_blocked")]
+    truth_pass_adjusted = sum(1 for r in truth_rows_eff if r.get("truth_match") is True)
     tot_se     = sum(r["sql_errors"]   for r in results if r["sql_errors"]   >= 0)
     tot_pe     = sum(r["parse_errors"] for r in results if r["parse_errors"] >= 0)
 
@@ -1148,6 +1302,10 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
     print(f"\n  Real pass:    {real_pass}/{total} "
           f"({100 * real_pass // total if total else 0}%)"
           f"  [{forced_fails} forced-fail on empty result]")
+    if n_snap:
+        print(f"  Real pass*:   {real_pass_adjusted}/{eff_total} "
+              f"({100 * real_pass_adjusted // eff_total if eff_total else 0}%)"
+              f"  [* excludes {n_snap} snapshot-blocked]")
     print(f"  SQL success:  {sql_ok}/{total} "
           f"({100 * sql_ok // total if total else 0}%)")
     print(f"  Single-call:  {single}/{total} "
@@ -1331,6 +1489,23 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
         for r in ff_rows:
             print(f"    {r['id']:<8} {r['question'][:60]}")
 
+    # ── ground-truth summary (mirrors eval.py) ────────────────────────────────
+    if truth_rows:
+        print(f"\n  TRUTH MATCH:  {truth_pass}/{len(truth_rows)} "
+              f"({100 * truth_pass // len(truth_rows)}%)  "
+              f"— result-level correctness on covered audit cases")
+        if len(truth_rows_eff) != len(truth_rows):
+            print(f"  TRUTH MATCH*: {truth_pass_adjusted}/{len(truth_rows_eff)} "
+                  f"({100 * truth_pass_adjusted // len(truth_rows_eff) if truth_rows_eff else 0}%)"
+                  f"  [* excludes snapshot-blocked]")
+        for r in truth_fail:
+            tag = " (snapshot-blocked)" if r.get("snapshot_blocked") else ""
+            print(f"    ✗ {r['id']:<12} {r['truth_detail'][:80]}{tag}")
+        for r in truth_err:
+            print(f"    ? {r['id']:<12} {r['truth_detail'][:80]}")
+    if n_snap:
+        print(f"\n  SNAPSHOT-BLOCKED (excluded from headline): {', '.join(snap_ids)}")
+
     # ── save ─────────────────────────────────────────────────────────────────
     ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = output_file or f"eval_audit_results_{ts}.json"
@@ -1347,6 +1522,14 @@ def run_eval(model_pair_label="llama3.1:8b + deepseek:6.7b",
             sql_errors_total=tot_se,
             parse_errors_total=tot_pe,
             forced_fails=forced_fails,
+            truth_covered=len(truth_rows),
+            truth_pass=truth_pass,
+            data_health=data_health,
+            snapshot_blocked=n_snap,
+            snapshot_blocked_ids=snap_ids,
+            real_pass_adjusted=real_pass_adjusted,
+            truth_covered_adjusted=len(truth_rows_eff),
+            truth_pass_adjusted=truth_pass_adjusted,
             latency_breakdown_ms=dict(
                 total_wall=round(_tot_wall_ms), reasoning=_tot_reason_ms,
                 sql_gen=_tot_sqlgen_ms, sql_exec=_tot_sqlexec_ms, other=_tot_other_ms,
@@ -1449,4 +1632,5 @@ if __name__ == "__main__":
                         "HTTP round-trips per generate_sql call; off by default.")
     a = p.parse_args()
     results = run_eval(a.model_pair, a.skip_multiturn, a.category, a.output, a.profile_tokens)
-    sys.exit(0 if all(r["real_pass"] for r in results) else 1)
+    sys.exit(0 if all(r["real_pass"] for r in results
+                      if not r.get("snapshot_blocked")) else 1)

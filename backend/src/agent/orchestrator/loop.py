@@ -147,7 +147,20 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             print("  ✓ Database connection reused from another domain instance")
         else:
             print("  Connecting to database...")
-            self.db_engine = create_engine(db_connection_string)
+            # Phase 5 hardening: pre_ping validates a pooled connection before
+            # every checkout (a dropped/idle-timed-out/server-restarted conn is
+            # transparently replaced instead of failing the query); pool_recycle
+            # proactively retires connections older than N seconds. Size knobs
+            # come from settings (env-overridable) with production-safe defaults.
+            from src.config.settings import get_settings as _get_settings
+            _s = _get_settings()
+            self.db_engine = create_engine(
+                db_connection_string,
+                pool_pre_ping=True,
+                pool_recycle=_s.db_pool_recycle,
+                pool_size=_s.db_pool_size,
+                max_overflow=_s.db_max_overflow,
+            )
             with self.db_engine.connect() as conn:
                 conn.execute(sql_text("SELECT 1")).fetchone()
             print("  ✓ Database connected")

@@ -882,6 +882,51 @@ def generate_sql(
                 (col, uid, src) for col, uid, src in _hint_uuid_filters
                 if uid.lower() not in raw_sql.lower()
             ]
+
+            # Equivalent-identity escape hatch: the coder is allowed to pin the
+            # SAME single row via a table's unique VARCHAR display code instead
+            # of the resolved UUID PK — e.g. schema_hint says
+            # "WHERE arep.id = '<uuid>'" and the coder writes
+            # "WHERE arep.audit_id = '2026/07/ST044/AUD001'" (audit_id is a 1:1
+            # alternate key on audit_report). That's not a dropped/fuzzed
+            # filter, so firing a retry just wastes a round-trip and always
+            # "fails" (the coder re-emits the same, correct query). Only for
+            # columns confirmed 1:1 unique + NOT NULL — corrective_action_id is
+            # deliberately excluded on the audit side ('CA_DRAFT' placeholder
+            # makes it non-unique), audit_plan has no code at all.
+            _DISPLAY_ID_COLS = {
+                "audit_report": "audit_id",
+                "audit_schedule": "schedule_id",
+                "inspection_report": "inspection_id",
+                "inspection_corrective_action": "corrective_action_id",
+            }
+            if _missing_uuid:
+                _alias_to_table = {
+                    a.lower(): t.lower() for t, a in re.findall(
+                        r"(?:FROM|JOIN)\s+(\w+)\s+(?:AS\s+)?(\w+)", raw_sql, re.IGNORECASE
+                    )
+                }
+                _kept = []
+                for col, uid, src in _missing_uuid:
+                    _alias, _, _local = col.partition(".")
+                    _tbl = _alias_to_table.get(_alias.lower())
+                    _dcol = _DISPLAY_ID_COLS.get(_tbl)
+                    if (
+                        src == "eq" and _local.lower() == "id" and _dcol
+                        and re.search(
+                            rf"\b{re.escape(_alias)}\.{_dcol}\s*=\s*'[^']+'",
+                            raw_sql, re.IGNORECASE,
+                        )
+                    ):
+                        if _debug_logger:
+                            _debug_logger.debug(
+                                f"  [uuid-guard] identity preserved via display-code "
+                                f"filter {_alias}.{_dcol} — skipping retry for {col}"
+                            )
+                        continue
+                    _kept.append((col, uid, src))
+                _missing_uuid = _kept
+
             if _missing_uuid and _last_attempt:
                 if _debug_logger:
                     _debug_logger.debug(
