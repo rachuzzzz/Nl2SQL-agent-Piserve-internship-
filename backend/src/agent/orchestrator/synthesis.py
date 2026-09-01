@@ -6,6 +6,7 @@ agent/orchestrator.py.
 
 import json
 import logging
+import os
 import re
 import time
 
@@ -19,7 +20,7 @@ from src.api.response_formatting import strip_row_identity_columns
 
 from src.agent.orchestrator.models import AgentStep, QueryStats, ConversationTurn, AgentResult
 from src.agent.orchestrator.debug import _ilike_escape, _has_uuid_leak, _dbg, _detect_truncation, _cap_text
-from src.llm.base import extract_token_counts
+from src.llm.base import extract_token_counts, extract_llamacpp_timings, TokenUsage
 from src.agent.tool_defs import get_declared
 from src.agent.orchestrator.disambiguation_reply import _find_exact_candidate
 
@@ -69,7 +70,7 @@ class SynthesisMixin:
     # ------------------------------------------------------------------ #
 
     def _finish(self, question, answer, steps, iteration, emit_fn=None,
-                stats=None, session=None, query_start=None):
+                stats=None, session=None, query_start=None, qid: str = "", sub: str = ""):
         s = AgentStep(iteration, "[auto] synthesized", "final_answer",
                       {"answer": answer}, {"answer": answer}, 0)
         steps.append(s)
@@ -738,8 +739,9 @@ class SynthesisMixin:
             ))
 
         _final_stats = stats or QueryStats()
-        _log_query.debug("[QUERY] _finish sub=? iter=%d wall=%dms llm=%dms sql=%dms "
+        _log_query.debug("[QUERY] _finish qid=%s sub=%s iter=%d wall=%dms llm=%dms sql=%dms "
                          "llm_calls=%d prompt_tok=%d completion_tok=%d",
+                         qid, sub,
                          iteration,
                          _final_stats.total_wall_ms,
                          _final_stats.total_llm_latency_ms,
@@ -1256,23 +1258,41 @@ class SynthesisMixin:
 
 
     def _call_llm(self, messages, stats=None, iteration=0):
+        # TEMP — MTP determinism investigation. Dumps the exact reasoning
+        # prompt bytes sent to the model so they can be replayed via curl
+        # against MTP-on vs MTP-off servers for a byte-exact comparison.
+        # Remove once the investigation is closed out.
+        _dump_path = os.environ.get("DUMP_REASONING_PROMPT")
+        if _dump_path:
+            with open(_dump_path, "a", encoding="utf-8") as _f:
+                _f.write(f"\n\n===== iter={iteration} =====\n")
+                for _m in messages:
+                    _f.write(f"--- role={_m.role} ---\n{_m.content}\n")
+
         t0 = time.time()
         response = self.reasoning_llm.chat(messages)
         latency_ms = int((time.time() - t0) * 1000)
         content = response.message.content.strip()
-        _prompt_tok = 0
-        _completion_tok = 0
+        _usage = TokenUsage()
         if stats:
             stats.total_llm_calls += 1
             stats.total_llm_latency_ms += latency_ms
             raw = getattr(response, "raw", {}) or {}
-            _prompt_tok, _completion_tok = extract_token_counts(raw)
-            stats.total_prompt_tokens += _prompt_tok
-            stats.total_completion_tokens += _completion_tok
+            _usage = extract_token_counts(raw)
+            stats.total_prompt_tokens += _usage.prompt_tokens
+            stats.total_completion_tokens += _usage.completion_tokens
+            stats.total_cache_read_tokens += _usage.cache_read_tokens
+            stats.total_cache_creation_tokens += _usage.cache_creation_tokens
             self._prefix_cache.record(raw)
+            _t = extract_llamacpp_timings(raw)
+            stats.reasoning_prefill_ms += int(_t.prompt_ms)
+            stats.reasoning_decode_ms += int(_t.predicted_ms)
 
-        _log_llm.debug("[LLM ] iter=%d latency=%dms prompt_tok=%d completion_tok=%d out_len=%d",
-                       iteration, latency_ms, _prompt_tok, _completion_tok, len(content))
+        _log_llm.debug(
+            "[LLM ] iter=%d latency=%dms prompt_tok=%d completion_tok=%d "
+            "cache_read=%d cache_write=%d out_len=%d",
+            iteration, latency_ms, _usage.prompt_tokens, _usage.completion_tokens,
+            _usage.cache_read_tokens, _usage.cache_creation_tokens, len(content))
 
         # Debug logging (raw LLM output to separate file when DEBUG_LLM=1)
         if self._debug:

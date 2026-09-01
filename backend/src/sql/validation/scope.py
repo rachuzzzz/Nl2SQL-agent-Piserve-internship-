@@ -249,7 +249,7 @@ class ScopeMixin:
                 return rewritten
 
             except Exception:
-                logging.warning("enforce_scope: AST injection failed, using string fallback",
+                _log_security.warning("[SCOPE] enforce_scope: AST injection failed, using string fallback",
                                 exc_info=True)
 
         # ── Fallback: string injection (no sqlglot) ───────────────────────────

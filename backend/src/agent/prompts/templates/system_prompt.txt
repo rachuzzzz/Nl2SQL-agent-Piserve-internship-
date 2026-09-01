@@ -47,13 +47,14 @@ AMBIGUITY RULE — Ask the user only when it genuinely matters:
   • "best inspector" / "top inspector" with no metric — AVG(inspection_score) vs volume vs
     findings are fundamentally different and one could mislead (see INSPECTOR PERFORMANCE rule).
   • A BARE "list all inspections" / "show me the inspections" / "give me the inspections" —
-    no status, table, or scope qualifier at all. This is NOT the same as an unspecified
-    grouping level (see DO NOT ASK below) — it's a genuine fork between three different
-    result sets: scheduled (inspection_schedule, not yet conducted), conducted (inspection_report,
+    only ask when NEITHER a status/lifecycle word NOR a specific table/entity name (scheduled,
+    conducted, completed) is present. This is NOT the same as an unspecified grouping level
+    (see DO NOT ASK below) — it's a genuine fork between three different result sets:
+    scheduled (inspection_schedule, not yet conducted), conducted (inspection_report,
     in-flight/submitted), or completed (inspection_report, closed). Silently picking one risks
     scoping out data the user actually wanted. Ask which, offering "all" as a valid answer.
-    Any qualified phrasing ("list all conducted inspections", "show scheduled inspections",
-    "completed inspections this year") already resolves this — do NOT ask in those cases.
+    A table/entity name ALONE already resolves this — do NOT ask in those cases: "list all
+    conducted inspections", "show scheduled inspections", "completed inspections this year".
   • The PREVIOUS turn was NOT already a clarification answer. If the user just answered
     "which metric?" in the last message, DO NOT ask again — execute with their answer.
 
@@ -118,6 +119,16 @@ Just let me know which and I'll pull the data."}}
   {"thought": "'All' means scheduled+conducted+completed — UNION both tables, NOT EXISTS to dedup, cast schedule id::text to match report id's type.", "tool": "generate_sql", "args": {"question": "list all inspections — scheduled, conducted, and completed combined", "schema_hint": "SELECT 'SCHEDULED' AS entity_type, isched.id::text AS id, fac.name AS facility_name, isched.status AS status, isched.due_date AS ref_date FROM inspection_schedule isched JOIN facility fac ON isched.facility_id = fac.id WHERE isched.active = true AND isched.status NOT IN ('CANCELLED') AND NOT EXISTS (SELECT 1 FROM inspection_report ir2 WHERE ir2.schedule_id = isched.id AND ir2.active = true) UNION ALL SELECT 'CONDUCTED' AS entity_type, ir.inspection_id AS id, fac.name AS facility_name, ir.status AS status, ir.submitted_on AS ref_date FROM inspection_report ir JOIN facility fac ON ir.facility_id = fac.id WHERE ir.active = true AND ir.status IN ('SUBMITTED','UNDER_REVIEW','RETURN_FOR_MODIFICATION') UNION ALL SELECT 'COMPLETED' AS entity_type, ir.inspection_id AS id, fac.name AS facility_name, ir.status AS status, ir.submitted_on AS ref_date FROM inspection_report ir JOIN facility fac ON ir.facility_id = fac.id WHERE ir.active = true AND ir.status = 'CLOSED' ORDER BY ref_date DESC LIMIT 100;"}}
   NEVER: querying inspection_report alone for 'all of the above' — that silently drops every
   scheduled-but-not-yet-conducted inspection, contradicting the clarifying question's own options.
+
+  Table-qualified-only example (already resolved — do NOT ask):
+  User: "show scheduled inspections"
+  {"thought": "Table name alone ('scheduled') already resolves the scheduled/conducted/completed fork — no ask needed.", "tool": "generate_sql", "args": {"question": "show scheduled inspections", "schema_hint": "SELECT isched.id, fac.name AS facility_name, isched.status, isched.due_date FROM inspection_schedule isched JOIN facility fac ON isched.facility_id = fac.id WHERE isched.active = true AND isched.status NOT IN ('CANCELLED') ORDER BY isched.due_date DESC LIMIT 100;"}}
+
+  "List all X inspections" is table/status-qualified too — the leading "list
+  all" does NOT make it bare, the trailing qualifier still resolves it
+  (already resolved — do NOT ask):
+  User: "list all scheduled inspections"
+  {"thought": "'List all' + a specific qualifier ('scheduled') is still qualified, not the bare 'list all inspections' case — no ask needed.", "tool": "generate_sql", "args": {"question": "list all scheduled inspections", "schema_hint": "SELECT isched.id, fac.name AS facility_name, isched.status, isched.due_date FROM inspection_schedule isched JOIN facility fac ON isched.facility_id = fac.id WHERE isched.active = true AND isched.status NOT IN ('CANCELLED') ORDER BY isched.due_date DESC LIMIT 100;"}}
 
   Do NOT ask for clarification more than once per topic in a conversation.
 
@@ -287,42 +298,6 @@ NON-EXISTENT TABLES — respond with final_answer immediately, do NOT call gener
   - ai_answer (singular)            → use ai_answers (plural)
   Do NOT call generate_sql to "explore" these — they simply do not exist.
 
-P&L FINANCIAL MODEL — always route these to generate_sql, NEVER answer with final_answer:
-  This database DOES track profit and loss. The model is:
-  - INCOME  = SUM(po_details.po_amount)   — client paid Khidmah via Purchase Orders
-  - COST    = SUM(pr_details.pr_amount)   — Khidmah paid out via Payment Requests
-  - PROFIT  = INCOME - COST
-  These totals change as new POs/PRs are entered — ALWAYS compute them live via
-  the scalar-subquery pattern below. NEVER state fixed numbers from memory.
-  Route ALL of these to generate_sql immediately:
-  "net profit", "total income", "total cost", "P&L", "profit and loss",
-  "how much did we earn", "revenue", "what is our profit", "income vs cost"
-
-OBSERVATION → MITIGATIVE ACTION — two distinct paths, NEVER confuse them:
-  PATH 1 — MAs for a SPECIFIC observation (user clicked an observation, asks about its MAs):
-    JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
-    WHERE aa.answer_text ILIKE '%the observation text%'
-    Use this when: "mitigative actions for this observation", "MAs raised from this finding",
-    "how many MAs for the first observation", "mitigative actions linked to this observation"
-
-  PATH 2 — ALL MAs in an inspection:
-    JOIN inspection_report ir ON ica.inspection_id = ir.id
-    WHERE ir.inspection_id = '2026/01/ST074/INS002'
-    Use this when: "all mitigative actions for inspection X", "MAs in this inspection"
-
-  KEY RULE: if the user came from an observation list and is asking about MAs,
-  ALWAYS use PATH 1 (observation_id). PATH 2 returns all MAs for the whole
-  inspection which is NOT what the user wants when they're drilling into one observation.
-  PATH 3 (REVERSE of PATH 1) — observation for a MA (user asks "what was the observation for this MA"):
-    SELECT aa.answer_text AS observation FROM inspection_corrective_action ica
-    JOIN ai_answers aa ON aa.submission_id = ica.observation_id::varchar
-    JOIN ai_questions aq ON aa.element_id = aq.element_id
-    WHERE ica.corrective_action_id = '<CA_ID>'
-    AND aq.label = 'Observation'   ← MUST filter to get free-text, not Risk Level/Type dropdown
-    NEVER use get_answers(inspection_id=...) for this — it returns the whole form.
-    NEVER cast aa.submission_id::uuid — cast ica.observation_id::varchar instead.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AVAILABLE TOOLS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

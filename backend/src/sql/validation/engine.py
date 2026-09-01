@@ -425,6 +425,11 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
         "audit_block_conformity_spelling",
         "audit_warn_ca_draft_literal", "audit_warn_role_name_auditor_filter",
         "audit_block_review_completed_not_approved", "audit_block_portfolio_ap_alias",
+        # Group Y — audit_schedule.schedule_status and audit_plan.status DRAFT
+        # exclusion had zero enforcement (confirmed 2026-08-18) — same trap Group C's
+        # audit_block_ca_draft_not_excluded guards for adequacy_status, now applied
+        # to these two sibling columns.
+        "audit_block_schedule_draft_not_excluded", "audit_block_plan_draft_not_excluded",
         # Group D — inspection domain's own review-table approval trap (shared
         # table, same status='COMPLETED' != approved issue as Group C's audit
         # rule above — see block_rules.py's inspection_block_review_completed_not_approved).
@@ -560,7 +565,7 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
         self._rules = get_audit_engine() if domain == "audit" else get_engine()
 
 
-    def _registry_block_warn_issues(self, sql: str, question: str = "") -> list:
+    def _registry_block_warn_issues(self, sql: str, question: str = "", qid: str = "") -> list:
         """
         Consume business_rules.py's BLOCK/WARN registry rules, restricted to
         _CONSUMED_RULE_IDS. Applies the same table_guard / question_pattern
@@ -581,6 +586,8 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
             if rule["_sql_re"].search(sql):
                 code = rule["code"]
                 retryable = code not in self._NON_RETRYABLE_CODES
+                logger.debug("[VALID] qid=%s rule fired id=%s code=%s severity=HARD_FAIL",
+                             qid, rule["id"], code)
                 issues.append(ValidationIssue("HARD_FAIL", code, rule["message"], retryable=retryable))
                 ValidatorStats.record(code, is_retry_trigger=retryable)
         for rule in self._rules._warn_rules:
@@ -591,6 +598,8 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
                 continue
             if rule["_sql_re"].search(sql):
                 code = rule["code"]
+                logger.debug("[VALID] qid=%s rule fired id=%s code=%s severity=SOFT_WARN",
+                             qid, rule["id"], code)
                 issues.append(ValidationIssue("SOFT_WARN", code, rule["message"], retryable=False))
                 ValidatorStats.record(code, is_retry_trigger=False)
         return issues
@@ -614,7 +623,7 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
     # Primary validation — HARD_FAIL vs SOFT_WARN separation
     # ------------------------------------------------------------------ #
 
-    def validate(self, sql: str, question: str = "") -> ValidationResult:
+    def validate(self, sql: str, question: str = "", qid: str = "") -> ValidationResult:
         """
         Validate SQL. Returns ValidationResult.
 
@@ -645,7 +654,7 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
         # DML block, hallucinated table names, dynamic fb_ tables, responsible/
         # pending_with join, close_on arithmetic, missing-limit, hardcoded-year,
         # plus the Group-B financial-integrity guards — see _CONSUMED_RULE_IDS.
-        issues.extend(self._registry_block_warn_issues(sql, question))
+        issues.extend(self._registry_block_warn_issues(sql, question, qid))
 
         # ── 4. Hallucinated columns on ai_* tables ────────────────────────
         for table, col_hints in self.HALLUCINATED_AI_COLUMNS.items():
@@ -1142,12 +1151,12 @@ class SQLValidator(CleanerMixin, IdentityMixin, IntentAutocorrectMixin, ShapeMix
         passed = len(hard_fails) == 0
 
         if hard_fails:
-            logger.info("[VALID] HARD_FAIL (%d): %s",
-                        len(hard_fails), "; ".join(str(f) for f in hard_fails))
+            logger.info("[VALID] qid=%s HARD_FAIL (%d): %s",
+                        qid, len(hard_fails), "; ".join(str(f) for f in hard_fails))
         soft = [i for i in issues if i.severity == "SOFT_WARN"]
         if soft:
-            logger.debug("[VALID] SOFT_WARN (%d, not sent to LLM): %s",
-                         len(soft), "; ".join(str(w) for w in soft))
+            logger.debug("[VALID] qid=%s SOFT_WARN (%d, not sent to LLM): %s",
+                         qid, len(soft), "; ".join(str(w) for w in soft))
 
         return ValidationResult(passed=passed, issues=issues)
 

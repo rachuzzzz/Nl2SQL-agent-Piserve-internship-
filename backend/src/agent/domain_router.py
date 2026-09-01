@@ -176,7 +176,7 @@ class DomainRouter:
     def from_env(cls, reasoning_llm=None, debug_logger=None) -> "DomainRouter":
         return cls(reasoning_llm=reasoning_llm, debug_logger=debug_logger)
 
-    def classify(self, question: str, session=None) -> DomainRoute:
+    def classify(self, question: str, session=None, qid: str = "") -> DomainRoute:
         # ── Tier 1 — keyword (instant) ──────────────────────────────────────
         audit_hit = bool(_AUDIT_KEYWORDS_RE.search(question or ""))
         inspection_hit = bool(_INSPECTION_KEYWORDS_RE.search(question or ""))
@@ -227,7 +227,7 @@ class DomainRouter:
             response = self.reasoning_llm.chat(messages)
             raw = (response.message.content or "").strip()
         except Exception as exc:
-            _log_router.warning("[ROUTER] Tier-3 LLM call failed: %s", exc)
+            _log_router.warning("qid=%s [ROUTER] Tier-3 LLM call failed: %s", qid, exc)
             _dbg(self._debug_logger, "ROUTER TIER-3 EXCEPTION", str(exc))
             return DomainRoute(
                 domain="AMBIGUOUS", tier=3, confidence=0.0,
@@ -240,7 +240,7 @@ class DomainRouter:
 
         parsed = _parse_domain_json(raw)
         if not parsed:
-            _log_router.warning("[ROUTER] Tier-3 could not parse LLM output: %r", raw[:200])
+            _log_router.warning("qid=%s [ROUTER] Tier-3 could not parse LLM output: %r", qid, raw[:200])
             return DomainRoute(
                 domain="AMBIGUOUS", tier=3, confidence=0.0,
                 clarifying_question=(
@@ -260,7 +260,7 @@ class DomainRouter:
             confidence = 0.5
 
         _log_router.info(
-            "[ROUTER] tier=3 domain=%s confidence=%.2f question=%r",
-            domain, confidence, question[:120],
+            "qid=%s [ROUTER] tier=3 domain=%s confidence=%.2f question=%r",
+            qid, domain, confidence, question[:120],
         )
         return DomainRoute(domain=domain, tier=3, confidence=confidence, clarifying_question=clarifying)

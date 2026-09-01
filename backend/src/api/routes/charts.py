@@ -13,6 +13,8 @@ from src.api.schemas import ChartRequest, ChartConfig
 
 router = APIRouter()
 
+log = logging.getLogger("inspectai.charts")
+
 
 @router.post("/api/chart")
 async def get_chart(req: ChartRequest, request: Request, token_data: dict = Depends(require_auth)):
@@ -49,7 +51,8 @@ async def get_chart(req: ChartRequest, request: Request, token_data: dict = Depe
             sql=_sql, orch=_chart_orch, params=_sql_params,
             lc=lc_override, num_cols=num_cols_override, aggregate=_aggregate,
         )
-        logging.info(f"Forcing chart {req.chart_type} for lc={lc_override}, nums={num_cols_override}. Config generated: {bool(cfg)}")
+        log.info("Forcing chart %s for lc=%s, nums=%s. Config generated: %s",
+                 req.chart_type, lc_override, num_cols_override, bool(cfg))
         if cfg is None:
             raise HTTPException(
                 status_code=422,

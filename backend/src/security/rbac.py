@@ -18,6 +18,10 @@ real identity-API values — see the domain-router plan's §5. Structurally
 this mirrors inspection's inspector/inspectee split with auditor/auditee.
 """
 
+import logging
+
+_log_security = logging.getLogger("inspectai.security")
+
 # Inspection data-visibility permissions — the only ones the orchestrator is
 # allowed to know about. All other permissions are stripped before the
 # visibility_scope dict reaches the SQL layer. This is the boundary wall.
@@ -125,7 +129,7 @@ def _build_audit_scope_filter(perms: set, user_subq: str) -> str:
     return 'BLOCK'
 
 
-def build_scope_filter(visibility_scope: dict, domain: str = "inspection") -> str:
+def build_scope_filter(visibility_scope: dict, domain: str = "inspection", qid: str = "") -> str:
     """Return a SQL WHERE fragment that enforces data-visibility scope.
 
     Returns '' for unrestricted access, 'BLOCK' when the user has no
@@ -152,6 +156,12 @@ def build_scope_filter(visibility_scope: dict, domain: str = "inspection") -> st
     blocking.
     """
     if visibility_scope is None or visibility_scope == {}:
+        _log_security.warning(
+            "[SCOPE] qid=%s build_scope_filter received empty/None visibility_scope — "
+            "treating as UNRESTRICTED (fail-open); confirm caller meant this, "
+            "not an unfetched-permissions bug",
+            qid,
+        )
         return ''
     perms = set(visibility_scope.get('permissions', []))
     sub   = str(visibility_scope.get('sub', '')).strip()

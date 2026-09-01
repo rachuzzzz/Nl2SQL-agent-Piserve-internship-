@@ -22,7 +22,7 @@ from src.agent.orchestrator.models import ConversationTurn
 from src.api.intent_recap import start_intent_recap, resolve_intent_recap
 from src.api.deps import (
     get_orch, get_orch_inspection, get_orch_audit, get_router,
-    get_or_create_session, _sessions,
+    get_or_create_session, forget_session, _sessions,
 )
 from src.api.response_formatting import (
     is_chart_followup, extract_requested_type, strip_uuid_columns,
@@ -39,6 +39,23 @@ log_query = logging.getLogger("inspectai.query")
 log_security = logging.getLogger("inspectai.security")
 
 router = APIRouter()
+
+# ── Phase 5 hardening: pipeline backpressure + per-request deadline ──────────
+# _PIPELINE_SEM bounds how many /api/chat turns run the reasoning+SQL pipeline
+# at once — the llama-servers have a fixed number of slots, so unbounded
+# fan-out just makes every request slow and eventually times out. Built lazily
+# on first use so settings/env are read after load_dotenv() has run.
+_PIPELINE_SEM: "asyncio.Semaphore | None" = None
+_PIPELINE_SEM_SIZE: int = 0
+
+
+def _pipeline_sem() -> asyncio.Semaphore:
+    global _PIPELINE_SEM, _PIPELINE_SEM_SIZE
+    if _PIPELINE_SEM is None:
+        from src.config.settings import get_settings
+        _PIPELINE_SEM_SIZE = max(1, get_settings().max_concurrent_pipelines)
+        _PIPELINE_SEM = asyncio.Semaphore(_PIPELINE_SEM_SIZE)
+    return _PIPELINE_SEM
 
 # A bare greeting is never a real data question worth carrying forward as a
 # domain-clarification's "origin" — see the domain-pick carryover logic below.
@@ -219,7 +236,7 @@ async def chat(
         # to see the actual domain word, e.g. "Audit") — only the message
         # actually sent to the orchestrator gets swapped for the origin
         # question, once resolved.
-        route = router_.classify(req.message, session=_sess_obj)
+        route = router_.classify(req.message, session=_sess_obj, qid=qid)
         log_query.info("[ROUTER] qid=%s tier=%d domain=%s confidence=%.2f%s",
                         qid, route.tier, route.domain, route.confidence,
                         " (origin-question carryover)" if _is_pending_domain_pick and route.domain != "AMBIGUOUS" else "")
@@ -293,11 +310,37 @@ async def chat(
         _router_locked_domain = route.tier == 1 and not _is_pending_domain_pick
 
         t0 = time.time()
-        result = await asyncio.to_thread(
-            orch.query, _effective_message, session=sess_data["session"],
-            visibility_scope=visibility_scope, query_id=qid,
-            router_locked_domain=_router_locked_domain,
-        )
+        # ── backpressure: wait for a pipeline slot, or 503 if the server is
+        # saturated (all slots busy longer than sem_acquire_timeout_s). ──────
+        from src.config.settings import get_settings as _get_settings
+        _s = _get_settings()
+        _sem = _pipeline_sem()
+        try:
+            await asyncio.wait_for(_sem.acquire(), timeout=_s.sem_acquire_timeout_s)
+        except asyncio.TimeoutError:
+            log_query.warning("[QUERY] BUSY qid=%s — %d/%d pipeline slots in use, rejecting",
+                              qid, _PIPELINE_SEM_SIZE, _PIPELINE_SEM_SIZE)
+            raise HTTPException(status_code=503, detail="Server busy, please retry",
+                                headers={"Retry-After": "5"})
+        try:
+            # ── per-request deadline: free the event loop on a wedged turn.
+            # The worker thread can't be force-killed and finishes in the
+            # background, but the slot is released and the client gets 504
+            # instead of hanging. ────────────────────────────────────────────
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    orch.query, _effective_message, session=sess_data["session"],
+                    visibility_scope=visibility_scope, query_id=qid,
+                    router_locked_domain=_router_locked_domain,
+                ),
+                timeout=_s.request_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            log_query.error("[QUERY] TIMEOUT qid=%s after %.0fs", qid, _s.request_timeout_s)
+            raise HTTPException(status_code=504,
+                                detail=f"Query exceeded the {_s.request_timeout_s:.0f}s time limit")
+        finally:
+            _sem.release()
         elapsed_ms = int((time.time() - t0) * 1000)
         sess_data["message_count"] += 1
         intent_recap = resolve_intent_recap(_recap_future, _effective_message, sess_data["session"])
@@ -405,7 +448,7 @@ async def chat(
                     # Inline the same scope predicate the tool applied at query time.
                     # Uses build_scope_filter (server-trusted SQL, int(sub) cast).
                     # Added to clauses before SQL string is built to preserve :params.
-                    _ga_scope = build_scope_filter(visibility_scope) if visibility_scope else 'BLOCK'
+                    _ga_scope = build_scope_filter(visibility_scope, qid=qid) if visibility_scope else 'BLOCK'
                     if _ga_scope and _ga_scope != 'BLOCK':
                         _ga_clauses.append(_ga_scope)
                     _ga_where = " AND ".join(_ga_clauses)
@@ -603,14 +646,24 @@ async def chat(
 
         log_query.info(
             "[QUERY] END   qid=%s sub=%s elapsed=%dms llm_calls=%d "
-            "sql_errors=%d rows=%d tokens=%d/%d success=%s",
+            "sql_errors=%d rows=%d tokens=%d/%d cache_read=%d cache_write=%d success=%s "
+            "| reasoning=%dms(prefill=%dms decode=%dms) sql_gen=%dms(prefill=%dms decode=%dms) sql_exec=%dms",
             qid, sub, elapsed_ms,
             result.stats.total_llm_calls,
             sql_errors,
             _row_count,
             result.stats.total_prompt_tokens,
             result.stats.total_completion_tokens,
+            result.stats.total_cache_read_tokens,
+            result.stats.total_cache_creation_tokens,
             result.success,
+            result.stats.total_llm_latency_ms,
+            result.stats.reasoning_prefill_ms,
+            result.stats.reasoning_decode_ms,
+            result.stats.total_sql_gen_ms,
+            result.stats.sql_gen_prefill_ms,
+            result.stats.sql_gen_decode_ms,
+            result.stats.total_sql_exec_ms,
         )
 
         # Ground-truth flag, not a frontend heuristic — true only when this
@@ -630,6 +683,8 @@ async def chat(
             prompt_tokens=result.stats.total_prompt_tokens,
             completion_tokens=result.stats.total_completion_tokens,
             total_tokens=result.stats.total_prompt_tokens + result.stats.total_completion_tokens,
+            cache_read_tokens=result.stats.total_cache_read_tokens,
+            cache_creation_tokens=result.stats.total_cache_creation_tokens,
             time_ms=elapsed_ms,
             llm_calls=result.stats.total_llm_calls,
             sql_errors=sql_errors,
@@ -651,6 +706,10 @@ async def chat(
             dashboard=_dashboard,
         )
 
+    except HTTPException:
+        # 503 (busy) / 504 (timeout) / other deliberate HTTP errors pass
+        # through with their real status — don't remap them to 500 below.
+        raise
     except Exception as exc:
         log_query.exception("[QUERY] ERROR qid=%s sub=%s exc=%s", qid, sub, exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -738,7 +797,7 @@ async def get_page(req: PageRequest, token_data: dict = Depends(require_auth), o
 
 @router.delete("/api/sessions/{session_id}")
 async def clear_session(session_id: str, token_data: dict = Depends(require_auth)):
-    _sessions.pop(f"{session_id}:{token_data['sub']}", None)
+    forget_session(f"{session_id}:{token_data['sub']}")
     return {"status": "cleared", "session_id": session_id}
 
 

@@ -22,7 +22,7 @@ FROM audit_schedule asch
 LEFT JOIN facility fac ON asch.facility_id = fac.id
 LEFT JOIN users u_aud ON asch.auditor_id = u_aud.id
 LEFT JOIN users u_ee ON asch.auditee_id = u_ee.id
-WHERE asch.active = true
+WHERE asch.active = true AND asch.schedule_status != 'DRAFT'
 ORDER BY asch.follow_up_date DESC NULLS LAST
 LIMIT 100;
 """,
@@ -345,7 +345,7 @@ FROM audit_plan ap
 JOIN audit_cycle acyc ON ap.cycle_id = acyc.id
 LEFT JOIN audit_category acat ON ap.category_id = acat.id
 LEFT JOIN users u ON ap.user_id = u.id
-WHERE ap.active = true
+WHERE ap.active = true AND ap.status != 'DRAFT'
 ORDER BY acyc.start_date DESC
 LIMIT 100;
 """,
@@ -1571,5 +1571,51 @@ ORDER BY ref_date DESC
 LIMIT 100;
 """,
         'domain': 'audit_report', 'intent': 'listing', 'limit': 100,
+    },
+
+    # ── window functions / nested aggregates (Phase 4.6.3 — added 2026-08-28
+    #    to unblock the two Coder-gen shapes that hard-failed every retry) ────
+    {
+        'nl':     'show audits where the audit score dropped from the previous audit at the same facility',
+        'sql':    """\
+-- LAG() window over audits at one facility, ordered by when they happened.
+-- Facility is 2 hops from audit_report: schedule_id -> audit_schedule.facility_id
+-- (audit_report has NO facility_id of its own). "When it happened" = submitted_on.
+WITH scored AS (
+  SELECT arep.audit_id, fac.name AS facility_name, arep.submitted_on,
+         arep.audit_score,
+         LAG(arep.audit_score) OVER (
+             PARTITION BY asch.facility_id ORDER BY arep.submitted_on) AS previous_score
+  FROM audit_report arep
+  JOIN audit_schedule asch ON arep.schedule_id = asch.id
+  JOIN facility fac ON asch.facility_id = fac.id
+  WHERE arep.active = true AND arep.audit_score IS NOT NULL
+)
+SELECT audit_id, facility_name, submitted_on,
+       audit_score AS current_score, previous_score,
+       ROUND((previous_score - audit_score)::numeric, 2) AS score_drop
+FROM scored
+WHERE previous_score IS NOT NULL AND audit_score < previous_score
+ORDER BY score_drop DESC
+LIMIT 50;
+""",
+        'domain': 'audit_report', 'intent': 'filter', 'limit': 50,
+    },
+    {
+        'nl':     'what is the highest number of corrective actions raised against a single audit observation',
+        'sql':    """\
+-- Nested aggregate: MAX() over a per-observation COUNT(). Group the corrective
+-- actions by observation_id first, then take the largest group.
+-- A 'CA_DRAFT' row is still a corrective action that WAS raised — do NOT filter
+-- adequacy_status / corrective_action_id here.
+SELECT MAX(ca_count) AS max_corrective_actions_per_observation
+FROM (
+    SELECT observation_id, COUNT(*) AS ca_count
+    FROM audit_corrective_action
+    WHERE active = true AND observation_id IS NOT NULL
+    GROUP BY observation_id
+) per_observation;
+""",
+        'domain': 'audit_corrective_action', 'intent': 'aggregate', 'limit': None,
     },
 ]

@@ -1,0 +1,11 @@
+P&L FINANCIAL MODEL — always route these to generate_sql, NEVER answer with final_answer:
+  This database DOES track profit and loss. The model is:
+  - INCOME  = SUM(po_details.po_amount)   — client paid Khidmah via Purchase Orders
+  - COST    = SUM(pr_details.pr_amount)   — Khidmah paid out via Payment Requests
+  - PROFIT  = INCOME - COST
+  These totals change as new POs/PRs are entered — ALWAYS compute them live via
+  the scalar-subquery pattern below. NEVER state fixed numbers from memory.
+  Route ALL of these to generate_sql immediately:
+  "net profit", "total income", "total cost", "P&L", "profit and loss",
+  "how much did we earn", "revenue", "what is our profit", "income vs cost"
+

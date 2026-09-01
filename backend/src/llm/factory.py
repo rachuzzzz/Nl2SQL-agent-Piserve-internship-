@@ -168,6 +168,47 @@ def get_sql_llm_vllm(model: str, base_url: str):
     )
 
 
+def get_reasoning_llm_llamacpp(model: str, base_url: str):
+    """
+    llama.cpp equivalent of get_reasoning_llm_vllm above. llama-server
+    exposes the same OpenAI-compatible /v1 API vLLM does, so this reuses
+    build_vllm_client as-is rather than duplicating it — the only
+    difference is which server base_url points at (a llama-server process,
+    not vLLM). Same context_window/max_tokens/thinking-disable as the vLLM
+    version since it's serving the same qwen3.5-family model.
+    """
+    return build_vllm_client(
+        model=model,
+        base_url=base_url,
+        temperature=0.0,
+        max_tokens=1024,
+        context_window=20000,
+        additional_kwargs={
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        },
+    )
+
+
+def get_sql_llm_llamacpp(model: str, base_url: str):
+    """
+    llama.cpp equivalent of get_sql_llm_vllm above — see
+    get_reasoning_llm_llamacpp's docstring for why build_vllm_client is
+    reused rather than a separate llama.cpp-specific wrapper.
+    """
+    return build_vllm_client(
+        model=model,
+        base_url=base_url,
+        temperature=0.0,
+        max_tokens=1024,
+        context_window=16384,
+        additional_kwargs={
+            "top_p": 0.9,
+            "stop": [";", "[/SQL]", "This query", "Note:", "-- Note", "/*"],
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        },
+    )
+
+
 # {provider: {role: factory}} — every (provider, role) combination this app
 # supports. Adding a new provider means adding one entry here, not touching
 # every call site (see llm/base.py's LLMClient protocol).
@@ -183,6 +224,10 @@ _PROVIDER_ROLE_FACTORIES = {
     "vllm": {
         "reasoning": get_reasoning_llm_vllm,
         "sql": get_sql_llm_vllm,
+    },
+    "llamacpp": {
+        "reasoning": get_reasoning_llm_llamacpp,
+        "sql": get_sql_llm_llamacpp,
     },
 }
 

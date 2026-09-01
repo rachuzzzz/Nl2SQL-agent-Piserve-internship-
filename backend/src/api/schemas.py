@@ -98,6 +98,14 @@ class ChatResponse(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    # Anthropic prompt-caching stats — always 0 on Ollama/vLLM, which have
+    # no such concept (see llm/base.py's TokenUsage). Already included in
+    # prompt_tokens above (Anthropic's own usage accounting counts cache
+    # reads/writes as part of input tokens); broken out separately here so
+    # cache effectiveness is visible without inferring it from a
+    # before/after prompt_tokens delta.
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
     time_ms: int
     llm_calls: int
     sql_errors: int

@@ -82,7 +82,7 @@ BLOCK_RULES: list[dict] = [
         "type":        BLOCK,
         "description": "facility.organization_id is unpopulated (all NULL) — joining to organisation always returns zero rows.",
         "sql_pattern": r"\bJOIN\s+organisation\b",
-        "message":     "UNSUPPORTED: facility.organization_id is not populated in the current dataset. All facilities belong to a single organisation (Khidmah). Grouping by organisation is not meaningful — use facility, region, country, project, or entity instead.",
+        "message":     "UNSUPPORTED: facility.organization_id is not populated in the current dataset. All facilities belong to a single organisation (Khidmah). Grouping by organisation is not meaningful — use facility, region, country, project, or entity instead. (verified 2026-07-08 — re-check via SELECT COUNT(*) FROM facility WHERE organization_id IS NOT NULL if this ever needs re-verifying.)",
     },
 
 

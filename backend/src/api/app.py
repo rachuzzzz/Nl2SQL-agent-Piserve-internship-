@@ -98,6 +98,24 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="InspectAI NL2SQL API", version="1.0.0", lifespan=lifespan)
 
+
+# ── Phase 5 hardening: catch-all so an unhandled pipeline bug returns a clean
+# JSON error with a correlation id (logged server-side with the full trace)
+# instead of a bare 500 / leaked stack trace. HTTPException / request-
+# validation errors keep their own handlers.
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request, exc):  # noqa: ANN001
+    import uuid as _uuid
+
+    from fastapi.responses import JSONResponse
+    eid = _uuid.uuid4().hex[:8]
+    log.exception("[UNHANDLED] eid=%s %s %s", eid, request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal server error", "error_id": eid},
+    )
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

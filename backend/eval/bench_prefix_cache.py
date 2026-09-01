@@ -16,6 +16,19 @@ Cases (per domain, per role):
                             shared Ollama server, quantifying slot eviction
                             risk from running both domains' orchestrators in
                             one process (see api/app.py).
+  classifier_thrash       — TurnClassifier's short, differently-shaped system
+                            prompt interleaved with the reasoning role's own
+                            (warmed) system prompt on the SAME model, in the
+                            same order query() actually calls them (classify()
+                            always runs immediately before the main loop's
+                            first iteration). Compares the reasoning call's
+                            prefill speed here against warm_repeat's (same
+                            prefix, NOT preceded by a classifier call) — a
+                            large gap is the direct evidence for the
+                            TurnClassifier cache-thrash hypothesis in the
+                            token/caching audit (see agent/orchestrator/
+                            turn_classifier.py and loop.py's classify() call
+                            site).
 
 Run this BEFORE applying the prompt-ordering fix / keep_alive change to get a
 true baseline, and again AFTER to quantify the actual win.
@@ -33,6 +46,7 @@ import os
 import json
 import time
 import argparse
+import concurrent.futures
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -143,6 +157,31 @@ def run_case_reasoning(client, base_url, model, domain, prefix, questions, repea
     return rows
 
 
+def _simulated_per_question_schema_hint(schema_hint: str, question: str) -> str:
+    """
+    The real generate_sql() builds {schema_hint} per-question — it's not a
+    fixed block. _build_additional_context() (sql/generation.py) appends a
+    "Planner draft — editable" section carrying the reasoning LLM's own
+    per-question draft SQL/mandatory hints on top of the schema reference,
+    so two different questions in the same domain get DIFFERENT schema_hint
+    text even though the underlying table/column reference is the same.
+    warm_prefix_varied_tail exists specifically to measure whether the
+    prefix cache survives that per-question variation — using a byte-
+    identical schema_hint across every question (as this benchmark did
+    before this function existed) can't detect the bug Option A/the
+    token-caching-audit fix addresses at all, since nothing before
+    {question} would ever actually change. This stub doesn't need to be a
+    real SQL draft, only a plausible-sized, genuinely question-dependent
+    addition, so the benchmark exercises the real caching boundary.
+    """
+    return (
+        f"{schema_hint}\n\n"
+        f"#### Planner draft — editable\n"
+        f"-- draft for: {question}\n"
+        f"SELECT 1 -- placeholder draft, length/content varies per question\n"
+    )
+
+
 def run_case_sql(client, base_url, model, domain, template, schema_hint, core, questions, repeats):
     rows = []
     nonce_core = core + f"\n-- bench nonce {time.time()}"
@@ -155,10 +194,16 @@ def run_case_sql(client, base_url, model, domain, template, schema_hint, core, q
                           **_chat(client, base_url, model,
                                   [{"role": "user", "content": _fill_sql_prompt(template, schema_hint, core, questions[0])}],
                                   num_ctx=SQL_NUM_CTX)))
+    # Real per-question schema_hint variation (see
+    # _simulated_per_question_schema_hint's docstring) — NOT the same
+    # fixed schema_hint used above, since holding it constant across
+    # questions can't exercise the byte-prefix-shift bug this case exists
+    # to catch.
     for q in questions[1:]:
         rows.append(dict(case="warm_prefix_varied_tail", domain=domain, role="sql",
                           **_chat(client, base_url, model,
-                                  [{"role": "user", "content": _fill_sql_prompt(template, schema_hint, core, q)}],
+                                  [{"role": "user", "content": _fill_sql_prompt(
+                                      template, _simulated_per_question_schema_hint(schema_hint, q), core, q)}],
                                   num_ctx=SQL_NUM_CTX)))
     return rows
 
@@ -173,6 +218,116 @@ def run_cross_domain_thrash(client, base_url, model, role, domains, build_messag
         for d in domains:
             rows.append(dict(case="cross_domain_thrash", domain=d, role=role, cycle=cycle,
                               **_chat(client, base_url, model, build_messages_fn(d), num_ctx=num_ctx)))
+    return rows
+
+
+def run_classifier_thrash(client, base_url, model, domain, reasoning_prefix,
+                           classifier_prompt, questions, cycles=3):
+    """Interleaves a classifier-shaped call (short, distinct system prompt)
+    between reasoning-shaped calls on the SAME model, in the same order
+    query() actually issues them — classify() (loop.py) always runs
+    immediately before the main loop's own first .chat() call, every turn
+    after the first. Compare this case's classifier_thrash_reasoning rows
+    against run_case_reasoning's warm_repeat rows (identical reasoning_prefix,
+    but NOT preceded by a classifier call): a much slower/colder prefill here
+    is the direct evidence that TurnClassifier's differently-shaped prompt is
+    evicting the reasoning role's own warmed prefix from Ollama's slot cache
+    before the main loop gets to use it — the root-cause hypothesis in the
+    token/caching audit, not yet confirmed by any measurement before this."""
+    rows = []
+    # A plausible-shaped CONVERSATION STATE block — real content doesn't
+    # matter for a prefill-speed measurement, only that it's roughly the
+    # size real traffic sends (see turn_classifier.py's _render_state).
+    fake_state = (
+        "CONVERSATION STATE:\n"
+        "Recent turns (most recent last, 1 of up to 8 kept):\n"
+        f"  Turn 1 [domain={domain}]: User: 'sample prior question' -> 'sample prior answer'\n"
+        "Current active scope: (none)\n"
+    )
+    for cycle in range(cycles):
+        q = questions[cycle % len(questions)]
+        rows.append(dict(case="classifier_thrash_classifier", domain=domain, role="turn_classifier", cycle=cycle,
+                          **_chat(client, base_url, model,
+                                  [{"role": "system", "content": classifier_prompt},
+                                   {"role": "user", "content": f"{fake_state}\n\nCURRENT MESSAGE: {q}"}],
+                                  num_ctx=REASONING_NUM_CTX)))
+        rows.append(dict(case="classifier_thrash_reasoning", domain=domain, role="reasoning", cycle=cycle,
+                          **_chat(client, base_url, model,
+                                  [{"role": "system", "content": reasoning_prefix},
+                                   {"role": "user", "content": q}],
+                                  num_ctx=REASONING_NUM_CTX)))
+    return rows
+
+
+def run_concurrent_warmup_thrash(client, base_url, model, domain, reasoning_prefix,
+                                  classifier_prompt, questions, cycles=3):
+    """
+    Tests a DIFFERENT hypothesis than classifier_thrash: that one is fully
+    SEQUENTIAL (classifier call completes, then the reasoning call starts) —
+    with no two requests ever genuinely in flight together, num_parallel has
+    no concurrency to schedule across a second slot, which is the confirmed
+    reason NUM_PARALLEL=2 measured zero improvement there (see the
+    token/caching audit's classifier_thrash results).
+
+    This case creates REAL concurrency instead: at the moment the classifier
+    call fires, a second request — just the reasoning role's static prefix,
+    num_predict=1, fire-and-forget — is issued AT THE SAME TIME, on a
+    separate thread, so both are genuinely in flight together. The
+    classifier's own output isn't needed to build this warmup request (it
+    only needs reasoning_prefix, which never depends on the classifier's
+    action/reference), so this doesn't change the real data dependency
+    that forces the classifier before the real reasoning call — the real
+    call still fires only after both of these complete.
+
+    If Ollama's slot-routing keys on prefix match for concurrent requests,
+    the warmup should land on a different slot than the classifier and
+    leave the reasoning prefix hot there, so the REAL reasoning call
+    (fired after, same prefix) hits warm. If it doesn't — if concurrent
+    requests still land on the same slot regardless of prefix, or slot
+    assignment doesn't work this way at all — the real reasoning call's
+    prefill should look the same as classifier_thrash's cold number.
+    """
+    rows = []
+    fake_state = (
+        "CONVERSATION STATE:\n"
+        "Recent turns (most recent last, 1 of up to 8 kept):\n"
+        f"  Turn 1 [domain={domain}]: User: 'sample prior question' -> 'sample prior answer'\n"
+        "Current active scope: (none)\n"
+    )
+    for cycle in range(cycles):
+        q = questions[cycle % len(questions)]
+        classifier_messages = [
+            {"role": "system", "content": classifier_prompt},
+            {"role": "user", "content": f"{fake_state}\n\nCURRENT MESSAGE: {q}"},
+        ]
+        warmup_messages = [
+            {"role": "system", "content": reasoning_prefix},
+            {"role": "user", "content": "warmup"},
+        ]
+        t_concurrent_start = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            f_classifier = pool.submit(_chat, client, base_url, model, classifier_messages,
+                                        num_predict=8, num_ctx=REASONING_NUM_CTX)
+            f_warmup = pool.submit(_chat, client, base_url, model, warmup_messages,
+                                    num_predict=1, num_ctx=REASONING_NUM_CTX)
+            classifier_result = f_classifier.result()
+            warmup_result = f_warmup.result()
+        concurrent_wall_ms = round((time.time() - t_concurrent_start) * 1000, 1)
+
+        rows.append(dict(case="concurrent_warmup_classifier", domain=domain, role="turn_classifier",
+                          cycle=cycle, concurrent_wall_ms=concurrent_wall_ms, **classifier_result))
+        rows.append(dict(case="concurrent_warmup_prefetch", domain=domain, role="reasoning_prefetch",
+                          cycle=cycle, concurrent_wall_ms=concurrent_wall_ms, **warmup_result))
+
+        # The REAL reasoning call — fired only after both above complete,
+        # same as production (classify() must finish before the reasoning
+        # prompt's session-context block, which needs its output, can be
+        # built). This is the number that matters: is it warm now?
+        rows.append(dict(case="concurrent_warmup_reasoning", domain=domain, role="reasoning", cycle=cycle,
+                          **_chat(client, base_url, model,
+                                  [{"role": "system", "content": reasoning_prefix},
+                                   {"role": "user", "content": q}],
+                                  num_ctx=REASONING_NUM_CTX)))
     return rows
 
 
@@ -242,6 +397,30 @@ def main():
         for r in rows:
             print(f"    cycle={r['cycle']} domain={r['domain']:<10} "
                   f"prefill={r['prompt_eval_duration_ms']:.0f}ms")
+
+        print(f"\n-- classifier_thrash (TurnClassifier vs. reasoning role, same model) --")
+        from src.agent.orchestrator.turn_classifier import _CLASSIFIER_SYSTEM_PROMPT
+        for domain in ("inspection", "audit"):
+            rows = run_classifier_thrash(
+                client, base_url, settings.ollama_chat_model, domain,
+                prefixes[domain], _CLASSIFIER_SYSTEM_PROMPT, QUESTIONS[domain], args.cycles,
+            )
+            all_rows += rows
+            for r in rows:
+                print(f"    domain={domain:<10} case={r['case']:<28} cycle={r['cycle']} "
+                      f"prefill={r['prompt_eval_duration_ms']:>7.0f}ms tokens={r['prompt_eval_count']:>5}")
+
+        print(f"\n-- concurrent_warmup_thrash (classifier + reasoning-prefix warmup fired concurrently) --")
+        for domain in ("inspection", "audit"):
+            rows = run_concurrent_warmup_thrash(
+                client, base_url, settings.ollama_chat_model, domain,
+                prefixes[domain], _CLASSIFIER_SYSTEM_PROMPT, QUESTIONS[domain], args.cycles,
+            )
+            all_rows += rows
+            for r in rows:
+                cw = f" concurrent_wall={r['concurrent_wall_ms']:.0f}ms" if "concurrent_wall_ms" in r else ""
+                print(f"    domain={domain:<10} case={r['case']:<28} cycle={r['cycle']} "
+                      f"prefill={r['prompt_eval_duration_ms']:>7.0f}ms tokens={r['prompt_eval_count']:>5}{cw}")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = args.output or f"bench_prefix_cache_{ts}.json"

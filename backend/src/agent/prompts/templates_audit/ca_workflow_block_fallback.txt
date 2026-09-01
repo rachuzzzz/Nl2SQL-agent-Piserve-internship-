@@ -1,6 +1,6 @@
 -- AUDIT CORRECTIVE ACTION WORKFLOW — four independent tracks on aca:
 --   status (system):                    DRAFT | SUBMITTED | OPEN | OVERDUE | CLOSED | CLOSE_WITH_DEFERRED
---   progress_stage (auditee):           NOT_STARTED, ON_TRACK, BEHIND, AT_RISK, COMPLETED, CLOSE_WITH_DEFERRED
+--   progress_stage (internal stakeholder/FM manager — person doing the work): NOT_STARTED, ON_TRACK, BEHIND, AT_RISK, COMPLETED, CLOSE_WITH_DEFERRED
 --   implementation_status (auditor, auditee-side check): NULL | PENDING_FOR_REVIEW | APPROVE | RETURN_FOR_MODIFICATION
 --   adequacy_status (auditor, adequacy check — NO inspection equivalent): same 4 values as implementation_status
 --     EXACT STRINGS for both: 'APPROVE' not 'APPROVED' — 'PENDING_FOR_REVIEW' not 'PENDING'

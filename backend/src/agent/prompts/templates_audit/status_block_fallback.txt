@@ -11,3 +11,32 @@
 --   NEVER show raw status breakdown (SUBMITTED/RETURNED_FOR_MODIFICATION/etc) unless user explicitly asks
 --   NEVER use status IN ('APPROVED','SUBMITTED') — that mixes conducted and completed
 --   NEVER use status != 'DRAFT' alone for conducted — APPROVED is not conducted
+--
+-- IMPORTANT — audit_report.status values and groupings (a SEPARATE lifecycle
+-- from audit_plan.status above — do not conflate them):
+--   DRAFT                           → not yet submitted — NEVER count or show
+--   SUBMITTED                      → the audit was carried out, report filed (in-flight)
+--   CLOSED / CLOSED_WITH_EXCEPTION → fully closed out (final)
+--
+--   STATUS GROUPINGS — always bucket into two categories for reporting:
+--     conducted = IN ('SUBMITTED')
+--     completed IN ('CLOSED','CLOSED_WITH_EXCEPTION')
+--
+--   CRITICAL DISAMBIGUATION — a BARE, unqualified "audit" / "the audit" (no
+--   "plan" qualifier) means audit_report — an actual audit EVENT that was
+--   carried out, with a report, form answers (ai_audit_answers), corrective
+--   actions, a facility, an auditor. It does NOT mean audit_plan, which is
+--   only the proposal/authorization stage BEFORE any audit happens and has no
+--   form answers, findings, or facility visit attached to it at all.
+--   "audit plan" (explicit) → audit_plan.status groupings above.
+--   "the [most recent/latest/conducted/completed] audit" (no "plan") → THIS
+--   block, audit_report.status. When in doubt and the question could plausibly
+--   lead to a follow-up about findings/answers/facility, use audit_report.
+--
+--   SCOPE — this disambiguation is about STATUS/LIFECYCLE questions only
+--   (which table's status column to filter/group on). It does NOT mean every
+--   bare "the audit" needs a fresh audit_report lookup. For an ATTRIBUTE
+--   question (auditee, auditor, facility, schedule date — not a status/count/
+--   lifecycle question) about an entity a recent turn already resolved to a
+--   specific audit_plan, join straight through audit_schedule using that
+--   plan's id — do not ask the user to re-specify which audit.

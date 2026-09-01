@@ -9,6 +9,7 @@ Tool return contract:
   Every tool returns {"success": bool, "result": <any>, "error": str | None}
 """
 
+import logging
 from typing import Any, Optional
 
 from sqlalchemy import inspect as sa_inspect, text as sql_text
@@ -20,6 +21,8 @@ from src.sql.validation import SQLValidator
 from src.sql.generation import generate_sql
 from src.sql.execution import execute_sql
 
+_log_security = logging.getLogger("inspectai.security")
+_log_sql = logging.getLogger("inspectai.sql")
 
 _SEMANTIC_MIN_SCORE = 0.55
 
@@ -188,6 +191,7 @@ def get_answers(
     offset: int = 0,
     scope_filter: str = '',
     domain: str = "inspection",
+    _qid: str = "",
 ) -> dict[str, Any]:
     """
     Query submitted answers from ai_answers (inspection) or ai_audit_answers
@@ -206,6 +210,8 @@ def get_answers(
     """
     try:
         if scope_filter == 'BLOCK':
+            _log_security.warning("[SCOPE] qid=%s outcome=BLOCKED tool=get_answers domain=%s",
+                                  _qid, domain)
             return {"success": False, "result": None, "error": "SCOPE_BLOCKED"}
 
         is_audit = domain == "audit"
@@ -314,6 +320,7 @@ def get_answers(
             "error": None,
         }
     except Exception as exc:
+        _log_sql.debug("qid=%s get_answers raised %s", _qid, type(exc).__name__, exc_info=True)
         return {"success": False, "result": None, "error": str(exc)}
 
 
@@ -536,7 +543,7 @@ class ToolRegistry:
                  debug_logger=None, seed_index=None, db_schema=None,
                  core_context: str | None = None, build_core_context_fn=None,
                  join_graph_module=None, rules_engine=None,
-                 domain: str = "inspection") -> None:
+                 domain: str = "inspection", profile: bool = False) -> None:
         self._db_engine = db_engine
         self._semantic_index = semantic_index
         self._validator = validator
@@ -562,6 +569,11 @@ class ToolRegistry:
         # ai_answers/inspection_report or ai_audit_answers/audit_report —
         # added 2026-07-29 when ai_audit_answers was confirmed live for audit.
         self._domain = domain
+        # Phase 3.8 profiling flag — see sql/generation.py's generate_sql()
+        # _profile param docstring. False (default) means every downstream
+        # generate_sql call skips the extra /tokenize round-trips entirely,
+        # so production/non-profiling callers pay nothing for this.
+        self._profile = profile
 
     def call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         # Tools declared via agent/tool_defs (see that package's docstring)
@@ -725,12 +737,15 @@ class ToolRegistry:
                     _db_schema=self._db_schema,
                     _active_cycle_uuid=str(args.get("_active_cycle_uuid", "")),
                     _retry_attempt=_retry_attempt,
+                    _last_attempt=bool(args.get("_last_attempt", False)),
                     relevant_tables=_tables,
                     _core_context=self._core_context,
                     _build_core_context_fn=self._build_core_context_fn,
                     _join_graph_module=self._join_graph_module,
                     _rules_engine=self._rules_engine,
                     _domain=self._domain,
+                    _profile=self._profile,
+                    _qid=str(args.get("_qid", "")),
                 )
 
             if name == "execute_sql":
@@ -742,7 +757,8 @@ class ToolRegistry:
                                    sql=str(args["sql"]),
                                    question=str(args.get("question", "")),
                                    offset=_offset,
-                                   force=bool(args.get("force", False)))
+                                   force=bool(args.get("force", False)),
+                                   qid=str(args.get("_qid", "")))
 
             if name == "get_schema":
                 return get_schema(self._db_engine,

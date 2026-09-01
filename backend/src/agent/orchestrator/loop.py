@@ -21,6 +21,7 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from src.llm.factory import get_llm_client
 from src.llm.prefix_cache import PrefixCacheManager
+from src.llm.anthropic import build_cached_system_message
 from src.retrieval import SemanticQuestionIndex, SeedExampleIndex, text_similarity
 from src.sql.validation import SQLValidator
 from src.agent.domains import get_domain_config
@@ -127,7 +128,9 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                  domain: str = "inspection",
                  db_engine=None, embed_model=None, reasoning_llm=None,
                  reasoning_llm_provider: str = "ollama", sql_llm_provider: str = "ollama",
-                 anthropic_api_key: str = "", vllm_url: str = ""):
+                 anthropic_api_key: str = "", vllm_url: str = "",
+                 llamacpp_reasoning_url: str = "", llamacpp_sql_url: str = "",
+                 profile: bool = False):
         print(f"Initialising AgentOrchestrator (domain={domain})...")
         self.domain = domain
         self._domain_cfg = get_domain_config(domain)
@@ -144,7 +147,20 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             print("  ✓ Database connection reused from another domain instance")
         else:
             print("  Connecting to database...")
-            self.db_engine = create_engine(db_connection_string)
+            # Phase 5 hardening: pre_ping validates a pooled connection before
+            # every checkout (a dropped/idle-timed-out/server-restarted conn is
+            # transparently replaced instead of failing the query); pool_recycle
+            # proactively retires connections older than N seconds. Size knobs
+            # come from settings (env-overridable) with production-safe defaults.
+            from src.config.settings import get_settings as _get_settings
+            _s = _get_settings()
+            self.db_engine = create_engine(
+                db_connection_string,
+                pool_pre_ping=True,
+                pool_recycle=_s.db_pool_recycle,
+                pool_size=_s.db_pool_size,
+                max_overflow=_s.db_max_overflow,
+            )
             with self.db_engine.connect() as conn:
                 conn.execute(sql_text("SELECT 1")).fetchone()
             print("  ✓ Database connected")
@@ -188,13 +204,30 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             .replace("{inspection_schema_sql}", "")
             .replace("{audit_schema_sql}", "")
         )
-        # Everything before {schema_hint} is the true byte-identical prefix
-        # across every SQL-gen call in this domain — {schema_hint},
-        # {dynamic_examples}, and {question} (in that order in the template)
-        # are all per-request variable content, so Ollama's prefix match
-        # stops at the first one regardless of what's warmed. Priming past
-        # that point would prime bytes real traffic never repeats.
-        self._sql_static_prefix = self._sql_prompt.split("{schema_hint}")[0]
+        # The template puts {dynamic_examples} before {schema_hint} (see
+        # sql/examples/templates/sql_generation_prompt.txt — deliberately
+        # reordered so the guaranteed-static content comes first; it used to
+        # be {schema_hint} first, which meant even the STATIC CORE_CONTEXT
+        # block landed at a different byte offset on every call, since it's
+        # substituted into {dynamic_examples} and {schema_hint} is fully
+        # variable per question — see sql/generation.py's dynamic_examples =
+        # core_context + build_core_context_additions(question) + retrieved).
+        # {question} still comes last, after {schema_hint}.
+        #
+        # core_context (CORE_CONTEXT / CORE_CONTEXT_AUDIT, per domain — see
+        # domains.py) is itself fully static, built once at import, but it's
+        # SUBSTITUTED content, not template text — splitting the raw template
+        # string on {dynamic_examples} only gets the literal skeleton text
+        # before that placeholder, not what actually replaces it. Appending
+        # core_context here is what makes the warmed prefix match the real
+        # bytes every call sends: skeleton + core_context is byte-identical
+        # across every question in this domain (retrieved examples and any
+        # per-question conditional block are appended after core_context
+        # inside {dynamic_examples}'s own substituted value, so they don't
+        # participate in this guaranteed-stable prefix).
+        self._sql_static_prefix = (
+            self._sql_prompt.split("{dynamic_examples}")[0] + self._domain_cfg.core_context
+        )
 
         if embed_model is not None:
             self.embed_model = embed_model
@@ -232,9 +265,15 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # .complete(prompt) per the LLMClient protocol (llm/base.py), so
         # neither knows or cares which provider built it.
         _base_urls = {"ollama": ollama_url, "vllm": vllm_url}
+        # llamacpp gets a per-role base_url instead of one shared URL: unlike
+        # Ollama (one server, many models) or this app's vLLM usage,
+        # reasoning and sql are two separate llama-server processes/ports
+        # (one model per process — see llm/factory.py's
+        # get_reasoning_llm_llamacpp docstring).
+        _llamacpp_role_urls = {"reasoning": llamacpp_reasoning_url, "sql": llamacpp_sql_url}
 
         def _build(role: str, provider: str, model: str):
-            base_url = _base_urls.get(provider, "")
+            base_url = _llamacpp_role_urls[role] if provider == "llamacpp" else _base_urls.get(provider, "")
             return get_llm_client(provider, role, model, base_url=base_url, api_key=anthropic_api_key)
 
         if reasoning_llm is not None:
@@ -273,7 +312,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # changed — see turn_classifier.py's module docstring for the regex
         # bank this replaces. Reuses self.reasoning_llm, same as DomainRouter
         # does for its own Tier-3 (one extra short completion, no model swap).
-        self._turn_classifier = TurnClassifier(self.reasoning_llm, self._debug)
+        self._turn_classifier = TurnClassifier(self.reasoning_llm, self._debug, domain=self.domain)
 
         # Domain-scoped pieces threaded through to generate_sql() (see
         # sql/generation.py) via ToolRegistry — the rules engine is also
@@ -295,7 +334,12 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             join_graph_module=self._domain_cfg.join_graph_module,
             rules_engine=self._rules_engine,
             domain=self.domain,
+            profile=profile,
         )
+        # Phase 3.21: also kept on self (previously only forwarded to
+        # ToolRegistry) — needed at the build_context_block() call site
+        # below for the opt-in real-token conversation-history instrumentation.
+        self._profile = profile
 
         # Instance attribute shadows the class-level _TERMINAL_TOOLS set,
         # unioned with any declared tool (agent/tool_defs) that opts into
@@ -361,7 +405,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         if visibility_scope is None:
             scope_filter = 'BLOCK'
         else:
-            scope_filter = build_scope_filter(visibility_scope, domain=self.domain)
+            scope_filter = build_scope_filter(visibility_scope, domain=self.domain, qid=qid)
 
         _perm_count = len((visibility_scope or {}).get("permissions", []))
 
@@ -425,11 +469,43 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # Computed once per turn, before build_context_block (which needs it)
         # and reused by the pagination fast-path and the ordinal/selection/
         # count-followup backstops further down this same method.
-        _turn_action = self._turn_classifier.classify(question, session, stats=stats)
+        _turn_action = self._turn_classifier.classify(question, session, stats=stats, qid=qid)
         if session and session.turns:
-            system_content += "\n\n" + session.build_context_block(
+            _history_block = session.build_context_block(
                 question, current_domain=self.domain, turn_action=_turn_action,
             )
+            system_content += "\n\n" + _history_block
+            # Phase 3.21: production instrumentation for conversation-history
+            # cost — this block was flagged (2026-08 token audit) as the
+            # single largest uninstrumented growth vector for multi-turn
+            # sessions (a real logged case hit 83,456 total system_content
+            # chars by turn 18) but eval.py's synthetic multi-turn coverage
+            # (4 questions) is too thin to validate any cut against, so this
+            # phase only adds real visibility, not a behavior change.
+            # Char count is free (no network call) and always logged;
+            # real token count adds one live /tokenize round-trip so it's
+            # opt-in behind self._profile (same zero-cost-when-off contract
+            # as every other _profile-gated instrumentation in this codebase).
+            stats.history_block_chars = len(_history_block)
+            stats.history_block_turn_count = len(session.turns)
+            _log_llm.info(
+                "[HISTORY-SIZE] turn=%d history_chars=%d",
+                len(session.turns), len(_history_block),
+            )
+            if self._profile and _history_block:
+                try:
+                    from src.llm.tokenize import count_tokens_llamacpp
+                    _reasoning_base_url = (
+                        getattr(self.reasoning_llm, "api_base", "")
+                        or getattr(self.reasoning_llm, "base_url", "")
+                    )
+                    stats.history_block_tokens = count_tokens_llamacpp(_history_block, _reasoning_base_url)
+                    _log_llm.info(
+                        "[HISTORY-SIZE] turn=%d history_tokens=%d",
+                        len(session.turns), stats.history_block_tokens,
+                    )
+                except Exception:
+                    pass  # instrumentation must never break a real query
 
         # Cheap char-count proxy for "getting close to num_ctx" — this
         # codebase doesn't tokenize prompts client-side, so this is only a
@@ -448,8 +524,20 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 len(system_content),
             )
 
+        # system_content always starts with self._system_prompt (see its
+        # construction above: `self._system_prompt + build_dynamic_prompt_
+        # additions(...)`, then `+=` for CURRENT USER / SECURITY CONSTRAINT /
+        # session history) — self._system_prompt is the one piece that's
+        # byte-identical across EVERY call for this domain's whole lifetime,
+        # so it's the right Anthropic cache breakpoint; everything after it
+        # is per-question/per-turn and must stay outside the cached region.
+        # build_cached_system_message no-ops to today's exact single flat
+        # message on every non-Anthropic client (Ollama/vLLM) — see its
+        # docstring in llm/anthropic.py.
         messages = [
-            ChatMessage(role=MessageRole.SYSTEM, content=system_content),
+            build_cached_system_message(
+                self.reasoning_llm, self._system_prompt, system_content[len(self._system_prompt):],
+            ),
             ChatMessage(role=MessageRole.USER, content=question),
         ]
         steps = []
@@ -524,7 +612,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 # Path A: last turn used execute_sql — re-run the SQL for the
                 # NEXT window (prev.page_offset), not the same first rows again.
                 if prev.sql:
-                    _pg_args = {"sql": prev.sql, "question": question, "offset": prev.page_offset}
+                    _pg_args = {"sql": prev.sql, "question": question, "offset": prev.page_offset, "_qid": qid}
                     er = self.registry.call("execute_sql", _pg_args)
                     s = AgentStep(1, "[auto] pagination", "execute_sql",
                                   _pg_args, er, 0)
@@ -936,6 +1024,19 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 # drop the seed example the SQL-gen model is fixating on
                 # (see SeedExampleIndex.retrieve's skip_top_match).
                 args["_retry_attempt"] = _sql_retry_signal
+                args["_qid"] = qid
+
+                # Tells generate_sql this call, if it also fails validation
+                # or execution, will be the 3rd failure that trips
+                # _refuse_or_clarify_after_failures() below (gen_sql_failures
+                # >= 3) — so its own internal guard retries (offset/table/
+                # uuid, see generation.py) can skip firing: whatever they'd
+                # produce still gets judged by the same terminal cap on the
+                # next pass, so the extra LLM call(s) they'd otherwise make
+                # can't change the outcome, only add latency/tokens. Not set
+                # (defaults False) on attempts 1-2, where a guard fixing the
+                # SQL genuinely can still save the query.
+                args["_last_attempt"] = gen_sql_failures >= 2
 
                 # Preserve explicit LIMIT from user question.
                 # Negative lookahead after the digit excludes time-window
@@ -1151,6 +1252,10 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 args["question"] = question
                 tc["args"] = args
 
+            if tool == "execute_sql":
+                args["_qid"] = qid
+                tc["args"] = args
+
             # Enforce scope for any direct execute_sql call the LLM emits
             if tool == "execute_sql" and scope_filter:
                 exec_sql = args.get("sql", "")
@@ -1163,6 +1268,8 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                         )
                         tc["args"] = args
                     except ValueError:
+                        _log_security.warning("[SCOPE] %soutcome=BLOCKED sub=%s — direct execute_sql scope injection blocked",
+                                              _pfx, _sub)
                         stats.total_wall_ms = int((time.time() - query_start) * 1000)
                         return AgentResult(
                             question, "You don't have permission to query this data.",
@@ -1291,6 +1398,7 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             # scope_filter is never 'BLOCK' here — BLOCK is returned before this loop.
             if tool == "get_answers":
                 args["scope_filter"] = scope_filter
+                args["_qid"] = qid
                 tc["args"] = args
 
             # Declared tools (agent/tool_defs) may need per-call orchestrator
@@ -1306,10 +1414,28 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 _loop_locals = {"session": session, "domain": self.domain}
                 dispatch_args = {**args, **_declared_tool.context_provider(_loop_locals)}
 
+            # Separate timer from `t0` (set at the top of this iteration,
+            # before the reasoning LLM call above) — AgentStep.duration_ms
+            # below deliberately keeps its existing, long-standing meaning
+            # of "whole iteration span since t0" (reasoning-LLM-call time +
+            # dispatch time combined; other consumers of .duration_ms rely
+            # on that), so it can't also be used as a clean dispatch-only
+            # measurement for QueryStats.total_sql_gen_ms. Confirmed live
+            # during Phase 3.1 profiling: reusing s.duration_ms here made
+            # sql_gen_ms include the preceding reasoning-LLM latency too,
+            # inflating the reported breakdown well past 100% of wall time.
+            _dispatch_t0 = time.time()
             result = dispatch(tc, self.registry, override_args=dispatch_args)
+            _dispatch_ms = int((time.time()-_dispatch_t0)*1000)
             s = AgentStep(iteration, thought, tool, args, result,
                           int((time.time()-t0)*1000))
             steps.append(s); _emit(s)
+
+            # See QueryStats.total_sql_gen_ms's docstring — the only place
+            # this whole-call duration (retrieval + prompt build + sql_llm
+            # completion + validation/guard retries) is captured.
+            if tool == "generate_sql":
+                stats.total_sql_gen_ms += _dispatch_ms
 
             # generate_sql's LLM calls (initial + up to 3 guard retries, see
             # sql/generation.py) were never folded into stats before — only
@@ -1324,6 +1450,35 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 if _sql_tok:
                     stats.total_prompt_tokens += _sql_tok.get("prompt_tokens", 0)
                     stats.total_completion_tokens += _sql_tok.get("completion_tokens", 0)
+                    stats.total_cache_read_tokens += _sql_tok.get("cache_read_tokens", 0)
+                    stats.total_cache_creation_tokens += _sql_tok.get("cache_creation_tokens", 0)
+                # See QueryStats.sql_gen_prefill_ms/sql_gen_decode_ms docstring.
+                _sql_timing = (result.get("result") or {}).get("_llm_timings")
+                if _sql_timing:
+                    stats.sql_gen_prefill_ms += int(_sql_timing.get("prefill_ms", 0))
+                    stats.sql_gen_decode_ms += int(_sql_timing.get("decode_ms", 0))
+                # Phase 3.8 profiling — see QueryStats.sql_gen_question_tokens
+                # docstring. None unless the orchestrator was built with
+                # profile=True (ToolRegistry threads it into every
+                # generate_sql call's _profile arg).
+                _sql_comp = (result.get("result") or {}).get("_prompt_composition")
+                if _sql_comp:
+                    stats.sql_gen_question_tokens += _sql_comp.get("question_tokens", 0)
+                    stats.sql_gen_schema_hint_tokens += _sql_comp.get("schema_hint_tokens", 0)
+                    stats.sql_gen_core_context_tokens += _sql_comp.get("core_context_tokens", 0)
+                    stats.sql_gen_retrieved_example_tokens += _sql_comp.get("retrieved_example_tokens", 0)
+                    stats.sql_gen_total_prompt_tokens += _sql_comp.get("total_prompt_tokens", 0)
+                    stats.sql_gen_profiled_calls += 1
+                    # Phase 3.9 — schema_hint's own sub-contributors, see
+                    # QueryStats.sql_gen_auto_schema_tokens docstring.
+                    _sh_breakdown = _sql_comp.get("schema_hint_breakdown")
+                    if _sh_breakdown:
+                        stats.sql_gen_auto_schema_tokens += _sh_breakdown.get("auto_schema_tokens", 0)
+                        stats.sql_gen_mandatory_hint_tokens += _sh_breakdown.get("mandatory_hint_tokens", 0)
+                        stats.sql_gen_planner_notes_tokens += _sh_breakdown.get("planner_notes_tokens", 0)
+                        stats.sql_gen_join_path_tokens += _sh_breakdown.get("join_path_tokens", 0)
+                        stats.sql_gen_business_rules_tokens += _sh_breakdown.get("business_rules_tokens", 0)
+                        stats.sql_gen_draft_sql_tokens += _sh_breakdown.get("draft_sql_tokens", 0)
 
             # Path A: generate_sql → auto-execute
             if tool == "generate_sql" and result.get("success"):
@@ -1353,14 +1508,14 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                                 primary_alias=self._scope_primary_alias,
                             )
                         except ValueError:
-                            _log_query.warning("[SCOPE] %sscope injection blocked execution sub=%s", _pfx, _sub)
+                            _log_security.warning("[SCOPE] %soutcome=BLOCKED sub=%s — scope injection blocked execution", _pfx, _sub)
                             stats.total_wall_ms = int((time.time() - query_start) * 1000)
                             return AgentResult(
                                 question, "You don't have permission to query this data.",
                                 steps, iteration, False, stats,
                             )
                     et0 = time.time()
-                    er = self.registry.call("execute_sql", {"sql": sql, "question": question})
+                    er = self.registry.call("execute_sql", {"sql": sql, "question": question, "_qid": qid})
                     _exec_ms = int((time.time() - et0) * 1000)
                     auto = AgentStep(iteration, "[auto] execute after generate_sql",
                                      "execute_sql", {"sql": sql}, er, _exec_ms)
@@ -1445,7 +1600,8 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                         continue
 
                     ans = self._synthesize(question, "execute_sql", er, sql=sql, session=session)
-                    return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
+                    return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start,
+                                        qid=qid, sub=_sub)
 
                 else:
                     gen_sql_failures += 1
@@ -1520,7 +1676,8 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
                 ans = self._synthesize(question, tool, result,
                                         sql=args.get("sql", "") if tool == "execute_sql" else "",
                                         session=session)
-                return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start)
+                return self._finish(question, ans, steps, iteration, _emit, stats, session, query_start,
+                                    qid=qid, sub=_sub)
 
             # Path C: non-terminal → continue reasoning
             messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=raw))
@@ -1572,13 +1729,19 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
 
     @classmethod
     def from_env(cls, env_path=".env", domain: str = "inspection",
-                 db_engine=None, embed_model=None, reasoning_llm=None):
+                 db_engine=None, embed_model=None, reasoning_llm=None,
+                 profile: bool = False):
         """
         db_engine/embed_model/reasoning_llm let a second domain instance share
         the first's DB connection pool, embedding model, and reasoning LLM
         client instead of building its own (one DB pool, one embedding model,
         one warm LLM client for both "inspection" and "audit" — see
         api/app.py's lifespan and the domain-router plan's §3/§6).
+
+        profile: Phase 3.8 prompt-composition profiling — see ToolRegistry's
+        profile param and sql/generation.py's generate_sql() _profile param.
+        False by default; eval.py/eval_audit.py's --profile-tokens CLI flag
+        is the only caller expected to pass True.
         """
         from dotenv import load_dotenv; load_dotenv(env_path)
         from src.config.settings import get_settings
@@ -1588,18 +1751,22 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
         # configured for — independent per role, so e.g. reasoning="vllm" +
         # sql="ollama" picks vllm_reasoning_model for chat_model and
         # ollama_sql_model for sql_model at the same time.
-        def _model_for(provider: str, ollama_model: str, vllm_model: str) -> str:
+        def _model_for(provider: str, ollama_model: str, vllm_model: str, llamacpp_model: str) -> str:
             if provider == "anthropic":
                 return settings.anthropic_model
             if provider == "vllm":
                 return vllm_model
+            if provider == "llamacpp":
+                return llamacpp_model
             return ollama_model
 
         chat_model = _model_for(
-            settings.reasoning_llm_provider, settings.ollama_chat_model, settings.vllm_reasoning_model
+            settings.reasoning_llm_provider, settings.ollama_chat_model,
+            settings.vllm_reasoning_model, settings.llamacpp_reasoning_model,
         )
         sql_model = _model_for(
-            settings.sql_llm_provider, settings.ollama_sql_model, settings.vllm_sql_model
+            settings.sql_llm_provider, settings.ollama_sql_model,
+            settings.vllm_sql_model, settings.llamacpp_sql_model,
         )
         return cls(
             db_connection_string=(
@@ -1619,5 +1786,8 @@ class AgentOrchestrator(SynthesisMixin, DisambiguationMixin):
             sql_llm_provider=settings.sql_llm_provider,
             anthropic_api_key=settings.anthropic_api_key,
             vllm_url=settings.vllm_url,
+            llamacpp_reasoning_url=settings.llamacpp_reasoning_url,
+            llamacpp_sql_url=settings.llamacpp_sql_url,
+            profile=profile,
         )
 

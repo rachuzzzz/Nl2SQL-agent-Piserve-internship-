@@ -174,10 +174,19 @@ class ConversationSession:
         _RECENT_FULL_DETAIL_TURNS = 3
         _QUESTION_RENDER_CAP = 300
         _COLUMNS_RENDER_CAP = 12
+        # A bare greeting ("hello" -> AMBIGUOUS) or a bare domain-name pick
+        # ("audit"/"inspection" with nothing else) resolves no domain/data at
+        # all (see chat.py's ConversationTurn(...) construction for both) —
+        # rendering these verbatim just because they're recent adds noise
+        # with zero informational value, and (confirmed live) makes later
+        # unrelated turns' prompts sensitive to byte-level differences in
+        # throwaway greeting text. domain_ack does set turn.domain, so
+        # tool_used — not domain — is the reliable marker for both.
+        _EMPTY_TURN_TOOLS = frozenset({"domain_clarification", "domain_ack"})
 
         lines = ["━━━ CONVERSATION HISTORY ━━━"]
         for i, t in enumerate(self.turns, 1):
-            if (len(self.turns) - i) >= _RECENT_FULL_DETAIL_TURNS:
+            if (len(self.turns) - i) >= _RECENT_FULL_DETAIL_TURNS or t.tool_used in _EMPTY_TURN_TOOLS:
                 _q_short = t.question[:150] + ("…" if len(t.question) > 150 else "")
                 _a_short = t.answer[:120] + ("…" if len(t.answer) > 120 else "")
                 _subj = (

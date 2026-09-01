@@ -701,7 +701,16 @@ def _check_uuid_leaks_regex(
 
 
 
-_AGG_FUNCS = (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)
+# Statistical aggregates (Stddev*/Variance*) added 2026-08-28: they ARE
+# aggregate functions, but their omission here made _check_ungrouped_select_
+# columns_ast flag e.g. `SELECT STDDEV(x), AVG(x), COUNT(*) FROM t` (valid
+# Postgres, implicit single group) as UNGROUPED_COLUMN — turning a correct
+# query into a 3-retry giveup (eval_audit STDV-01). PERCENTILE_CONT/DISC
+# parse as exp.WithinGroup (a wrapper, not a plain agg node) and are a
+# separate, currently-untriggered gap — deliberately NOT folded in here.
+_AGG_FUNCS = (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max,
+              exp.Stddev, exp.StddevSamp, exp.StddevPop,
+              exp.Variance, exp.VariancePop)
 
 
 def _check_ungrouped_select_columns_ast(sql: str, issues: list[ValidationIssue]) -> None:
@@ -745,8 +754,48 @@ def _check_ungrouped_select_columns_ast(sql: str, issues: list[ValidationIssue])
     if top_select is None:
         return
 
+    def _has_agg(node):
+        base = node.this if isinstance(node, exp.Alias) else node
+        return isinstance(base, _AGG_FUNCS) or bool(list(base.find_all(*_AGG_FUNCS)))
+
     group = top_select.args.get("group")
     if group is None:
+        # No GROUP BY at all. Postgres still rejects the query when the
+        # SELECT list mixes an aggregate with any expression carrying a
+        # non-aggregated column reference ("column ... must appear in the
+        # GROUP BY clause or be used in an aggregate function") — the
+        # implicit-single-group case the explicit-GROUP-BY diff below can't
+        # see. Plain Postgres semantics, domain-agnostic. Confirmed live
+        # 2026-08-27 (CONV-03 "how are we doing overall"): a
+        #   SELECT CASE WHEN ir.status='CLOSED' THEN ... END AS category,
+        #          COUNT(*), SUM(CASE ...) ...
+        # with no GROUP BY passed validation, hit GroupingError at execution,
+        # and the reasoning loop regenerated the identical query 3x before
+        # refusing. Fail-safe: skip expressions containing a subquery or
+        # window function, where functional-dependency rules are harder to
+        # reproduce without risking a false positive on valid SQL.
+        if not any(_has_agg(e) for e in top_select.expressions):
+            return
+        for col_expr in top_select.expressions:
+            inner = col_expr.this if isinstance(col_expr, exp.Alias) else col_expr
+            if _has_agg(inner):
+                continue
+            if inner.find(exp.Subquery) or inner.find(exp.Window) or inner.find(exp.Select):
+                continue
+            if not list(inner.find_all(exp.Column)):
+                continue
+            rendered = inner.sql(dialect="postgres")
+            issues.append(ValidationIssue(
+                "HARD_FAIL", "UNGROUPED_COLUMN",
+                f"'{rendered}' references a column alongside aggregates in a "
+                f"query with no GROUP BY — Postgres will reject this with "
+                f"'column must appear in the GROUP BY clause or be used in an "
+                f"aggregate function'. Add a GROUP BY for the non-aggregated "
+                f"expression(s), or wrap/remove this one.",
+                detail="query has aggregate functions but no GROUP BY clause",
+            ))
+            ValidatorStats.record("UNGROUPED_COLUMN", is_retry_trigger=True)
+            return
         return
     if any(isinstance(g, exp.Literal) and g.is_int for g in group.expressions):
         return
